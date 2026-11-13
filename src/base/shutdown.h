@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_BASE_SHUTDOWN_H
+#define EREMITE_BASE_SHUTDOWN_H
 
 // Stop requests, from SIGINT, SIGTERM or the program itself.
 
@@ -16,3 +17,5 @@ int shutdown_requested(void);
 
 // How many stops were requested.
 int shutdown_requests(void);
+
+#endif

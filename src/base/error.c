@@ -5,7 +5,7 @@
 
 void (*die_hook)(void);
 
-_Noreturn void die(const char *fmt, ...) {
+[[noreturn]] void die(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   if (die_hook) die_hook();

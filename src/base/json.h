@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_BASE_JSON_H
+#define EREMITE_BASE_JSON_H
 
 // JSON documents, parsed into trees.
 
@@ -20,3 +21,5 @@ Json *json_get(const Json *object, const char *key);
 
 // Frees the tree and its strings.
 void json_free(Json *root);
+
+#endif

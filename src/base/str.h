@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_BASE_STR_H
+#define EREMITE_BASE_STR_H
 #include <stddef.h>
 
 // A string that grows as text is appended, always NUL-terminated.
@@ -15,3 +16,5 @@ void str_cat(Str *s, const char *t);
 
 // Prints formatted text at the end.
 void str_printf(Str *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+#endif

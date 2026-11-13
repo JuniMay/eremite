@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_PLATFORM_THREADS_H
+#define EREMITE_PLATFORM_THREADS_H
 #include <stddef.h>
 
 #if EREMITE_THREADS_GCD
@@ -111,4 +112,6 @@ THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority, vo
 THREADS_API void threads_apply(size_t n, ThreadsPriority priority, void *context, void (*fn)(void *, size_t)) {
   dispatch_apply_f(n, threads_queue(priority), context, fn);
 }
+#endif
+
 #endif

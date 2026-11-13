@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_PLATFORM_CONTEXT_H
+#define EREMITE_PLATFORM_CONTEXT_H
 
 // Switching between stacks, keeping the registers that a function call keeps.
 // macOS deprecates POSIX's ucontext, so the switch is written in assembly for
@@ -11,3 +12,5 @@ void context_switch(void **save, void *load);
 // Prepares the stack that ends at top so that the first switch to the
 // returned stack pointer calls entry, which must not return.
 void *context_new(void *top, void (*entry)(void));
+
+#endif

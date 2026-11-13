@@ -1,4 +1,5 @@
-#pragma once
+#ifndef EREMITE_ENGINE_PASS_H
+#define EREMITE_ENGINE_PASS_H
 #include "platform/threads.h"
 #include <stddef.h>
 
@@ -76,3 +77,5 @@ void pass_wait_group(ThreadsGroup *group);
 
 // When set, runs before a pass yields.
 extern void (*pass_before_yield)(void);
+
+#endif
