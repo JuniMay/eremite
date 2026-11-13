@@ -74,9 +74,14 @@ FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.h' 2>/dev/null)
 .PHONY: all test gpu-test format format-check clean
 all: $(LIB) $(CLI) $(TESTS) $(TIME_LIMIT) compile_commands.json
 
+# Each compiled file writes its entry of the compilation database beside its
+# output, with the command as written here.
+database_entry = printf '{"directory": "%s", "file": "%s", "command": "%s"},\n' '$(CURDIR)' '$(1)' '$(2)' > $(3)
+
 $(OBJ)/%.o: %
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -MMD -MP -MJ $(@:.o=.json) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+	@$(call database_entry,$<,$(CC) $(CFLAGS) -c $< -o $@,$(@:.o=.json))
 
 $(BUILD)/liberemite.a: $(LIB_OBJ)
 	rm -f $@
@@ -84,17 +89,18 @@ $(BUILD)/liberemite.a: $(LIB_OBJ)
 
 $(BUILD)/eremite: src/cli/main.c $(LIB)
 	@mkdir -p $(OBJ)/src/cli
-	$(CC) $(CFLAGS) -MMD -MP -MF $(OBJ)/src/cli/main.d -MJ $(OBJ)/src/cli/main.json -o $@ $< $(LIB) $(LDLIBS)
+	$(CC) $(CFLAGS) -MMD -MP -MF $(OBJ)/src/cli/main.d -o $@ $< $(LIB) $(LDLIBS)
+	@$(call database_entry,$<,$(CC) $(CFLAGS) -c $<,$(OBJ)/src/cli/main.json)
 
 define test_rule
 $(BUILD)/tests/$(1)-%: tests/$(1)/%.c $$(LIB)
 	@mkdir -p $$(@D)
-	$$(CC) $$(CFLAGS) $$(TEST_CFLAGS) -Itests -MMD -MP -MF $$@.d -MJ $$@.json -o $$@ $$< $$(TEST_LIBS) $$(LDLIBS)
+	$$(CC) $$(CFLAGS) $$(TEST_CFLAGS) -Itests -MMD -MP -MF $$@.d -o $$@ $$< $$(TEST_LIBS) $$(LDLIBS)
+	@$$(call database_entry,$$<,$$(CC) $$(CFLAGS) $$(TEST_CFLAGS) -Itests -c $$<,$$@.json)
 endef
 $(foreach g,$(TEST_GROUPS),$(eval $(call test_rule,$(g))))
 
-# clangd's compilation database, from the fragments that -MJ writes beside
-# each object and program.
+# clangd's compilation database, from the entries beside each object and program.
 compile_commands.json: $(LIB_OBJ) $(CLI) $(TESTS)
 	@mkdir -p $(BUILD)
 	@{ echo '['; find $(BUILD) -name '*.json' -exec cat {} + | sed '$$ s/,$$//'; echo ']'; } > $@
