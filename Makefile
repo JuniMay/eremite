@@ -44,6 +44,10 @@ TEST_SRC := $(wildcard tests/*/*.c)
 TEST_GROUPS := $(sort $(patsubst tests/%/,%,$(dir $(TEST_SRC))))
 TESTS := $(foreach t,$(TEST_SRC),$(BUILD)/tests/$(subst /,-,$(t:tests/%.c=%)))
 group_tests = $(filter $(BUILD)/tests/$(1)-%,$(TESTS))
+# Each test runs with a time limit, so that a hang fails the run: after
+# TEST_SECONDS, the test and the processes it started end. 0 sets no limit.
+TEST_SECONDS ?= 600
+TIME_LIMIT := $(BUILD)/tests/time-limit
 
 # A test links the whole library unless it sets TEST_LIBS to something
 # smaller. Tests that include a library source to replace its calls rely on
@@ -54,7 +58,7 @@ TEST_CFLAGS =
 FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.h' 2>/dev/null)
 
 .PHONY: all test gpu-test format format-check clean
-all: $(LIB) $(CLI) $(TESTS) compile_commands.json
+all: $(LIB) $(CLI) $(TESTS) $(TIME_LIMIT) compile_commands.json
 
 $(OBJ)/%.o: %
 	@mkdir -p $(@D)
@@ -81,11 +85,15 @@ compile_commands.json: $(LIB_OBJ) $(CLI) $(TESTS)
 	@mkdir -p $(BUILD)
 	@{ echo '['; find $(BUILD) -name '*.json' -exec cat {} + | sed '$$ s/,$$//'; echo ']'; } > $@
 
-test: $(call group_tests,unit)
-	@set -e; for t in $^; do echo "== $$t"; $$t; done
+$(TIME_LIMIT): tests/time_limit.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -o $@ $<
 
-gpu-test: $(call group_tests,gpu)
-	@set -e; for t in $^; do echo "== $$t"; $$t; done
+test: $(TIME_LIMIT) $(call group_tests,unit)
+	@set -e; for t in $(call group_tests,unit); do echo "== $$t"; $(TIME_LIMIT) $(TEST_SECONDS) $$t; done
+
+gpu-test: $(TIME_LIMIT) $(call group_tests,gpu)
+	@set -e; for t in $(call group_tests,gpu); do echo "== $$t"; $(TIME_LIMIT) $(TEST_SECONDS) $$t; done
 
 format:
 	$(if $(FORMAT_SRC),clang-format -i $(FORMAT_SRC))
