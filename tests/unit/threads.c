@@ -1,3 +1,4 @@
+#include "check.h"
 #include "platform/threads.h"
 #include <stdatomic.h>
 #include <stdint.h>
@@ -7,13 +8,6 @@
 #endif
 
 // Tests the threads layer with the backend this build selects.
-
-static int failures;
-
-static void check(int ok, const char *what) {
-  printf("%s: %s\n", ok ? "ok" : "FAIL", what);
-  failures += !ok;
-}
 
 // A spawned thread's mark, and the event it signals after setting it.
 typedef struct {
