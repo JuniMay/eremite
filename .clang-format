@@ -1,0 +1,15 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 120
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortEnumsOnASingleLine: true
+IndentCaseLabels: false
+PointerAlignment: Right
+SpacesBeforeTrailingComments: 2
+AlignTrailingComments:
+  Kind: Never
+SortIncludes: Never
