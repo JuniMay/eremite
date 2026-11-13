@@ -14,6 +14,10 @@ struct ThreadsGroup {
   pthread_mutex_t lock;
   pthread_cond_t finished;
   long count;
+  // The events to signal when the count is zero, each once, and the room of
+  // their array.
+  ThreadsEvent **events;
+  int nevents, events_room;
 };
 
 // A task waits in its priority's queue until a worker of that priority takes it.
@@ -55,10 +59,12 @@ ThreadsGroup *threads_group_new(void) {
   pthread_mutex_init(&group->lock, NULL);
   pthread_cond_init(&group->finished, NULL);
   group->count = 0;
+  group->events = NULL, group->nevents = group->events_room = 0;
   return group;
 }
 
 void threads_group_free(ThreadsGroup *group) {
+  free(group->events);
   pthread_cond_destroy(&group->finished);
   pthread_mutex_destroy(&group->lock);
   free(group);
@@ -70,10 +76,20 @@ void threads_group_enter(ThreadsGroup *group) {
   pthread_mutex_unlock(&group->lock);
 }
 
+// At the count's zero, the events to signal leave the group, and are
+// signaled after its lock is released.
 void threads_group_leave(ThreadsGroup *group) {
+  ThreadsEvent **events = NULL;
+  int nevents = 0;
   pthread_mutex_lock(&group->lock);
-  if (--group->count == 0) pthread_cond_broadcast(&group->finished);
+  if (--group->count == 0) {
+    pthread_cond_broadcast(&group->finished);
+    events = group->events, nevents = group->nevents;
+    group->events = NULL, group->nevents = group->events_room = 0;
+  }
   pthread_mutex_unlock(&group->lock);
+  for (int i = 0; i < nevents; i++) threads_event_signal(events[i]);
+  free(events);
 }
 
 int threads_group_done(ThreadsGroup *group) {
@@ -86,6 +102,29 @@ int threads_group_done(ThreadsGroup *group) {
 void threads_group_wait(ThreadsGroup *group) {
   pthread_mutex_lock(&group->lock);
   while (group->count) pthread_cond_wait(&group->finished, &group->lock);
+  pthread_mutex_unlock(&group->lock);
+}
+
+void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event) {
+  pthread_mutex_lock(&group->lock);
+  if (!group->count) {
+    pthread_mutex_unlock(&group->lock);
+    threads_event_signal(event);
+    return;
+  }
+  int listed = 0;
+  for (int i = 0; i < group->nevents; i++) listed |= group->events[i] == event;
+  if (!listed) {
+    if (group->nevents == group->events_room) {
+      group->events_room = group->events_room ? 2 * group->events_room : 1;
+      group->events = realloc(group->events, (size_t)group->events_room * sizeof *group->events);
+      if (!group->events) {
+        fputs("threads: out of memory\n", stderr);
+        abort();
+      }
+    }
+    group->events[group->nevents++] = event;
+  }
   pthread_mutex_unlock(&group->lock);
 }
 

@@ -40,6 +40,27 @@ THREADS_API void threads_group_leave(ThreadsGroup *group);
 THREADS_API int threads_group_done(ThreadsGroup *group);  // without blocking: whether the group is done
 THREADS_API void threads_group_wait(ThreadsGroup *group);  // until the count is zero
 
+// An event that one thread waits for and other threads signal. A signal that
+// comes while no thread waits stays for the next wait, and several signals
+// before a wait count as one. So after each wait, the waiter looks again at
+// what it waits for.
+typedef struct ThreadsEvent ThreadsEvent;
+
+// Returns a new event that is not signaled.
+ThreadsEvent *threads_event_new(void);
+// Frees the event. No group may still have to signal it.
+void threads_event_free(ThreadsEvent *event);
+// Signals the event. Any thread may call it.
+void threads_event_signal(ThreadsEvent *event);
+// Blocks until the event is signaled, then takes the signal.
+void threads_event_wait(ThreadsEvent *event);
+// Takes the event's signal if there is one, without blocking. Returns whether
+// there was one.
+int threads_event_take(ThreadsEvent *event);
+// Signals the event once the group's count is zero, on another thread. If the
+// count is zero already, it signals the event soon.
+THREADS_API void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event);
+
 // Calls fn(context) once on a background thread and returns without waiting
 // for it. Unless group is null, group counts the call until fn returns.
 THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context, void (*fn)(void *));
@@ -73,6 +94,14 @@ THREADS_API int threads_group_done(ThreadsGroup *group) {
 THREADS_API void threads_group_wait(ThreadsGroup *group) {
   dispatch_group_wait(threads_dispatch(group), DISPATCH_TIME_FOREVER);
 }
+
+// Signals the event that threads_group_notify passes.
+static inline void threads_signal_event(void *event) { threads_event_signal(event); }
+
+THREADS_API void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event) {
+  dispatch_group_notify_f(threads_dispatch(group), threads_queue(THREADS_INTERACTIVE), event, threads_signal_event);
+}
+
 THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context, void (*fn)(void *)) {
   if (group)
     dispatch_group_async_f(threads_dispatch(group), threads_queue(priority), context, fn);
