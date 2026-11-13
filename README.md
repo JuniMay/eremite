@@ -14,3 +14,6 @@ make            # the library, the command-line program and the test programs
 make test       # tests that need neither a GPU nor model files
 make gpu-test   # tests that need a GPU but no model files
 ```
+
+`make THREADS=pthread` builds the threads layer on POSIX threads instead of
+Grand Central Dispatch.

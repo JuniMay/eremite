@@ -8,6 +8,9 @@
 #   make format-check   fail if clang-format would change a C source
 #   make clean          remove build/ and compile_commands.json
 #
+#   THREADS=pthread     build the threads layer on POSIX threads instead of
+#                       Grand Central Dispatch (src/platform/threads.h)
+#
 # Every .c and .S file under src/ goes into the library, except src/cli/,
 # which is the command-line program. Every tests/<group>/<name>.c becomes
 # build/tests/<group>-<name>.
@@ -16,6 +19,20 @@ CC := clang
 BUILD := build
 OBJ := $(BUILD)/obj
 CFLAGS := -std=c23 -O2 -Wall -Wextra -Isrc
+
+THREADS ?= gcd
+THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
+THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
+$(if $(THREADS_FLAG_$(THREADS)),,$(error THREADS is gcd or pthread))
+CFLAGS += $(THREADS_FLAG_$(THREADS))
+
+# Every object and program is built for one threads backend: when THREADS
+# differs from the last build's, that build's outputs are removed first.
+-include $(BUILD)/threads.mk
+ifneq ($(BUILT_THREADS),$(THREADS))
+$(shell rm -rf $(OBJ) $(BUILD)/tests $(BUILD)/eremite $(BUILD)/liberemite.a; mkdir -p $(BUILD); \
+  echo 'BUILT_THREADS := $(THREADS)' > $(BUILD)/threads.mk)
+endif
 
 SOURCES := $(shell find src -name '*.c' -o -name '*.S' 2>/dev/null)
 LIB_SRC := $(filter-out src/cli/%,$(SOURCES))
