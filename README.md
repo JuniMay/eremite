@@ -17,5 +17,6 @@ make gpu-test   # tests that need a GPU but no model files
 ```
 
 `make THREADS=pthread` builds the threads layer on POSIX threads instead of
-Grand Central Dispatch. Each test ends after `TEST_SECONDS` (default 600), so
-that a hang fails the run; `TEST_SECONDS=0` sets no limit.
+Grand Central Dispatch. `make SANITIZE=1` builds with AddressSanitizer and
+UndefinedBehaviorSanitizer. Each test ends after `TEST_SECONDS` (default 600),
+so that a hang fails the run; `TEST_SECONDS=0` sets no limit.

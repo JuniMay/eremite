@@ -5,6 +5,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#include <sanitizer/common_interface_defs.h>
+#define PASS_ASAN 1
+#endif
+#endif
 
 // A pass and the code that resumes it take turns on one thread, so nothing
 // here races.
@@ -12,6 +18,9 @@
 struct Pass {
   void *stack, *sp;  // the mapping, and the saved stack pointer while not running
   size_t mapped;
+  char *bottom;  // the stack above the guard page, and its size
+  size_t size;
+  void *fake;  // AddressSanitizer's state of the stack while the pass does not run
   void (*body)(void *);
   void *argument;
   PassWait wait;  // what it waits for; ready is null when it waits for nothing
@@ -23,13 +32,36 @@ struct Pass {
 };
 
 static Pass *running;
-static void *resumer_sp;
+static void *resumer_sp, *resumer_fake;
+static const void *resumer_bottom;
+static size_t resumer_size;
+
+// Before a switch, tells AddressSanitizer which stack is about to run.
+static void fiber_switch_start(void **fake, const void *bottom, size_t size) {
+#if PASS_ASAN
+  __sanitizer_start_switch_fiber(fake, bottom, size);
+#else
+  (void)fake, (void)bottom, (void)size;
+#endif
+}
+
+// After a switch, tells AddressSanitizer that it is done, and stores the
+// previous stack's bottom and size unless they are null.
+static void fiber_switch_finish(void *fake, const void **bottom, size_t *size) {
+#if PASS_ASAN
+  __sanitizer_finish_switch_fiber(fake, bottom, size);
+#else
+  (void)fake, (void)bottom, (void)size;
+#endif
+}
 
 // A new pass's first resume continues here, on the pass's own stack.
 static void pass_entry(void) {
+  fiber_switch_finish(NULL, &resumer_bottom, &resumer_size);
   Pass *p = running;
   p->body(p->argument);
   p->ended = 1;
+  fiber_switch_start(NULL, resumer_bottom, resumer_size);
   context_switch(&p->sp, resumer_sp);
   die("a finished pass was resumed");
 }
@@ -42,7 +74,13 @@ Pass *pass_new(void (*body)(void *), void *argument, size_t stack_bytes) {
   if (stack == MAP_FAILED) die("cannot map a pass's stack");
   if (mprotect(stack, page, PROT_NONE)) die("cannot protect a pass's stack");
   void *sp = context_new((char *)stack + bytes, pass_entry);
-  *p = (Pass){.stack = stack, .mapped = bytes, .sp = sp, .body = body, .argument = argument};
+  *p = (Pass){.stack = stack,
+              .mapped = bytes,
+              .bottom = (char *)stack + page,
+              .size = bytes - page,
+              .sp = sp,
+              .body = body,
+              .argument = argument};
   return p;
 }
 
@@ -81,7 +119,9 @@ int pass_resume(Pass *p) {
   if (p->resumed) p->resumed();
   p->wait = (PassWait){0};
   running = p;
+  fiber_switch_start(&resumer_fake, p->bottom, p->size);
   context_switch(&resumer_sp, p->sp);
+  fiber_switch_finish(resumer_fake, NULL, NULL);
   running = NULL;
   at = 0;
   for (int i = 0; i < p->nvariables; i++) {
@@ -136,7 +176,9 @@ void pass_wait(const PassWait *wait) {
   if (wait->ready && wait->ready(wait->context)) return;
   if (pass_before_yield) pass_before_yield();
   p->wait = *wait;
+  fiber_switch_start(&p->fake, resumer_bottom, resumer_size);
   context_switch(&p->sp, resumer_sp);
+  fiber_switch_finish(p->fake, &resumer_bottom, &resumer_size);
 }
 
 static int group_ready(void *group) { return threads_group_done(group); }

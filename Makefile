@@ -10,6 +10,7 @@
 #
 #   THREADS=pthread     build the threads layer on POSIX threads instead of
 #                       Grand Central Dispatch (src/platform/threads.h)
+#   SANITIZE=1          build with AddressSanitizer and UndefinedBehaviorSanitizer
 #
 # Every .c and .S file under src/ goes into the library, except src/cli/,
 # which is the command-line program. Every tests/<group>/<name>.c becomes
@@ -31,12 +32,20 @@ THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
 $(if $(THREADS_FLAG_$(THREADS)),,$(error THREADS is gcd or pthread))
 CFLAGS += $(THREADS_FLAG_$(THREADS))
 
-# Every object and program is built for one threads backend: when THREADS
-# differs from the last build's, that build's outputs are removed first.
--include $(BUILD)/threads.mk
-ifneq ($(BUILT_THREADS),$(THREADS))
+# Undefined behavior aborts the program instead of only being reported.
+SANITIZE ?=
+ifneq ($(SANITIZE),)
+CFLAGS += -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+endif
+
+# Every object and program is built for one configuration: when THREADS or
+# SANITIZE differs from the last build's, that build's outputs are removed
+# first.
+CONFIG := threads=$(THREADS) sanitize=$(SANITIZE)
+-include $(BUILD)/config.mk
+ifneq ($(BUILT_CONFIG),$(CONFIG))
 $(shell rm -rf $(OBJ) $(BUILD)/tests $(BUILD)/eremite $(BUILD)/liberemite.a; mkdir -p $(BUILD); \
-  echo 'BUILT_THREADS := $(THREADS)' > $(BUILD)/threads.mk)
+  echo 'BUILT_CONFIG := $(CONFIG)' > $(BUILD)/config.mk)
 endif
 
 SOURCES := $(shell find src -name '*.c' -o -name '*.S' 2>/dev/null)
