@@ -7,7 +7,8 @@ on one GPU, and serves an OpenAI- and Codex-compatible API.
 
 ## Build
 
-Requirements: macOS 27 with Xcode 27.
+Requirements: macOS 27 with Xcode 27, and `pkgconf` and `yyjson` from
+Homebrew.
 
 ```sh
 make            # the library, the command-line program and the test programs

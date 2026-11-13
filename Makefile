@@ -20,6 +20,11 @@ BUILD := build
 OBJ := $(BUILD)/obj
 CFLAGS := -std=c23 -O2 -Wall -Wextra -Isrc
 
+# Libraries found through pkg-config.
+PKGS := yyjson
+CFLAGS += $(shell pkg-config --cflags $(PKGS))
+LDLIBS := $(shell pkg-config --libs $(PKGS))
+
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
 THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
