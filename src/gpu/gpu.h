@@ -44,6 +44,11 @@ typedef struct {
 // CPU waits for it to reach a value.
 typedef struct GpuEvent GpuEvent;
 
+// A clock keeper: keeps the GPU's clock up while the GPU would idle. The GPU
+// lowers its clock within milliseconds of idling. The work after the idle time
+// then runs up to 3 times slower.
+typedef struct GpuClockKeeper GpuClockKeeper;
+
 // Returns a new Gpu: opens the device and compiles source as Metal 4.1, without
 // fast math. Ends the program if it does not compile.
 Gpu *gpu_new(const char *source, size_t len);
@@ -151,6 +156,19 @@ void gpu_wait_signal(GpuEvent *event, uint64_t value);
 // Sets how long a wait for a signal lasts, in seconds, before it ends the
 // program. The default is a minute.
 void gpu_set_signal_timeout(Gpu *gpu, double seconds);
+
+// Returns a clock keeper for the GPU, with its own queue and spin kernel. slot
+// counts its small buffer. It takes up to a second, since it times its kernel.
+GpuClockKeeper *gpu_clock_keeper_new(Gpu *gpu, MemorySlot *slot);
+
+// Keeps the GPU's clock up for about seconds, and returns at once. It runs a
+// spin kernel on one simdgroup, in the clock keeper's own queue. Work on the
+// main queue runs beside the spin. A command buffer begun but not committed
+// there does not hold the spin back.
+void gpu_keep_clock_up(GpuClockKeeper *keeper, double seconds);
+
+// Waits until the clock keeper's spins have finished.
+void gpu_wait_for_clock_keeper(GpuClockKeeper *keeper);
 
 // Waits for the last committed command buffer, and so for all opened before
 // it. Ends the program if one of them failed.

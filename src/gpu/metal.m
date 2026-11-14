@@ -2,6 +2,7 @@
 #include "base/error.h"
 #include "engine/memory.h"
 #include <Metal/Metal.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,6 +26,44 @@ static constexpr uint32_t RESIDENCY_SETS = 32;
 // measured to pick a minute: it only needs to be far longer than any command
 // buffer runs, so that only a failed command buffer or a stopped GPU ends it.
 static constexpr uint64_t DEFAULT_SIGNAL_TIMEOUT_MS = 60000;
+
+// The clock keeper's kernel. Each of its threads runs iters multiply-adds in a
+// row. The write that never happens keeps the compiler from dropping the loop.
+static const char SPIN_SOURCE[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void spin(constant uint &iters [[buffer(0)]],\n"
+    "                 device float *out [[buffer(1)]],\n"
+    "                 uint t [[thread_position_in_grid]]) {\n"
+    "  float x = float(t);\n"
+    "  for (uint i = 0; i < iters; i++) x = fma(x, 1.0000001f, 0.5f);\n"
+    "  if (x == 1.2345f) out[0] = x;\n"
+    "}\n";
+
+// The clock keeper times spins of 200,000 iterations, which take about 2.7 ms
+// on an M5 Max. The clock rises over tens of milliseconds of work, so the
+// spins repeat until the fastest has not improved by 1% in 5 runs, or 100
+// runs have passed. Nothing was measured to pick these numbers.
+static constexpr uint32_t TIMED_ITERATIONS = 200000;
+static constexpr double IMPROVEMENT = 0.99;
+static constexpr int STALE_RUNS = 5, MOST_RUNS = 100;
+
+// One simdgroup, 32 threads, runs the spin: a sliver of one GPU core.
+static constexpr unsigned long SPIN_THREADS = 32;
+
+struct GpuClockKeeper {
+  Gpu *gpu;
+  // Its own queue, so that a command buffer open in the main queue does not
+  // hold the spins back.
+  id<MTLCommandQueue> queue;
+  id<MTLComputePipelineState> spin;
+  // The buffer the kernel could write to.
+  Buf out;
+  // Seconds per iteration of the kernel, at a raised clock.
+  double iteration_seconds;
+  // The last spin committed, retained.
+  id<MTLCommandBuffer> last;
+};
 
 struct GpuEvent {
   Gpu *gpu;
@@ -471,6 +510,65 @@ static void check_finished(Gpu *gpu, int count) {
   gpu->ndone -= count;
   memmove(gpu->done, gpu->done + count, (size_t)gpu->ndone * sizeof *gpu->done);
   free_marked(gpu);
+}
+
+// Commits a spin of iterations on the clock keeper's queue.
+static id<MTLCommandBuffer> spin(GpuClockKeeper *keeper, uint32_t iterations) {
+  id<MTLCommandBuffer> c = [keeper->queue commandBuffer];
+  id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
+  [e setComputePipelineState:keeper->spin];
+  [e setBytes:&iterations length:sizeof iterations atIndex:0];
+  [e setBuffer:keeper->out.obj offset:0 atIndex:1];
+  [e dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(SPIN_THREADS, 1, 1)];
+  [e endEncoding];
+  [c commit];
+  return c;
+}
+
+GpuClockKeeper *gpu_clock_keeper_new(Gpu *gpu, MemorySlot *slot) {
+  GpuClockKeeper *keeper = xmalloc(sizeof *keeper);
+  *keeper =
+      (GpuClockKeeper){.gpu = gpu, .queue = [gpu->device newCommandQueue]};
+  NSError *err = nil;
+  id<MTLLibrary> library = [gpu->device
+      newLibraryWithSource:[NSString stringWithUTF8String:SPIN_SOURCE]
+                   options:nil
+                     error:&err];
+  if (!library) die("Metal compile of the spin kernel: %s", describe(err));
+  id<MTLFunction> function = [library newFunctionWithName:@"spin"];
+  keeper->spin = [gpu->device newComputePipelineStateWithFunction:function
+                                                            error:&err];
+  [function release];
+  [library release];
+  if (!keeper->spin) die("pipeline of the spin kernel: %s", describe(err));
+  keeper->out = gpu_alloc(gpu, slot, sizeof(float));
+  void *pool = objc_autoreleasePoolPush();
+  double fastest = INFINITY;
+  for (int run = 0, stale = 0; run < MOST_RUNS && stale < STALE_RUNS; run++) {
+    id<MTLCommandBuffer> c = spin(keeper, TIMED_ITERATIONS);
+    [c waitUntilCompleted];
+    double t = [c GPUEndTime] - [c GPUStartTime];
+    stale = t > 0 && t < fastest * IMPROVEMENT ? 0 : stale + 1;
+    if (t > 0 && t < fastest) fastest = t;
+  }
+  objc_autoreleasePoolPop(pool);
+  if (fastest == INFINITY) die("cannot time the GPU's spin kernel");
+  keeper->iteration_seconds = fastest / TIMED_ITERATIONS;
+  return keeper;
+}
+
+void gpu_keep_clock_up(GpuClockKeeper *keeper, double seconds) {
+  double iterations = seconds / keeper->iteration_seconds;
+  if (iterations > UINT32_MAX) iterations = UINT32_MAX;
+  id<MTLCommandBuffer> c = spin(keeper, (uint32_t)iterations);
+  [keeper->last release];
+  keeper->last = [c retain];
+}
+
+void gpu_wait_for_clock_keeper(GpuClockKeeper *keeper) {
+  // The queue runs its spins in order, so the last one finishes last.
+  [keeper->last waitUntilCompleted];
 }
 
 // Ends the program for a value not signaled in time: with the error of a
