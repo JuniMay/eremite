@@ -232,11 +232,13 @@ static int requested(MemorySlot *slot, MemorySlot *const *wanted, size_t n) {
   return 0;
 }
 
+// Whether the slot is idle for mode. needed is set when memory is needed and
+// the other idle slots cannot make the room.
 static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n,
-                     MemoryAdmission mode) {
+                     MemoryAdmission mode, int needed) {
   if (!slot->bytes || !slot->evict || slot->pins || slot->account->admitting ||
       requested(slot, wanted, n) ||
-      (slot->can_evict && !slot->can_evict(slot->context)))
+      (slot->can_evict && !slot->can_evict(slot->context, needed)))
     return 0;
   // State goes only after the rest of its model.
   if (slot->kind == MEMORY_STATE &&
@@ -255,7 +257,7 @@ static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n,
           slot->account->memory->times.keep_recently_used_weights)
     return 0;
   for (MemorySlot *child = slot->children; child; child = child->sibling)
-    if (child->bytes && !evictable(child, wanted, n, mode)) return 0;
+    if (child->bytes && !evictable(child, wanted, n, mode, needed)) return 0;
   return 1;
 }
 
@@ -320,22 +322,25 @@ static uint64_t reclaim_room(const MemoryAccount *account, MemoryKind kind,
 static uint64_t reclaimable_of(Memory *memory, const MemoryAccount *account,
                                MemoryKind kind, MemorySlot *const *wanted,
                                const uint64_t *sizes, size_t n,
-                               MemoryAdmission mode) {
+                               MemoryAdmission mode, int needed) {
   uint64_t possible = 0;
   for (MemorySlot *s = memory->slots; s; s = s->next)
     if (s->account == account && s->kind == kind &&
-        evictable(s, wanted, n, mode))
+        evictable(s, wanted, n, mode, needed))
       possible += s->bytes;
   uint64_t room = reclaim_room(account, kind, wanted, sizes, n);
   return possible < room ? possible : room;
 }
+
 static uint64_t reclaimable(Memory *memory, MemorySlot *const *wanted,
                             const uint64_t *sizes, size_t n,
-                            MemoryAdmission mode) {
+                            MemoryAdmission mode, int needed) {
   uint64_t total = 0;
   for (MemoryAccount *a = memory->accounts; a; a = a->next) {
-    total += reclaimable_of(memory, a, MEMORY_MODEL, wanted, sizes, n, mode);
-    total += reclaimable_of(memory, a, MEMORY_STATE, wanted, sizes, n, mode);
+    total +=
+        reclaimable_of(memory, a, MEMORY_MODEL, wanted, sizes, n, mode, needed);
+    total +=
+        reclaimable_of(memory, a, MEMORY_STATE, wanted, sizes, n, mode, needed);
   }
   return total;
 }
@@ -347,11 +352,11 @@ static int fits(const MemoryUsage *usage, uint64_t extra) {
 
 static MemorySlot *victim(Memory *memory, MemorySlot *const *wanted,
                           const uint64_t *sizes, size_t n, MemoryAdmission mode,
-                          uint64_t need) {
+                          uint64_t need, int needed) {
   MemorySlot *best = NULL;
   double rank = INFINITY;
   for (MemorySlot *s = memory->slots; s; s = s->next) {
-    if (!evictable(s, wanted, n, mode) || has_children(s)) continue;
+    if (!evictable(s, wanted, n, mode, needed) || has_children(s)) continue;
     uint64_t useful = reclaim_room(s->account, s->kind, wanted, sizes, n);
     if (!useful) continue;
     if (useful > s->bytes) useful = s->bytes;
@@ -382,7 +387,7 @@ uint64_t memory_reclaim(Memory *memory, uint64_t bytes) {
   uint64_t before = usage->allocated;
   while (before - usage->allocated < bytes) {
     MemorySlot *slot = victim(memory, NULL, NULL, 0, MEMORY_REQUIRED,
-                              bytes - (before - usage->allocated));
+                              bytes - (before - usage->allocated), 0);
     if (!slot) break;
     evict_slot(slot);
   }
@@ -401,7 +406,7 @@ uint64_t memory_unload(MemoryAccount *account) {
     again = 0;
     for (MemorySlot *s = memory->slots; s; s = s->next)
       if (s->account == account && !has_children(s) &&
-          evictable(s, NULL, 0, MEMORY_REQUIRED)) {
+          evictable(s, NULL, 0, MEMORY_REQUIRED, 0)) {
         evict_slot(s);
         again = 1;
       }
@@ -437,8 +442,12 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
     usage->refusals++;
     return 0;
   }
+  // Required memory also takes the slots that their owners keep only while
+  // other slots can go, once those others cannot make the room.
+  int needed = mode == MEMORY_REQUIRED && need && need != UINT64_MAX &&
+               need > reclaimable(memory, wanted, sizes, n, mode, 0);
   if (need && (need == UINT64_MAX ||
-               need > reclaimable(memory, wanted, sizes, n, mode))) {
+               need > reclaimable(memory, wanted, sizes, n, mode, needed))) {
     if (short_by)
       say("memory: %s: refused %.2f GiB: %.2f GiB short of the %.1f GiB "
           "reserve",
@@ -458,7 +467,8 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
              left = total > target ? total - target : 0;
     if (!over && !left) break;
     uint64_t want = over > left ? over : left;
-    MemorySlot *best = victim(memory, wanted, sizes, n, mode, want);
+    MemorySlot *best = victim(memory, wanted, sizes, n, mode, want, 0);
+    if (!best && needed) best = victim(memory, wanted, sizes, n, mode, want, 1);
     if (!best) die("memory reservation changed during eviction");
     freed += evict_slot(best);
     evicted = 1, taken++;
@@ -525,7 +535,7 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
 static int idle_state(MemorySlot *slot) {
   return slot->kind == MEMORY_STATE && slot->bytes && slot->evict &&
          !slot->pins && !has_children(slot) &&
-         (!slot->can_evict || slot->can_evict(slot->context));
+         (!slot->can_evict || slot->can_evict(slot->context, 0));
 }
 
 // Evicts the account's idle state slots, oldest first, until adding bytes to

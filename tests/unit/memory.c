@@ -355,6 +355,51 @@ static void refused_addition_evicts_nothing(void) {
   REQUIRE(memory_usage(memory).allocated == 100);
 }
 
+// A can_evict function that keeps the slot unless the memory is needed.
+static int keep_unless_needed(void *context, int needed) {
+  (void)context;
+  return needed;
+}
+
+static void required_memory_takes_kept_slots_last(void) {
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 100);
+  MemoryAccount cache, other;
+  memory_account_init(memory, &cache, "cache", 0);
+  memory_account_init(memory, &other, "other", 0);
+  TestSlot kept, plain, wanted;
+  test_slot(&kept, &cache, NULL, 50, 1);
+  kept.slot.can_evict = keep_unless_needed;
+  test_slot(&plain, &cache, NULL, 20, 2);
+  // Both were used long ago, the kept one first: by age alone it goes first.
+  kept.slot.touched = clock_now - 2000, plain.slot.touched = clock_now - 1000;
+  test_slot(&wanted, &other, NULL, 0, 3);
+  REQUIRE(!claim(&wanted, 60, MEMORY_CACHE) && order_count == 0);
+  REQUIRE(claim(&wanted, 60, MEMORY_REQUIRED));
+  REQUIRE(order_count == 2 && order[0] == 2 && order[1] == 1);
+  REQUIRE(wanted.slot.payload == 60 && memory_usage(memory).committed == 60);
+}
+
+// A new state's memory takes the cache slots that their owner keeps, when
+// nothing else makes room for it above the reserve.
+static void a_new_state_takes_kept_slots_for_the_reserve(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", UINT64_MAX);
+  TestSlot weights, kept, state;
+  test_slot(&weights, &model, NULL, 50, 1);
+  memory_pin(&weights.slot, 1);
+  test_slot(&kept, &model, &weights, 30, 2);
+  kept.slot.can_evict = keep_unless_needed;
+  memory_slot_init(&state.slot, &model, MEMORY_STATE, NULL, "state", NULL,
+                   NULL);
+  // 80 bytes are counted, and nothing more fits above the reserve.
+  available_bytes = 100;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  REQUIRE(claim(&state, 10, MEMORY_REQUIRED));
+  REQUIRE(kept.evicted == 1 && state.slot.payload == 10);
+}
+
 static void workspace_evicts_its_models_cache(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 100);
@@ -591,6 +636,11 @@ int main(void) {
        readings_wait_for_their_interval},
       {"a refused addition to two slots evicts nothing",
        refused_addition_evicts_nothing},
+      {"slots that their owners keep go only for required memory, after the "
+       "others",
+       required_memory_takes_kept_slots_last},
+      {"a new state takes slots that their owners keep, to keep the reserve",
+       a_new_state_takes_kept_slots_for_the_reserve},
       {"a workspace can evict its own model's cache",
        workspace_evicts_its_models_cache},
       {"host memory and state memory count toward the limit",

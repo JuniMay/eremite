@@ -32,6 +32,10 @@ typedef struct MemorySlot MemorySlot;
 // - its can_evict function, if any, allows it,
 // - every slot that depends on it is idle. Those are evicted first.
 // - if it is a state slot, the rest of its account holds no memory.
+//
+// A can_evict function may keep a slot that its owner would rather keep. When
+// required memory does not fit otherwise, can_evict is asked again with needed
+// set, and such slots are evicted too, after the others.
 typedef enum {
   // For needed memory. May evict any idle slot.
   MEMORY_REQUIRED,
@@ -92,8 +96,10 @@ struct MemorySlot {
   int automatic;
   // Whether the contents are ready. Any thread may read it.
   atomic_int ready;
-  // Whether the slot may be evicted now. Null means always.
-  int (*can_evict)(void *context);
+  // Whether the slot may be evicted now. Null means always. needed is set when
+  // the memory is required and the other idle slots cannot make the room: the
+  // slot then stays only if evicting it would break what uses it.
+  int (*can_evict)(void *context, int needed);
   // Frees the contents. Null means the slot is never evicted.
   void (*evict)(void *context);
   void *context;
