@@ -367,7 +367,7 @@ GpuResidency gpu_residency(Gpu *gpu) {
   return r;
 }
 
-// Opens a command buffer, in the queue or not, and starts encoding into it. An
+// Begins a command buffer, in the queue or not, and starts encoding into it. An
 // open command buffer keeps its Metal command buffer and encoder retained, so
 // that a sync, which drains the autorelease pool, does not free them.
 static GpuCommandBuffer begin(Gpu *gpu, int in_queue) {

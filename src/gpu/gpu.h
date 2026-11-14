@@ -6,7 +6,7 @@
 
 // Runs kernels on the GPU through Metal. Kernels are compiled from source at
 // run time. Buffers are counted in model memory. Command buffers run in the
-// order they are opened.
+// order they are begun.
 
 // The GPU, its queue and its compiled kernels.
 typedef struct Gpu Gpu;
@@ -105,14 +105,14 @@ typedef struct {
 // Returns what the residency sets hold.
 GpuResidency gpu_residency(Gpu *gpu);
 
-// Opens a command buffer in the queue, behind those opened before, and starts
-// encoding into it. It runs after them and before those opened after it,
-// whenever it is committed.
+// Begins a command buffer at the end of the queue and starts encoding into it.
+// Command buffers in the queue run in the order they were begun, whenever each
+// one is committed.
 GpuCommandBuffer gpu_begin(Gpu *gpu);
 
-// Opens a command buffer outside the queue and starts encoding into it. It
-// joins the queue when it is committed, so it runs after the command buffers
-// committed before it, even ones opened after it.
+// Begins a command buffer outside the queue and starts encoding into it. It
+// joins the end of the queue when it is committed. So it runs after every
+// command buffer committed before it, even one begun after it.
 GpuCommandBuffer gpu_begin_detached(Gpu *gpu);
 
 // Ends the encoding and commits the command buffer. Ends the program if it was
@@ -140,12 +140,17 @@ void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
 // Returns a new event at 0.
 GpuEvent *gpu_event_new(Gpu *gpu);
 
-// Returns the next value of event, which the GPU signals once the work encoded
-// so far has finished. The command buffer goes on with a new encoder, so the
-// next dispatches need their kernel and arguments set again. The GPU never
-// lowers an event, so a wait for a value returns as soon as a later value is
-// signaled: take an event's values in the order its command buffers were
-// begun. Ends the program if event belongs to another GPU.
+// Marks this point in the command buffer, and returns the next value of event.
+// The GPU signals that value on event when it reaches this point, after it has
+// finished the work encoded before it. The command buffer goes on with a new
+// encoder, so the next dispatches need their kernel and arguments set again.
+//
+// The GPU never lowers an event, so a wait for a value returns as soon as any
+// later value is signaled. Take an event's values in the order its command
+// buffers run: a command buffer in the queue runs in the order it was begun,
+// and a detached one in the order it was committed.
+//
+// Ends the program if event belongs to another GPU.
 uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event);
 
 // Waits until the GPU has signaled value on event. Ends the program if the
@@ -170,7 +175,7 @@ void gpu_keep_clock_up(GpuClockKeeper *keeper, double seconds);
 // Waits until the clock keeper's spins have finished.
 void gpu_wait_for_clock_keeper(GpuClockKeeper *keeper);
 
-// Waits for the last committed command buffer, and so for all opened before
+// Waits for the last committed command buffer, and so for all begun before
 // it. Ends the program if one of them failed.
 void gpu_sync(Gpu *gpu);
 
