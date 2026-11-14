@@ -38,6 +38,10 @@ typedef struct {
   void *encoder;
 } GpuCommandBuffer;
 
+// An event: a counter on the GPU. Command buffers raise it as they run, and the
+// CPU waits for it to reach a value.
+typedef struct GpuEvent GpuEvent;
+
 // Returns a new Gpu: opens the device and compiles source as Metal 4.1, without
 // fast math. Ends the program if it does not compile.
 Gpu *gpu_new(const char *source, size_t len);
@@ -111,6 +115,26 @@ void gpu_copy_bytes(GpuCommandBuffer *c, int idx, const void *p, size_t n);
 void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
                     uint32_t groups_z, uint32_t threads_x, uint32_t threads_y,
                     uint32_t threads_z);
+
+// Returns a new event at 0.
+GpuEvent *gpu_event_new(Gpu *gpu);
+
+// Returns the next value of event, which the GPU signals once the work encoded
+// so far has finished. The command buffer goes on with a new encoder, so the
+// next dispatches need their kernel and arguments set again. The GPU never
+// lowers an event, so a wait for a value returns as soon as a later value is
+// signaled: take an event's values in the order its command buffers were
+// begun. Ends the program if event belongs to another GPU.
+uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event);
+
+// Waits until the GPU has signaled value on event. Ends the program if the
+// event never gave out value, if a command buffer failed, or if value is not
+// signaled within the GPU's signal timeout.
+void gpu_wait_signal(GpuEvent *event, uint64_t value);
+
+// Sets how long a wait for a signal lasts, in seconds, before it ends the
+// program. The default is a minute.
+void gpu_set_signal_timeout(Gpu *gpu, double seconds);
 
 // Waits for the last committed command buffer, and so for all opened before
 // it. Ends the program if one of them failed.

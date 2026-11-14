@@ -21,6 +21,18 @@ enum { RESIDENCY_SETS = 32 };
 // rebuild of the table leaves it out.
 #define REMOVED_BUFFER ((id)1)
 
+// A wait for a signal ends the program after a minute by default. Nothing was
+// measured to pick a minute: it only needs to be far longer than any command
+// buffer runs, so that only a failed command buffer or a stopped GPU ends it.
+enum { DEFAULT_SIGNAL_TIMEOUT_MS = 60000 };
+
+struct GpuEvent {
+  Gpu *gpu;
+  id<MTLSharedEvent> event;
+  // The last value given out.
+  uint64_t signaled;
+};
+
 // A residency set, and the bytes of the buffers in it.
 typedef struct {
   id<MTLResidencySet> set;
@@ -69,6 +81,8 @@ struct Gpu {
   // The resident buffers, and the entries that are not empty: theirs and the
   // removed ones.
   size_t resident_buffers, resident_filled;
+  // How long a wait for a signal lasts before it ends the program.
+  uint64_t signal_timeout_ms;
 };
 
 // Returns the bits of the smallest table that count resident buffers fill at
@@ -90,6 +104,7 @@ Gpu *gpu_new(const char *source, size_t len) {
   gpu->device = MTLCreateSystemDefaultDevice();
   if (!gpu->device) die("no Metal device");
   gpu->queue = [gpu->device newCommandQueue];
+  gpu->signal_timeout_ms = DEFAULT_SIGNAL_TIMEOUT_MS;
   // A set holds a twentieth of the working set, so 20 sets cover it, within
   // Metal's limit of 32.
   gpu->residency_set_bytes = [gpu->device recommendedMaxWorkingSetSize] / 20;
@@ -333,6 +348,21 @@ void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
       threadsPerThreadgroup:MTLSizeMake(threads_x, threads_y, threads_z)];
 }
 
+GpuEvent *gpu_event_new(Gpu *gpu) {
+  GpuEvent *event = xmalloc(sizeof *event);
+  *event = (GpuEvent){gpu, [gpu->device newSharedEvent], 0};
+  return event;
+}
+
+uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event) {
+  if (event->gpu != c->gpu) die("GPU: a signal on an event of another GPU");
+  [encoder(c) endEncoding];
+  id<MTLCommandBuffer> buffer = c->buffer;
+  [buffer encodeSignalEvent:event->event value:++event->signaled];
+  c->encoder = [buffer computeCommandEncoder];
+  return event->signaled;
+}
+
 // Checks the first count command buffers of done, all finished. Ends the
 // program on an error.
 static void check_finished(Gpu *gpu, int count) {
@@ -346,6 +376,33 @@ static void check_finished(Gpu *gpu, int count) {
   }
   gpu->ndone -= count;
   memmove(gpu->done, gpu->done + count, (size_t)gpu->ndone * sizeof *gpu->done);
+}
+
+// Ends the program for a value not signaled in time: with the error of a
+// failed command buffer if there is one, since its signals never come.
+static void unsignaled(Gpu *gpu, uint64_t value) {
+  for (int i = 0; i < gpu->ndone; i++)
+    if ([gpu->done[i] status] == MTLCommandBufferStatusError)
+      die("GPU: %s", describe([gpu->done[i] error]));
+  die("GPU: value %llu not signaled in %.1f s", (unsigned long long)value,
+      gpu->signal_timeout_ms / 1000.0);
+}
+
+void gpu_wait_signal(GpuEvent *event, uint64_t value) {
+  if (value > event->signaled)
+    die("GPU: waiting for value %llu, which the event never gave out",
+        (unsigned long long)value);
+  if (![event->event waitUntilSignaledValue:value
+                                  timeoutMS:event->gpu->signal_timeout_ms])
+    unsignaled(event->gpu, value);
+}
+
+void gpu_set_signal_timeout(Gpu *gpu, double seconds) {
+  // Metal takes whole milliseconds, at most UINT64_MAX of them.
+  double milliseconds = seconds * 1000;
+  gpu->signal_timeout_ms = !(milliseconds > 0)     ? 0
+                           : milliseconds < 0x1p64 ? (uint64_t)milliseconds
+                                                   : UINT64_MAX;
 }
 
 void gpu_sync(Gpu *gpu) {
