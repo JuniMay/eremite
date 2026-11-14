@@ -122,7 +122,7 @@ $(TIME_LIMIT): tests/time_limit.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $<
 
-test: $(TIME_LIMIT) $(call group_tests,unit)
+test: $(TIME_LIMIT) $(CLI) $(call group_tests,unit)
 	@set -e; for t in $(call group_tests,unit); do echo "== $$t"; $(TIME_LIMIT) $(TEST_SECONDS) $$t; done
 
 gpu-test: $(TIME_LIMIT) $(call group_tests,gpu)

@@ -56,6 +56,30 @@ static void usage(void) {
       "                memory decides)\n"
       "  --reserve GB  memory kept available to other programs, 2-1024 "
       "(default 10)\n"
+      "  --gpu-timeout S  seconds a wait for the GPU may last before the "
+      "program ends (default 60)\n"
+      "  --freed-memory-delay S  seconds that freed memory takes to show in "
+      "the system's memory counts\n"
+      "                (default 1.5)\n"
+      "  --available-memory-reading-interval S  seconds between two readings "
+      "of the system's available\n"
+      "                memory (default 1)\n"
+      "  --available-memory-reading-max-age S  seconds after which a reading "
+      "is taken again, even right\n"
+      "                after memory was freed (default 5)\n"
+      "  --keep-recently-used-weights S  seconds that used weights count as "
+      "recently used: a growing\n"
+      "                expert cache does not evict them (default 30)\n"
+      "  --free-pages-only-after-swapout S  seconds after macOS swaps memory "
+      "out during which an expert\n"
+      "                cache grows only into free memory (default 300)\n"
+      "  --expert-cache-growth-margin GB  room that must stay free above the "
+      "reserve for an expert cache\n"
+      "                to grow (default 4)\n"
+      "  --gpu-memory-limit-margin GB  room kept unused below the GPU's "
+      "memory limit, for slots the GPU\n"
+      "                driver still counts after they leave its list (default "
+      "3)\n"
       "  --tokens IDS  comma-separated token ids, or @FILE (commas, spaces or "
       "newlines between them); run\n"
       "                without generation\n"
@@ -111,14 +135,17 @@ static const float *prefilled(const float *logits) {
       "--reserve, or --memory");
 }
 
-static double sampling_option(const char *name, const char *value,
-                              double upper) {
+// Returns an option's number: finite, from 0 up to upper. Ends the program
+// with the option's range for any other value.
+static double parse_number_option(const char *name, const char *value,
+                                  double upper) {
   char *end;
   errno = 0;
   double n = strtod(value, &end);
-  if (end == value || *end || errno || !isfinite(n) || n < 0 || n > upper)
-    die("%s must be finite and in %s", name,
-        isfinite(upper) ? "[0, 1]" : "[0, infinity)");
+  if (end == value || *end || errno || !isfinite(n) || n < 0 || n > upper) {
+    if (isfinite(upper)) die("%s must be finite and in [0, %g]", name, upper);
+    die("%s must be finite and in [0, infinity)", name);
+  }
   return n;
 }
 
@@ -138,15 +165,26 @@ static uint64_t model_cache_bytes(void) {
 // The Memory object's eviction callback.
 static void after_evictions(void *gpu) { gpu_return_freed_memory(gpu); }
 
-// Makes the memory and the GPU, sets the memory's limits, and opens the model.
-static Model *open_model(const char *dir, const Options *o, double memory_gb,
-                         double reserve_gb) {
+// Returns a new state of the model. Ends the program if its memory does not
+// fit.
+static ModelState *new_state(const ModelOps *ops) {
+  ModelState *state = ops->state_new();
+  if (!state)
+    die("a state's memory does not fit the free memory less --reserve, or "
+        "--memory");
+  return state;
+}
+
+// Makes the memory and the GPU, sets the memory's settings, and opens the
+// model.
+static Model *open_model(const char *dir, const Options *o,
+                         MemorySettings settings, double gpu_timeout_seconds) {
   Memory *memory = memory_new();
-  expert_store_set_memory(memory, (MemorySettings){.model_gib = memory_gb,
-                                                   .reserve_gib = reserve_gb});
+  expert_store_set_memory(memory, settings);
   size_t length;
   const char *source = kernel_library_source(&length);
   Gpu *gpu = gpu_new(source, length);
+  if (gpu_timeout_seconds > 0) gpu_set_signal_timeout(gpu, gpu_timeout_seconds);
   memory_set_eviction_callback(memory, after_evictions, gpu);
   return model_open(memory, gpu, dir, o);
 }
@@ -161,7 +199,8 @@ int main(int argc, char **argv) {
   double temp = 0, top_p = 1;
   uint64_t seed = 0;
   int seed_set = 0;
-  double memory_gb = 0, reserve_gb = 10;
+  double gpu_timeout_seconds = 0;
+  MemorySettings memory_settings = {.reserve_gib = 10};
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
   const char *media_path[16];
   int nmedia = 0, vision_fd = -1;
@@ -212,9 +251,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "-n"))
       ntokens = atoi(v);
     else if (!strcmp(a, "-t") || !strcmp(a, "--temperature"))
-      temp = sampling_option("temperature", v, INFINITY);
+      temp = parse_number_option("temperature", v, INFINITY);
     else if (!strcmp(a, "--top-p"))
-      top_p = sampling_option("top-p", v, 1);
+      top_p = parse_number_option("top-p", v, 1);
     else if (!strcmp(a, "--seed")) {
       char *end;
       errno = 0;
@@ -240,7 +279,30 @@ int main(int argc, char **argv) {
     } else if (!strcmp(a, "--ctx"))
       o.ctx = atoi(v);
     else if (!strcmp(a, "--memory"))
-      memory_gb = sampling_option("memory", v, 1024);
+      memory_settings.model_gib = parse_number_option("memory", v, 1024);
+    else if (!strcmp(a, "--gpu-timeout"))
+      gpu_timeout_seconds = parse_number_option("gpu-timeout", v, INFINITY);
+    else if (!strcmp(a, "--freed-memory-delay"))
+      memory_settings.times.freed_memory_delay =
+          parse_number_option("freed-memory-delay", v, INFINITY);
+    else if (!strcmp(a, "--available-memory-reading-interval"))
+      memory_settings.times.available_memory_reading_interval =
+          parse_number_option("available-memory-reading-interval", v, INFINITY);
+    else if (!strcmp(a, "--available-memory-reading-max-age"))
+      memory_settings.times.available_memory_reading_max_age =
+          parse_number_option("available-memory-reading-max-age", v, INFINITY);
+    else if (!strcmp(a, "--keep-recently-used-weights"))
+      memory_settings.times.keep_recently_used_weights =
+          parse_number_option("keep-recently-used-weights", v, INFINITY);
+    else if (!strcmp(a, "--free-pages-only-after-swapout"))
+      memory_settings.free_pages_only_after_swapout =
+          parse_number_option("free-pages-only-after-swapout", v, INFINITY);
+    else if (!strcmp(a, "--expert-cache-growth-margin"))
+      memory_settings.expert_cache_growth_margin_gib =
+          parse_number_option("expert-cache-growth-margin", v, INFINITY);
+    else if (!strcmp(a, "--gpu-memory-limit-margin"))
+      memory_settings.gpu_memory_limit_margin_gib =
+          parse_number_option("gpu-memory-limit-margin", v, INFINITY);
     else if (!strcmp(a, "--reserve")) {
       char *end;
       double gib = strtod(v, &end);
@@ -249,7 +311,7 @@ int main(int argc, char **argv) {
             gib <= EXPERT_STORE_RESERVE_GIB_MAX))
         die("--reserve takes %d to %d GiB", EXPERT_STORE_RESERVE_GIB_MIN,
             EXPERT_STORE_RESERVE_GIB_MAX);
-      reserve_gb = gib;
+      memory_settings.reserve_gib = gib;
     } else if (!strcmp(a, "--tokens"))
       ids = v;
     else if (!strcmp(a, "--dump-fd"))
@@ -301,7 +363,7 @@ int main(int argc, char **argv) {
     die("--bench: this model has no kernel timings");
   if (bench) {
     o.ctx = 2048;
-    model = open_model(dir, &o, memory_gb, reserve_gb);
+    model = open_model(dir, &o, memory_settings, gpu_timeout_seconds);
     if (shutdown_requested()) return 0;
     if (!model)
       die("model weights do not fit the free memory less --reserve, or "
@@ -363,12 +425,12 @@ int main(int argc, char **argv) {
       printf("%d%c", tokens[i], i + 1 < n ? ',' : '\n');
     return 0;
   }
-  model = open_model(dir, &o, memory_gb, reserve_gb);
+  model = open_model(dir, &o, memory_settings, gpu_timeout_seconds);
   if (shutdown_requested()) return 0;
   if (!model)
     die("model weights do not fit the free memory less --reserve, or --memory");
   const int V = ops->vocab_size();
-  ModelState *st = ops->state_new();
+  ModelState *st = new_state(ops);
   for (int i = 0; i < nmedia; i++) {
     if (shutdown_requested()) return 0;
     double t = now();
@@ -388,7 +450,7 @@ int main(int argc, char **argv) {
     prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, a));
     if (shutdown_requested()) return 0;
     if (n >= 4) {  // two prompt batches, the first of odd length, against one
-      ModelState *s2 = ops->state_new();
+      ModelState *s2 = new_state(ops);
       int n1 = (n / 2) | 1, diff = 0;
       prefilled(ops->prefill(s2, tokens, n1, 0, 0, -1, 0, 0));
       const float *c = prefilled(ops->prefill(s2, tokens, n, n1, 0, -1, 0, 0)),
@@ -399,7 +461,7 @@ int main(int argc, char **argv) {
           n1, n - n1, diff, V);
     }
     if (shutdown_requested()) return 0;
-    ModelState *s3 = ops->state_new();
+    ModelState *s3 = new_state(ops);
     int agree[2] = {0}, count[2] = {0};
     double snr[2] = {0};
     for (int i = 0; i < n && !shutdown_requested(); i++) {
@@ -424,7 +486,7 @@ int main(int argc, char **argv) {
   if (check_batch) {  // the next token of the prompt (a) and of the prompt less
                       // 3 tokens (b), alone and together
     if (n < 5) die("--check-batch needs a prompt of at least 5 tokens");
-    ModelState *both_st[2] = {st, ops->state_new()};
+    ModelState *both_st[2] = {st, new_state(ops)};
     ModelSnapshot *at[2];
     int len[2] = {n, n - 3}, next[2];
     float *alone = xmalloc((size_t)2 * V * 4);
