@@ -8,11 +8,14 @@
 // limit, and keeps a reserve free for other programs.
 //
 // Each model has one account. Its memory is split into slots: weights, cached
-// experts and workspaces. When memory runs short, unused slots are freed. This
-// is called evicting.
+// experts, workspaces and state. When memory runs short, unused slots are
+// freed. This is called evicting.
 //
-// State memory holds a request's or a conversation's state. It is counted
-// apart from model memory and comes first.
+// State slots hold the model's requests' and conversations' state, such as KV
+// caches. They count toward the limit, and each account also has a limit for
+// its state. When an account's state reaches it, its idle state slots are
+// evicted, oldest first. Otherwise state is evicted only once the rest of its
+// model is gone, so that loading experts never evicts state.
 
 typedef struct MemoryAccount MemoryAccount;
 typedef struct MemorySlot MemorySlot;
@@ -26,6 +29,7 @@ typedef struct MemorySlot MemorySlot;
 // - its account is not raising its minimum,
 // - its can_evict function, if any, allows it,
 // - every slot that depends on it is idle. Those are evicted first.
+// - if it is a state slot, the rest of its account holds no memory.
 typedef enum {
   // For needed memory. May evict any idle slot.
   MEMORY_REQUIRED,
@@ -41,6 +45,15 @@ typedef enum {
   MEMORY_WORKSPACE
 } MemoryAdmission;
 
+// What a slot holds.
+typedef enum {
+  // Weights, cached experts or a workspace.
+  MEMORY_MODEL,
+  // A request's or a conversation's state, such as a KV cache. It counts just
+  // its bytes in use.
+  MEMORY_STATE
+} MemoryKind;
+
 struct MemoryAccount {
   // Next account in the list.
   MemoryAccount *next;
@@ -49,12 +62,15 @@ struct MemoryAccount {
   uint64_t bytes, minimum;
   // Set while it raises its minimum. Its slots are then not evicted.
   int admitting;
+  // Bytes counted for its state slots, and the most they may hold.
+  uint64_t state_bytes, state_limit;
 };
 
 struct MemorySlot {
   // Next slot in the list.
   MemorySlot *next;
   MemoryAccount *account;
+  MemoryKind kind;
   // This slot is evicted before its dependency.
   MemorySlot *dependency;
   // First slot that depends on this one, and next slot with the same
@@ -79,9 +95,8 @@ struct MemorySlot {
 };
 
 typedef struct {
-  // The limit, bytes in use, bytes counted, the most ever counted, and state
-  // memory.
-  uint64_t limit, allocated, committed, peak, state;
+  // The limit, bytes in use, bytes counted, and the most ever counted.
+  uint64_t limit, allocated, committed, peak;
   // Slots evicted, and additions refused.
   uint64_t evictions, refusals;
 } MemoryUsage;
@@ -98,12 +113,13 @@ void memory_set_reserve(uint64_t reserve, uint64_t (*available)(void),
 // The most memory the models may use now, within the limit and the reserve.
 uint64_t memory_current_limit(void);
 
-// Starts an empty account.
-void memory_account_init(MemoryAccount *account, const char *name);
+// Starts an empty account. Its state slots may hold up to state_limit bytes.
+void memory_account_init(MemoryAccount *account, const char *name,
+                         uint64_t state_limit);
 
 // Starts an empty slot. dependency may be null. evict(context) frees its
 // contents; null means the slot is never evicted.
-void memory_slot_init(MemorySlot *slot, MemoryAccount *account,
+void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
                       MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context);
 
@@ -124,7 +140,8 @@ int memory_ready(const MemorySlot *slot);
 void memory_set_ready(MemorySlot *slot, int ready);
 
 // Admits the slots: sets each slot's bytes to its size, evicting as mode
-// allows. Returns whether all fit. If not, nothing changes.
+// allows. Returns whether all fit. If not, nothing changes. Ends the program if
+// a slot is a state slot.
 int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count,
                  MemoryAdmission mode);
 
@@ -134,7 +151,9 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
                        MemoryAdmission mode);
 
 // Claims bytes for the slot: adds them to its bytes in use, evicting as mode
-// allows. Returns whether they fit.
+// allows. Returns whether they fit. A state slot first stays within its
+// account's state limit: the account's idle state slots are evicted, oldest
+// first, and the bytes are refused if that is not enough.
 int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode);
 
 // Releases bytes: removes them from the slot's bytes in use.
@@ -142,10 +161,6 @@ void memory_release(MemorySlot *slot, uint64_t bytes);
 
 // Shrinks the slot's bytes to its bytes in use.
 void memory_shrink(MemorySlot *slot);
-
-// Adds bytes to state memory when allocated is set, or removes them. Adding
-// first evicts idle slots to keep the reserve free.
-void memory_state_change(uint64_t bytes, int allocated);
 
 // Returns the counts.
 MemoryUsage memory_usage(void);
@@ -165,18 +180,17 @@ uint64_t memory_room(const MemoryAccount *account);
 // Returns the bytes freed.
 uint64_t memory_reclaim(uint64_t bytes);
 
-// Unloads the account: evicts its idle slots. Returns the bytes freed.
+// Unloads the account: evicts its idle slots, its state slots last. Returns the
+// bytes freed.
 uint64_t memory_unload(MemoryAccount *account);
 
-// Returns zeroed host memory of bytes, counted as state memory when state is
-// set, and in slot otherwise. Null if it does not fit. Ends the program if slot
-// is null when it is needed.
-void *memory_host_alloc(MemorySlot *slot, size_t bytes, int state);
+// Returns zeroed host memory of bytes, counted in slot. Null if it does not
+// fit. Ends the program if slot is null.
+void *memory_host_alloc(MemorySlot *slot, size_t bytes);
 
-// Returns zeroed host memory of bytes, counted as state memory when state is
-// set, and in slot otherwise. Ends the program if slot is null when it is
-// needed, or if the memory does not fit.
-void *memory_host_alloc_required(MemorySlot *slot, size_t bytes, int state);
+// Returns zeroed host memory of bytes, counted in slot. Ends the program if
+// slot is null or the memory does not fit.
+void *memory_host_alloc_required(MemorySlot *slot, size_t bytes);
 
 // Frees host memory, also memory from plain malloc.
 void memory_host_free(void *pointer);

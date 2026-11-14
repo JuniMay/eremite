@@ -24,7 +24,7 @@ static uint64_t read_bytes, read_used, read_pending;
 #define LONG_AGO -1e9
 static double read_at = LONG_AGO, released_at = LONG_AGO;
 
-static uint64_t in_use(void) { return usage.allocated + usage.state; }
+static uint64_t in_use(void) { return usage.allocated; }
 #define GIB_F 1073741824.0
 // Evictions that free at least this much at once are logged.
 #define LOGGED_EVICTION (1ull << 30)
@@ -63,6 +63,9 @@ static uint64_t counted(const MemoryAccount *account) {
 }
 
 static void change(MemorySlot *slot, uint64_t bytes) {
+  if (slot->kind == MEMORY_STATE)
+    slot->account->state_bytes =
+        slot->account->state_bytes - slot->bytes + bytes;
   uint64_t before = counted(slot->account);
   slot->account->bytes -= slot->bytes;
   slot->account->bytes += bytes;
@@ -87,16 +90,19 @@ uint64_t memory_current_limit(void) {
   return limit < usage.limit ? limit : usage.limit;
 }
 
-void memory_account_init(MemoryAccount *account, const char *name) {
-  *account = (MemoryAccount){.next = accounts, .name = name};
+void memory_account_init(MemoryAccount *account, const char *name,
+                         uint64_t state_limit) {
+  *account = (MemoryAccount){
+      .next = accounts, .name = name, .state_limit = state_limit};
   accounts = account;
 }
 
-void memory_slot_init(MemorySlot *slot, MemoryAccount *account,
+void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
                       MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context) {
   *slot = (MemorySlot){.next = slots,
                        .account = account,
+                       .kind = kind,
                        .dependency = dependency,
                        .name = name,
                        .evict = evict,
@@ -145,6 +151,10 @@ static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n,
   if (!slot->bytes || !slot->evict || slot->pins || slot->account->admitting ||
       requested(slot, wanted, n) ||
       (slot->can_evict && !slot->can_evict(slot->context)))
+    return 0;
+  // State goes only after the rest of its model.
+  if (slot->kind == MEMORY_STATE &&
+      slot->account->bytes > slot->account->state_bytes)
     return 0;
   if (mode == MEMORY_SPECULATIVE) return 0;
   if (mode == MEMORY_WORKSPACE && !slot->dependency) return 0;
@@ -269,7 +279,8 @@ uint64_t memory_reclaim(uint64_t bytes) {
 uint64_t memory_unload(MemoryAccount *account) {
   uint64_t before = usage.allocated;
   // Each round evicts the idle slots that nothing depends on. A slot whose
-  // dependents went in one round can go in the next.
+  // dependents went in one round can go in the next, and the state slots once
+  // the rest of the model is gone.
   for (int again = 1; again;) {
     again = 0;
     for (MemorySlot *s = slots; s; s = s->next)
@@ -293,7 +304,7 @@ static uint64_t over_limit(uint64_t extra) {
              : extra - (usage.limit - usage.committed);
 }
 
-int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
+static int admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
                  MemoryAdmission mode) {
   int evicted = 0;
   uint64_t extra = growth(wanted, sizes, n);
@@ -341,6 +352,14 @@ int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
   return 1;
 }
 
+int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
+                 MemoryAdmission mode) {
+  for (size_t i = 0; i < n; i++)
+    if (wanted[i]->kind == MEMORY_STATE)
+      die("%s: state memory is added only by claims", wanted[i]->name);
+  return admit(wanted, sizes, n, mode);
+}
+
 int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
                        MemoryAdmission mode) {
   uint64_t old = account->minimum, before = counted(account);
@@ -349,7 +368,8 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
   account->minimum = old;
   if (after > before) {
     MemorySlot promise;
-    memory_slot_init(&promise, account, NULL, "admission", NULL, NULL);
+    memory_slot_init(&promise, account, MEMORY_MODEL, NULL, "admission", NULL,
+                     NULL);
     uint64_t extra = after - account->bytes;
     MemorySlot *wanted[] = {&promise};
     account->admitting = 1;
@@ -368,11 +388,48 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
   return 1;
 }
 
+// Whether the state slot may be evicted to keep its account within its state
+// limit, while the rest of its model stays.
+static int idle_state(MemorySlot *slot) {
+  return slot->kind == MEMORY_STATE && slot->bytes && slot->evict &&
+         !slot->pins && !has_children(slot) &&
+         (!slot->can_evict || slot->can_evict(slot->context));
+}
+
+// Evicts the account's idle state slots, oldest first, until adding bytes to
+// slot stays within its state limit. Returns whether it does.
+static int within_state_limit(MemorySlot *slot, uint64_t bytes) {
+  MemoryAccount *account = slot->account;
+  uint64_t idle = 0;
+  for (MemorySlot *s = slots; s; s = s->next)
+    if (s->account == account && s != slot && idle_state(s)) idle += s->bytes;
+  if (UINT64_MAX - account->state_bytes < bytes ||
+      account->state_bytes + bytes - idle > account->state_limit)
+    return 0;
+  int evicted = 0;
+  while (account->state_bytes + bytes > account->state_limit) {
+    MemorySlot *oldest = NULL;
+    for (MemorySlot *s = slots; s; s = s->next)
+      if (s->account == account && s != slot && idle_state(s) &&
+          (!oldest || s->touched < oldest->touched))
+        oldest = s;
+    if (!oldest) die("state memory changed during eviction");
+    evict_slot(oldest);
+    evicted = 1;
+  }
+  if (evicted && collect_released) collect_released();
+  return 1;
+}
+
 int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode) {
   if (UINT64_MAX - slot->payload < bytes) return 0;
+  if (slot->kind == MEMORY_STATE && !within_state_limit(slot, bytes)) {
+    usage.refusals++;
+    return 0;
+  }
   uint64_t wanted_size = slot->payload + bytes;
   MemorySlot *wanted[] = {slot};
-  if (wanted_size > slot->bytes && !memory_admit(wanted, &wanted_size, 1, mode))
+  if (wanted_size > slot->bytes && !admit(wanted, &wanted_size, 1, mode))
     return 0;
   slot->payload += bytes;
   usage.allocated += bytes;
@@ -382,31 +439,10 @@ int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode) {
 void memory_release(MemorySlot *slot, uint64_t bytes) {
   slot->payload -= bytes;
   usage.allocated -= bytes;
-  if (slot->automatic) memory_shrink(slot);
+  // A state slot always counts just its bytes in use.
+  if (slot->automatic || slot->kind == MEMORY_STATE) memory_shrink(slot);
 }
 void memory_shrink(MemorySlot *slot) { change(slot, slot->payload); }
-void memory_state_change(uint64_t bytes, int allocated) {
-  if (!allocated) {
-    usage.state -= bytes;
-    return;
-  }
-  uint64_t short_by = shortage(bytes), freed = 0;
-  int released = 0;
-  while (freed < short_by) {
-    MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED, short_by - freed);
-    // Nothing idle is left; the state's owner frees idle state later.
-    if (!slot) break;
-    freed += evict_slot(slot);
-    released++;
-  }
-  if (released && collect_released) collect_released();
-  if (short_by && freed >= LOGGED_EVICTION)
-    say("memory: state memory grows %.2f GiB, %.2f GiB short of the %.1f GiB "
-        "reserve: evicted %d slots, %.2f GiB",
-        bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, released,
-        freed / GIB_F);
-  usage.state += bytes;
-}
 MemoryUsage memory_usage(void) { return usage; }
 void memory_collect_with(void (*collect)(void)) { collect_released = collect; }
 uint64_t memory_room(const MemoryAccount *account) {
@@ -421,8 +457,9 @@ MemorySlot *memory_shared(void) {
   static MemorySlot slot;
   static int initialized;
   if (!initialized) {
-    memory_account_init(&shared, "shared");
-    memory_slot_init(&slot, &shared, NULL, "shared runtime", NULL, NULL);
+    memory_account_init(&shared, "shared", 0);
+    memory_slot_init(&slot, &shared, MEMORY_MODEL, NULL, "shared runtime", NULL,
+                     NULL);
     slot.automatic = 1;
     initialized = 1;
   }
@@ -434,35 +471,32 @@ typedef struct HostAllocation {
   void *pointer;
   MemorySlot *slot;
   size_t bytes;
-  int state;
 } HostAllocation;
 static HostAllocation *host_allocations;
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void *memory_host_alloc(MemorySlot *slot, size_t bytes, int state) {
-  if (!slot && !state)
-    die("host memory of %zu bytes without a memory slot", bytes);
-  if (!state && !memory_claim(slot, bytes, MEMORY_REQUIRED)) return NULL;
+void *memory_host_alloc(MemorySlot *slot, size_t bytes) {
+  if (!slot) die("host memory of %zu bytes without a memory slot", bytes);
+  if (!memory_claim(slot, bytes, MEMORY_REQUIRED)) return NULL;
   void *pointer = calloc(1, bytes ? bytes : 1);
   HostAllocation *record = pointer ? malloc(sizeof *record) : NULL;
   if (!pointer || !record) {
     free(pointer);
-    if (!state) memory_release(slot, bytes);
+    memory_release(slot, bytes);
     return NULL;
   }
-  if (state) memory_state_change(bytes, 1);
   pthread_mutex_lock(&host_lock);
-  *record = (HostAllocation){host_allocations, pointer, slot, bytes, state};
+  *record = (HostAllocation){host_allocations, pointer, slot, bytes};
   host_allocations = record;
   pthread_mutex_unlock(&host_lock);
   return pointer;
 }
 
-void *memory_host_alloc_required(MemorySlot *slot, size_t bytes, int state) {
-  void *pointer = memory_host_alloc(slot, bytes, state);
+void *memory_host_alloc_required(MemorySlot *slot, size_t bytes) {
+  void *pointer = memory_host_alloc(slot, bytes);
   if (!pointer)
     die("cannot allocate %zu bytes of %s memory", bytes,
-        state ? "state" : "model");
+        slot->kind == MEMORY_STATE ? "state" : "model");
   return pointer;
 }
 
@@ -474,10 +508,7 @@ void memory_host_free(void *pointer) {
   if (record) *at = record->next;
   pthread_mutex_unlock(&host_lock);
   if (record) {
-    if (record->state)
-      memory_state_change(record->bytes, 0);
-    else
-      memory_release(record->slot, record->bytes);
+    memory_release(record->slot, record->bytes);
     free(record);
   }
   free(pointer);
