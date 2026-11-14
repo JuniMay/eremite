@@ -13,6 +13,8 @@ typedef struct Gpu Gpu;
 
 // A buffer, or a view of part of one.
 typedef struct {
+  // The GPU that made the buffer.
+  Gpu *gpu;
   // The Metal buffer.
   void *obj;
   // The CPU address of the view's first byte.
@@ -53,8 +55,37 @@ size_t gpu_round_up_to_pages(size_t size);
 Buf gpu_alloc(Gpu *gpu, MemorySlot *slot, size_t size);
 
 // Frees the buffer, stops counting it, and empties *b. GPU work that uses the
-// buffer must have finished.
+// buffer must have finished. If the buffer is resident, it leaves its residency
+// set at the next gpu_commit_residency. Metal frees its memory only then.
 void gpu_free(Buf *b);
+
+// Sets whether the buffer is resident: kept ready for the GPU between command
+// buffers, in one of the GPU's residency sets. A view sets its whole buffer.
+// The change takes effect at the next gpu_commit_residency. Ends the program
+// if the buffer is empty.
+void gpu_set_resident(const Buf *b, int resident);
+
+// Commits the residency sets that changed since their last commit.
+void gpu_commit_residency(Gpu *gpu);
+
+// Sets the most bytes a residency set holds. A resident buffer goes to the
+// first set with room for it, or else to a new set. Once Metal's limit of 32
+// sets is reached, it goes to the set that holds the fewest bytes. The default
+// is a twentieth of Metal's recommended working set.
+void gpu_set_residency_set_bytes(Gpu *gpu, uint64_t bytes);
+
+// What the residency sets hold, as Metal reports it.
+typedef struct {
+  // Residency sets, and the buffers they hold. A removed buffer is held until
+  // the next gpu_commit_residency.
+  uint32_t sets, buffers;
+  // Bytes of the buffers that the sets hold after that commit, and of those in
+  // the largest set.
+  uint64_t bytes, largest_set;
+} GpuResidency;
+
+// Returns what the residency sets hold.
+GpuResidency gpu_residency(Gpu *gpu);
 
 // Opens a command buffer in the queue, behind those opened before, and starts
 // encoding into it.

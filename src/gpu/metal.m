@@ -14,6 +14,28 @@ extern void objc_autoreleasePoolPop(void *);
 
 enum { MAX_KERNELS = 512 };
 
+// Metal allows at most 32 residency sets per command queue.
+enum { RESIDENCY_SETS = 32 };
+
+// Marks a table entry whose buffer was removed. Searches go past it, and a
+// rebuild of the table leaves it out.
+#define REMOVED_BUFFER ((id)1)
+
+// A residency set, and the bytes of the buffers in it.
+typedef struct {
+  id<MTLResidencySet> set;
+  uint64_t bytes;
+} ResidencySet;
+
+// An entry of the table of resident buffers.
+typedef struct {
+  // The Metal buffer; null if the entry is empty.
+  id<MTLBuffer> buffer;
+  // The bytes the buffer takes, and its residency set.
+  uint64_t bytes;
+  uint32_t set;
+} ResidentBuffer;
+
 struct Gpu {
   id<MTLDevice> device;
   id<MTLCommandQueue> queue;
@@ -31,7 +53,31 @@ struct Gpu {
   id<MTLCommandBuffer> last;
   // The autorelease pool.
   void *pool;
+  // The residency sets. Buffers are spread over several sets, since one very
+  // large set made the GPU about ten times slower.
+  ResidencySet residency[RESIDENCY_SETS];
+  // The sets made, and one bit for each set changed since its last commit.
+  uint32_t nresidency, residency_changed;
+  // The most bytes a set holds.
+  uint64_t residency_set_bytes;
+  // The resident buffers, in a table of 2^resident_bits entries. The table is
+  // keyed by the Metal buffer, so views of a buffer share its entry. Each
+  // buffer has a start entry; if that is taken, the buffer goes in the next
+  // free entry after it.
+  ResidentBuffer *resident;
+  uint32_t resident_bits;
+  // The resident buffers, and the entries that are not empty: theirs and the
+  // removed ones.
+  size_t resident_buffers, resident_filled;
 };
+
+// Returns the bits of the smallest table that count resident buffers fill at
+// most half of.
+static uint32_t table_bits(size_t count) {
+  uint32_t bits = 0;
+  while (((size_t)1 << bits) < 2 * count) bits++;
+  return bits;
+}
 
 static const char *describe(NSError *err) {
   return [[err localizedDescription] UTF8String];
@@ -44,6 +90,12 @@ Gpu *gpu_new(const char *source, size_t len) {
   gpu->device = MTLCreateSystemDefaultDevice();
   if (!gpu->device) die("no Metal device");
   gpu->queue = [gpu->device newCommandQueue];
+  // A set holds a twentieth of the working set, so 20 sets cover it, within
+  // Metal's limit of 32.
+  gpu->residency_set_bytes = [gpu->device recommendedMaxWorkingSetSize] / 20;
+  gpu->resident_bits = table_bits(0);
+  gpu->resident =
+      xmalloc(((size_t)1 << gpu->resident_bits) * sizeof *gpu->resident);
   MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
   [opts setMathMode:MTLMathModeSafe];  // IEEE: no fast math
   [opts setLanguageVersion:MTLLanguageVersion4_1];  // for tensors
@@ -85,6 +137,7 @@ size_t gpu_round_up_to_pages(size_t size) {
 static Buf allocate(Gpu *gpu, MemorySlot *slot, size_t size) {
   if (!slot) die("a GPU buffer of %zu bytes without a memory slot", size);
   Buf b = {0};
+  b.gpu = gpu;
   b.allocated = gpu_round_up_to_pages(size);
   b.memory = slot;
   if (!memory_claim(slot, b.allocated, MEMORY_REQUIRED)) return (Buf){0};
@@ -106,10 +159,125 @@ Buf gpu_alloc(Gpu *gpu, MemorySlot *slot, size_t size) {
 
 void gpu_free(Buf *b) {
   if (b->obj) {
+    gpu_set_resident(b, 0);
     [(id)b->obj release];
     if (b->memory) memory_release(b->memory, b->allocated);
   }
   memset(b, 0, sizeof *b);
+}
+
+// Returns the entry of buffer in the table, or else the entry it would take:
+// the first removed entry on the way, or the empty entry that ends the search.
+// Metal buffer objects are 16-byte aligned, so the start entry comes from the
+// address without its low 4 bits.
+static size_t resident_entry(const Gpu *gpu, id<MTLBuffer> buffer) {
+  size_t mask = ((size_t)1 << gpu->resident_bits) - 1;
+  size_t at = ((uintptr_t)buffer >> 4) & mask, removed = SIZE_MAX;
+  for (; gpu->resident[at].buffer; at = (at + 1) & mask) {
+    if (gpu->resident[at].buffer == buffer) return at;
+    if (gpu->resident[at].buffer == REMOVED_BUFFER && removed == SIZE_MAX)
+      removed = at;
+  }
+  return removed != SIZE_MAX ? removed : at;
+}
+
+// Rebuilds the table with 2^bits entries, leaving out the removed ones.
+static void rebuild_resident_table(Gpu *gpu, uint32_t bits) {
+  ResidentBuffer *old = gpu->resident;
+  size_t old_size = (size_t)1 << gpu->resident_bits;
+  gpu->resident_bits = bits;
+  gpu->resident = xmalloc(((size_t)1 << bits) * sizeof *gpu->resident);
+  for (size_t i = 0; i < old_size; i++)
+    if (old[i].buffer && old[i].buffer != REMOVED_BUFFER)
+      gpu->resident[resident_entry(gpu, old[i].buffer)] = old[i];
+  free(old);
+  gpu->resident_filled = gpu->resident_buffers;
+}
+
+// Returns the set for a resident buffer of bytes: the first set that is empty
+// or has room for it, or else a new set. Once all 32 sets exist, the set that
+// holds the fewest bytes.
+static uint32_t residency_set_for(Gpu *gpu, uint64_t bytes) {
+  uint64_t most = gpu->residency_set_bytes;
+  uint32_t fewest = 0;
+  for (uint32_t i = 0; i < gpu->nresidency; i++) {
+    uint64_t held = gpu->residency[i].bytes;
+    if (!held || (held <= most && bytes <= most - held)) return i;
+    if (held < gpu->residency[fewest].bytes) fewest = i;
+  }
+  if (gpu->nresidency == RESIDENCY_SETS) return fewest;
+  MTLResidencySetDescriptor *descriptor =
+      [[MTLResidencySetDescriptor alloc] init];
+  NSError *err = nil;
+  id<MTLResidencySet> set =
+      [gpu->device newResidencySetWithDescriptor:descriptor error:&err];
+  [descriptor release];
+  if (!set) die("residency set: %s", describe(err));
+  [gpu->queue addResidencySet:set];
+  gpu->residency[gpu->nresidency].set = set;
+  return gpu->nresidency++;
+}
+
+void gpu_set_resident(const Buf *b, int resident) {
+  if (!b->obj) die("residency of an empty buffer");
+  Gpu *gpu = b->gpu;
+  id<MTLBuffer> buffer = b->obj;
+  size_t at = resident_entry(gpu, buffer);
+  if (resident) {
+    if (gpu->resident[at].buffer == buffer) return;
+    // Before the table is three quarters full, removed entries included, it
+    // is rebuilt so that searches stay short: at the smallest size that the
+    // resident buffers, this one included, fill at most half of.
+    size_t size = (size_t)1 << gpu->resident_bits;
+    if ((gpu->resident_filled + 1) * 4 >= size * 3) {
+      rebuild_resident_table(gpu, table_bits(gpu->resident_buffers + 1));
+      at = resident_entry(gpu, buffer);
+    }
+    uint64_t bytes = [buffer allocatedSize];
+    uint32_t set = residency_set_for(gpu, bytes);
+    [gpu->residency[set].set addAllocation:buffer];
+    gpu->residency[set].bytes += bytes;
+    gpu->residency_changed |= 1u << set;
+    if (!gpu->resident[at].buffer) gpu->resident_filled++;
+    gpu->resident[at] = (ResidentBuffer){buffer, bytes, set};
+    gpu->resident_buffers++;
+  } else if (gpu->resident[at].buffer == buffer) {
+    ResidentBuffer *entry = &gpu->resident[at];
+    [gpu->residency[entry->set].set removeAllocation:buffer];
+    gpu->residency[entry->set].bytes -= entry->bytes;
+    gpu->residency_changed |= 1u << entry->set;
+    entry->buffer = REMOVED_BUFFER;
+    gpu->resident_buffers--;
+  }
+}
+
+void gpu_commit_residency(Gpu *gpu) {
+  for (uint32_t i = 0; i < gpu->nresidency; i++)
+    if (gpu->residency_changed & (1u << i)) [gpu->residency[i].set commit];
+  gpu->residency_changed = 0;
+}
+
+void gpu_set_residency_set_bytes(Gpu *gpu, uint64_t bytes) {
+  gpu->residency_set_bytes = bytes;
+}
+
+GpuResidency gpu_residency(Gpu *gpu) {
+  GpuResidency r = {.sets = gpu->nresidency};
+  // allAllocations keeps each buffer alive until its autorelease pool is
+  // drained, so its arrays get a pool of their own.
+  void *pool = objc_autoreleasePoolPush();
+  for (uint32_t i = 0; i < gpu->nresidency; i++) {
+    id<MTLResidencySet> set = gpu->residency[i].set;
+    r.buffers += (uint32_t)[set allocationCount];
+    NSArray *allocations = [set allAllocations];
+    uint64_t bytes = 0;
+    for (unsigned long j = 0; j < [allocations count]; j++)
+      bytes += [[allocations objectAtIndex:j] allocatedSize];
+    r.bytes += bytes;
+    if (bytes > r.largest_set) r.largest_set = bytes;
+  }
+  objc_autoreleasePoolPop(pool);
+  return r;
 }
 
 GpuCommandBuffer gpu_begin(Gpu *gpu) {
