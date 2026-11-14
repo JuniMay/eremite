@@ -21,8 +21,9 @@ BUILD := build
 OBJ := $(BUILD)/obj
 CFLAGS := -std=c23 -O2 -Wall -Wextra -Isrc
 
-# Libraries found through pkg-config.
-PKGS := yyjson
+# Libraries found through pkg-config: yyjson, and libjpeg from jpeg-turbo, which
+# decodes JPEG images as Pillow decodes them.
+PKGS := yyjson libjpeg
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
 LDLIBS := $(shell pkg-config --libs $(PKGS))
 
@@ -34,6 +35,9 @@ LDLIBS += -licucore
 
 # IOKit, through which the memory statistics read the GPU driver's memory.
 LDLIBS += -framework IOKit
+
+# ImageIO and CoreGraphics, which decode images in formats other than JPEG.
+LDLIBS += -framework ImageIO -framework CoreGraphics
 
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
