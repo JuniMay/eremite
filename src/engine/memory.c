@@ -2,6 +2,7 @@
 #include "base/clock.h"
 #include "base/error.h"
 #include "base/log.h"
+#include "base/shutdown.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -448,11 +449,20 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
                need > reclaimable(memory, wanted, sizes, n, mode, 0);
   if (need && (need == UINT64_MAX ||
                need > reclaimable(memory, wanted, sizes, n, mode, needed))) {
-    if (short_by)
+    if (short_by) {
+      // The parts of the available memory (available()).
+      double since = ((double)in_use(memory) - (double)memory->read_used);
+      uint64_t promised = usage->committed > usage->allocated
+                              ? usage->committed - usage->allocated
+                              : 0;
       say("memory: %s: refused %.2f GiB: %.2f GiB short of the %.1f GiB "
-          "reserve",
+          "reserve (read %.2f GiB available %.1f s ago; since then %+.2f GiB "
+          "used; %.2f GiB not written; %.2f GiB promised)",
           wanted[0]->name, extra / GIB_F, short_by / GIB_F,
-          memory->reserve / GIB_F);
+          memory->reserve / GIB_F, memory->read_bytes / GIB_F,
+          now() - memory->read_at, since / GIB_F, memory->read_pending / GIB_F,
+          promised / GIB_F);
+    }
     usage->refusals++;
     return 0;
   }
@@ -530,6 +540,54 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
   return 1;
 }
 
+// Tries attempt(context) until it succeeds. While it fails but each new
+// reading shows more available memory than the one before, it waits
+// freed_memory_delay before the next try. Returns whether it succeeded. A stop
+// request ends the waiting.
+static int retry_while_memory_returns(Memory *memory,
+                                      int (*attempt)(void *context),
+                                      void *context) {
+  uint64_t seen = memory->read_available ? memory->read_available() : 0;
+  while (!attempt(context)) {
+    if (!memory->read_available || shutdown_requested()) return 0;
+    sleep_seconds(memory->times.freed_memory_delay);
+    uint64_t now_available = memory->read_available();
+    if (now_available <= seen) return 0;
+    seen = now_available;
+    memory->read_at = LONG_AGO;  // the next try takes a new reading
+  }
+  return 1;
+}
+
+// A minimum or a claim to retry.
+typedef struct {
+  MemoryAccount *account;
+  MemorySlot *slot;
+  uint64_t bytes;
+} Retried;
+
+static int set_minimum_required(void *context) {
+  Retried *retried = context;
+  return memory_set_minimum(retried->account, retried->bytes, MEMORY_REQUIRED);
+}
+
+static int claim_required(void *context) {
+  Retried *retried = context;
+  return memory_claim(retried->slot, retried->bytes, MEMORY_REQUIRED);
+}
+
+int memory_wait_for_minimum(MemoryAccount *account, uint64_t bytes) {
+  Retried retried = {.account = account, .bytes = bytes};
+  return retry_while_memory_returns(account->memory, set_minimum_required,
+                                    &retried);
+}
+
+int memory_wait_for_claim(MemorySlot *slot, uint64_t bytes) {
+  Retried retried = {.slot = slot, .bytes = bytes};
+  return retry_while_memory_returns(slot->account->memory, claim_required,
+                                    &retried);
+}
+
 // Whether the state slot may be evicted to keep its account within its state
 // limit, while the rest of its model stays.
 static int idle_state(MemorySlot *slot) {
@@ -602,9 +660,9 @@ uint64_t memory_room(const MemoryAccount *account) {
 }
 MemorySlot *memory_shared(Memory *memory) { return &memory->shared; }
 
-void *memory_host_alloc(MemorySlot *slot, size_t bytes) {
-  if (!slot) die("host memory of %zu bytes without a memory slot", bytes);
-  if (!memory_claim(slot, bytes, MEMORY_REQUIRED)) return NULL;
+// Returns zeroed host memory of bytes, already claimed in slot, and records it
+// there. Null if the system has no such memory: the claim is released then.
+static void *host_alloc_claimed(MemorySlot *slot, size_t bytes) {
   void *pointer = calloc(1, bytes ? bytes : 1);
   HostAllocation *record = pointer ? malloc(sizeof *record) : NULL;
   if (!pointer || !record) {
@@ -620,8 +678,16 @@ void *memory_host_alloc(MemorySlot *slot, size_t bytes) {
   return pointer;
 }
 
+void *memory_host_alloc(MemorySlot *slot, size_t bytes) {
+  if (!slot) die("host memory of %zu bytes without a memory slot", bytes);
+  if (!memory_claim(slot, bytes, MEMORY_REQUIRED)) return NULL;
+  return host_alloc_claimed(slot, bytes);
+}
+
 void *memory_host_alloc_required(MemorySlot *slot, size_t bytes) {
-  void *pointer = memory_host_alloc(slot, bytes);
+  if (!slot) die("host memory of %zu bytes without a memory slot", bytes);
+  void *pointer =
+      memory_wait_for_claim(slot, bytes) ? host_alloc_claimed(slot, bytes) : 0;
   if (!pointer)
     die("cannot allocate %zu bytes of %s memory", bytes,
         slot->kind == MEMORY_STATE ? "state" : "model");

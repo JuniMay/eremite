@@ -199,11 +199,25 @@ int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count,
 int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
                        MemoryAdmission mode);
 
+// Sets the account's minimum as memory_set_minimum does in MEMORY_REQUIRED
+// mode. While it does not fit but each new reading shows more available
+// memory than the one before, as while memory that another program released
+// comes back, it waits freed_memory_delay and tries again. Returns whether it
+// fits. A stop request ends the waiting.
+int memory_wait_for_minimum(MemoryAccount *account, uint64_t bytes);
+
 // Claims bytes for the slot: adds them to its bytes in use, evicting as mode
 // allows. Returns whether they fit. A state slot first stays within its
 // account's state limit: the account's idle state slots are evicted, oldest
 // first, and the bytes are refused if that is not enough.
 int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode);
+
+// Claims bytes for the slot as memory_claim does in MEMORY_REQUIRED mode.
+// While they do not fit but each new reading shows more available memory than
+// the one before, as while released memory comes back, it waits
+// freed_memory_delay and tries again. Returns whether they fit. A stop request
+// ends the waiting.
+int memory_wait_for_claim(MemorySlot *slot, uint64_t bytes);
 
 // Releases bytes: removes them from the slot's bytes in use.
 void memory_release(MemorySlot *slot, uint64_t bytes);
@@ -240,8 +254,9 @@ uint64_t memory_unload(MemoryAccount *account);
 // fit. Ends the program if slot is null.
 void *memory_host_alloc(MemorySlot *slot, size_t bytes);
 
-// Returns zeroed host memory of bytes, counted in slot. Ends the program if
-// slot is null or the memory does not fit.
+// Returns zeroed host memory of bytes, counted in slot, waiting as
+// memory_wait_for_claim does. Ends the program if slot is null or the memory
+// does not fit.
 void *memory_host_alloc_required(MemorySlot *slot, size_t bytes);
 
 // Frees host memory counted in slot, also memory from plain malloc. Ends the

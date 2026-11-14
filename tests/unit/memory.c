@@ -1,3 +1,4 @@
+#include "base/shutdown.h"
 #include "check.h"
 #include "engine/memory.h"
 #include <stdarg.h>
@@ -20,7 +21,17 @@ static uint64_t available_bytes;
 // The times the eviction callback ran.
 static int callbacks;
 
+// Memory that another program released, and the bytes of it that come back to
+// the system's counts at each sleep.
+static uint64_t coming_back, coming_back_step;
+
 double now(void) { return clock_now; }
+void sleep_seconds(double seconds) {
+  clock_now += seconds;
+  uint64_t step =
+      coming_back < coming_back_step ? coming_back : coming_back_step;
+  available_bytes += step, coming_back -= step;
+}
 [[noreturn]] void die(const char *format, ...) {
   va_list args;
   va_start(args, format);
@@ -312,6 +323,59 @@ static void readings_wait_for_their_interval(void) {
   REQUIRE(memory_current_limit(memory) == 200);
   clock_now += 1;
   REQUIRE(memory_current_limit(memory) == 50);
+}
+
+static void minimum_waits_while_memory_comes_back(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  // 120 bytes are available and 100 stay for other programs: a minimum of 100
+  // fits once 80 more come back, 50 at each sleep.
+  available_bytes = 120, coming_back = 80, coming_back_step = 50;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  double started = clock_now;
+  REQUIRE(memory_wait_for_minimum(&model, 100));
+  REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
+}
+
+static void minimum_fails_once_no_memory_comes_back(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  // The first sleep brings 30 bytes, too few, and the second none.
+  available_bytes = 120, coming_back = 30, coming_back_step = 50;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  double started = clock_now;
+  REQUIRE(!memory_wait_for_minimum(&model, 100));
+  REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
+  REQUIRE(memory_usage(memory).committed == 0);
+}
+
+static void claim_waits_while_memory_comes_back(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  TestSlot slot;
+  test_slot(&slot, &model, NULL, 0, 1);
+  // 120 bytes are available and 100 stay for other programs: a claim of 100
+  // fits once 80 more come back, 50 at each sleep.
+  available_bytes = 120, coming_back = 80, coming_back_step = 50;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  double started = clock_now;
+  REQUIRE(memory_wait_for_claim(&slot.slot, 100));
+  REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
+  REQUIRE(slot.slot.payload == 100);
+}
+
+static void stop_ends_the_wait_for_a_minimum(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  available_bytes = 120, coming_back = 80, coming_back_step = 50;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  shutdown_request();
+  double started = clock_now;
+  REQUIRE(!memory_wait_for_minimum(&model, 100) && clock_now == started);
 }
 
 static void speculative_memory_never_evicts(void) {
@@ -634,6 +698,16 @@ int main(void) {
        recently_used_weights_stay_for_their_time},
       {"a reading is taken again only after available_memory_reading_interval",
        readings_wait_for_their_interval},
+      {"a minimum that does not fit waits while memory comes back, and fits "
+       "once enough is back",
+       minimum_waits_while_memory_comes_back},
+      {"a minimum fails once a reading shows no more available memory",
+       minimum_fails_once_no_memory_comes_back},
+      {"a stop request ends the wait for a minimum",
+       stop_ends_the_wait_for_a_minimum},
+      {"a required claim waits while memory comes back, and fits once enough "
+       "is back",
+       claim_waits_while_memory_comes_back},
       {"a refused addition to two slots evicts nothing",
        refused_addition_evicts_nothing},
       {"slots that their owners keep go only for required memory, after the "
