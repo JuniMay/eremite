@@ -231,6 +231,29 @@ static void minimum_must_fit(void) {
           fixed.evicted == 0);
 }
 
+// A slot grows in an account at its minimum, and the reserve is short. Evicting
+// another slot of the account lowers the counted bytes only to the minimum. It
+// also lowers the growth. Together they make room for the reserve.
+static void evictions_at_the_minimum_also_lower_the_growth(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  REQUIRE(memory_set_minimum(&model, 80, MEMORY_REQUIRED));
+  TestSlot cache, kept, growing;
+  test_slot(&cache, &model, NULL, 50, 1);
+  test_slot(&kept, &model, NULL, 50, 2);
+  memory_pin(&kept.slot, 1);
+  test_slot(&growing, &model, NULL, 0, 3);
+  // 100 bytes are counted, and 10 fit above the reserve. So adding 40 bytes is
+  // 30 bytes short of the reserve.
+  available_bytes = 110;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  REQUIRE(claim(&growing, 40, MEMORY_REQUIRED));
+  // Evicting the cache lowered the counted bytes by 20, to the minimum, and
+  // the growth by 30.
+  REQUIRE(cache.evicted == 1 && memory_usage(memory).committed == 90);
+}
+
 static void recently_used_weights_stay_for_their_time(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 100);
@@ -526,6 +549,9 @@ int main(void) {
       {"unloading a model evicts its idle state slots last",
        unload_evicts_idle_state},
       {"a minimum that does not fit is refused", minimum_must_fit},
+      {"evictions at an account's minimum also lower the growth, and so keep "
+       "the reserve",
+       evictions_at_the_minimum_also_lower_the_growth},
       {"speculative memory never evicts, and a cache waits 30 seconds to evict "
        "weights",
        speculative_memory_never_evicts},

@@ -424,9 +424,16 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
     return 0;
   }
   int taken = 0;
-  while ((over = over_limit(usage, extra)) || freed < short_by) {
-    uint64_t left = freed < short_by ? short_by - freed : 0,
-             want = over > left ? over : left;
+  // Evictions lower the counted bytes, down to each account's minimum. In a
+  // growing account they also lower extra. The reserve is met once the counted
+  // bytes and extra together are short_by below where they started.
+  uint64_t target = usage->committed + extra - short_by;
+  for (;;) {
+    over = over_limit(usage, extra);
+    uint64_t total = usage->committed + extra,
+             left = total > target ? total - target : 0;
+    if (!over && !left) break;
+    uint64_t want = over > left ? over : left;
     MemorySlot *best = victim(memory, wanted, sizes, n, mode, want);
     if (!best) die("memory reservation changed during eviction");
     freed += evict_slot(best);
