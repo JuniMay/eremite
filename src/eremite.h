@@ -6,20 +6,22 @@
 // eremite's inference engine behind a C ABI, for a server. The engine runs the
 // models of every checkpoint that the model interface runs (DeepSeek V4.1
 // Flash), several of them in one process, at most one of each family. For
-// each model: loading, sampling, context-copy drafts, the draft-count chooser,
-// the identity of its saved states, statistics, and its tokenizer; for the
+// each model: loading, the attention states and their snapshots, prefill and
+// decoding, the model's drafts and their verification, sampling,
+// context-copy drafts, the vision encoder, and its tokenizer; for the
 // process: the log and the stop on SIGINT or SIGTERM. The server owns
 // everything about requests: their queue and scheduling, the prefix cache
 // (which states and snapshots to keep, and how a prompt reuses them), HTTP,
 // and the status it builds from eremite_read_stats.
 //
-// Threads: eremite_init, eremite_load and every function on models, samplers
-// and context lookups run on one thread, the server's engine thread: the
-// engine, the models and the GPU keep their state without locks, and one
-// command queue carries every model's passes. The tokenizer's functions,
-// eremite_log, eremite_is_stopping and eremite_request_stop may be called from
-// any thread. eremite_read_stats runs on the engine thread between passes; the
-// caller publishes a copy for its HTTP handlers and terminal.
+// Threads: eremite_init, eremite_load and every function on models, states,
+// snapshots, prefill, decoding, drafts, samplers, context lookups and images
+// run on one thread, the server's engine thread: the engine, the models and the
+// GPU keep their state without locks, and one command queue carries every
+// model's passes. The tokenizer's functions, eremite_log, eremite_is_stopping
+// and eremite_request_stop may be called from any thread. eremite_read_stats
+// runs on the engine thread between passes; the caller publishes a copy for its
+// HTTP handlers and terminal.
 
 #define EREMITE_ABI 1
 
@@ -170,8 +172,79 @@ int eremite_rewind_margin(const eremite_model *m);
 int eremite_vocab_size(const eremite_model *m);
 int eremite_is_stop_token(const eremite_model *m, int32_t token);
 
+// ---- attention states and snapshots ----
+
+// One sequence's state, of one model.
+typedef struct ModelState eremite_state;
+// Returns a new, empty state, or null when its memory does not fit.
+eremite_state *eremite_state_new(eremite_model *m);
+void eremite_state_free(eremite_model *m, eremite_state *s);
+// Returns the bytes that s, or a new state for a null s, takes when it holds
+// that many positions.
+size_t eremite_state_bytes(const eremite_model *m, const eremite_state *s,
+                           int positions);
+// Copies the rows of src before positions that later positions do not change
+// into dst. src may be a running request's state.
+void eremite_state_copy(eremite_model *m, eremite_state *dst,
+                        const eremite_state *src, int positions);
+
+// A state's rolling part at one position: the rows that later positions
+// overwrite. A state continues at the position of a snapshot restored into it,
+// or up to eremite_rewind_margin() positions before it. The rows before that
+// position must first be copied into it from the snapshot's own state. For
+// that, the state's rings hold eremite_rewind_margin() positions' rows before
+// each window.
+//
+// A row written past where the state then continues takes the place of one
+// of those rows, the oldest. Such stale rows are a verify pass's rows after
+// the tokens that eremite_accept keeps, and a state's rows after the end of a
+// prompt that continued it before them. Each row written at the state's end
+// replaces one again. A state, and a snapshot of it, then continues at most
+// eremite_rewind_margin() less the stale rows before its position. The caller
+// counts the stale rows.
+typedef struct ModelSnapshot eremite_snapshot;
+// Returns a snapshot of s's rolling rows now, as they are at pos. If logits
+// are given, the snapshot also holds them: the logits that pos's token is
+// sampled from, as a prefill or decoding call returned them.
+eremite_snapshot *eremite_snapshot_take(eremite_model *m, eremite_state *s,
+                                        int pos, const float *logits);
+void eremite_snapshot_restore(eremite_model *m, eremite_state *s,
+                              const eremite_snapshot *x);
+void eremite_snapshot_free(eremite_model *m, eremite_snapshot *x);
+size_t eremite_snapshot_bytes(const eremite_model *m, int with_logits);
+// Returns the snapshot's logits, or null if it has none.
+const float *eremite_snapshot_logits(const eremite_model *m,
+                                     const eremite_snapshot *x);
+
 // ---- saved states ----
 
+// The server names, opens, syncs and renames the files. These calls write
+// and read their contents, past the page cache (F_NOCACHE), with a CRC32C for
+// each 4 MiB block. A saved state is a list of parts.
+//
+// eremite_state_write writes one part: the rows of s that positions from
+// `from` on wrote, up to `to`. s holds at least `to` positions. The rows that
+// the first `from` positions do not change are in earlier parts. Returns the
+// bytes written, or -1 if a write failed or a second stop request ended it.
+// With fd -1, it writes nothing and returns the bytes it would take.
+// eremite_snapshot_write does the same with fd -1.
+int64_t eremite_state_write(eremite_model *m, eremite_state *s, int from,
+                            int to, int fd);
+// Fills s, a new state, with the rows before `positions` from a saved state's
+// parts, given in the order they were written. Each part's rows replace the
+// earlier parts' from its own start. s then holds what eremite_state_copy of
+// that many positions would give, and a snapshot is restored into it next, or
+// a prefill replays. Returns 0, or -1 if a part is short, damaged or of
+// another shape, or if the parts leave rows out. After -1, s is of no use.
+int eremite_state_read(eremite_model *m, eremite_state *s, int positions,
+                       const int *fds, int count);
+// Writes snapshot x without its logits, or for a null x, s's rolling rows as
+// they are at pos, its end. Returns the bytes written, or -1.
+int64_t eremite_snapshot_write(eremite_model *m, const eremite_snapshot *x,
+                               eremite_state *s, int pos, int fd);
+// Returns the snapshot that a file holds, or null if the file is short,
+// damaged or of another shape.
+eremite_snapshot *eremite_snapshot_read(eremite_model *m, int fd);
 // Writes the identity of m's saved states: what they depend on. It is known
 // before the weights load. It covers the family's state layout, the
 // checkpoint's weights, the experts' GGUF set, and the options that change a
@@ -180,6 +253,120 @@ int eremite_is_stop_token(const eremite_model *m, int32_t token);
 // name, size, and first and last 64 KiB. A state saved with another identity
 // is not read.
 void eremite_state_identity(eremite_model *m, uint8_t out[32]);
+
+// ---- running a model ----
+
+typedef struct {
+  int chunks, tokens, decoder_tokens, ced_applied, prune_applied, prefix_tokens;
+} eremite_prefill_info;
+
+// Prefills positions from to n - 1 of a prompt in s, and returns the last
+// one's logits: vocabulary floats, valid until the next call that runs a
+// model. tokens holds all n of the prompt's tokens.
+//
+// Without replay, the state holds every position before from: its own, or
+// copied rows and a snapshot restored at from. With replay, it holds only the
+// rows that eremite_state_copy copies before from, and the prefill rebuilds
+// the rest: it computes earlier positions again. eremite_replay_rows returns -1
+// for a model whose rolling rows cannot be rebuilt from the rows it keeps. Such
+// a model resumes only from a snapshot, and its prefill computes the positions
+// after the snapshot again. For DeepSeek with --ced off, the replay is exact:
+// the prefill starts earlier, each layer where its window needs. With --ced,
+// the replay is bounded and approximate, as DeepInfer's bounded replay of the
+// encoder's sliding window.
+//
+// With a capture of 0 or more and a non-null captured, *captured gets the
+// rolling rows at that position as a snapshot, taken during the prefill. The
+// position is a replay's branch point, from, or a position after from and
+// before n. *captured gets null if the model cannot take a whole state's
+// snapshot there, as for DeepSeek under CED compaction. A non-null info gets
+// the prefill's plan.
+//
+// The server gives valid token IDs, positions and row counts, within the
+// limits above. Prompt IDs may include the negative image keys from
+// eremite_media_expand. The calls that return logits return null when they
+// are cancelled, or when the model's workspace does not fit in the memory.
+const float *eremite_prefill(eremite_model *m, eremite_state *s,
+                             const int32_t *tokens, int n, int from, int replay,
+                             int capture, eremite_snapshot **captured,
+                             eremite_prefill_info *info,
+                             const eremite_media *images);
+// What a replay at k costs beyond the prompt's new rows. eremite_replay_rows
+// returns the rows before k that it computes again, per layer on average, or
+// -1 for a model that resumes only from snapshots. eremite_replay_start
+// returns the first position that it computes again: the prompt's images from
+// there on must be encoded (eremite_media_encode).
+int eremite_replay_rows(const eremite_model *m, int k);
+int eremite_replay_start(const eremite_model *m, int k);
+// Runs one token for each of count states at once, count at most
+// eremite_max_rows(), without drafts. Row r is tokens[r] at pos[r], states[r]'s
+// next position. Returns rows of logits.
+const float *eremite_decode_rows(eremite_model *m, eremite_state **states,
+                                 const int32_t *tokens, const int32_t *pos,
+                                 int count);
+// The model's drafts. eremite_propose_drafts writes n drafts after token at pos
+// of s, n at most eremite_drafts_per_pass(). It returns the sampled proposals'
+// probabilities, or null for proposals without sampling. eremite_verify runs
+// count rows from pos, the token and then its drafts, and returns rows of
+// logits. eremite_accept keeps the first n of the rows.
+const double *eremite_propose_drafts(eremite_model *m, eremite_state *s,
+                                     int32_t token, int pos, int32_t *drafts,
+                                     int n, eremite_sampler *sampler);
+const float *eremite_verify(eremite_model *m, eremite_state *s,
+                            const int32_t *rows, int count, int pos);
+void eremite_accept(eremite_model *m, eremite_state *s, const int32_t *rows,
+                    int n, int pos);
+// Sets s's token history at pos from the tokens before it, which DeepSeek's
+// Engram uses.
+void eremite_set_history(eremite_model *m, eremite_state *s,
+                         const int32_t *tokens, int pos);
+
+// ---- streams ----
+
+// A stream runs one model's calls, one after another, on its own stack and
+// with its own working buffers. The calls of several streams, of any models,
+// run at the same time: whichever stream can continue runs while the others
+// wait for the GPU or the SSD. Posting a call returns at once, and
+// eremite_run_streams advances the streams. A state takes part in one call at a
+// time; other states may be used between the calls of a stream. Pointers given
+// to a call stay valid until it finishes.
+typedef struct eremite_stream eremite_stream;
+eremite_stream *eremite_stream_new(eremite_model *m);
+// Frees a stream that has no call posted.
+void eremite_stream_free(eremite_stream *x);
+// Post the calls of eremite_prefill and eremite_decode_rows. Their results come
+// from the functions below.
+void eremite_stream_prefill(eremite_stream *x, eremite_state *s,
+                            const int32_t *tokens, int n, int from, int replay,
+                            int capture, const eremite_media *images);
+void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
+                                const int32_t *tokens, const int32_t *pos,
+                                int count);
+// Posts a token and its drafts, decoded together. rows[0] is the token at pos
+// of s. With proposed 0, the model's drafts fill rows[1] to rows[drafts];
+// otherwise they are already there. The verified rows are then sampled, and
+// the kept ones accepted.
+void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
+                           int drafts, int proposed, int pos,
+                           eremite_sampler *sampler);
+// Advances the streams until a call finishes, and returns that stream's index.
+// It returns -1 when no stream has a call posted, and when eremite_wake asks it
+// to. Only this function runs the streams. A run whose calls can only wait for
+// each other ends the program.
+int eremite_run_streams(eremite_stream *const *streams, int n);
+// Makes eremite_run_streams return -1 soon: at once if it waits, or else after
+// the call that runs now waits. A wake that comes outside eremite_run_streams
+// ends its next run after one look at the streams. Any thread may call it.
+void eremite_wake(void);
+// A finished call's results. The logits stay valid until the stream's next
+// call. Null logits: the call did not fit in memory.
+const float *eremite_stream_logits(const eremite_stream *x);
+eremite_snapshot *eremite_stream_captured_snapshot(const eremite_stream *x);
+void eremite_stream_prefill_info(const eremite_stream *x,
+                                 eremite_prefill_info *info);
+// For a verify call: returns the next token, and sets *accepted to the drafts
+// kept.
+int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted);
 
 // ---- sampling ----
 
@@ -225,6 +412,24 @@ int eremite_draft_choice_next_count(eremite_draft_choice *x, int most);
 // other call beside it.
 void eremite_draft_choice_record_pass(eremite_draft_choice *x, int count,
                                       int kept, double seconds);
+
+// ---- encoded media ----
+
+// Opens a prompt's media inputs: each placeholder becomes its feature span.
+// Returns null, with a message, if an input cannot be decoded.
+eremite_media *eremite_media_open(eremite_model *m, const uint8_t *const *data,
+                                  const size_t *len, int n, char *message,
+                                  size_t cap);
+// Writes the prompt with the spans in place to out, at most max tokens.
+// Returns its length, or -1 if its places and images differ or it does not
+// fit.
+int eremite_media_expand(eremite_media *x, const int32_t *in, int n,
+                         int32_t *out, int max);
+// Encodes the inputs at positions from `from` on, and gives all of them to the
+// model's next prefill. Returns the count encoded.
+int eremite_media_encode(eremite_media *x, int from);
+// Closes the inputs, after that prefill.
+void eremite_media_close(eremite_media *x);
 
 // ---- statistics, for the server's status ----
 

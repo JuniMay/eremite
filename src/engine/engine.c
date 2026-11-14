@@ -58,6 +58,10 @@ static int nmodels;
 // GPU that the models run on, made when the first model loads.
 static Memory *memory;
 static Gpu *gpu;
+// What the engine thread blocks on while no stream's call can go on, made by
+// eremite_init, and whether eremite_wake asked eremite_run_streams to return.
+static ThreadsEvent *wake;
+static atomic_int woken;
 
 // What the engine thread does. The GPU's idle times are split by it.
 enum {
@@ -92,6 +96,11 @@ static Gpu *models_gpu(void) {
     memory_set_eviction_callback(memory, after_evictions, gpu);
   }
   return gpu;
+}
+
+// Records what the engine thread does now, once the GPU is made.
+static void set_thread_state(int state) {
+  if (gpu) gpu_set_thread_state(gpu, state);
 }
 
 // The state memory of every model.
@@ -147,6 +156,7 @@ int eremite_init(const eremite_process *p) {
   // SIGINT and SIGTERM request a stop, which ends a load and lets the server
   // save its states.
   shutdown_watch(p->on_stop);
+  wake = threads_event_new();
   initialized = 1;
   return 0;
 }
@@ -281,7 +291,69 @@ int eremite_is_stop_token(const eremite_model *m, int32_t token) {
   return m->ops->is_stop_token(token);
 }
 
+// ---- attention states and snapshots ----
+
+eremite_state *eremite_state_new(eremite_model *m) {
+  return m->ops->state_new();
+}
+
+void eremite_state_free(eremite_model *m, eremite_state *s) {
+  m->ops->state_free(s);
+}
+
+size_t eremite_state_bytes(const eremite_model *m, const eremite_state *s,
+                           int positions) {
+  return m->ops->state_bytes(s, positions);
+}
+
+void eremite_state_copy(eremite_model *m, eremite_state *dst,
+                        const eremite_state *src, int positions) {
+  m->ops->state_copy(dst, src, positions);
+}
+
+eremite_snapshot *eremite_snapshot_take(eremite_model *m, eremite_state *s,
+                                        int pos, const float *logits) {
+  return m->ops->snapshot_take(s, pos, logits);
+}
+
+void eremite_snapshot_restore(eremite_model *m, eremite_state *s,
+                              const eremite_snapshot *x) {
+  m->ops->snapshot_restore(s, x);
+}
+
+void eremite_snapshot_free(eremite_model *m, eremite_snapshot *x) {
+  m->ops->snapshot_free(x);
+}
+
+size_t eremite_snapshot_bytes(const eremite_model *m, int with_logits) {
+  return m->ops->snapshot_bytes(with_logits);
+}
+
+const float *eremite_snapshot_logits(const eremite_model *m,
+                                     const eremite_snapshot *x) {
+  return m->ops->snapshot_logits(x);
+}
+
 // ---- saved states ----
+
+int64_t eremite_state_write(eremite_model *m, eremite_state *s, int from,
+                            int to, int fd) {
+  return state_file_write(m->ops, s, from, to, fd);
+}
+
+int eremite_state_read(eremite_model *m, eremite_state *s, int positions,
+                       const int *fds, int count) {
+  return state_file_read(m->ops, s, positions, fds, count);
+}
+
+int64_t eremite_snapshot_write(eremite_model *m, const eremite_snapshot *x,
+                               eremite_state *s, int pos, int fd) {
+  return snapshot_file_write(m->ops, (eremite_snapshot *)x, s, pos, fd);
+}
+
+eremite_snapshot *eremite_snapshot_read(eremite_model *m, int fd) {
+  return snapshot_file_read(m->ops, fd);
+}
 
 static void identity_number(CC_SHA256_CTX *h, int64_t v) {
   CC_SHA256_Update(h, &v, sizeof v);
@@ -310,6 +382,272 @@ void eremite_state_identity(eremite_model *m, uint8_t out[32]) {
     m->identified = 1;
   }
   memcpy(out, m->identity, 32);
+}
+
+// ---- running a model ----
+
+const float *eremite_prefill(eremite_model *m, eremite_state *s,
+                             const int32_t *tokens, int n, int from, int replay,
+                             int capture, eremite_snapshot **captured,
+                             eremite_prefill_info *info,
+                             const eremite_media *images) {
+  if (captured) *captured = 0;
+  int start = replay && from > 0 ? m->ops->replay_start(from) : from;
+  if (m->ops->set_prefill_media)
+    m->ops->set_prefill_media(images ? images->items : NULL,
+                              images ? images->n : 0);
+  const float *lg =
+      m->ops->prefill(s, tokens, n, from, replay, capture, captured, 0);
+  if (info) {  // the family's plan, or every row through every layer
+    ModelPlan p = {
+        .chunks = 1, .tokens = n - start, .decoder_tokens = n - start};
+    if (m->ops->read_last_plan) m->ops->read_last_plan(&p);
+    *info = (eremite_prefill_info){.chunks = p.chunks,
+                                   .tokens = p.tokens,
+                                   .decoder_tokens = p.decoder_tokens,
+                                   .ced_applied = p.ced_applied,
+                                   .prune_applied = p.prune_applied,
+                                   .prefix_tokens = p.prefix_tokens};
+  }
+  return lg;
+}
+
+// ---- streams ----
+
+// The most rows of a stream's decoding call.
+static constexpr int STREAM_ROWS = 16;
+
+typedef enum {
+  STREAM_NONE,
+  STREAM_PREFILL,
+  STREAM_DECODE,
+  STREAM_VERIFY,
+  STREAM_QUIT
+} StreamCall;
+
+struct eremite_stream {
+  eremite_model *m;
+  Pass *pass;
+  // The call posted and not finished.
+  StreamCall call;
+  // It finished, and eremite_run_streams has not reported that yet.
+  int finished;
+  // the call's arguments
+  eremite_state *states[STREAM_ROWS];
+  int32_t row_tokens[STREAM_ROWS], row_pos[STREAM_ROWS];
+  // A prefill's prompt; a verify's rows (the token, then the drafts).
+  const int32_t *tokens;
+  int n, from, replay, capture, count, drafts, proposed, pos;
+  const eremite_media *images;
+  eremite_sampler *sampler;
+  // its results
+  const float *logits;
+  eremite_snapshot *captured;
+  eremite_prefill_info info;
+  int32_t next;
+  int accepted;
+};
+
+static int stream_has_call(void *context) {
+  return ((eremite_stream *)context)->call != STREAM_NONE;
+}
+
+static void stream_run(eremite_stream *x) {
+  eremite_model *m = x->m;
+  x->logits = NULL;
+  switch (x->call) {
+  case STREAM_PREFILL:
+    x->logits =
+        eremite_prefill(m, x->states[0], x->tokens, x->n, x->from, x->replay,
+                        x->capture, &x->captured, &x->info, x->images);
+    break;
+  case STREAM_DECODE:
+    x->logits =
+        eremite_decode_rows(m, x->states, x->row_tokens, x->row_pos, x->count);
+    break;
+  case STREAM_VERIFY: {
+    int32_t *rows = (int32_t *)x->tokens;
+    const double *q =
+        x->proposed ? NULL
+                    : eremite_propose_drafts(m, x->states[0], rows[0], x->pos,
+                                             rows + 1, x->drafts, x->sampler);
+    x->logits = eremite_verify(m, x->states[0], rows, x->drafts + 1, x->pos);
+    if (x->logits) {
+      x->next = eremite_sample_verify_drafts(m, x->logits, rows + 1, x->drafts,
+                                             q, x->sampler, &x->accepted);
+      eremite_accept(m, x->states[0], rows, x->accepted + 1, x->pos);
+    }
+    break;
+  }
+  default: break;
+  }
+}
+
+// The stream's pass: a call after another, with its own buffers; between
+// calls no state stays bound to it.
+static void stream_body(void *argument) {
+  eremite_stream *x = argument;
+  x->m->ops->pass_begin();
+  for (;;) {
+    pass_wait(&(PassWait){stream_has_call, NULL, x, PASS_WAIT_OTHER, NULL});
+    if (x->call == STREAM_QUIT) break;
+    stream_run(x);
+    if (x->m->ops->pass_release) x->m->ops->pass_release();
+    x->call = STREAM_NONE;
+    x->finished = 1;
+  }
+  x->m->ops->pass_end();
+}
+
+eremite_stream *eremite_stream_new(eremite_model *m) {
+  eremite_stream *x = xmalloc(sizeof *x);
+  x->m = m;
+  x->pass = m->ops->pass_new(stream_body, x);
+  return x;
+}
+
+void eremite_stream_free(eremite_stream *x) {
+  if (!x) return;
+  x->call = STREAM_QUIT;
+  pass_run(x->pass);
+  pass_free(x->pass);
+  free(x);
+}
+
+void eremite_stream_prefill(eremite_stream *x, eremite_state *s,
+                            const int32_t *tokens, int n, int from, int replay,
+                            int capture, const eremite_media *images) {
+  x->states[0] = s, x->tokens = tokens, x->n = n, x->from = from,
+  x->replay = replay, x->capture = capture, x->images = images;
+  x->captured = NULL;
+  x->call = STREAM_PREFILL;
+}
+
+void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
+                                const int32_t *tokens, const int32_t *pos,
+                                int count) {
+  if (count < 1 || count > STREAM_ROWS)
+    die("a stream's decoding call takes 1 to %d rows", STREAM_ROWS);
+  memcpy(x->states, states, (size_t)count * sizeof *states);
+  memcpy(x->row_tokens, tokens, (size_t)count * sizeof *tokens);
+  memcpy(x->row_pos, pos, (size_t)count * sizeof *pos);
+  x->count = count;
+  x->call = STREAM_DECODE;
+}
+
+void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
+                           int drafts, int proposed, int pos,
+                           eremite_sampler *sampler) {
+  x->states[0] = s, x->tokens = rows, x->drafts = drafts,
+  x->proposed = proposed, x->pos = pos, x->sampler = sampler;
+  x->accepted = 0;
+  x->call = STREAM_VERIFY;
+}
+
+// What the streams with a call wait for while none can go on (THREAD_*): the
+// GPU if any waits for it, else reads if any waits for them, else something
+// else.
+static int streams_wait_for(eremite_stream *const *streams, int n) {
+  int reads = 0;
+  for (int k = 0; k < n; k++) {
+    if (streams[k]->call == STREAM_NONE) continue;
+    int kind = pass_waiting_for(streams[k]->pass);
+    if (kind == PASS_WAIT_GPU) return THREAD_WAIT_GPU;
+    reads |= kind == PASS_WAIT_READ;
+  }
+  return reads ? THREAD_WAIT_READ : THREAD_WAIT_OTHER;
+}
+
+// The streams' calls advance on this thread: each stream that can go on runs
+// until it would wait. When none can go on, the thread waits for any of them.
+int eremite_run_streams(eremite_stream *const *streams, int n) {
+  static unsigned first;
+  int posted = 0;
+  for (int k = 0; k < n; k++) posted += streams[k]->call != STREAM_NONE;
+  for (int i = 0; i < nmodels; i++)
+    if (models[i]->ops->set_other_passes)
+      models[i]->ops->set_other_passes(posted - 1);
+  Pass *waiting[n];
+  int finished = -1;
+  for (;;) {
+    int ran = 0;
+    for (int k = 0; k < n && finished < 0; k++) {
+      int i = (int)(((unsigned)first + (unsigned)k) % (unsigned)n);
+      eremite_stream *x = streams[i];
+      if (pass_ready(x->pass))
+        set_thread_state(THREAD_PASS), pass_resume(x->pass), ran = 1;
+      if (x->finished) x->finished = 0, first = (unsigned)i + 1, finished = i;
+    }
+    if (finished >= 0 || atomic_exchange(&woken, 0)) break;
+    if (ran) continue;
+    int count = 0;
+    for (int k = 0; k < n; k++)
+      if (streams[k]->call != STREAM_NONE) waiting[count++] = streams[k]->pass;
+    if (!count) break;
+    set_thread_state(streams_wait_for(streams, n));
+    if (!pass_wait_for_any(waiting, count, wake))
+      die("the streams' calls wait for each other: none can go on");
+  }
+  set_thread_state(THREAD_OUTSIDE);
+  return finished;
+}
+
+void eremite_wake(void) {
+  atomic_store(&woken, 1);
+  if (wake) threads_event_signal(wake);
+}
+
+const float *eremite_stream_logits(const eremite_stream *x) {
+  return x->logits;
+}
+
+eremite_snapshot *eremite_stream_captured_snapshot(const eremite_stream *x) {
+  return x->captured;
+}
+
+void eremite_stream_prefill_info(const eremite_stream *x,
+                                 eremite_prefill_info *info) {
+  *info = x->info;
+}
+
+int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted) {
+  if (accepted) *accepted = x->accepted;
+  return x->next;
+}
+
+int eremite_replay_rows(const eremite_model *m, int k) {
+  return m->ops->replay_rows(k);
+}
+
+int eremite_replay_start(const eremite_model *m, int k) {
+  return m->ops->replay_start(k);
+}
+
+const float *eremite_decode_rows(eremite_model *m, eremite_state **states,
+                                 const int32_t *tokens, const int32_t *pos,
+                                 int count) {
+  return m->ops->decode_rows(states, tokens, pos, count);
+}
+
+const double *eremite_propose_drafts(eremite_model *m, eremite_state *s,
+                                     int32_t token, int pos, int32_t *drafts,
+                                     int n, eremite_sampler *sampler) {
+  return m->ops->propose_drafts(s, token, pos, drafts, n, &sampler->sp);
+}
+
+const float *eremite_verify(eremite_model *m, eremite_state *s,
+                            const int32_t *rows, int count, int pos) {
+  return m->ops->verify(s, rows, count, pos);
+}
+
+void eremite_accept(eremite_model *m, eremite_state *s, const int32_t *rows,
+                    int n, int pos) {
+  m->ops->accept(s, rows, n, pos);
+}
+
+void eremite_set_history(eremite_model *m, eremite_state *s,
+                         const int32_t *tokens, int pos) {
+  m->ops->set_history(s, tokens, pos);
 }
 
 // ---- sampling ----
@@ -381,6 +719,54 @@ int eremite_draft_choice_next_count(eremite_draft_choice *x, int most) {
 void eremite_draft_choice_record_pass(eremite_draft_choice *x, int count,
                                       int kept, double seconds) {
   draft_choice_record_pass(x, count, kept, seconds);
+}
+
+// ---- images ----
+
+eremite_media *eremite_media_open(eremite_model *m, const uint8_t *const *data,
+                                  const size_t *len, int n, char *message,
+                                  size_t cap) {
+  if (!m->ops->encode_media || !m->ops->prepare_media) {
+    snprintf(message, cap, "this model has no media encoder");
+    return 0;
+  }
+  eremite_media *x = xmalloc(sizeof *x);
+  x->m = m;
+  x->items = xmalloc((size_t)n * sizeof *x->items), x->n = 0;
+  for (int i = 0; i < n; i++) {
+    const char *why;
+    if (!m->ops->prepare_media(m->dir, &x->items[i], data[i], len[i], &why)) {
+      snprintf(message, cap, "media %d: %s", i + 1, why);
+      eremite_media_close(x);
+      return 0;
+    }
+    x->n = i + 1;
+  }
+  return x;
+}
+
+int eremite_media_expand(eremite_media *x, const int32_t *in, int n,
+                         int32_t *out, int max) {
+  int token = tokenizer_require_added(x->m->tk, x->m->ops->media_token);
+  return media_expand_prompt(in, n, x->items, x->n, out, max, token);
+}
+
+int eremite_media_encode(eremite_media *x, int from) {
+  int encoded = 0;  // the encoder runs for the images the prefill reaches; the
+                    // others are in the state's rows
+  for (int i = 0; i < x->n; i++)
+    if (x->items[i].start + media_span_length(&x->items[i]) > from) {
+      if (!x->m->ops->encode_media(&x->items[i])) return -1;
+      encoded++;
+    }
+  return encoded;
+}
+
+void eremite_media_close(eremite_media *x) {
+  if (!x) return;
+  x->m->ops->set_prefill_media(0, 0);
+  for (int i = 0; i < x->n; i++) media_free(&x->items[i]);
+  free(x->items), free(x);
 }
 
 // ---- statistics ----
