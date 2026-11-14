@@ -1,18 +1,12 @@
 #include "check.h"
-#include "base/error.h"
+#include "copy.h"
 #include "gpu/gpu.h"
-#include <signal.h>
-#include <spawn.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 // Tests signals and waits: after a wait for a signal, the CPU reads what the
 // GPU wrote before it, and a wait that cannot end ends the program instead of
 // returning. Those cases run in a copy of this program, because Metal does not
 // work after fork.
-
-extern char **environ;
 
 static const char library[] =
     "#include <metal_stdlib>\n"
@@ -48,38 +42,6 @@ static void end_case(const char *how) {
     GpuCommandBuffer c = gpu_begin(gpu_new(library, sizeof library - 1));
     gpu_signal(&c, event);
   }
-}
-
-// Runs a copy of this program with the argument how. Returns whether the copy
-// ended with an error within 20 s, saying expected. Every case ends within a
-// second; a copy still running after 20 s is stopped.
-static int ends_with(const char *self, const char *how, const char *expected) {
-  int out[2];
-  if (pipe(out)) die("pipe");
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_adddup2(&actions, out[1], 1);
-  posix_spawn_file_actions_adddup2(&actions, out[1], 2);
-  posix_spawn_file_actions_addclose(&actions, out[0]);
-  char *args[] = {(char *)self, (char *)how, NULL};
-  pid_t pid;
-  if (posix_spawn(&pid, self, &actions, NULL, args, environ))
-    die("cannot run %s", self);
-  posix_spawn_file_actions_destroy(&actions);
-  close(out[1]);
-  int status = 0, done = 0;
-  for (int tenths = 0; tenths < 200 && !done; tenths++) {
-    done = waitpid(pid, &status, WNOHANG) == pid;
-    if (!done) usleep(100000);
-  }
-  if (!done) kill(pid, SIGKILL), waitpid(pid, &status, 0);
-  char said[512] = {0};
-  for (ssize_t n = 0, k; n + 1 < (ssize_t)sizeof said &&
-                         (k = read(out[0], said + n, sizeof said - 1 - n)) > 0;)
-    n += k;
-  close(out[0]);
-  return done && WIFEXITED(status) && WEXITSTATUS(status) != 0 &&
-         strstr(said, expected);
 }
 
 int main(int argc, char **argv) {

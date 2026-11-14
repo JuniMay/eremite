@@ -328,18 +328,24 @@ GpuResidency gpu_residency(Gpu *gpu) {
   return r;
 }
 
-// An open command buffer keeps its Metal command buffer and encoder retained,
-// so that a sync, which drains the autorelease pool, does not free them.
-GpuCommandBuffer gpu_begin(Gpu *gpu) {
+// Opens a command buffer, in the queue or not, and starts encoding into it. An
+// open command buffer keeps its Metal command buffer and encoder retained, so
+// that a sync, which drains the autorelease pool, does not free them.
+static GpuCommandBuffer begin(Gpu *gpu, int in_queue) {
   id<MTLCommandBuffer> buffer =
       [[gpu->queue commandBufferWithUnretainedReferences] retain];
-  [buffer enqueue];
+  // A command buffer that is not in the queue joins it when it is committed.
+  if (in_queue) [buffer enqueue];
   gpu->open = room_for_one_more(gpu->open, gpu->nopen, &gpu->open_cap,
                                 sizeof *gpu->open);
   gpu->open[gpu->nopen++] = ++gpu->begun;
   return (GpuCommandBuffer){
       gpu, buffer, [[buffer computeCommandEncoder] retain], gpu->begun};
 }
+
+GpuCommandBuffer gpu_begin(Gpu *gpu) { return begin(gpu, 1); }
+
+GpuCommandBuffer gpu_begin_detached(Gpu *gpu) { return begin(gpu, 0); }
 
 // The encoder of a command buffer that is still being encoded.
 static id<MTLComputeCommandEncoder> encoder(const GpuCommandBuffer *c) {
@@ -361,6 +367,7 @@ static void move_to_done(Gpu *gpu, id<MTLCommandBuffer> c, uint64_t number) {
 }
 
 void gpu_commit(GpuCommandBuffer *c) {
+  if (!c->buffer) die("committing a command buffer twice");
   id<MTLComputeCommandEncoder> ending = encoder(c);
   [ending endEncoding];
   [ending release];
@@ -368,6 +375,7 @@ void gpu_commit(GpuCommandBuffer *c) {
   [buffer commit];
   move_to_done(c->gpu, buffer, c->number);
   [buffer release];
+  c->buffer = NULL;
   c->encoder = NULL;
 }
 

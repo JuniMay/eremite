@@ -32,7 +32,7 @@ typedef struct {
 // program.
 typedef struct {
   Gpu *gpu;
-  // The Metal command buffer. It is held until the commit.
+  // The Metal command buffer. It is held until the commit, and null after it.
   void *buffer;
   // Its compute encoder. It is held until the commit, and null after it.
   void *encoder;
@@ -101,10 +101,17 @@ typedef struct {
 GpuResidency gpu_residency(Gpu *gpu);
 
 // Opens a command buffer in the queue, behind those opened before, and starts
-// encoding into it.
+// encoding into it. It runs after them and before those opened after it,
+// whenever it is committed.
 GpuCommandBuffer gpu_begin(Gpu *gpu);
 
-// Ends the encoding and commits the command buffer.
+// Opens a command buffer outside the queue and starts encoding into it. It
+// joins the queue when it is committed, so it runs after the command buffers
+// committed before it, even ones opened after it.
+GpuCommandBuffer gpu_begin_detached(Gpu *gpu);
+
+// Ends the encoding and commits the command buffer. Ends the program if it was
+// committed before.
 void gpu_commit(GpuCommandBuffer *c);
 
 // Selects kernel k for the next dispatches. Ends the program if there is no
