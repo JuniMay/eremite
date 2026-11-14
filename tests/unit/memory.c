@@ -177,13 +177,13 @@ static void host_memory_counts_toward_the_limit(void) {
   MemorySlot work;
   memory_slot_init(&work, &account, NULL, "workspace", NULL, NULL);
   work.automatic = 1;
-  memory_scope(&work);
-  void *host = memory_host_alloc(60, 0), *state = memory_host_alloc(250, 1);
+  void *host = memory_host_alloc(&work, 60, 0),
+       *state = memory_host_alloc(NULL, 250, 1);
   REQUIRE(host && state && memory_usage().allocated == 60 &&
           memory_usage().state == 250);
-  REQUIRE(memory_host_alloc(50, 0) == NULL);
+  REQUIRE(memory_host_alloc(&work, 50, 0) == NULL);
   REQUIRE(memory_usage().allocated == 60);
-  void *more = memory_host_alloc(30, 0);
+  void *more = memory_host_alloc(&work, 30, 0);
   REQUIRE(more && memory_usage().committed == 90);
   memory_host_free(state);
   memory_host_free(host);
@@ -191,6 +191,8 @@ static void host_memory_counts_toward_the_limit(void) {
   REQUIRE(memory_usage().allocated == 0 && memory_usage().state == 0 &&
           memory_usage().committed == 0);
 }
+
+static void host_memory_without_a_slot(void) { memory_host_alloc(NULL, 60, 0); }
 
 static void reclaim_evicts_idle_slots(void) {
   memory_set_limit(120);
@@ -249,6 +251,20 @@ static void limit_holds_for_new_accounts(void) {
   REQUIRE(memory_usage().limit == 100 && memory_usage().allocated == 40);
 }
 
+// Runs a case in its own process. Returns its exit status, or -1 if it did not
+// exit.
+static int exit_status(void (*run)(void)) {
+  fflush(stdout);
+  pid_t child = fork();
+  if (!child) {
+    run();
+    _exit(0);
+  }
+  int status;
+  REQUIRE(child > 0 && waitpid(child, &status, 0) == child);
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 int main(void) {
   struct {
     const char *name;
@@ -275,16 +291,10 @@ int main(void) {
        unload_evicts_one_accounts_idle_slots},
       {"a limit holds for accounts added later", limit_holds_for_new_accounts},
   };
-  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-    fflush(stdout);
-    pid_t child = fork();
-    if (!child) {
-      cases[i].run();
-      _exit(0);
-    }
-    int status;
-    REQUIRE(child > 0 && waitpid(child, &status, 0) == child);
-    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, cases[i].name);
-  }
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
+    check(exit_status(cases[i].run) == 0, cases[i].name);
+  // This test's die exits with status 2.
+  check(exit_status(host_memory_without_a_slot) == 2,
+        "host memory without a slot ends the program");
   return failures != 0;
 }

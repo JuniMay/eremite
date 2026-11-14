@@ -153,13 +153,6 @@ MemoryUsage memory_usage(void);
 // Sets a function that runs after evictions.
 void memory_collect_with(void (*collect)(void));
 
-// The slot that counts this thread's host memory. Null counts nothing. Each
-// thread has its own.
-extern thread_local MemorySlot *memory_scope_slot;
-
-// Sets this thread's memory_scope_slot. Returns the old one.
-MemorySlot *memory_scope(MemorySlot *slot);
-
 // Returns the shared slot: the one slot for memory that no model owns. Its
 // memory counts toward the limit. The slot has no evict function, so it is
 // never evicted, and its memory stops being counted as soon as it is released.
@@ -175,13 +168,15 @@ uint64_t memory_reclaim(uint64_t bytes);
 // Unloads the account: evicts its idle slots. Returns the bytes freed.
 uint64_t memory_unload(MemoryAccount *account);
 
-// Returns zeroed host memory, counted by memory_scope_slot, or as state memory
-// when state is set. Null if it does not fit.
-void *memory_host_alloc(size_t bytes, int state);
+// Returns zeroed host memory of bytes, counted as state memory when state is
+// set, and in slot otherwise. Null if it does not fit. Ends the program if slot
+// is null when it is needed.
+void *memory_host_alloc(MemorySlot *slot, size_t bytes, int state);
 
-// Returns zeroed host memory, counted by memory_scope_slot, or as state memory
-// when state is set. Ends the program if it does not fit.
-void *memory_host_required(size_t bytes, int state);
+// Returns zeroed host memory of bytes, counted as state memory when state is
+// set, and in slot otherwise. Ends the program if slot is null when it is
+// needed, or if the memory does not fit.
+void *memory_host_alloc_required(MemorySlot *slot, size_t bytes, int state);
 
 // Frees host memory, also memory from plain malloc.
 void memory_host_free(void *pointer);

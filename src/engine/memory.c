@@ -12,7 +12,6 @@ static MemoryAccount *accounts;
 static MemorySlot *slots;
 static MemoryUsage usage = {.limit = UINT64_MAX};
 static void (*collect_released)(void);
-thread_local MemorySlot *memory_scope_slot;
 
 // The kernel's count of available memory lags behind this program. So each
 // reading is corrected for what this program used since, and bytes counted
@@ -417,11 +416,6 @@ uint64_t memory_room(const MemoryAccount *account) {
       account->minimum > account->bytes ? account->minimum - account->bytes : 0;
   return UINT64_MAX - free < own ? UINT64_MAX : free + own;
 }
-MemorySlot *memory_scope(MemorySlot *slot) {
-  MemorySlot *before = memory_scope_slot;
-  memory_scope_slot = slot;
-  return before;
-}
 MemorySlot *memory_shared(void) {
   static MemoryAccount shared;
   static MemorySlot slot;
@@ -445,9 +439,9 @@ typedef struct HostAllocation {
 static HostAllocation *host_allocations;
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void *memory_host_alloc(size_t bytes, int state) {
-  if (!memory_scope_slot && !state) return calloc(1, bytes ? bytes : 1);
-  MemorySlot *slot = memory_scope_slot;
+void *memory_host_alloc(MemorySlot *slot, size_t bytes, int state) {
+  if (!slot && !state)
+    die("host memory of %zu bytes without a memory slot", bytes);
   if (!state && !memory_claim(slot, bytes, MEMORY_REQUIRED)) return NULL;
   void *pointer = calloc(1, bytes ? bytes : 1);
   HostAllocation *record = pointer ? malloc(sizeof *record) : NULL;
@@ -464,8 +458,8 @@ void *memory_host_alloc(size_t bytes, int state) {
   return pointer;
 }
 
-void *memory_host_required(size_t bytes, int state) {
-  void *pointer = memory_host_alloc(bytes, state);
+void *memory_host_alloc_required(MemorySlot *slot, size_t bytes, int state) {
+  void *pointer = memory_host_alloc(slot, bytes, state);
   if (!pointer)
     die("cannot allocate %zu bytes of %s memory", bytes,
         state ? "state" : "model");
