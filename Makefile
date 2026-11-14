@@ -29,6 +29,9 @@ LDLIBS := $(shell pkg-config --libs $(PKGS))
 # Metal, Foundation and the Objective-C runtime, for the GPU layer.
 LDLIBS += -framework Metal -framework Foundation -lobjc
 
+# ICU, in which the tokenizer runs its regular expressions and normalization.
+LDLIBS += -licucore
+
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
 THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
