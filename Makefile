@@ -32,6 +32,9 @@ LDLIBS += -framework Metal -framework Foundation -lobjc
 # ICU, in which the tokenizer runs its regular expressions and normalization.
 LDLIBS += -licucore
 
+# IOKit, through which the memory statistics read the GPU driver's memory.
+LDLIBS += -framework IOKit
+
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
 THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
