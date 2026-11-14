@@ -230,6 +230,10 @@ void gpu_wait_until_finished(Gpu *gpu, uint64_t number);
 // Each one holds back the command buffers begun after it.
 int gpu_count_uncommitted_in_queue(Gpu *gpu);
 
+// The most states of the thread that commits the GPU's work. The GPU's idle
+// times are split by them. The engine uses five. Eight leave room for more.
+static constexpr int GPU_THREAD_STATES = 8;
+
 // The GPU's times, counted when command buffers are checked.
 typedef struct {
   // Seconds the GPU ran any checked command buffer.
@@ -237,7 +241,16 @@ typedef struct {
   // Seconds the GPU sat idle between checked command buffers. The time across a
   // gpu_sync is not counted, since the CPU waited then.
   double idle_seconds;
+  // Seconds the committing thread spent in each state, and the GPU's idle
+  // seconds while the thread was in each state.
+  double thread_seconds[GPU_THREAD_STATES], idle_by_state[GPU_THREAD_STATES];
 } GpuTimes;
+
+// Sets the state of the thread that commits the GPU's work, from now on. A
+// state is a number below GPU_THREAD_STATES, such as running a pass or waiting
+// for reads. The GPU's idle times are split by the thread's states. Ends the
+// program for a state out of range.
+void gpu_set_thread_state(Gpu *gpu, int state);
 
 // Returns the GPU's times.
 GpuTimes gpu_times(Gpu *gpu);

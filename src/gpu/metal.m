@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 // Calls Metal in Objective-C; the rest of the file is C. Metal objects are
@@ -26,6 +27,11 @@ static constexpr uint32_t RESIDENCY_SETS = 32;
 // measured to pick a minute: it only needs to be far longer than any command
 // buffer runs, so that only a failed command buffer or a stopped GPU ends it.
 static constexpr uint64_t DEFAULT_SIGNAL_TIMEOUT_MS = 60000;
+
+// The thread state changes that a GPU keeps, for splitting its idle times. The
+// idle times are counted whenever command buffers are checked, which happens
+// far more often than this many changes.
+static constexpr uint64_t THREAD_CHANGES = 1 << 16;
 
 // The clock keeper's kernel. Each of its threads runs iters multiply-adds in a
 // row. The write that never happens keeps the compiler from dropping the loop.
@@ -84,6 +90,12 @@ typedef struct {
   Buf b;
   uint64_t after;
 } MarkedBuffer;
+
+// A change of the committing thread's state, and when it happened.
+typedef struct {
+  double t;
+  int state;
+} ThreadChange;
 
 // A residency set, and the bytes of the buffers in it.
 typedef struct {
@@ -149,6 +161,15 @@ struct Gpu {
   // GPU: 0 after a sync.
   GpuTimes times;
   double checked_end;
+  // The committing thread's state changes, in a ring of THREAD_CHANGES made at
+  // the first change, on the clock of the command buffers' GPU start and end
+  // times. The changes recorded, and the first one that the next idle time
+  // may need.
+  ThreadChange *changes;
+  uint64_t nchanges, idle_from;
+  // The thread's state, and when it began; 0 before the first change.
+  int thread_state;
+  double thread_since;
 };
 
 // Returns the bits of the smallest table that count resident buffers fill at
@@ -534,14 +555,53 @@ void gpu_mark_to_free(Buf *b) {
   memset(b, 0, sizeof *b);
 }
 
-// Checks the first count command buffers of done, all finished. Ends the
-// program on an error.
+// The host's clock, which Metal's GPU start and end times also use.
+static double host_seconds(void) {
+  return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9;
+}
+
+void gpu_set_thread_state(Gpu *gpu, int state) {
+  if (state < 0 || state >= GPU_THREAD_STATES)
+    die("GPU: thread state %d out of range", state);
+  if (state == gpu->thread_state && gpu->thread_since) return;
+  double t = host_seconds();
+  if (gpu->thread_since)
+    gpu->times.thread_seconds[gpu->thread_state] += t - gpu->thread_since;
+  if (!gpu->changes)
+    gpu->changes = xmalloc(THREAD_CHANGES * sizeof *gpu->changes);
+  gpu->changes[gpu->nchanges++ % THREAD_CHANGES] = (ThreadChange){t, state};
+  gpu->thread_state = state, gpu->thread_since = t;
+}
+
+// Splits the GPU's idle time from a to b by the thread's states then.
+static void idle_between(Gpu *gpu, double a, double b) {
+  if (!gpu->nchanges) return;
+  // Changes older than the ring were overwritten.
+  if (gpu->nchanges - gpu->idle_from > THREAD_CHANGES)
+    gpu->idle_from = gpu->nchanges - THREAD_CHANGES;
+  while (gpu->idle_from + 1 < gpu->nchanges &&
+         gpu->changes[(gpu->idle_from + 1) % THREAD_CHANGES].t <= a)
+    gpu->idle_from++;
+  for (uint64_t k = gpu->idle_from; k < gpu->nchanges; k++) {
+    const ThreadChange *change = &gpu->changes[k % THREAD_CHANGES];
+    double from = change->t, to = k + 1 < gpu->nchanges
+                                      ? gpu->changes[(k + 1) % THREAD_CHANGES].t
+                                      : b;
+    if (from < a) from = a;
+    if (to > b) to = b;
+    if (to > from) gpu->times.idle_by_state[change->state] += to - from;
+    if (to >= b) break;
+  }
+}
+
 // Orders GPU run times by their start.
 static int by_start(const void *a, const void *b) {
   double x = ((const double *)a)[0], y = ((const double *)b)[0];
   return (x > y) - (x < y);
 }
 
+// Checks the first count command buffers of done, all finished. Ends the
+// program on an error.
 static void check_finished(Gpu *gpu, int count) {
   if (!count) return;
   double (*runs)[2] = xmalloc((size_t)count * sizeof *runs);
@@ -562,6 +622,7 @@ static void check_finished(Gpu *gpu, int count) {
     double start = runs[i][0] > end ? runs[i][0] : end;
     if (end && runs[i][0] > end) {
       gpu->times.idle_seconds += runs[i][0] - end;
+      idle_between(gpu, end, runs[i][0]);
     }
     if (runs[i][1] > start) gpu->times.busy_seconds += runs[i][1] - start;
     if (runs[i][1] > end) end = runs[i][1];
@@ -730,7 +791,13 @@ void gpu_wait_until_finished(Gpu *gpu, uint64_t number) {
 
 int gpu_count_uncommitted_in_queue(Gpu *gpu) { return gpu->open_in_queue; }
 
-GpuTimes gpu_times(Gpu *gpu) { return gpu->times; }
+GpuTimes gpu_times(Gpu *gpu) {
+  GpuTimes times = gpu->times;
+  if (gpu->thread_since)
+    times.thread_seconds[gpu->thread_state] +=
+        host_seconds() - gpu->thread_since;
+  return times;
+}
 
 void gpu_return_freed_memory(Gpu *gpu) {
   // Check first. The check may free resident buffers. They leave their
