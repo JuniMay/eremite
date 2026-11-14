@@ -214,6 +214,31 @@ static void state_memory_keeps_the_reserve(void) {
   REQUIRE(cache.evicted == 1 && model.state_bytes == 100);
 }
 
+static void current_limit_keeps_the_reserve(void) {
+  Memory *memory = memory_new();
+  REQUIRE(memory_current_limit(memory) == UINT64_MAX);
+  memory_set_limit(memory, 1000);
+  REQUIRE(memory_current_limit(memory) == 1000);
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  TestSlot weights;
+  test_slot(&weights, &model, NULL, 100, 1);
+  available_bytes = 300;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  // 100 bytes are counted, and 200 more fit above the reserve.
+  REQUIRE(memory_current_limit(memory) == 300);
+  // The reading is corrected for the 50 bytes added since.
+  REQUIRE(claim(&weights, 50, MEMORY_REQUIRED));
+  REQUIRE(memory_current_limit(memory) == 300);
+  memory_set_limit(memory, 250);
+  REQUIRE(memory_current_limit(memory) == 250);
+  // A second later, less memory is available than the reserve. Then the
+  // limit is what is already counted.
+  available_bytes = 50;
+  clock_now += 1;
+  REQUIRE(memory_current_limit(memory) == 150);
+}
+
 static void unload_evicts_idle_state(void) {
   Memory *memory = memory_new();
   MemoryAccount model;
@@ -248,6 +273,22 @@ static void minimum_must_fit(void) {
   REQUIRE(!memory_set_minimum(&a, 80, MEMORY_REQUIRED));
   REQUIRE(a.minimum == 60 && memory_usage(memory).committed == 100 &&
           fixed.evicted == 0);
+}
+
+static void room_counts_the_unused_minimum(void) {
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 100);
+  MemoryAccount a, b;
+  memory_account_init(memory, &a, "A", 0);
+  memory_account_init(memory, &b, "B", 0);
+  REQUIRE(memory_set_minimum(&a, 40, MEMORY_REQUIRED));
+  TestSlot used;
+  test_slot(&used, &a, NULL, 10, 1);
+  // 60 bytes are free, and 30 bytes of A's minimum are unused.
+  REQUIRE(memory_room(&a) == 90 && memory_room(&b) == 60);
+  // Over the limit, only A's unused minimum is left.
+  memory_set_limit(memory, 20);
+  REQUIRE(memory_room(&a) == 30 && memory_room(&b) == 0);
 }
 
 // A slot grows in an account at its minimum, and the reserve is short. Evicting
@@ -526,6 +567,32 @@ static void host_memory_freed_with_another_slot(void) {
   memory_host_free(&second, memory_host_alloc(&first, 60));
 }
 
+// Starts a workspace slot in a new Memory with a limit of 100 bytes.
+static void workspace_in_100_bytes(MemoryAccount *account, MemorySlot *work) {
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 100);
+  memory_account_init(memory, account, "model", 0);
+  memory_slot_init(work, account, MEMORY_MODEL, NULL, "workspace", NULL, NULL);
+}
+
+static void required_host_memory_is_counted(void) {
+  MemoryAccount account;
+  MemorySlot work;
+  workspace_in_100_bytes(&account, &work);
+  unsigned char *bytes = memory_host_alloc_required(&work, 100);
+  for (int i = 0; i < 100; i++) REQUIRE(bytes[i] == 0);
+  REQUIRE(memory_usage(account.memory).allocated == 100);
+  memory_host_free(&work, bytes);
+  REQUIRE(memory_usage(account.memory).allocated == 0);
+}
+
+static void required_host_memory_that_does_not_fit(void) {
+  MemoryAccount account;
+  MemorySlot work;
+  workspace_in_100_bytes(&account, &work);
+  memory_host_alloc_required(&work, 101);
+}
+
 static void reclaim_evicts_idle_slots(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 120);
@@ -689,9 +756,13 @@ int main(void) {
        state_goes_after_its_model},
       {"state memory evicts model memory to keep the reserve free",
        state_memory_keeps_the_reserve},
+      {"the current limit keeps the reserve free and stays within the limit",
+       current_limit_keeps_the_reserve},
       {"unloading a model evicts its idle state slots last",
        unload_evicts_idle_state},
       {"a minimum that does not fit is refused", minimum_must_fit},
+      {"an account's room is the free bytes plus its unused minimum",
+       room_counts_the_unused_minimum},
       {"evictions at an account's minimum also lower the growth, and so keep "
        "the reserve",
        evictions_at_the_minimum_also_lower_the_growth},
@@ -727,6 +798,8 @@ int main(void) {
        workspace_evicts_its_models_cache},
       {"host memory and state memory count toward the limit",
        host_memory_counts_toward_the_limit},
+      {"required host memory is zeroed and counted in its slot",
+       required_host_memory_is_counted},
       {"reclaiming evicts idle slots, dependents first",
        reclaim_evicts_idle_slots},
       {"unloading evicts one account's idle slots",
@@ -745,6 +818,8 @@ int main(void) {
         "host memory without a slot ends the program");
   check(exit_status(host_memory_freed_with_another_slot) == 2,
         "host memory freed with another slot ends the program");
+  check(exit_status(required_host_memory_that_does_not_fit) == 2,
+        "required host memory that does not fit ends the program");
   check(exit_status(dependency_in_another_memory) == 2,
         "a slot that depends on a slot of another Memory ends the program");
   check(exit_status(slots_of_two_memories_admitted) == 2,
