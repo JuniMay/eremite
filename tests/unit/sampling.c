@@ -1,0 +1,329 @@
+#include "check.h"
+#include "base/clock.h"
+#include "engine/sampling.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Tests sampling: the settings' validity, greedy ties, frequencies against
+// the analytic probabilities, top-p and top-k against a full sort, the
+// verification of drafts against serial sampling, sampled proposals, and the
+// time of top-p over DeepSeek V4.1 Flash's vocabulary.
+
+static int stop_token;
+
+static int is_stop(int token) { return token == stop_token; }
+
+static void expect(const char *name, int ok) { check(ok, name); }
+
+static double normal(void) {
+  return sqrt(-2 * log(drand48() + 1e-300)) *
+         cos(6.283185307179586 * drand48());
+}
+
+// Top-p as a full sort of every token computes it, the reference: the kept
+// tokens' probabilities (normalized) in out, the drawn token, and one draw
+// from seed.
+static const double *ranked_p;
+
+static int by_p(const void *a, const void *b) {
+  int i = *(const int *)a, j = *(const int *)b;
+  if (ranked_p[i] != ranked_p[j]) return ranked_p[i] > ranked_p[j] ? -1 : 1;
+  return (i > j) - (i < j);
+}
+
+static int full_sort_top_p(const float *logits, int count, double temp,
+                           double top_p, unsigned short seed[3], double *out) {
+  double *p = malloc((size_t)count * sizeof *p);
+  int *order = malloc((size_t)count * sizeof *order),
+      best = sample_greedy(logits, count), n = 0, k = 0;
+  double sum = 0, kept = 0;
+  for (int i = 0; i < count; i++)
+    p[i] = exp(((double)logits[i] - logits[best]) / temp), sum += p[i];
+  for (int i = 0; i < count; i++)
+    if (p[i] > 0) order[n++] = i;
+  ranked_p = p;
+  qsort(order, (size_t)n, sizeof *order, by_p);
+  double threshold = top_p * sum;
+  do kept += p[order[k++]];
+  while (k < n && kept < threshold);
+  memset(out, 0, (size_t)count * sizeof *out);
+  for (int i = 0; i < k; i++) out[order[i]] = p[order[i]] / kept;
+  double r = erand48(seed) * kept;
+  int token = best;
+  for (int i = 0; i < k; i++) {
+    if (p[order[i]] == 0) continue;
+    token = order[i];
+    if (r < p[order[i]]) break;
+    r -= p[order[i]];
+  }
+  free(p), free(order);
+  return token;
+}
+
+static void frequency(double temp, double top_p, const double expected[3],
+                      const char *name) {
+  float logits[3] = {logf(.6f), logf(.3f), logf(.1f)};
+  Sampler s = {.temperature = temp, .top_p = top_p};
+  sampler_set_seed(&s, 982451653);
+  int count[3] = {0};
+  for (int i = 0; i < 100000; i++) count[sample_token(logits, 3, &s)]++;
+  int ok = 1;
+  for (int i = 0; i < 3; i++)
+    ok &= fabs(count[i] / 100000.0 - expected[i]) < .006;
+  expect(name, ok);
+}
+
+int main(void) {
+  Sampler s = {.temperature = 1, .top_p = 1};
+  expect("temperature one and top-p one are valid", sampler_is_valid(&s));
+  s.temperature = -1;
+  expect("negative temperature is invalid", !sampler_is_valid(&s));
+  s.temperature = NAN;
+  expect("NaN temperature is invalid", !sampler_is_valid(&s));
+  s.temperature = INFINITY;
+  expect("infinite temperature is invalid", !sampler_is_valid(&s));
+  s.temperature = 1;
+  s.top_p = 1.1;
+  expect("top-p above one is invalid", !sampler_is_valid(&s));
+  s.top_p = -.1;
+  expect("negative top-p is invalid", !sampler_is_valid(&s));
+  s.top_p = NAN;
+  expect("NaN top-p is invalid", !sampler_is_valid(&s));
+  s.top_p = 0;
+  expect("zero top-p keeps the highest-probability token",
+         sampler_is_valid(&s));
+  float tie[4] = {0, 1, 1, -1};
+  s.temperature = 0;
+  sampler_set_seed(&s, 1234);
+  Sampler before = s;
+  expect("greedy chooses the lower ID on a tie", sample_token(tie, 4, &s) == 1);
+  expect("greedy consumes no random draw",
+         !memcmp(s.seed, before.seed, sizeof s.seed));
+  s.temperature = 1;
+  s.top_p = 1;
+  sampler_set_seed(&s, 0);
+  float tiny[2] = {-30.5f, 0};
+  expect("top-p one retains tiny positive probabilities",
+         sample_token(tiny, 2, &s) == 0);
+  frequency(1, 1, (double[]){.6, .3, .1},
+            "full softmax frequencies match analytic probabilities");
+  frequency(1, .7, (double[]){2.0 / 3, 1.0 / 3, 0},
+            "nucleus renormalizes the smallest sufficient prefix");
+  frequency(1, 0, (double[]){1, 0, 0}, "zero top-p retains one token");
+  double sum = sqrt(.6) + sqrt(.3) + sqrt(.1);
+  frequency(2, 1, (double[]){sqrt(.6) / sum, sqrt(.3) / sum, sqrt(.1) / sum},
+            "temperature scales logits before sampling");
+
+  enum { N = 7, VERIFY_DRAFTS = 15 };
+
+  float logits[(VERIFY_DRAFTS + 1) * N];
+  for (int r = 0; r <= VERIFY_DRAFTS; r++)
+    for (int t = 0; t < N; t++)
+      logits[r * N + t] = (float)((r * 17 + t * 13) % 19 - 9) / 3;
+  int matches = 1, rng_matches = 1, eos_stops = 1, greedy_matches = 1;
+  for (int trial = 0; trial < 1000; trial++)
+    for (int k = 0; k <= VERIFY_DRAFTS; k++) {
+      Sampler original = {.temperature = trial % 3 ? 1 : 0,
+                          .top_p = trial % 2 ? 1 : .8};
+      sampler_set_seed(&original, 98317u * (unsigned)trial + 12457);
+      Sampler serial = original, after[VERIFY_DRAFTS + 1];
+      int expected[VERIFY_DRAFTS + 1];
+      for (int r = 0; r <= k; r++) {
+        expected[r] = sample_token(logits + r * N, N, &serial);
+        after[r] = serial;
+      }
+      for (int mismatch = 0; mismatch <= k; mismatch++) {
+        int drafts[VERIFY_DRAFTS];
+        for (int r = 0; r < k; r++) drafts[r] = expected[r];
+        if (mismatch < k) drafts[mismatch] = (drafts[mismatch] + 1) % N;
+        Sampler speculative = original;
+        int accepted;
+        int next = sample_verify_drafts(logits, N, drafts, k, 0, &speculative,
+                                        &accepted);
+        matches &= accepted == mismatch && next == expected[mismatch];
+        rng_matches &= !memcmp(speculative.seed, after[mismatch].seed,
+                               sizeof speculative.seed);
+        if (original.temperature == 0)
+          greedy_matches &= accepted == mismatch && next == expected[mismatch];
+      }
+      if (k > 0) {
+        int drafts[VERIFY_DRAFTS];
+        for (int r = 0; r < k; r++) drafts[r] = expected[r];
+        Sampler speculative = original;
+        int accepted;
+        stop_token = expected[0];
+        int next = sample_verify_drafts(logits, N, drafts, k, is_stop,
+                                        &speculative, &accepted);
+        eos_stops &=
+            next == expected[0] && accepted == 0 &&
+            !memcmp(speculative.seed, after[0].seed, sizeof speculative.seed);
+      }
+    }
+  expect("every rejection position and all-accepted bonus match serial tokens",
+         matches);
+  expect("verification preserves the serial random stream", rng_matches);
+  expect("EOS stops verification without consuming later draws", eos_stops);
+  expect("greedy verification remains exact", greedy_matches);
+  int coupled_equal = 1, coupled_exact = 1;
+  for (int trial = 0; trial < 256; trial++) {
+    Sampler initial = {.temperature = 1, .top_p = trial % 2 ? 1 : .8};
+    sampler_set_seed(&initial, 98317u * (unsigned)trial + 91);
+    for (int changed = 0; changed < 2; changed++) {
+      Sampler proposal = initial, target = initial, reference = initial;
+      int drafts[5], accepted, expected[6];
+      Sampler after[6];
+      for (int r = 0; r < 6; r++) {
+        expected[r] = sample_token(logits + r * N, N, &reference);
+        after[r] = reference;
+        if (r < 5) {
+          float q[N];
+          for (int i = 0; i < N; i++)
+            q[i] = logits[r * N + (changed ? (i + r + 1) % N : i)];
+          drafts[r] = sample_token(q, N, &proposal);
+        }
+      }
+      int next =
+          sample_verify_drafts(logits, N, drafts, 5, 0, &target, &accepted);
+      if (!changed) coupled_equal &= accepted == 5;
+      for (int r = 0; r < accepted; r++)
+        coupled_exact &= drafts[r] == expected[r];
+      coupled_exact &=
+          next == expected[accepted] &&
+          !memcmp(target.seed, after[accepted].seed, sizeof target.seed);
+    }
+  }
+  expect("shared uniforms accept an identical draft distribution",
+         coupled_equal);
+  expect("shared uniforms preserve target tokens and RNG with a different "
+         "draft distribution",
+         coupled_exact);
+
+  // top-k: draws stay within the k highest-ranked tokens (the higher logit,
+  // then the lower id, as a full sort ranks them), one draw each; k = 1 is
+  // greedy; k at the vocabulary is the unrestricted sampler.
+  enum { V = 300 };
+
+  float tied[V];
+  for (int i = 0; i < V; i++)
+    tied[i] = (float)((i * 7919) % 41) * 0.25f;  // many equal logits
+  int rank[V];
+  for (int i = 0; i < V; i++) rank[i] = i;
+  for (int i = 1; i < V; i++)  // a full sort, the reference order
+    for (int j = i; j > 0 && (tied[rank[j]] > tied[rank[j - 1]] ||
+                              (tied[rank[j]] == tied[rank[j - 1]] &&
+                               rank[j] < rank[j - 1]));
+         j--) {
+      int x = rank[j];
+      rank[j] = rank[j - 1], rank[j - 1] = x;
+    }
+  int within = 1, greedy = 1, unrestricted = 1, seen_last = 0;
+  for (int k = 1; k <= 24; k += 23) {
+    Sampler s = {.temperature = 1.3, .top_p = 1, .top_k = k};
+    sampler_set_seed(&s, 1234 + k);
+    for (int d = 0; d < 4000; d++) {
+      int t = sample_token(tied, V, &s), in = 0;
+      for (int r = 0; r < k; r++) in |= rank[r] == t;
+      within &= in;
+      if (k == 1)
+        greedy &= t == sample_greedy(tied, V);
+      else
+        seen_last |= t == rank[k - 1];
+    }
+  }
+  for (int trial = 0; trial < 64; trial++) {
+    Sampler a = {.temperature = 0.8, .top_p = trial % 2 ? 1 : .9}, b = a;
+    b.top_k = V;
+    sampler_set_seed(&a, 77 + trial), sampler_set_seed(&b, 77 + trial);
+    unrestricted &= sample_token(tied, V, &a) == sample_token(tied, V, &b);
+  }
+  expect("top-k draws only among the k highest-ranked tokens, the last of them "
+         "included",
+         within && seen_last);
+  expect("top-k of 1 is greedy", greedy);
+  expect("top-k of the whole vocabulary draws as without top-k", unrestricted);
+  // The first emitted speculative token must follow p, even when q differs.
+  float p_logits[6] = {logf(.6f), logf(.3f), logf(.1f),
+                       logf(.6f), logf(.3f), logf(.1f)};
+  float q_logits[3] = {logf(.2f), logf(.7f), logf(.1f)};
+  Sampler sampled = {.temperature = 1, .top_p = 1};
+  sampler_set_seed(&sampled, 71823);
+  int frequency[3] = {0}, accepts = 0;
+  for (int i = 0; i < 100000; i++) {
+    double q[3];
+    int proposed = sample_proposal(q_logits, 3, &sampled, q), kept;
+    int next = sample_verify_sampled_drafts(p_logits, 3, &proposed, 1, q, NULL,
+                                            &sampled, &kept);
+    frequency[kept ? proposed : next]++;
+    accepts += kept;
+  }
+  expect("sampled proposals preserve target probabilities",
+         fabs(frequency[0] / 100000.0 - .6) < .006 &&
+             fabs(frequency[1] / 100000.0 - .3) < .006 &&
+             fabs(frequency[2] / 100000.0 - .1) < .006);
+  expect("acceptance equals the distribution overlap",
+         fabs(accepts / 100000.0 - .6) < .006);
+  int all_kept = 1, disjoint = 1;
+  for (int i = 0; i < 1000; i++) {
+    double q[3];
+    int proposed = sample_proposal(p_logits, 3, &sampled, q), kept;
+    sample_verify_sampled_drafts(p_logits, 3, &proposed, 1, q, NULL, &sampled,
+                                 &kept);
+    all_kept &= kept == 1;
+    Sampler restricted = {.temperature = 1, .top_p = 1, .top_k = 1};
+    sampler_set_seed(&restricted, 1234 + i);
+    proposed = sample_proposal(q_logits, 3, &restricted, q);
+    int next = sample_verify_sampled_drafts(p_logits, 3, &proposed, 1, q, NULL,
+                                            &restricted, &kept);
+    disjoint &= proposed == 1 && kept == 0 && next == 0;
+  }
+  expect("identical proposal distributions are always accepted", all_kept);
+  expect("disjoint proposal support returns target support", disjoint);
+
+  // Top-p over DeepSeek's whole vocabulary keeps, weighs and draws what a full
+  // sort of every token gives: flat to peaked logits, equal logits, several
+  // temperatures and top-p values. And it takes little time: the engine thread
+  // samples every decoding request's token between passes.
+  enum { VOCAB = 129280 };
+
+  float *big = malloc(VOCAB * sizeof *big);
+  double *got = malloc(VOCAB * sizeof *got),
+         *want = malloc(VOCAB * sizeof *want);
+  int nucleus_same = 1;
+  for (int trial = 0; trial < 40; trial++) {
+    srand48(trial + 1);
+    double spread = (double[]){.05, .5, 1, 2, 3, 5, 8, 12}[trial % 8];
+    for (int i = 0; i < VOCAB; i++) big[i] = (float)(spread * normal());
+    if (trial % 3 == 0)
+      for (int i = 0; i < VOCAB; i += 7)
+        big[i] = big[(i * 31 + 5) % VOCAB];  // equal logits
+    big[(trial * 7919) % VOCAB] += (float)(trial % 5) * 3;  // a leading token
+    double temp = (double[]){.6, 1, 1.3}[trial % 3],
+           top_p = (double[]){0, .5, .9, .95, .99}[trial % 5];
+    Sampler s = {.temperature = temp, .top_p = top_p};
+    sampler_set_seed(&s, 4242 + (uint64_t)trial);
+    unsigned short seed[3];
+    memcpy(seed, s.seed, sizeof seed);
+    int drawn = sample_proposal(big, VOCAB, &s, got);
+    nucleus_same &=
+        drawn == full_sort_top_p(big, VOCAB, temp, top_p, seed, want) &&
+        !memcmp(got, want, VOCAB * sizeof *got) &&
+        !memcmp(s.seed, seed, sizeof seed);
+  }
+  expect("top-p keeps, weighs and draws the tokens that a full sort keeps",
+         nucleus_same);
+  srand48(99);
+  for (int i = 0; i < VOCAB; i++) big[i] = (float)(3 * normal());
+  Sampler timed = {.temperature = 1, .top_p = .95};
+  sampler_set_seed(&timed, 7);
+  double fastest = 1;
+  for (int rep = 0; rep < 12; rep++) {
+    double t0 = now();
+    sample_token(big, VOCAB, &timed);
+    if (now() - t0 < fastest) fastest = now() - t0;
+  }
+  expect("top-p samples a 129,280-token vocabulary within 4 ms",
+         fastest < 4e-3);
+  free(big), free(got), free(want);
+  return failures != 0;
+}
