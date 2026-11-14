@@ -8,7 +8,8 @@ on one GPU, and serves an OpenAI- and Codex-compatible API.
 ## Build
 
 Requirements: macOS 27 with Xcode 27, and `pkgconf` and `yyjson` from
-Homebrew.
+Homebrew. The GPU code compiles its kernels at run time as Metal 4.1, which
+needs macOS 27.
 
 ```sh
 make            # the library, the command-line program and the test programs

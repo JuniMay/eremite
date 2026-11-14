@@ -4,15 +4,15 @@
 #   make                build/liberemite.a, build/eremite and every test program
 #   make test           run the tests that need neither a GPU nor model files
 #   make gpu-test       run the tests that need a GPU but no model files
-#   make format         format the C sources in place with clang-format
-#   make format-check   fail if clang-format would change a C source
+#   make format         format the sources in place with clang-format
+#   make format-check   fail if clang-format would change a source
 #   make clean          remove build/ and compile_commands.json
 #
 #   THREADS=pthread     build the threads layer on POSIX threads instead of
 #                       Grand Central Dispatch (src/platform/threads.h)
 #   SANITIZE=1          build with AddressSanitizer and UndefinedBehaviorSanitizer
 #
-# Every .c and .S file under src/ goes into the library, except src/cli/,
+# Every .c, .m and .S file under src/ goes into the library, except src/cli/,
 # which is the command-line program. Every tests/<group>/<name>.c becomes
 # build/tests/<group>-<name>.
 
@@ -25,6 +25,9 @@ CFLAGS := -std=c23 -O2 -Wall -Wextra -Isrc
 PKGS := yyjson
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
 LDLIBS := $(shell pkg-config --libs $(PKGS))
+
+# Metal, Foundation and the Objective-C runtime, for the GPU layer.
+LDLIBS += -framework Metal -framework Foundation -lobjc
 
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
@@ -48,7 +51,7 @@ $(shell rm -rf $(OBJ) $(BUILD)/tests $(BUILD)/eremite $(BUILD)/liberemite.a; mkd
   echo 'BUILT_CONFIG := $(CONFIG)' > $(BUILD)/config.mk)
 endif
 
-SOURCES := $(shell find src -name '*.c' -o -name '*.S' 2>/dev/null)
+SOURCES := $(shell find src -name '*.c' -o -name '*.m' -o -name '*.S' 2>/dev/null)
 LIB_SRC := $(filter-out src/cli/%,$(SOURCES))
 LIB_OBJ := $(LIB_SRC:%=$(OBJ)/%.o)
 LIB := $(if $(LIB_SRC),$(BUILD)/liberemite.a)
@@ -69,7 +72,7 @@ TIME_LIMIT := $(BUILD)/tests/time-limit
 TEST_LIBS = $(LIB)
 TEST_CFLAGS =
 
-FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.h' 2>/dev/null)
+FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.m' -o -name '*.h' 2>/dev/null)
 
 .PHONY: all test gpu-test format format-check clean
 all: $(LIB) $(CLI) $(TESTS) $(TIME_LIMIT) compile_commands.json

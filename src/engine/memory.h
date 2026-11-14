@@ -156,7 +156,9 @@ extern thread_local MemorySlot *memory_scope_slot;
 // Sets this thread's memory_scope_slot. Returns the old one.
 MemorySlot *memory_scope(MemorySlot *slot);
 
-// Returns the shared slot: the slot for memory that no model owns.
+// Returns the shared slot: the one slot for memory that no model owns. Its
+// memory counts toward the limit. The slot has no evict function, so it is
+// never evicted, and its memory stops being counted as soon as it is released.
 MemorySlot *memory_shared(void);
 
 // Returns the account's room: the bytes it may still add within the limit.
