@@ -254,6 +254,32 @@ static void evictions_at_the_minimum_also_lower_the_growth(void) {
   REQUIRE(cache.evicted == 1 && memory_usage(memory).committed == 90);
 }
 
+// The minimum is the least that an account's model memory counts, and its
+// state memory counts beside it. So state bytes leave the minimum's room to the
+// model's own slots.
+static void state_leaves_the_minimum_to_the_model(void) {
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 100);
+  MemoryAccount model, other;
+  memory_account_init(memory, &model, "model", 100);
+  memory_account_init(memory, &other, "other", 0);
+  TestSlot weights, state, cache, wanted;
+  test_slot(&weights, &model, NULL, 40, 1);
+  memory_pin(&weights.slot, 1);
+  test_state_slot(&state, &model, 30, 2);
+  test_slot(&cache, &model, NULL, 0, 3);
+  test_slot(&wanted, &other, NULL, 0, 4);
+  // The minimum keeps 20 bytes for the cache beside the weights.
+  REQUIRE(memory_set_minimum(&model, 60, MEMORY_REQUIRED));
+  REQUIRE(memory_usage(memory).committed == 90);
+  // Another account finds only the 10 bytes above them.
+  REQUIRE(!claim(&wanted, 20, MEMORY_REQUIRED));
+  REQUIRE(claim(&wanted, 10, MEMORY_REQUIRED));
+  // The cache fills its 20 bytes without new room, also speculatively.
+  REQUIRE(claim(&cache, 20, MEMORY_SPECULATIVE));
+  REQUIRE(memory_usage(memory).committed == 100 && state.evicted == 0);
+}
+
 static void recently_used_weights_stay_for_their_time(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 100);
@@ -552,6 +578,9 @@ int main(void) {
       {"evictions at an account's minimum also lower the growth, and so keep "
        "the reserve",
        evictions_at_the_minimum_also_lower_the_growth},
+      {"an account's minimum keeps room for its model memory beside its state "
+       "memory",
+       state_leaves_the_minimum_to_the_model},
       {"speculative memory never evicts, and a cache waits 30 seconds to evict "
        "weights",
        speculative_memory_never_evicts},

@@ -92,10 +92,12 @@ static uint64_t shortage(Memory *memory, uint64_t bytes) {
   return bytes > room ? bytes - room : 0;
 }
 
-// The bytes counted for the account: its slots' bytes, or its minimum if
-// larger.
+// The bytes counted for the account: its model memory's bytes, or its minimum
+// if larger, and its state memory's bytes.
 static uint64_t counted(const MemoryAccount *account) {
-  return account->bytes > account->minimum ? account->bytes : account->minimum;
+  uint64_t model = account->bytes - account->state_bytes;
+  return (model > account->minimum ? model : account->minimum) +
+         account->state_bytes;
 }
 
 static void change(MemorySlot *slot, uint64_t bytes) {
@@ -263,12 +265,16 @@ static int has_children(MemorySlot *slot) {
   return 0;
 }
 
-static uint64_t proposed_bytes(const MemoryAccount *account,
+// The bytes of the account's slots of kind, with the wanted slots at their
+// new sizes. UINT64_MAX when they are more than that.
+static uint64_t proposed_bytes(const MemoryAccount *account, MemoryKind kind,
                                MemorySlot *const *wanted, const uint64_t *sizes,
                                size_t n) {
-  uint64_t proposed = account->bytes;
+  uint64_t proposed = kind == MEMORY_STATE
+                          ? account->state_bytes
+                          : account->bytes - account->state_bytes;
   for (size_t i = 0; i < n; i++)
-    if (wanted[i]->account == account) {
+    if (wanted[i]->account == account && wanted[i]->kind == kind) {
       uint64_t bytes =
           sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload;
       if (bytes > wanted[i]->bytes &&
@@ -283,8 +289,12 @@ static uint64_t growth(Memory *memory, MemorySlot *const *wanted,
                        const uint64_t *sizes, size_t n) {
   uint64_t extra = 0;
   for (MemoryAccount *a = memory->accounts; a; a = a->next) {
-    uint64_t proposed = proposed_bytes(a, wanted, sizes, n);
-    uint64_t after = proposed > a->minimum ? proposed : a->minimum;
+    uint64_t model = proposed_bytes(a, MEMORY_MODEL, wanted, sizes, n),
+             state = proposed_bytes(a, MEMORY_STATE, wanted, sizes, n);
+    if (model == UINT64_MAX || state == UINT64_MAX) return UINT64_MAX;
+    uint64_t floor = model > a->minimum ? model : a->minimum;
+    if (UINT64_MAX - floor < state) return UINT64_MAX;
+    uint64_t after = floor + state;
     if (after > counted(a)) {
       if (UINT64_MAX - extra < after - counted(a)) return UINT64_MAX;
       extra += after - counted(a);
@@ -293,25 +303,39 @@ static uint64_t growth(Memory *memory, MemorySlot *const *wanted,
   return extra;
 }
 
-static uint64_t reclaim_room(const MemoryAccount *account,
+// The bytes that evicting the account's slots of kind can take off its count:
+// its model memory's down to the minimum, and all of its state memory's.
+static uint64_t reclaim_room(const MemoryAccount *account, MemoryKind kind,
                              MemorySlot *const *wanted, const uint64_t *sizes,
                              size_t n) {
-  uint64_t bytes = proposed_bytes(account, wanted, sizes, n);
-  if (bytes < account->bytes) bytes = account->bytes;
+  if (kind == MEMORY_STATE) return account->state_bytes;
+  uint64_t bytes = proposed_bytes(account, MEMORY_MODEL, wanted, sizes, n),
+           model = account->bytes - account->state_bytes;
+  if (bytes < model) bytes = model;
   return bytes > account->minimum ? bytes - account->minimum : 0;
 }
 
+// The bytes that evicting the account's idle slots of kind can take off its
+// count.
+static uint64_t reclaimable_of(Memory *memory, const MemoryAccount *account,
+                               MemoryKind kind, MemorySlot *const *wanted,
+                               const uint64_t *sizes, size_t n,
+                               MemoryAdmission mode) {
+  uint64_t possible = 0;
+  for (MemorySlot *s = memory->slots; s; s = s->next)
+    if (s->account == account && s->kind == kind &&
+        evictable(s, wanted, n, mode))
+      possible += s->bytes;
+  uint64_t room = reclaim_room(account, kind, wanted, sizes, n);
+  return possible < room ? possible : room;
+}
 static uint64_t reclaimable(Memory *memory, MemorySlot *const *wanted,
                             const uint64_t *sizes, size_t n,
                             MemoryAdmission mode) {
   uint64_t total = 0;
   for (MemoryAccount *a = memory->accounts; a; a = a->next) {
-    uint64_t possible = 0;
-    for (MemorySlot *s = memory->slots; s; s = s->next)
-      if (s->account == a && evictable(s, wanted, n, mode))
-        possible += s->bytes;
-    uint64_t room = reclaim_room(a, wanted, sizes, n);
-    total += possible < room ? possible : room;
+    total += reclaimable_of(memory, a, MEMORY_MODEL, wanted, sizes, n, mode);
+    total += reclaimable_of(memory, a, MEMORY_STATE, wanted, sizes, n, mode);
   }
   return total;
 }
@@ -328,7 +352,7 @@ static MemorySlot *victim(Memory *memory, MemorySlot *const *wanted,
   double rank = INFINITY;
   for (MemorySlot *s = memory->slots; s; s = s->next) {
     if (!evictable(s, wanted, n, mode) || has_children(s)) continue;
-    uint64_t useful = reclaim_room(s->account, wanted, sizes, n);
+    uint64_t useful = reclaim_room(s->account, s->kind, wanted, sizes, n);
     if (!useful) continue;
     if (useful > s->bytes) useful = s->bytes;
     if (useful > need) useful = need;
@@ -562,8 +586,8 @@ uint64_t memory_room(const MemoryAccount *account) {
   const MemoryUsage *usage = &account->memory->usage;
   uint64_t free =
       usage->limit > usage->committed ? usage->limit - usage->committed : 0;
-  uint64_t own =
-      account->minimum > account->bytes ? account->minimum - account->bytes : 0;
+  uint64_t model = account->bytes - account->state_bytes,
+           own = account->minimum > model ? account->minimum - model : 0;
   return UINT64_MAX - free < own ? UINT64_MAX : free + own;
 }
 MemorySlot *memory_shared(Memory *memory) { return &memory->shared; }

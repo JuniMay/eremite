@@ -62,7 +62,8 @@ struct MemoryAccount {
   // Next account in the list.
   MemoryAccount *next;
   const char *name;
-  // Bytes counted for its slots, and the least the account counts.
+  // Bytes counted for its slots, and the least that its model memory counts.
+  // Its state memory counts beside the minimum.
   uint64_t bytes, minimum;
   // Set while it raises its minimum. Its slots are then not evicted.
   int admitting;
@@ -187,7 +188,8 @@ int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count,
                  MemoryAdmission mode);
 
 // Sets the account's minimum, evicting as mode allows. Returns whether it
-// fits.
+// fits. The minimum is the least that the account's model memory counts, so it
+// keeps room for model slots whatever its state memory holds.
 int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
                        MemoryAdmission mode);
 
