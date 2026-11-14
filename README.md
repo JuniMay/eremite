@@ -27,3 +27,10 @@ The tests in `tests/model` need a checkpoint's files and the GPU, and run by
 hand. Each one's usage is at the top of its source. For example,
 `build/tests/model-tokenizer CHECKPOINT` checks DeepSeek V4.1 Flash's tokenizer
 against the reference tokenizer's ids.
+
+## Run
+
+`build/eremite -m CHECKPOINT -p PROMPT` generates a reply with DeepSeek V4.1
+Flash, whose checkpoint is the directory CHECKPOINT. `--experts GGUF` reads
+the routed experts from a GGUF file set instead, and `--memory GB` limits the
+model memory, state memory included. `build/eremite` alone lists the options.
