@@ -5,9 +5,10 @@
 
 // Tests that passes of a model interleaved at every yield each compute what
 // they compute alone, byte for byte: every logit and, with drafts, every
-// proposed token. Two prompts are prefilled and decoded greedily alone, then
-// together, each on its own stack with its own buffers and signals. For
-// DeepSeek, whose passes share some work buffers, those buffers are filled
+// proposed token. As the engine does, the model is told how many other
+// passes run beside each one. Two prompts are prefilled and decoded greedily
+// alone, then together, each on its own stack with its own buffers and signals.
+// For DeepSeek, whose passes share some work buffers, those buffers are filled
 // with garbage at every switch: nothing a pass needs may be left in them
 // across a wait.
 //
@@ -140,6 +141,8 @@ static void interleave(Job **jobs, void (*const *bodies)(void *), int count) {
   Pass *passes[4];
   int ended[4] = {0}, alive = count;
   for (int i = 0; i < count; i++) passes[i] = ops->pass_new(bodies[i], jobs[i]);
+  // As the engine tells the model before it runs passes together.
+  if (ops->set_other_passes) ops->set_other_passes(count - 1);
   if (count == 1) {
     while (!pass_resume(passes[0])) jobs[0]->resumes++, pass_block(passes[0]);
     jobs[0]->resumes++;

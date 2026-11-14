@@ -263,6 +263,9 @@ typedef struct {
   Pass *(*pass_new)(void (*body)(void *), void *argument);
   void (*pass_begin)(void);
   void (*pass_end)(void);
+  // Sets how many passes besides the running one have GPU work. The engine
+  // sets it before it runs passes. Null where a family has no use for it.
+  void (*set_other_passes)(int passes);
   // Between two calls of a pass, releases what binds the states the pass used
   // to the model's variables, so that code outside the pass may use those
   // states; or null if nothing is bound.

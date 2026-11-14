@@ -49,6 +49,8 @@ static GpuEvent *event;
 // The number of the last command buffer that the running pass committed, or
 // that was committed outside passes; 0 for none. Each pass has its own.
 static uint64_t last_committed;
+// Passes with GPU work besides the running one, which the engine sets.
+static int other_passes;
 // The seconds that the last wait for a layer's expert reads took, per read.
 static double read_wait_per_read;
 
@@ -126,6 +128,12 @@ static void model_wait_signal(uint64_t value) {
         &(PassWait){signal_ready, signal_block, &wait, PASS_WAIT_GPU, NULL});
   else
     signal_block(&wait);
+}
+
+// Keeps the GPU's clock up for about seconds, unless other passes have GPU
+// work, which keeps the clock up already.
+static void keep_clock(double seconds) {
+  if (other_passes <= 0) gpu_keep_clock_up(clock_keeper, seconds);
 }
 
 // Before a pass yields: ends the program if a command buffer begun in the
@@ -1983,7 +1991,7 @@ static void routed_rows(GpuCommandBuffer *c, const Batch *b, int l, int ahead,
                 used);  // after this layer's victims, before the read-aheads'
   // The GPU idles until the reads are in: its clock stays up for as long as
   // the last wait for reads took per read.
-  if (reading) gpu_keep_clock_up(clock_keeper, reading * read_wait_per_read);
+  if (reading) keep_clock(reading * read_wait_per_read);
   if (full_ahead(m))
     read_ahead(l, m, (const int *)PR.ptr);
   else
@@ -3616,7 +3624,7 @@ void deepseek_run_bench(void) {
     int gap = mode ? 3 : 0;
     double busy = 0;
     for (int r = 0; r < 40; r++) {
-      if (mode == 2) gpu_keep_clock_up(clock_keeper, 2.8e-3);
+      if (mode == 2) keep_clock(2.8e-3);
       double a = now();
       while (now() - a < gap * 1e-3) {}
       double g = gpu_times(gpu).busy_seconds;
@@ -4401,6 +4409,11 @@ void deepseek_pass_end(void) {
   gpu_event_free(event);
 }
 
+static void ds_set_other_passes(int passes) {
+  other_passes = passes;
+  if (experts_store) expert_store_set_other_passes(experts_store, passes);
+}
+
 static const char *const ds_types[] = {"deepseek_v41", 0};
 
 static int ds_prepare_image(const char *dir, Media *im, const void *data,
@@ -4456,4 +4469,5 @@ const ModelOps deepseek_ops = {.family = "DeepSeek V4.1",
                                .pass_new = deepseek_pass_new,
                                .pass_begin = deepseek_pass_begin,
                                .pass_end = deepseek_pass_end,
-                               .pass_release = deepseek_pass_release};
+                               .pass_release = deepseek_pass_release,
+                               .set_other_passes = ds_set_other_passes};
