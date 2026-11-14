@@ -22,6 +22,9 @@ typedef struct {
   size_t size;
   // Where the view starts in the Metal buffer.
   uint32_t off;
+  // The GPU address of the Metal buffer's first byte. Kernels reach some
+  // buffers through addresses kept in other buffers.
+  uint64_t address;
   // The slot that counts the buffer.
   MemorySlot *memory;
   // The bytes counted for the buffer. A view counts 0.
@@ -61,9 +64,25 @@ int gpu_find_kernel(Gpu *gpu, const char *name);
 // bytes takes.
 size_t gpu_round_up_to_pages(size_t size);
 
-// Allocates a buffer of size bytes, counted in slot. Ends the program if slot
-// is null or the buffer does not fit.
+// Allocates a buffer of size bytes, counted in slot, as required memory: while
+// it does not fit, it waits for released memory that comes back, as
+// memory_wait_for_claim does. Returns an empty buffer if it does not fit. Ends
+// the program if slot is null.
+Buf gpu_try_alloc_required(Gpu *gpu, MemorySlot *slot, size_t size);
+
+// Allocates a buffer as gpu_try_alloc_required does. Ends the program if the
+// buffer does not fit.
 Buf gpu_alloc(Gpu *gpu, MemorySlot *slot, size_t size);
+
+// Allocates a buffer of size bytes, counted in slot, if it fits with the
+// admission mode. Returns an empty buffer if it does not. Ends the program if
+// slot is null.
+Buf gpu_try_alloc(Gpu *gpu, MemorySlot *slot, size_t size,
+                  MemoryAdmission mode);
+
+// Returns Metal's recommended working set: the most memory, in bytes, that the
+// GPU should keep mapped at once.
+uint64_t gpu_recommended_working_set(Gpu *gpu);
 
 // Frees the buffer, stops counting it, and empties *b. GPU work that uses the
 // buffer must have finished. If the buffer is resident, it leaves its residency
@@ -130,6 +149,10 @@ void gpu_bind_buffer(GpuCommandBuffer *c, int idx, const Buf *b, size_t off);
 // reused at once.
 void gpu_copy_bytes(GpuCommandBuffer *c, int idx, const void *p, size_t n);
 
+// Declares that the command buffer's kernels read the buffer through its
+// address. A buffer in a committed residency set needs no such call.
+void gpu_declare_read(GpuCommandBuffer *c, const Buf *b);
+
 // Runs the selected kernel on a grid of groups_x by groups_y by groups_z
 // threadgroups. Each threadgroup has threads_x by threads_y by threads_z
 // threads, which run together and can share memory.
@@ -139,6 +162,9 @@ void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
 
 // Returns a new event at 0.
 GpuEvent *gpu_event_new(Gpu *gpu);
+
+// Frees the event. Command buffers that signal it must have finished.
+void gpu_event_free(GpuEvent *event);
 
 // Marks this point in the command buffer, and returns the next value of event.
 // The GPU signals that value on event when it reaches this point, after it has
@@ -183,6 +209,18 @@ void gpu_sync(Gpu *gpu);
 // Ends the program if one of them failed. Frees the marked buffers whose
 // command buffers have now all finished.
 void gpu_check_finished(Gpu *gpu);
+
+// The GPU's times, counted when command buffers are checked.
+typedef struct {
+  // Seconds the GPU ran any checked command buffer.
+  double busy_seconds;
+  // Seconds the GPU sat idle between checked command buffers. The time across a
+  // gpu_sync is not counted, since the CPU waited then.
+  double idle_seconds;
+} GpuTimes;
+
+// Returns the GPU's times.
+GpuTimes gpu_times(Gpu *gpu);
 
 // Returns the memory of freed buffers to the system. It does three things:
 // - It frees each buffer marked to be freed, if its GPU work has finished.

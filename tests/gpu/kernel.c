@@ -41,6 +41,17 @@ int main(void) {
   check(((uint32_t *)y.ptr)[0] == 42,
         "after a sync, the CPU reads what the kernel wrote");
 
+  check(gpu_recommended_working_set(gpu) > 0, "the GPU has a working set");
+  uint64_t counted = memory_usage(memory).allocated;
+  Buf too_big =
+      gpu_try_alloc(gpu, memory_shared(memory), 2ull << 30, MEMORY_REQUIRED);
+  check(!too_big.obj && memory_usage(memory).allocated == counted,
+        "a buffer past the limit is refused, and nothing is counted");
+  Buf required = gpu_try_alloc_required(gpu, memory_shared(memory), 2ull << 30);
+  check(!required.obj && memory_usage(memory).allocated == counted,
+        "a required buffer past the limit is refused when no freed memory "
+        "comes back, and nothing is counted");
+
   gpu_free(&x), gpu_free(&y);
   check(!x.obj && memory_usage(memory).allocated == before,
         "freed buffers are no longer counted");

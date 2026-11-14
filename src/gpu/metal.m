@@ -143,6 +143,10 @@ struct Gpu {
   size_t resident_buffers, resident_filled;
   // How long a wait for a signal lasts before it ends the program.
   uint64_t signal_timeout_ms;
+  // The GPU's times, and when the last checked command buffer ended on the
+  // GPU: 0 after a sync.
+  GpuTimes times;
+  double checked_end;
 };
 
 // Returns the bits of the smallest table that count resident buffers fill at
@@ -221,27 +225,47 @@ size_t gpu_round_up_to_pages(size_t size) {
   return (size + page - 1) / page * page;
 }
 
-static Buf allocate(Gpu *gpu, MemorySlot *slot, size_t size) {
+// A buffer counted in slot, admitted in mode. With waits set, a refused
+// buffer waits while released memory comes back (memory_wait_for_claim).
+// Without an object when it does not fit.
+static Buf allocate(Gpu *gpu, MemorySlot *slot, size_t size,
+                    MemoryAdmission mode, int waits) {
   if (!slot) die("a GPU buffer of %zu bytes without a memory slot", size);
   Buf b = {0};
   b.gpu = gpu;
   b.allocated = gpu_round_up_to_pages(size);
   b.memory = slot;
-  if (!memory_claim(slot, b.allocated, MEMORY_REQUIRED)) return (Buf){0};
+  if (!(waits ? memory_wait_for_claim(slot, b.allocated)
+              : memory_claim(slot, b.allocated, mode)))
+    return (Buf){0};
   id<MTLBuffer> buffer =
       [gpu->device newBufferWithLength:size
                                options:MTLResourceStorageModeShared];
   if (!buffer) die("cannot allocate %zu bytes on the GPU", size);
   b.obj = buffer;
   b.ptr = [buffer contents];
+  b.address = [buffer gpuAddress];
   b.size = size;
   return b;
 }
 
+Buf gpu_try_alloc_required(Gpu *gpu, MemorySlot *slot, size_t size) {
+  return allocate(gpu, slot, size, MEMORY_REQUIRED, 1);
+}
+
 Buf gpu_alloc(Gpu *gpu, MemorySlot *slot, size_t size) {
-  Buf b = allocate(gpu, slot, size);
+  Buf b = gpu_try_alloc_required(gpu, slot, size);
   if (!b.obj) die("%zu bytes of model memory do not fit", size);
   return b;
+}
+
+Buf gpu_try_alloc(Gpu *gpu, MemorySlot *slot, size_t size,
+                  MemoryAdmission mode) {
+  return allocate(gpu, slot, size, mode, 0);
+}
+
+uint64_t gpu_recommended_working_set(Gpu *gpu) {
+  return [gpu->device recommendedMaxWorkingSetSize];
 }
 
 void gpu_free(Buf *b) {
@@ -431,6 +455,10 @@ void gpu_copy_bytes(GpuCommandBuffer *c, int idx, const void *p, size_t n) {
   [encoder(c) setBytes:p length:n atIndex:(unsigned long)idx];
 }
 
+void gpu_declare_read(GpuCommandBuffer *c, const Buf *b) {
+  [encoder(c) useResource:b->obj usage:MTLResourceUsageRead];
+}
+
 void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
                     uint32_t groups_z, uint32_t threads_x, uint32_t threads_y,
                     uint32_t threads_z) {
@@ -443,6 +471,11 @@ GpuEvent *gpu_event_new(Gpu *gpu) {
   GpuEvent *event = xmalloc(sizeof *event);
   *event = (GpuEvent){gpu, [gpu->device newSharedEvent], 0};
   return event;
+}
+
+void gpu_event_free(GpuEvent *event) {
+  [event->event release];
+  free(event);
 }
 
 uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event) {
@@ -498,15 +531,38 @@ void gpu_mark_to_free(Buf *b) {
 
 // Checks the first count command buffers of done, all finished. Ends the
 // program on an error.
+// Orders GPU run times by their start.
+static int by_start(const void *a, const void *b) {
+  double x = ((const double *)a)[0], y = ((const double *)b)[0];
+  return (x > y) - (x < y);
+}
+
 static void check_finished(Gpu *gpu, int count) {
   if (!count) return;
+  double (*runs)[2] = xmalloc((size_t)count * sizeof *runs);
   for (int i = 0; i < count; i++) {
     id<MTLCommandBuffer> c = gpu->done[i].buffer;
     if ([c status] == MTLCommandBufferStatusError)
       die("GPU: %s", describe([c error]));
+    runs[i][0] = [c GPUStartTime];
+    runs[i][1] = [c GPUEndTime];
     if (c == gpu->last) gpu->last = nil;
     [c release];
   }
+  // The GPU's busy time is the union of the runs; idle time is the gaps
+  // between them, from the end of the last run checked before.
+  qsort(runs, (size_t)count, sizeof *runs, by_start);
+  double end = gpu->checked_end;
+  for (int i = 0; i < count; i++) {
+    double start = runs[i][0] > end ? runs[i][0] : end;
+    if (end && runs[i][0] > end) {
+      gpu->times.idle_seconds += runs[i][0] - end;
+    }
+    if (runs[i][1] > start) gpu->times.busy_seconds += runs[i][1] - start;
+    if (runs[i][1] > end) end = runs[i][1];
+  }
+  gpu->checked_end = end;
+  free(runs);
   gpu->ndone -= count;
   memmove(gpu->done, gpu->done + count, (size_t)gpu->ndone * sizeof *gpu->done);
   free_marked(gpu);
@@ -599,10 +655,14 @@ void gpu_set_signal_timeout(Gpu *gpu, double seconds) {
 }
 
 void gpu_sync(Gpu *gpu) {
-  if (!gpu->last) return;
+  if (!gpu->last) {
+    gpu->checked_end = 0;
+    return;
+  }
   [gpu->last waitUntilCompleted];
   for (int i = 0; i < gpu->ndone; i++) [gpu->done[i].buffer waitUntilCompleted];
   check_finished(gpu, gpu->ndone);
+  gpu->checked_end = 0;
   gpu->last = nil;
   objc_autoreleasePoolPop(gpu->pool);
   gpu->pool = objc_autoreleasePoolPush();
@@ -615,6 +675,8 @@ void gpu_check_finished(Gpu *gpu) {
     count++;
   check_finished(gpu, count);
 }
+
+GpuTimes gpu_times(Gpu *gpu) { return gpu->times; }
 
 void gpu_return_freed_memory(Gpu *gpu) {
   // Check first. The check may free resident buffers. They leave their
