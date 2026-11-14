@@ -18,7 +18,8 @@ static const char library[] =
     "}\n";
 
 // A set holds 1 MiB here, so it has room for one buffer of 768 KiB, not two.
-enum { SET_BYTES = 1 << 20, BUFFER_BYTES = 768 << 10 };
+static constexpr size_t SET_BYTES = 1 << 20;
+static constexpr size_t BUFFER_BYTES = 768 << 10;
 
 // Sets an empty buffer resident in a child process, before the GPU starts.
 // Returns the child's exit status, or -1 if it did not exit.
@@ -107,8 +108,7 @@ int main(void) {
   gpu_free(&large), gpu_free(&small);
   gpu_commit_residency(gpu);
 
-  enum { COUNT = 80 };
-
+  constexpr int COUNT = 80;
   Buf many[COUNT];
   for (int i = 0; i < COUNT; i++) {
     many[i] = gpu_alloc(gpu, slot, BUFFER_BYTES);
@@ -143,8 +143,7 @@ int main(void) {
 
   // A window of 100 resident buffers slides over 300 buffers, so that buffers
   // keep leaving and joining the table, as cached buffers do.
-  enum { WINDOW = 100, SLIDE = 300 };
-
+  constexpr int WINDOW = 100, SLIDE = 300;
   static Buf slide[SLIDE];
   for (int i = 0; i < SLIDE; i++) slide[i] = gpu_alloc(gpu, slot, 16 << 10);
   for (int i = 0; i < SLIDE; i++) {

@@ -9,13 +9,14 @@
 
 // Tests the threads layer with the backend this build selects.
 
+// The calls that count has made.
+static atomic_int counter;
+
 // A spawned thread's mark, and the event it signals after setting it.
 typedef struct {
   atomic_int ran;
   ThreadsEvent *event;
 } Spawned;
-
-static atomic_int counter;
 
 static void count(void *) { atomic_fetch_add(&counter, 1); }
 

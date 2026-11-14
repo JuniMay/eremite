@@ -12,10 +12,10 @@
 extern void *objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void *);
 
-enum { MAX_KERNELS = 512 };
+static constexpr int MAX_KERNELS = 512;
 
 // Metal allows at most 32 residency sets per command queue.
-enum { RESIDENCY_SETS = 32 };
+static constexpr uint32_t RESIDENCY_SETS = 32;
 
 // Marks a table entry whose buffer was removed. Searches go past it, and a
 // rebuild of the table leaves it out.
@@ -24,7 +24,7 @@ enum { RESIDENCY_SETS = 32 };
 // A wait for a signal ends the program after a minute by default. Nothing was
 // measured to pick a minute: it only needs to be far longer than any command
 // buffer runs, so that only a failed command buffer or a stopped GPU ends it.
-enum { DEFAULT_SIGNAL_TIMEOUT_MS = 60000 };
+static constexpr uint64_t DEFAULT_SIGNAL_TIMEOUT_MS = 60000;
 
 struct GpuEvent {
   Gpu *gpu;

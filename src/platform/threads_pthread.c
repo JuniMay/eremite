@@ -8,7 +8,7 @@
 
 // The threads layer on POSIX threads.
 
-enum { MAX_WORKERS = 64 };
+static constexpr int MAX_WORKERS = 64;
 
 struct ThreadsGroup {
   pthread_mutex_t lock;

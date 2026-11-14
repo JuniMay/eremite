@@ -47,13 +47,12 @@ struct Memory {
 };
 
 // A time before any reading or release.
-#define LONG_AGO -1e9
+static constexpr double LONG_AGO = -1e9;
+static constexpr double GIB_F = 1073741824.0;
+// Evictions that free at least this much at once are logged.
+static constexpr uint64_t LOGGED_EVICTION = 1ull << 30;
 
 static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
-
-#define GIB_F 1073741824.0
-// Evictions that free at least this much at once are logged.
-#define LOGGED_EVICTION (1ull << 30)
 
 // The available memory. A new reading is taken after
 // available_memory_reading_interval, or at once for 1 GiB or more, but not
