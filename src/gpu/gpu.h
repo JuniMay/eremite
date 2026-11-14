@@ -32,10 +32,12 @@ typedef struct {
 // program.
 typedef struct {
   Gpu *gpu;
-  // The Metal command buffer.
+  // The Metal command buffer. It is held until the commit.
   void *buffer;
-  // Its compute encoder. It is null once the command buffer is committed.
+  // Its compute encoder. It is held until the commit, and null after it.
   void *encoder;
+  // Its number: command buffers are numbered in the order they are begun.
+  uint64_t number;
 } GpuCommandBuffer;
 
 // An event: a counter on the GPU. Command buffers raise it as they run, and the
@@ -62,6 +64,13 @@ Buf gpu_alloc(Gpu *gpu, MemorySlot *slot, size_t size);
 // buffer must have finished. If the buffer is resident, it leaves its residency
 // set at the next gpu_commit_residency. Metal frees its memory only then.
 void gpu_free(Buf *b);
+
+// Marks the buffer to be freed once the GPU has finished every command buffer
+// begun before this call, since those may still use it. Empties *b at once. If
+// they have all finished already, frees the buffer now. If not, gpu_sync or
+// gpu_check_finished frees it later, once it finds them finished. Until then,
+// the buffer is still counted.
+void gpu_mark_to_free(Buf *b);
 
 // Sets whether the buffer is resident: kept ready for the GPU between command
 // buffers, in one of the GPU's residency sets. A view sets its whole buffer.
@@ -139,5 +148,10 @@ void gpu_set_signal_timeout(Gpu *gpu, double seconds);
 // Waits for the last committed command buffer, and so for all opened before
 // it. Ends the program if one of them failed.
 void gpu_sync(Gpu *gpu);
+
+// Checks which command buffers have finished, without waiting for the others.
+// Ends the program if one of them failed. Frees the marked buffers whose
+// command buffers have now all finished.
+void gpu_check_finished(Gpu *gpu);
 
 #endif

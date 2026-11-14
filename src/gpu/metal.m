@@ -33,6 +33,19 @@ struct GpuEvent {
   uint64_t signaled;
 };
 
+// A committed command buffer that is not checked yet, and its number.
+typedef struct {
+  id<MTLCommandBuffer> buffer;
+  uint64_t number;
+} Committed;
+
+// A buffer marked to be freed. It is freed when every command buffer with a
+// number up to after has finished.
+typedef struct {
+  Buf b;
+  uint64_t after;
+} MarkedBuffer;
+
 // A residency set, and the bytes of the buffers in it.
 typedef struct {
   id<MTLResidencySet> set;
@@ -59,8 +72,16 @@ struct Gpu {
   // Committed command buffers not yet checked, oldest first. Each stays
   // retained until it is checked, so that the autorelease pool can be drained
   // while it runs.
-  id<MTLCommandBuffer> *done;
+  Committed *done;
   int ndone, done_cap;
+  // The command buffers begun, which is also the last number given to one,
+  // and the numbers of the open ones: begun but not committed yet.
+  uint64_t begun;
+  uint64_t *open;
+  int nopen, open_cap;
+  // The buffers marked to be freed, which wait for command buffers to finish.
+  MarkedBuffer *marked;
+  int nmarked, marked_cap;
   // The last committed command buffer.
   id<MTLCommandBuffer> last;
   // The autorelease pool.
@@ -91,6 +112,18 @@ static uint32_t table_bits(size_t count) {
   uint32_t bits = 0;
   while (((size_t)1 << bits) < 2 * count) bits++;
   return bits;
+}
+
+// Makes room for one more item in a list. items holds count items of size
+// bytes and has room for *capacity of them. When it is full, its room doubles,
+// and the list may move. Returns the list.
+static void *room_for_one_more(void *items, int count, int *capacity,
+                               size_t size) {
+  if (count < *capacity) return items;
+  *capacity = *capacity ? 2 * *capacity : 1;
+  items = realloc(items, (size_t)*capacity * size);
+  if (!items) die("out of memory");
+  return items;
 }
 
 static const char *describe(NSError *err) {
@@ -295,11 +328,17 @@ GpuResidency gpu_residency(Gpu *gpu) {
   return r;
 }
 
+// An open command buffer keeps its Metal command buffer and encoder retained,
+// so that a sync, which drains the autorelease pool, does not free them.
 GpuCommandBuffer gpu_begin(Gpu *gpu) {
   id<MTLCommandBuffer> buffer =
-      [gpu->queue commandBufferWithUnretainedReferences];
+      [[gpu->queue commandBufferWithUnretainedReferences] retain];
   [buffer enqueue];
-  return (GpuCommandBuffer){gpu, buffer, [buffer computeCommandEncoder]};
+  gpu->open = room_for_one_more(gpu->open, gpu->nopen, &gpu->open_cap,
+                                sizeof *gpu->open);
+  gpu->open[gpu->nopen++] = ++gpu->begun;
+  return (GpuCommandBuffer){
+      gpu, buffer, [[buffer computeCommandEncoder] retain], gpu->begun};
 }
 
 // The encoder of a command buffer that is still being encoded.
@@ -308,22 +347,27 @@ static id<MTLComputeCommandEncoder> encoder(const GpuCommandBuffer *c) {
   return c->encoder;
 }
 
-static void move_to_done(Gpu *gpu, id<MTLCommandBuffer> c) {
-  if (gpu->ndone == gpu->done_cap) {
-    // The list doubles when it is full; 256 is only its first size.
-    gpu->done_cap = gpu->done_cap ? 2 * gpu->done_cap : 256;
-    gpu->done = realloc(gpu->done, (size_t)gpu->done_cap * sizeof *gpu->done);
-    if (!gpu->done) die("out of memory");
-  }
-  gpu->done[gpu->ndone++] = [c retain];
+// Moves a committed command buffer from the open ones to done.
+static void move_to_done(Gpu *gpu, id<MTLCommandBuffer> c, uint64_t number) {
+  int at = 0;
+  while (at < gpu->nopen && gpu->open[at] != number) at++;
+  if (at == gpu->nopen)
+    die("GPU: committing a command buffer that is not open");
+  gpu->open[at] = gpu->open[--gpu->nopen];
+  gpu->done = room_for_one_more(gpu->done, gpu->ndone, &gpu->done_cap,
+                                sizeof *gpu->done);
+  gpu->done[gpu->ndone++] = (Committed){[c retain], number};
   gpu->last = c;
 }
 
 void gpu_commit(GpuCommandBuffer *c) {
-  [encoder(c) endEncoding];
+  id<MTLComputeCommandEncoder> ending = encoder(c);
+  [ending endEncoding];
+  [ending release];
   id<MTLCommandBuffer> buffer = c->buffer;
   [buffer commit];
-  move_to_done(c->gpu, buffer);
+  move_to_done(c->gpu, buffer, c->number);
+  [buffer release];
   c->encoder = NULL;
 }
 
@@ -356,11 +400,53 @@ GpuEvent *gpu_event_new(Gpu *gpu) {
 
 uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event) {
   if (event->gpu != c->gpu) die("GPU: a signal on an event of another GPU");
-  [encoder(c) endEncoding];
+  id<MTLComputeCommandEncoder> ending = encoder(c);
+  [ending endEncoding];
+  [ending release];
   id<MTLCommandBuffer> buffer = c->buffer;
   [buffer encodeSignalEvent:event->event value:++event->signaled];
-  c->encoder = [buffer computeCommandEncoder];
+  c->encoder = [[buffer computeCommandEncoder] retain];
   return event->signaled;
+}
+
+// Returns the number of the oldest unfinished command buffer: one that is open,
+// or committed but not checked yet. With none, returns the next number.
+static uint64_t oldest_unfinished(const Gpu *gpu) {
+  uint64_t oldest = gpu->begun + 1;
+  for (int i = 0; i < gpu->nopen; i++)
+    if (gpu->open[i] < oldest) oldest = gpu->open[i];
+  for (int i = 0; i < gpu->ndone; i++)
+    if (gpu->done[i].number < oldest) oldest = gpu->done[i].number;
+  return oldest;
+}
+
+// Frees the marked buffers whose command buffers have all finished.
+static void free_marked(Gpu *gpu) {
+  uint64_t oldest = oldest_unfinished(gpu);
+  int kept = 0;
+  for (int i = 0; i < gpu->nmarked; i++)
+    if (gpu->marked[i].after >= oldest)
+      gpu->marked[kept++] = gpu->marked[i];
+    else
+      gpu_free(&gpu->marked[i].b);
+  gpu->nmarked = kept;
+}
+
+void gpu_mark_to_free(Buf *b) {
+  if (!b->obj) return;
+  Gpu *gpu = b->gpu;
+  // Only command buffers that exist now can use the buffer, since the caller
+  // gives it up here and cannot put it in a later one. So the buffer waits for
+  // every command buffer numbered up to the last one begun.
+  uint64_t after = gpu->begun;
+  if (oldest_unfinished(gpu) > after) {
+    gpu_free(b);
+    return;
+  }
+  gpu->marked = room_for_one_more(gpu->marked, gpu->nmarked, &gpu->marked_cap,
+                                  sizeof *gpu->marked);
+  gpu->marked[gpu->nmarked++] = (MarkedBuffer){*b, after};
+  memset(b, 0, sizeof *b);
 }
 
 // Checks the first count command buffers of done, all finished. Ends the
@@ -368,7 +454,7 @@ uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event) {
 static void check_finished(Gpu *gpu, int count) {
   if (!count) return;
   for (int i = 0; i < count; i++) {
-    id<MTLCommandBuffer> c = gpu->done[i];
+    id<MTLCommandBuffer> c = gpu->done[i].buffer;
     if ([c status] == MTLCommandBufferStatusError)
       die("GPU: %s", describe([c error]));
     if (c == gpu->last) gpu->last = nil;
@@ -376,14 +462,15 @@ static void check_finished(Gpu *gpu, int count) {
   }
   gpu->ndone -= count;
   memmove(gpu->done, gpu->done + count, (size_t)gpu->ndone * sizeof *gpu->done);
+  free_marked(gpu);
 }
 
 // Ends the program for a value not signaled in time: with the error of a
 // failed command buffer if there is one, since its signals never come.
 static void unsignaled(Gpu *gpu, uint64_t value) {
   for (int i = 0; i < gpu->ndone; i++)
-    if ([gpu->done[i] status] == MTLCommandBufferStatusError)
-      die("GPU: %s", describe([gpu->done[i] error]));
+    if ([gpu->done[i].buffer status] == MTLCommandBufferStatusError)
+      die("GPU: %s", describe([gpu->done[i].buffer error]));
   die("GPU: value %llu not signaled in %.1f s", (unsigned long long)value,
       gpu->signal_timeout_ms / 1000.0);
 }
@@ -408,9 +495,17 @@ void gpu_set_signal_timeout(Gpu *gpu, double seconds) {
 void gpu_sync(Gpu *gpu) {
   if (!gpu->last) return;
   [gpu->last waitUntilCompleted];
-  for (int i = 0; i < gpu->ndone; i++) [gpu->done[i] waitUntilCompleted];
+  for (int i = 0; i < gpu->ndone; i++) [gpu->done[i].buffer waitUntilCompleted];
   check_finished(gpu, gpu->ndone);
   gpu->last = nil;
   objc_autoreleasePoolPop(gpu->pool);
   gpu->pool = objc_autoreleasePoolPush();
+}
+
+void gpu_check_finished(Gpu *gpu) {
+  int count = 0;
+  while (count < gpu->ndone &&
+         [gpu->done[count].buffer status] >= MTLCommandBufferStatusCompleted)
+    count++;
+  check_finished(gpu, count);
 }
