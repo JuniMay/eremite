@@ -46,6 +46,9 @@ static MemorySlot *work_slot, state_slot;
 static GpuClockKeeper *clock_keeper;
 // The event that the model's command buffers signal. Each pass has its own.
 static GpuEvent *event;
+// The number of the last command buffer that the running pass committed, or
+// that was committed outside passes; 0 for none. Each pass has its own.
+static uint64_t last_committed;
 // The seconds that the last wait for a layer's expert reads took, per read.
 static double read_wait_per_read;
 
@@ -63,6 +66,74 @@ static Buf state_alloc(size_t size) {
   gpu_set_resident(&b, 1);
   gpu_commit_residency(gpu);
   return b;
+}
+
+// Commits the command buffer, and records it as the running pass's last one,
+// which the pass's syncs wait for.
+static void model_commit(GpuCommandBuffer *c) {
+  last_committed = c->number;
+  gpu_commit(c);
+}
+
+// Whether the command buffer numbered number has finished, and a wait for it:
+// a pass's wait carries the number, since last_committed holds the values of
+// whichever pass runs.
+static int committed_finished(void *number) {
+  return gpu_has_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+static void committed_wait(void *number) {
+  gpu_wait_until_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+// Waits for the GPU work that the running pass committed. Inside a pass, it
+// yields until that work has finished, so that the engine runs other passes
+// meanwhile. Outside passes, it waits for all GPU work.
+static void model_sync(void) {
+  if (!pass_current()) {
+    gpu_sync(gpu);
+    return;
+  }
+  if (last_committed)
+    pass_wait(&(PassWait){committed_finished, committed_wait,
+                          (void *)(uintptr_t)last_committed, PASS_WAIT_GPU,
+                          NULL});
+  gpu_check_finished(gpu);
+}
+
+// An event and a value, for a pass's wait for the signal.
+typedef struct {
+  GpuEvent *event;
+  uint64_t value;
+} SignalWait;
+
+static int signal_ready(void *context) {
+  const SignalWait *wait = context;
+  return gpu_has_signaled(wait->event, wait->value);
+}
+
+static void signal_block(void *context) {
+  const SignalWait *wait = context;
+  gpu_wait_signal(wait->event, wait->value);
+}
+
+// Waits until the GPU has signaled value on the running pass's event: inside a
+// pass, by yielding.
+static void model_wait_signal(uint64_t value) {
+  SignalWait wait = {event, value};
+  if (pass_current())
+    pass_wait(
+        &(PassWait){signal_ready, signal_block, &wait, PASS_WAIT_GPU, NULL});
+  else
+    signal_block(&wait);
+}
+
+// Before a pass yields: ends the program if a command buffer begun in the
+// queue is still open, since it would hold back every command buffer begun
+// after it, those of the other passes too.
+static void before_yield(void) {
+  if (gpu_count_uncommitted_in_queue(gpu))
+    die("a pass yields with a command buffer open in the queue");
 }
 
 static Engram ngram;
@@ -828,6 +899,7 @@ int deepseek_load(Gpu *model_gpu, MemorySlot *work, const char *dir,
     memory_slot_init(&state_slot, work->account, MEMORY_STATE, NULL,
                      "DeepSeek state", NULL, NULL);
     event = gpu_event_new(gpu);
+    pass_before_yield = before_yield;
     prepare_weights(dir, options);
   }
   MemorySlot *core = weight_group_slot(core_weights);
@@ -1927,7 +1999,7 @@ static void routed_rows(GpuCommandBuffer *c, const Batch *b, int l, int ahead,
       experts_go(c, l, r, eo, mf_off(b) + (size_t)r * MIX * 4,
                  hs_off(b) + (size_t)r * HC * DIM * STREAM_BYTES, 1);
     }
-    gpu_commit(c);
+    model_commit(c);
   }
   double t1 = now();
   expert_store_wait_for_reads(experts_store, l, need, nn);
@@ -2099,8 +2171,8 @@ static void draft_keys(GpuCommandBuffer *c, int rows, int p0) {
     linear(c, &D[d].wkv, rows, &MXQ, 0, DIM, &KV, 0, HEAD_DIM, 1);
     draft_window(c, &D[d].ring, 0, rows, p0, d);
   }
-  gpu_commit(c);
-  gpu_sync(gpu);
+  model_commit(c);
+  model_sync();
 }
 
 // The draft keys after a step of m sequences' rows (deepseek_decode_rows): row
@@ -2116,8 +2188,8 @@ static void draft_rows(GpuCommandBuffer *c, State *const *st, const int *pos,
     for (int r = 0; r < m; r++)
       draft_window(c, &st[r]->dring[d], r, 1, pos[r], d);
   }
-  gpu_commit(c);
-  gpu_sync(gpu);
+  model_commit(c);
+  model_sync();
 }
 
 // ---- decoding: one token ----
@@ -2153,8 +2225,8 @@ static void embed_rows(GpuCommandBuffer *c, const int *tokens, int m, int row,
   embed_read(tokens, m, row, pos);
   *c = gpu_begin(gpu);
   embed_encode(c, m, row);
-  gpu_commit(c);
-  gpu_sync(gpu);
+  model_commit(c);
+  model_sync();
 }
 
 // A prompt's or a step's Engram rows, read in the background, layer 1's
@@ -2203,8 +2275,8 @@ static uint64_t front_encode(GpuCommandBuffer *c, const Batch *b, int l) {
   if (l == 1 || l == 14) {
     engram(c, b, l);
     if (opt.dump_fd >= 0) {  // the streams after the Engram lookup
-      gpu_commit(c);
-      gpu_sync(gpu);
+      model_commit(c);
+      model_sync();
       if (write(opt.dump_fd, stream_floats(&HS, 0, HC * DIM), HC * DIM * 4) < 0)
         die("dump failed");
       *c = gpu_begin(gpu);
@@ -2221,7 +2293,7 @@ static uint64_t front_encode(GpuCommandBuffer *c, const Batch *b, int l) {
 static uint64_t layer_front(GpuCommandBuffer *c, const Batch *b, int l) {
   *c = gpu_begin(gpu);
   uint64_t v = front_encode(c, b, l);
-  gpu_commit(c);
+  model_commit(c);
   return v;
 }
 
@@ -2278,7 +2350,7 @@ static void step_rows(GpuCommandBuffer *c, const int *tokens, int m, int pos) {
             m)) {  // the residual's predictions, signaled before the attention
       int keep[FEW * KEEP], first[FEW * AHEAD], nk = 0, nf = 0;
       const int *pc = (const int *)PC.ptr;
-      gpu_wait_signal(event, sig - 1);
+      model_wait_signal(sig - 1);
       if (opt.routes_fd < 0) forecast_keep(m, l);
       for (int r = 0; r < m; r++) {
         for (int k = 0; k < KEEP; k++) keep[nk++] = pc[r * PREDICT + k];
@@ -2286,8 +2358,8 @@ static void step_rows(GpuCommandBuffer *c, const int *tokens, int m, int pos) {
       }
       read_residual_ahead(l, keep, nk, first, nf, INFLIGHT * m);
     }
-    gpu_wait_signal(event,
-                    sig);  // with it, the experts of the layer before have run
+    model_wait_signal(
+        sig);  // with it, the experts of the layer before have run
     held_release();
     phase_s[1] += now() - t0;
     t0 = now();
@@ -2302,17 +2374,17 @@ static void step_rows(GpuCommandBuffer *c, const int *tokens, int m, int pos) {
       hc_pre_norm(c, m, &HS, 0, &MF, 0, &final_norm);
       head_out(c, m, &logits);
     }
-    gpu_commit(c);
+    model_commit(c);
     if (l == 0 || l == 13) {  // the next front reads the table's rows
       double tw = now();
       pass_wait_group(rr.read[l == 13]);
       phase_s[0] += now() - tw;
     }
-    if (front.buffer) gpu_commit(&front);
+    if (front.buffer) model_commit(&front);
     phase_s[4] += now() - t0;
     if (!ahead) {
-      gpu_sync(gpu);  // the streams after attention and after the FFN, then the
-                      // routing
+      model_sync();  // the streams after attention and after the FFN, then the
+                     // routing
       if (opt.dump_fd >= 0 &&
           (write(opt.dump_fd, stream_floats(&H1, 0, HC * DIM), HC * DIM * 4) <
                0 ||
@@ -2325,7 +2397,7 @@ static void step_rows(GpuCommandBuffer *c, const int *tokens, int m, int pos) {
     sig = next;
   }
   double ta = now();
-  gpu_sync(gpu);
+  model_sync();
   held_release();
   phase_s[1] += now() - ta;
   for (int e = 0; e < 2; e++) threads_group_free(rr.read[e]);
@@ -2638,13 +2710,13 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
       attention(c, &b, l);
       ffn_front(c, &b, l);
       shared_expert(c, b.m, &L[l]);
-      gpu_commit(c);
+      model_commit(c);
       if (first_batch)
         expert_store_resize_in_prompt(
             experts_store,
             l);  // layer l - 1's experts may still be in use
       first_batch = 0;
-      gpu_sync(gpu);
+      model_sync();
       held_release();  // the batch before has run
       prefix_after(&b, l);
 #ifdef EREMITE_CED_CHECK
@@ -2656,7 +2728,7 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
                                               : 8;
       if (prefill_prune_active && !next_rows) ahead = 0;
       routed_batch(c, &b, l, ahead, 2 * EXPERTS, opt.deepseek.substitute > 0);
-      gpu_commit(c);
+      model_commit(c);
     }
     if (stopped) break;
     if (!opt.quiet) fprintf(stderr, "\rprefill: layer %d/%d", l + 1, LAYERS);
@@ -2670,9 +2742,9 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
     hc_pre_norm(c, 1, &HS, (size_t)(n - 1) * HC * DIM * STREAM_BYTES, &MF,
                 (size_t)(n - 1) * MIX * 4, &final_norm);
     head_out(c, 1, &logits);
-    gpu_commit(c);
+    model_commit(c);
   }
-  gpu_sync(gpu);
+  model_sync();
   held_release();
   if (all_logits && !stopped) {  // every row's logits, for checks
     for (int r = 0; r < n; r++) {
@@ -2680,8 +2752,8 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
       hc_pre_norm(c, 1, &HS, (size_t)r * HC * DIM * STREAM_BYTES, &MF,
                   (size_t)r * MIX * 4, &final_norm);
       head_out(c, 1, &logits);
-      gpu_commit(c);
-      gpu_sync(gpu);
+      model_commit(c);
+      model_sync();
       memcpy(all_logits + (size_t)r * VOCAB, logits.ptr, VOCAB * 4);
     }
     memcpy(logits.ptr, all_logits + (size_t)(n - 1) * VOCAB, VOCAB * 4);
@@ -3006,7 +3078,7 @@ int deepseek_encode_image(Media *im) {
       f = resident_alloc((size_t)L * DIM * 4);
   cmd = gpu_begin(gpu);
   vit_linear(&cmd, &vit.patch, n, &px, VIT_K, &x, &vit.patch_b);
-  gpu_commit(&cmd);
+  model_commit(&cmd);
   for (int l = 0; l < 32; l++) {  // a command buffer per block: one long buffer
                                   // would hold up the display
     VitBlock *b = &vit.b[l];
@@ -3033,7 +3105,7 @@ int deepseek_encode_image(Media *im) {
     gpu_run_kernel(&cmd, 2816 / 256, n, 1, 256, 1, 1);
     vit_linear(&cmd, &b->w2, n, &a, 2816, &t, 0);
     vit_add(&cmd, &x, &t, n);
-    gpu_commit(&cmd);
+    model_commit(&cmd);
   }
   uint32_t gr[3] = {(uint32_t)im->vh, (uint32_t)im->vw, (uint32_t)im->tw};
   cmd = gpu_begin(gpu);
@@ -3043,13 +3115,13 @@ int deepseek_encode_image(Media *im) {
       gpu_copy_bytes(&cmd, 2, gr, sizeof gr);
   gpu_run_kernel(&cmd, 9216 / 256, L, 1, 256, 1, 1);
   vit_linear(&cmd, &vit.a1, L, &u, 9216, &g, &vit.a1_b);
-  gpu_commit(&cmd);
-  gpu_sync(gpu);
+  model_commit(&cmd);
+  model_sync();
   threads_apply(L, THREADS_INITIATED, g.ptr, vit_gelu_row);
   cmd = gpu_begin(gpu);
   vit_linear(&cmd, &vit.a2, L, &g, DIM, &f, &vit.a2_b);
-  gpu_commit(&cmd);
-  gpu_sync(gpu);
+  model_commit(&cmd);
+  model_sync();
   for (size_t i = 0; i < (size_t)L * DIM; i++)
     im->rows[i] = (uint16_t)(((uint32_t *)f.ptr)[i] >> 16);
   Buf *all[] = {&px, &cs, &x, &y, &t, &qkv, &hv, &h, &a, &u, &g, &f};
@@ -3130,8 +3202,8 @@ static void draft_stage(GpuCommandBuffer *c, int d, int pos) {
   linear(c, &y->gate, m, &X, 0, DIM, &GL, 0, DRAFT_EXPERTS, 0);
   route_top(c, m, &(Routing){&GL, 0, y, &RT, 0, DRAFT_TOPK, 16, 1}, 1, 0);
   shared_expert(c, m, y);
-  gpu_commit(c);
-  gpu_sync(gpu);
+  model_commit(c);
+  model_sync();
   int idx[BLOCK][DRAFT_TOPK], need[BLOCK * DRAFT_TOPK], nn = 0;
   float wts[BLOCK][DRAFT_TOPK];
   for (int r = 0; r < m;
@@ -3234,7 +3306,7 @@ void deepseek_propose_drafts(int token, int pos, int *drafts, int n) {
         gpu_copy_bytes(&cmd, 2, &v, 4);
     gpu_run_kernel(&cmd, 1, 1, 1, 1024, 1, 1);
   }
-  gpu_commit(&cmd), gpu_sync(gpu);
+  model_commit(&cmd), model_sync();
   memcpy(drafts, (int *)DTOK.ptr + 1, n * sizeof *drafts);
   phase_s[6] += now() - t0;
 }
@@ -3273,7 +3345,7 @@ void deepseek_accept(const int *tokens, int n, int pos) {
 // rows and the Engram history. A state that grew shrinks back.
 void deepseek_zero_state(void) {
   shrink();
-  gpu_sync(gpu);
+  model_sync();
   for (int d = 0; opt.draft && d < DRAFTS; d++)
     memset(D[d].ring.ptr, 0, D[d].ring.size);
   for (int l = 0; l < LAYERS; l++) {
@@ -3303,8 +3375,8 @@ static double timed(void (*f)(GpuCommandBuffer *c, int r), int reps) {
     double g = gpu_times(gpu).busy_seconds;
     cmd = gpu_begin(gpu);
     for (int r = 0; r < reps; r++) f(&cmd, r);
-    gpu_commit(&cmd);
-    gpu_sync(gpu);
+    model_commit(&cmd);
+    model_sync();
     if (round && gpu_times(gpu).busy_seconds - g < best)
       best = gpu_times(gpu).busy_seconds - g;
   }
@@ -3333,8 +3405,8 @@ static void bench_experts(GpuCommandBuffer *c, int r) {
   int idx[TOPK] = {0, 1, 2, 3, 4, 5};
   float wts[TOPK] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
   memcpy(RT.ptr, idx, sizeof idx), memcpy(RT.ptr + 32, wts, sizeof wts);
-  gpu_commit(c);  // routed_rows opens its own command buffer, which the
-                  // benchmark commits
+  model_commit(c);  // routed_rows opens its own command buffer, which the
+                    // benchmark commits
   held_release();
   routed_rows(c, &(Batch){1, 0, 0}, r % 8, AHEAD, INFLIGHT, 0, 0);
 }
@@ -3395,8 +3467,8 @@ void deepseek_run_bench(void) {
         linear(&cmd, w, 1, &SC, (size_t)r * w->k * 4, w->k, &O,
                (size_t)r * w->n * 4, w->n, 1);
       linear(&cmd, w, 4, &SC, 0, w->k, &Q, 0, w->n, 1);
-      gpu_commit(&cmd);
-      gpu_sync(gpu);
+      model_commit(&cmd);
+      model_sync();
       int diff = memcmp(O.ptr, Q.ptr, (size_t)4 * w->n * 4) != 0;
       bench_field = (size_t)((const char *)w - (const char *)&L[3]),
       bench_in = &SC;
@@ -3433,10 +3505,10 @@ void deepseek_run_bench(void) {
     cmd = gpu_begin(gpu);
     quant(&cmd, &X, &XQ, DIM);
     uint64_t v = gpu_signal(&cmd, event);
-    gpu_commit(&cmd);
-    gpu_wait_signal(event, v);
+    model_commit(&cmd);
+    model_wait_signal(v);
   }
-  gpu_sync(gpu);
+  model_sync();
   fprintf(stderr, "%-24s %8.1f us\n", "signal round trip",
           (now() - t0) / 200 * 1e6);
   {  // the top 512 of 3000 index scores, against a CPU selection; distinct,
@@ -3454,8 +3526,8 @@ void deepseek_run_bench(void) {
           gpu_copy_bytes(&cmd, 2, &ix, sizeof ix),
           gpu_bind_buffer(&cmd, 3, &CAND, 0);
       gpu_run_kernel(&cmd, 1, 1, 1, 1024, 1, 1);
-      gpu_commit(&cmd);
-      gpu_sync(gpu);
+      model_commit(&cmd);
+      model_sync();
       const int *sel = (const int *)SEL.ptr;
       float kth;  // the 512th largest score
       float *sorted = xmalloc(n * 4);
@@ -3499,8 +3571,8 @@ void deepseek_run_bench(void) {
         gpu_copy_bytes(&cmd, 2, &ix, sizeof ix),
         gpu_bind_buffer(&cmd, 3, &CAND, 0);
     gpu_run_kernel(&cmd, 1, 1, 1, 1024, 1, 1);
-    gpu_commit(&cmd);
-    gpu_sync(gpu);
+    model_commit(&cmd);
+    model_sync();
     for (int b = 0; b < nb;
          b++) {  // a block's best score; the newest block always in
       best[b] = b == nb - 1 ? INFINITY : sc[b * 8];
@@ -3550,8 +3622,8 @@ void deepseek_run_bench(void) {
       double g = gpu_times(gpu).busy_seconds;
       cmd = gpu_begin(gpu);
       for (int k = 0; k < 6; k++) bench_mv(&cmd, r * 6 + k);
-      gpu_commit(&cmd);
-      gpu_sync(gpu);
+      model_commit(&cmd);
+      model_sync();
       busy += gpu_times(gpu).busy_seconds - g;
     }
     fprintf(stderr, "6 x wq_a after %d ms %s %8.1f us\n", gap,
@@ -3626,7 +3698,7 @@ size_t deepseek_state_bytes(const State *s, int positions) {
 // s's compressed rows and index keys for cap positions, keeping those of
 // the first `keep` positions.
 static void resize(State *s, int cap, int keep) {
-  gpu_sync(gpu);
+  model_sync();
   for (int l = 0; l < LAYERS; l++) {
     if (!L[l].kv_source) continue;
     for (int k = 0; k < 2; k++) {
@@ -3722,7 +3794,7 @@ static void bind(const State *s) {  // the layers' state buffers: s's, for the
 }
 
 void deepseek_set_state_in_use(State *s) {
-  gpu_sync(gpu);
+  model_sync();
   bind(s);
   history = s->history;
   active = s;
@@ -3748,7 +3820,7 @@ const float *deepseek_decode_rows(State **st, const int *tokens, const int *pos,
 }
 
 static void save_rows(int restore) {
-  gpu_sync(gpu);
+  model_sync();
   if (!active->saved) {
     if (restore) die("no saved attention state");
     active->saved = memory_host_alloc_required(&state_slot, saved_bytes());
@@ -3794,7 +3866,7 @@ static void rolling(State *s, char *p, int restore) {
 }
 
 Snapshot *deepseek_snapshot_take(State *s, int pos, const float *lg) {
-  gpu_sync(gpu);
+  model_sync();
   Snapshot *x = xmalloc(sizeof *x);
   *x = (Snapshot){.pos = pos,
                   .extent = LAYERS - 1,
@@ -3810,7 +3882,7 @@ Snapshot *deepseek_snapshot_take(State *s, int pos, const float *lg) {
 void deepseek_snapshot_restore(State *s, const Snapshot *x) {
   if (x->extent != LAYERS - 1)
     die("an encoder-only snapshot cannot restore a whole state");
-  gpu_sync(gpu);
+  model_sync();
   rolling(s, x->rows, 1);
 }
 
@@ -3838,7 +3910,7 @@ const float *deepseek_snapshot_logits(const Snapshot *x) { return x->logits; }
 static int state_regions(State *s, int positions, int fill, StateRegion *out) {
   if (positions < 0 || (!fill && positions > s->cap))
     die("invalid rows of %d positions", positions);
-  gpu_sync(gpu);
+  model_sync();
   if (fill) {
     int cap = grown(start_cap(), positions);
     if (s->cap != cap) resize(s, cap, 0);
@@ -3871,7 +3943,7 @@ void deepseek_state_copy(State *dst, const State *src, int positions) {
 // block's order (rolling()), as at pos.
 static int snapshot_parts(Snapshot *x, State *s, int pos, SnapshotPart *out,
                           int32_t *meta, int *nmeta) {
-  gpu_sync(gpu);
+  model_sync();
   int n = 0;
   *nmeta = 2;
   if (x) {
@@ -4251,6 +4323,7 @@ static const PassVariable pass_own[] = {
     V(DEROW),
     V(GPR),
     V(event),
+    V(last_committed),
 };
 #undef V
 
@@ -4286,6 +4359,7 @@ static Buf *const pass_request_buffers[] = {&HS,    &MF,    &SEL,   &CAND, &IMG,
 // keeps the constant rows some of them hold (the draft's noise tokens).
 void deepseek_pass_begin(void) {
   event = gpu_event_new(gpu);
+  last_committed = 0;
   expert_store_set_prompt_layer(experts_store, -1);
   active = &parked, history = parked.history;
   memset(history, 0, sizeof active->history);
@@ -4313,7 +4387,7 @@ static void deepseek_pass_release(void) {
 
 // Inside the pass, after its work has been waited for: frees what it owned.
 void deepseek_pass_end(void) {
-  gpu_sync(gpu);
+  model_sync();
   held_release();
   for (size_t i = 0;
        i < sizeof pass_request_buffers / sizeof *pass_request_buffers; i++)
