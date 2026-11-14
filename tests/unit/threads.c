@@ -16,16 +16,20 @@ typedef struct {
 } Spawned;
 
 static atomic_int counter;
+
 static void count(void *) { atomic_fetch_add(&counter, 1); }
+
 static void add_index(void *context, size_t i) {
   atomic_fetch_add((atomic_size_t *)context, i);
 }
+
 // Leaves the group, then blocks until every task has left it. The tasks end
 // only if they run side by side.
 static void meet(void *group) {
   threads_group_leave(group);
   threads_group_wait(group);
 }
+
 static void leave(void *group) { threads_group_leave(group); }
 
 static void signal_event(void *event) { threads_event_signal(event); }

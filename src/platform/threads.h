@@ -87,6 +87,7 @@ void threads_set_priority(ThreadsPriority priority);
 static inline dispatch_group_t threads_dispatch(ThreadsGroup *group) {
   return (dispatch_group_t)(void *)group;
 }
+
 static inline dispatch_queue_t threads_queue(ThreadsPriority priority) {
   return dispatch_get_global_queue(priority == THREADS_INTERACTIVE
                                        ? QOS_CLASS_USER_INTERACTIVE
@@ -95,21 +96,27 @@ static inline dispatch_queue_t threads_queue(ThreadsPriority priority) {
 }
 
 THREADS_API const char *threads_backend(void) { return "gcd"; }
+
 THREADS_API ThreadsGroup *threads_group_new(void) {
   return (ThreadsGroup *)(void *)dispatch_group_create();
 }
+
 THREADS_API void threads_group_free(ThreadsGroup *group) {
   dispatch_release(threads_dispatch(group));
 }
+
 THREADS_API void threads_group_enter(ThreadsGroup *group) {
   dispatch_group_enter(threads_dispatch(group));
 }
+
 THREADS_API void threads_group_leave(ThreadsGroup *group) {
   dispatch_group_leave(threads_dispatch(group));
 }
+
 THREADS_API int threads_group_done(ThreadsGroup *group) {
   return dispatch_group_wait(threads_dispatch(group), DISPATCH_TIME_NOW) == 0;
 }
+
 THREADS_API void threads_group_wait(ThreadsGroup *group) {
   dispatch_group_wait(threads_dispatch(group), DISPATCH_TIME_FOREVER);
 }
@@ -125,6 +132,7 @@ THREADS_API void threads_group_notify(ThreadsGroup *group,
                           threads_queue(THREADS_INTERACTIVE), event,
                           threads_signal_event);
 }
+
 THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority,
                                void *context, void (*fn)(void *)) {
   if (group)
@@ -133,6 +141,7 @@ THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority,
   else
     dispatch_async_f(threads_queue(priority), context, fn);
 }
+
 THREADS_API void threads_apply(size_t n, ThreadsPriority priority,
                                void *context, void (*fn)(void *, size_t)) {
   dispatch_apply_f(n, threads_queue(priority), context, fn);

@@ -26,12 +26,14 @@ static int callbacks;
 static uint64_t coming_back, coming_back_step;
 
 double now(void) { return clock_now; }
+
 void sleep_seconds(double seconds) {
   clock_now += seconds;
   uint64_t step =
       coming_back < coming_back_step ? coming_back : coming_back_step;
   available_bytes += step, coming_back -= step;
 }
+
 [[noreturn]] void die(const char *format, ...) {
   va_list args;
   va_start(args, format);
@@ -40,6 +42,7 @@ void sleep_seconds(double seconds) {
   fputc('\n', stderr);
   exit(2);
 }
+
 void say(const char *format, ...) {
   va_list args;
   va_start(args, format);
@@ -47,6 +50,7 @@ void say(const char *format, ...) {
   va_end(args);
   fputc('\n', stderr);
 }
+
 #define REQUIRE(test)                                                          \
   do {                                                                         \
     if (!(test)) die("%s:%d: %s", __func__, __LINE__, #test);                  \
@@ -56,12 +60,14 @@ typedef struct {
   MemorySlot slot;
   int id, evicted;
 } TestSlot;
+
 static void evict(void *context) {
   TestSlot *test = context;
   order[order_count++] = test->id;
   test->evicted++;
   memory_release(&test->slot, test->slot.payload);
 }
+
 static void test_slot(TestSlot *test, MemoryAccount *account, TestSlot *parent,
                       uint64_t bytes, int id) {
   *test = (TestSlot){.id = id};
@@ -70,6 +76,7 @@ static void test_slot(TestSlot *test, MemoryAccount *account, TestSlot *parent,
   REQUIRE(memory_claim(&test->slot, bytes, MEMORY_REQUIRED));
   memory_set_ready(&test->slot, 1);
 }
+
 static void test_state_slot(TestSlot *test, MemoryAccount *account,
                             uint64_t bytes, int id) {
   *test = (TestSlot){.id = id};
@@ -78,6 +85,7 @@ static void test_state_slot(TestSlot *test, MemoryAccount *account,
   REQUIRE(memory_claim(&test->slot, bytes, MEMORY_REQUIRED));
   memory_set_ready(&test->slot, 1);
 }
+
 static int claim(TestSlot *test, uint64_t bytes, MemoryAdmission mode) {
   return memory_claim(&test->slot, bytes, mode);
 }
@@ -729,6 +737,7 @@ int main(void) {
       {"the eviction callback runs after evictions, and only then",
        callback_runs_after_evictions},
   };
+
   for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
     check(exit_status(cases[i].run) == 0, cases[i].name);
   // This test's die exits with status 2.

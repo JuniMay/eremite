@@ -13,3 +13,4 @@ SpacesBeforeTrailingComments: 2
 AlignTrailingComments:
   Kind: Never
 SortIncludes: Never
+SeparateDefinitionBlocks: Always

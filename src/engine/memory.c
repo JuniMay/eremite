@@ -50,6 +50,7 @@ struct Memory {
 #define LONG_AGO -1e9
 
 static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
+
 #define GIB_F 1073741824.0
 // Evictions that free at least this much at once are logged.
 #define LOGGED_EVICTION (1ull << 30)
@@ -216,13 +217,16 @@ void memory_slot_remove(MemorySlot *slot) {
 }
 
 void memory_touch(MemorySlot *slot) { slot->touched = now(); }
+
 void memory_pin(MemorySlot *slot, int pinned) {
   slot->pins = !!pinned;
   if (pinned) memory_touch(slot);
 }
+
 int memory_ready(const MemorySlot *slot) {
   return atomic_load_explicit(&slot->ready, memory_order_acquire);
 }
+
 void memory_set_ready(MemorySlot *slot, int ready) {
   atomic_store_explicit(&slot->ready, !!ready, memory_order_release);
 }
@@ -645,11 +649,15 @@ void memory_release(MemorySlot *slot, uint64_t bytes) {
   // A state slot always counts just its bytes in use.
   if (slot->automatic || slot->kind == MEMORY_STATE) memory_shrink(slot);
 }
+
 void memory_shrink(MemorySlot *slot) { change(slot, slot->payload); }
+
 MemoryUsage memory_usage(const Memory *memory) { return memory->usage; }
+
 void memory_set_eviction_callback(Memory *memory, void (*callback)(void)) {
   memory->eviction_callback = callback;
 }
+
 uint64_t memory_room(const MemoryAccount *account) {
   const MemoryUsage *usage = &account->memory->usage;
   uint64_t free =
@@ -658,6 +666,7 @@ uint64_t memory_room(const MemoryAccount *account) {
            own = account->minimum > model ? account->minimum - model : 0;
   return UINT64_MAX - free < own ? UINT64_MAX : free + own;
 }
+
 MemorySlot *memory_shared(Memory *memory) { return &memory->shared; }
 
 // Returns zeroed host memory of bytes, already claimed in slot, and records it

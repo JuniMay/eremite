@@ -4,8 +4,10 @@
 // JSON documents, parsed into trees.
 
 typedef struct Json Json;
+
 struct Json {
   enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } type;
+
   int n;  // children of arrays and objects, bytes of strings
   const char *key;  // set on object members
   const char *s;

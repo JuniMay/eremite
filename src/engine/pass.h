@@ -13,6 +13,7 @@ typedef struct Pass Pass;
 // that another thread ends, notify makes the event be signaled when the wait
 // may be over. It is null for a wait that the GPU or another pass ends.
 enum { PASS_WAIT_OTHER, PASS_WAIT_GPU, PASS_WAIT_READ };
+
 typedef struct {
   int (*ready)(void *context);
   void (*block)(void *context);

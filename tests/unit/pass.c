@@ -8,8 +8,11 @@
 // what a yield and a resume cost.
 
 static int counter;
+
 static int always_ready(void *) { return 1; }
+
 static int flag_ready(void *flag) { return *(int *)flag; }
+
 // The wait ends when the resumer blocks.
 static void flag_block(void *flag) { *(int *)flag = 1; }
 
@@ -44,9 +47,11 @@ static int deep(int depth) {
   block[0] = (char)depth;
   return depth ? deep(depth - 1) + block[0] : block[0];
 }
+
 static void deep_body(void *argument) { *(int *)argument = deep(100); }
 
 static int shared;
+
 static void uses_variable(void *argument) {
   int value = *(int *)argument;
   check(shared == 0, "a pass starts from the value its variable had");
@@ -59,11 +64,13 @@ static void uses_variable(void *argument) {
 }
 
 static void leave_group(void *group) { threads_group_leave(group); }
+
 static void signal_event(void *event) { threads_event_signal(event); }
 
 static void waits_for_group(void *group) { pass_wait_group(group); }
 
 enum { SWITCHES = 2000000 };
+
 // Over at its third look, for a wait that stands for the GPU's.
 static int third_look(void *looks) { return ++*(int *)looks >= 3; }
 

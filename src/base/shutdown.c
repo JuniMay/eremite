@@ -61,4 +61,5 @@ void shutdown_watch(void (*hook)(void)) {
 }
 
 int shutdown_requested(void) { return stop_requested != 0; }
+
 int shutdown_requests(void) { return stop_requested; }

@@ -199,6 +199,7 @@ void pass_wait(const PassWait *wait) {
 }
 
 static int group_ready(void *group) { return threads_group_done(group); }
+
 static void group_block(void *group) { threads_group_wait(group); }
 
 static void group_notify(void *group, ThreadsEvent *event) {

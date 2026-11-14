@@ -6,6 +6,7 @@
 // Tests that a log line is the time of day followed by the message.
 
 static char last[1024];
+
 static void keep(const char *line) { snprintf(last, sizeof last, "%s", line); }
 
 int main(void) {
