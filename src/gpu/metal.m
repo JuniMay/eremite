@@ -33,7 +33,9 @@ struct Gpu {
   void *pool;
 };
 
-static const char *describe(NSError *err) { return [[err localizedDescription] UTF8String]; }
+static const char *describe(NSError *err) {
+  return [[err localizedDescription] UTF8String];
+}
 
 Gpu *gpu_new(const char *source, size_t len) {
   Gpu *gpu = xmalloc(sizeof *gpu);
@@ -49,7 +51,10 @@ Gpu *gpu_new(const char *source, size_t len) {
   memcpy(src, source, len);
   src[len] = 0;
   NSError *err = nil;
-  gpu->library = [gpu->device newLibraryWithSource:[NSString stringWithUTF8String:src] options:opts error:&err];
+  gpu->library =
+      [gpu->device newLibraryWithSource:[NSString stringWithUTF8String:src]
+                                options:opts
+                                  error:&err];
   if (!gpu->library) die("Metal compile: %s", describe(err));
   free(src);
   return gpu;
@@ -59,10 +64,12 @@ int gpu_find_kernel(Gpu *gpu, const char *name) {
   for (int i = 0; i < gpu->npipes; i++)
     if (!strcmp(gpu->names[i], name)) return i;
   if (gpu->npipes == MAX_KERNELS) die("more than %d kernels", MAX_KERNELS);
-  id<MTLFunction> fn = [gpu->library newFunctionWithName:[NSString stringWithUTF8String:name]];
+  id<MTLFunction> fn =
+      [gpu->library newFunctionWithName:[NSString stringWithUTF8String:name]];
   if (!fn) die("no kernel %s", name);
   NSError *err = nil;
-  id<MTLComputePipelineState> p = [gpu->device newComputePipelineStateWithFunction:fn error:&err];
+  id<MTLComputePipelineState> p =
+      [gpu->device newComputePipelineStateWithFunction:fn error:&err];
   if (!p) die("pipeline %s: %s", name, describe(err));
   gpu->names[gpu->npipes] = name;
   gpu->pipes[gpu->npipes] = p;
@@ -81,7 +88,9 @@ static Buf allocate(Gpu *gpu, MemorySlot *slot, size_t size) {
   b.allocated = gpu_round_up_to_pages(size);
   b.memory = slot;
   if (!memory_claim(slot, b.allocated, MEMORY_REQUIRED)) return (Buf){0};
-  id<MTLBuffer> buffer = [gpu->device newBufferWithLength:size options:MTLResourceStorageModeShared];
+  id<MTLBuffer> buffer =
+      [gpu->device newBufferWithLength:size
+                               options:MTLResourceStorageModeShared];
   if (!buffer) die("cannot allocate %zu bytes on the GPU", size);
   b.obj = buffer;
   b.ptr = [buffer contents];
@@ -104,7 +113,8 @@ void gpu_free(Buf *b) {
 }
 
 GpuCommandBuffer gpu_begin(Gpu *gpu) {
-  id<MTLCommandBuffer> buffer = [gpu->queue commandBufferWithUnretainedReferences];
+  id<MTLCommandBuffer> buffer =
+      [gpu->queue commandBufferWithUnretainedReferences];
   [buffer enqueue];
   return (GpuCommandBuffer){gpu, buffer, [buffer computeCommandEncoder]};
 }
@@ -147,10 +157,12 @@ void gpu_copy_bytes(GpuCommandBuffer *c, int idx, const void *p, size_t n) {
   [encoder(c) setBytes:p length:n atIndex:(unsigned long)idx];
 }
 
-void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, uint32_t threads_x,
-                    uint32_t threads_y, uint32_t threads_z) {
-  [encoder(c) dispatchThreadgroups:MTLSizeMake(groups_x, groups_y, groups_z)
-             threadsPerThreadgroup:MTLSizeMake(threads_x, threads_y, threads_z)];
+void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
+                    uint32_t groups_z, uint32_t threads_x, uint32_t threads_y,
+                    uint32_t threads_z) {
+  [encoder(c)
+       dispatchThreadgroups:MTLSizeMake(groups_x, groups_y, groups_z)
+      threadsPerThreadgroup:MTLSizeMake(threads_x, threads_y, threads_z)];
 }
 
 // Checks the first count command buffers of done, all finished. Ends the
@@ -159,7 +171,8 @@ static void check_finished(Gpu *gpu, int count) {
   if (!count) return;
   for (int i = 0; i < count; i++) {
     id<MTLCommandBuffer> c = gpu->done[i];
-    if ([c status] == MTLCommandBufferStatusError) die("GPU: %s", describe([c error]));
+    if ([c status] == MTLCommandBufferStatusError)
+      die("GPU: %s", describe([c error]));
     if (c == gpu->last) gpu->last = nil;
     [c release];
   }

@@ -15,6 +15,7 @@ void str_put(Str *s, const char *t, size_t n);
 void str_cat(Str *s, const char *t);
 
 // Prints formatted text at the end.
-void str_printf(Str *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void str_printf(Str *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 
 #endif

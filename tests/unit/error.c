@@ -23,11 +23,14 @@ int main(void) {
   close(pipe_fds[1]);
   char out[256] = {0};
   size_t got = 0;
-  for (ssize_t r; (r = read(pipe_fds[0], out + got, sizeof out - 1 - got)) > 0;) got += (size_t)r;
+  for (ssize_t r; (r = read(pipe_fds[0], out + got, sizeof out - 1 - got)) > 0;)
+    got += (size_t)r;
   int status;
   waitpid(child, &status, 0);
-  check(WIFEXITED(status) && WEXITSTATUS(status) == 1, "die exits with status 1");
-  check(!strcmp(out, "hook\neremite: bad layer 7\n"), "die runs its hook, then prints its message");
+  check(WIFEXITED(status) && WEXITSTATUS(status) == 1,
+        "die exits with status 1");
+  check(!strcmp(out, "hook\neremite: bad layer 7\n"),
+        "die runs its hook, then prints its message");
 
   unsigned char *p = xmalloc(64);
   int zero = 1;

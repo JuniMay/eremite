@@ -16,7 +16,8 @@ static volatile sig_atomic_t group, expired;
 
 static void end_group(int signal_number) {
   if (signal_number == SIGALRM) expired = 1;
-  if (group > 0) kill(-group, signal_number == SIGALRM ? SIGKILL : signal_number);
+  if (group > 0)
+    kill(-group, signal_number == SIGALRM ? SIGKILL : signal_number);
 }
 
 int main(int argc, char **argv) {

@@ -77,8 +77,9 @@ void gpu_copy_bytes(GpuCommandBuffer *c, int idx, const void *p, size_t n);
 // Runs the selected kernel on a grid of groups_x by groups_y by groups_z
 // threadgroups. Each threadgroup has threads_x by threads_y by threads_z
 // threads, which run together and can share memory.
-void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, uint32_t threads_x,
-                    uint32_t threads_y, uint32_t threads_z);
+void gpu_run_kernel(GpuCommandBuffer *c, uint32_t groups_x, uint32_t groups_y,
+                    uint32_t groups_z, uint32_t threads_x, uint32_t threads_y,
+                    uint32_t threads_z);
 
 // Waits for the last committed command buffer, and so for all opened before
 // it. Ends the program if one of them failed.

@@ -10,7 +10,8 @@
 static int counter;
 static int always_ready(void *) { return 1; }
 static int flag_ready(void *flag) { return *(int *)flag; }
-static void flag_block(void *flag) { *(int *)flag = 1; }  // the wait ends when the resumer blocks
+// The wait ends when the resumer blocks.
+static void flag_block(void *flag) { *(int *)flag = 1; }
 
 typedef struct {
   int id, yields, flag;
@@ -23,7 +24,8 @@ static void worker(void *argument) {
   volatile double kept = a->id * 1.5;
   for (int i = 0; i < a->yields; i++) {
     a->flag = 0;
-    pass_wait(&(PassWait){.ready = flag_ready, .block = flag_block, .context = &a->flag});
+    pass_wait(&(PassWait){
+        .ready = flag_ready, .block = flag_block, .context = &a->flag});
     a->log[strlen(a->log)] = (char)('0' + a->id);
     counter += a->id;
   }
@@ -50,8 +52,10 @@ static void uses_variable(void *argument) {
   check(shared == 0, "a pass starts from the value its variable had");
   shared = value;
   int never = 0;
-  pass_wait(&(PassWait){.ready = flag_ready, .block = flag_block, .context = &never});
-  check(shared == value, "a pass does not see what another pass wrote to its variable");
+  pass_wait(
+      &(PassWait){.ready = flag_ready, .block = flag_block, .context = &never});
+  check(shared == value,
+        "a pass does not see what another pass wrote to its variable");
 }
 
 static void leave_group(void *group) { threads_group_leave(group); }
@@ -64,17 +68,21 @@ enum { SWITCHES = 2000000 };
 static int third_look(void *looks) { return ++*(int *)looks >= 3; }
 
 static void waits_for_gpu(void *looks) {
-  pass_wait(&(PassWait){.ready = third_look, .context = looks, .kind = PASS_WAIT_GPU});
+  pass_wait(&(PassWait){
+      .ready = third_look, .context = looks, .kind = PASS_WAIT_GPU});
 }
 
 static int never_ready(void *) { return 0; }
 
 // A wait that only another pass could end, and that no pass ends.
-static void waits_for_another_pass(void *) { pass_wait(&(PassWait){.ready = never_ready, .kind = PASS_WAIT_OTHER}); }
+static void waits_for_another_pass(void *) {
+  pass_wait(&(PassWait){.ready = never_ready, .kind = PASS_WAIT_OTHER});
+}
 
 static void yielding(void *) {
   int flag = 0;
-  for (int i = 0; i < SWITCHES; i++) flag = 0, pass_wait(&(PassWait){.ready = flag_ready, .context = &flag});
+  for (int i = 0; i < SWITCHES; i++)
+    flag = 0, pass_wait(&(PassWait){.ready = flag_ready, .context = &flag});
 }
 
 int main(void) {
@@ -89,38 +97,45 @@ int main(void) {
     ends += pass_resume(q);
     pass_block(q);
   }
-  check(!strcmp(log, "121212") && counter == 9 && ends == 2, "two passes take turns, each where it yielded");
+  check(!strcmp(log, "121212") && counter == 9 && ends == 2,
+        "two passes take turns, each where it yielded");
   pass_free(p), pass_free(q);
 
   int done = 0;
   p = pass_new(waits_for_nothing, &done, 1 << 20);
-  check(pass_resume(p) == 1 && done == 1, "a pass that never yields ends in one resume");
+  check(pass_resume(p) == 1 && done == 1,
+        "a pass that never yields ends in one resume");
   pass_free(p);
 
   int deep_result = -1;
   p = pass_new(deep_body, &deep_result, 16u << 20);
   pass_run(p);
-  check(deep_result > 0, "a pass recurses through about 6 MiB of its own 16 MiB stack");
+  check(deep_result > 0,
+        "a pass recurses through about 6 MiB of its own 16 MiB stack");
   pass_free(p);
 
   shared = 0;
   int one = 11, two = 22;
   static const PassVariable variables[] = {{&shared, sizeof shared}};
-  p = pass_new(uses_variable, &one, 1 << 20), q = pass_new(uses_variable, &two, 1 << 20);
+  p = pass_new(uses_variable, &one, 1 << 20),
+  q = pass_new(uses_variable, &two, 1 << 20);
   pass_set_variables(p, variables, 1), pass_set_variables(q, variables, 1);
   pass_resume(p), pass_resume(q);
   pass_block(p), pass_block(q);
-  check(pass_resume(p) == 1 && pass_resume(q) == 1 && shared == 0, "the resumer's value is back after each resume");
+  check(pass_resume(p) == 1 && pass_resume(q) == 1 && shared == 0,
+        "the resumer's value is back after each resume");
   pass_free(p), pass_free(q);
 
   ThreadsGroup *group = threads_group_new();
   threads_group_enter(group);
   p = pass_new(waits_for_group, group, 1 << 20);
-  check(!pass_resume(p) && !pass_ready(p) && pass_waiting_for(p) == PASS_WAIT_READ,
+  check(!pass_resume(p) && !pass_ready(p) &&
+            pass_waiting_for(p) == PASS_WAIT_READ,
         "a pass yields while its group has an unfinished task");
   threads_async(NULL, THREADS_INITIATED, group, leave_group);
   pass_block(p);
-  check(pass_ready(p) && pass_resume(p) == 1, "the pass ends once the group's task has finished");
+  check(pass_ready(p) && pass_resume(p) == 1,
+        "the pass ends once the group's task has finished");
   pass_free(p);
 
   ThreadsEvent *event = threads_event_new();
@@ -148,7 +163,8 @@ int main(void) {
   threads_group_free(group);
 
   int looks = 0;
-  Pass *pair[2] = {pass_new(waits_for_gpu, &looks, 1 << 20), pass_new(waits_for_another_pass, NULL, 1 << 20)};
+  Pass *pair[2] = {pass_new(waits_for_gpu, &looks, 1 << 20),
+                   pass_new(waits_for_another_pass, NULL, 1 << 20)};
   pass_resume(pair[0]), pass_resume(pair[1]);
   check(pass_wait_for_any(pair, 2, event) && looks == 3 && pass_ready(pair[0]),
         "while a pass waits for the GPU, a wait for any pass looks again "
@@ -162,7 +178,8 @@ int main(void) {
   p = pass_new(yielding, NULL, 1 << 20);
   double start = now();
   while (!pass_resume(p)) {}
-  printf("a yield and a resume take %.0f ns\n", (now() - start) / SWITCHES * 1e9);
+  printf("a yield and a resume take %.0f ns\n",
+         (now() - start) / SWITCHES * 1e9);
   pass_free(p);
   return failures != 0;
 }

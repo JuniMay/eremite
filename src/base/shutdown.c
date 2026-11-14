@@ -41,20 +41,23 @@ static void *run_hook(void *) {
 static void start_hook(void (*hook)(void)) {
   int fds[2];
   pthread_t thread;
-  if (pipe(fds) || fcntl(fds[0], F_SETFD, FD_CLOEXEC) || fcntl(fds[1], F_SETFD, FD_CLOEXEC) ||
-      fcntl(fds[1], F_SETFL, O_NONBLOCK))
+  if (pipe(fds) || fcntl(fds[0], F_SETFD, FD_CLOEXEC) ||
+      fcntl(fds[1], F_SETFD, FD_CLOEXEC) || fcntl(fds[1], F_SETFL, O_NONBLOCK))
     die("cannot make the stop's pipe");
   request_hook = hook, hook_fd = fds[0];
-  if (pthread_create(&thread, NULL, run_hook, NULL) || pthread_detach(thread)) die("cannot start the stop's thread");
+  if (pthread_create(&thread, NULL, run_hook, NULL) || pthread_detach(thread))
+    die("cannot start the stop's thread");
   request_fd = fds[1];
 }
 
 // Installing the handlers again keeps a request that is already pending.
 void shutdown_watch(void (*hook)(void)) {
   if (hook && !request_hook) start_hook(hook);
-  struct sigaction action = {.sa_handler = request_shutdown, .sa_flags = SA_RESTART};
+  struct sigaction action = {.sa_handler = request_shutdown,
+                             .sa_flags = SA_RESTART};
   sigemptyset(&action.sa_mask);
-  if (sigaction(SIGINT, &action, 0) || sigaction(SIGTERM, &action, 0)) die("cannot install clean shutdown handlers");
+  if (sigaction(SIGINT, &action, 0) || sigaction(SIGTERM, &action, 0))
+    die("cannot install clean shutdown handlers");
 }
 
 int shutdown_requested(void) { return stop_requested != 0; }

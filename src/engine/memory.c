@@ -34,12 +34,17 @@ static uint64_t in_use(void) { return usage.allocated + usage.state; }
 // or more, but not within 1.5 s of a release unless the last is 5 s old.
 static uint64_t available(uint64_t adding) {
   double t = now();
-  if ((t - released_at >= 1.5 || t - read_at >= 5) && (adding >= 1ull << 30 || t - read_at >= 1)) {
+  if ((t - released_at >= 1.5 || t - read_at >= 5) &&
+      (adding >= 1ull << 30 || t - read_at >= 1)) {
     read_bytes = read_available(), read_used = in_use(), read_at = t;
     read_pending = read_unwritten ? read_unwritten() : 0;
   }
-  uint64_t used = in_use(), promised = usage.committed > usage.allocated ? usage.committed - usage.allocated : 0;
-  uint64_t a = used >= read_used ? (read_bytes > used - read_used ? read_bytes - (used - read_used) : 0)
+  uint64_t used = in_use(), promised = usage.committed > usage.allocated
+                                           ? usage.committed - usage.allocated
+                                           : 0;
+  uint64_t a = used >= read_used ? (read_bytes > used - read_used
+                                        ? read_bytes - (used - read_used)
+                                        : 0)
                                  : read_bytes + (read_used - used);
   a = a > read_pending ? a - read_pending : 0;
   return a > promised ? a - promised : 0;
@@ -69,7 +74,8 @@ static void change(MemorySlot *slot, uint64_t bytes) {
 
 void memory_set_limit(uint64_t bytes) { usage.limit = bytes; }
 
-void memory_set_reserve(uint64_t bytes, uint64_t (*reader)(void), uint64_t (*unwritten)(void)) {
+void memory_set_reserve(uint64_t bytes, uint64_t (*reader)(void),
+                        uint64_t (*unwritten)(void)) {
   reserve = bytes, read_available = reader, read_unwritten = unwritten;
   read_at = LONG_AGO;  // the next use takes a new reading
 }
@@ -77,7 +83,8 @@ void memory_set_reserve(uint64_t bytes, uint64_t (*reader)(void), uint64_t (*unw
 uint64_t memory_current_limit(void) {
   if (!read_available) return usage.limit;
   uint64_t a = available(0), room = a > reserve ? a - reserve : 0;
-  uint64_t limit = UINT64_MAX - usage.committed < room ? UINT64_MAX : usage.committed + room;
+  uint64_t limit =
+      UINT64_MAX - usage.committed < room ? UINT64_MAX : usage.committed + room;
   return limit < usage.limit ? limit : usage.limit;
 }
 
@@ -86,7 +93,8 @@ void memory_account_init(MemoryAccount *account, const char *name) {
   accounts = account;
 }
 
-void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemorySlot *dependency, const char *name,
+void memory_slot_init(MemorySlot *slot, MemoryAccount *account,
+                      MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context) {
   *slot = (MemorySlot){.next = slots,
                        .account = account,
@@ -120,7 +128,9 @@ void memory_pin(MemorySlot *slot, int pinned) {
   slot->pins = !!pinned;
   if (pinned) memory_touch(slot);
 }
-int memory_ready(const MemorySlot *slot) { return atomic_load_explicit(&slot->ready, memory_order_acquire); }
+int memory_ready(const MemorySlot *slot) {
+  return atomic_load_explicit(&slot->ready, memory_order_acquire);
+}
 void memory_set_ready(MemorySlot *slot, int ready) {
   atomic_store_explicit(&slot->ready, !!ready, memory_order_release);
 }
@@ -131,8 +141,10 @@ static int requested(MemorySlot *slot, MemorySlot *const *wanted, size_t n) {
   return 0;
 }
 
-static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n, MemoryAdmission mode) {
-  if (!slot->bytes || !slot->evict || slot->pins || slot->account->admitting || requested(slot, wanted, n) ||
+static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n,
+                     MemoryAdmission mode) {
+  if (!slot->bytes || !slot->evict || slot->pins || slot->account->admitting ||
+      requested(slot, wanted, n) ||
       (slot->can_evict && !slot->can_evict(slot->context)))
     return 0;
   if (mode == MEMORY_SPECULATIVE) return 0;
@@ -143,7 +155,8 @@ static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n, Memo
       if (wanted[i]->account == slot->account) return 0;
   }
   // A growing cache keeps weights used in the last 30 seconds.
-  if (mode == MEMORY_CACHE && !slot->dependency && now() - slot->touched < 30) return 0;
+  if (mode == MEMORY_CACHE && !slot->dependency && now() - slot->touched < 30)
+    return 0;
   for (MemorySlot *child = slot->children; child; child = child->sibling)
     if (child->bytes && !evictable(child, wanted, n, mode)) return 0;
   return 1;
@@ -155,19 +168,24 @@ static int has_children(MemorySlot *slot) {
   return 0;
 }
 
-static uint64_t proposed_bytes(const MemoryAccount *account, MemorySlot *const *wanted, const uint64_t *sizes,
+static uint64_t proposed_bytes(const MemoryAccount *account,
+                               MemorySlot *const *wanted, const uint64_t *sizes,
                                size_t n) {
   uint64_t proposed = account->bytes;
   for (size_t i = 0; i < n; i++)
     if (wanted[i]->account == account) {
-      uint64_t bytes = sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload;
-      if (bytes > wanted[i]->bytes && UINT64_MAX - proposed < bytes - wanted[i]->bytes) return UINT64_MAX;
+      uint64_t bytes =
+          sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload;
+      if (bytes > wanted[i]->bytes &&
+          UINT64_MAX - proposed < bytes - wanted[i]->bytes)
+        return UINT64_MAX;
       proposed = proposed - wanted[i]->bytes + bytes;
     }
   return proposed;
 }
 
-static uint64_t growth(MemorySlot *const *wanted, const uint64_t *sizes, size_t n) {
+static uint64_t growth(MemorySlot *const *wanted, const uint64_t *sizes,
+                       size_t n) {
   uint64_t extra = 0;
   for (MemoryAccount *a = accounts; a; a = a->next) {
     uint64_t proposed = proposed_bytes(a, wanted, sizes, n);
@@ -180,28 +198,35 @@ static uint64_t growth(MemorySlot *const *wanted, const uint64_t *sizes, size_t 
   return extra;
 }
 
-static uint64_t reclaim_room(const MemoryAccount *account, MemorySlot *const *wanted, const uint64_t *sizes, size_t n) {
+static uint64_t reclaim_room(const MemoryAccount *account,
+                             MemorySlot *const *wanted, const uint64_t *sizes,
+                             size_t n) {
   uint64_t bytes = proposed_bytes(account, wanted, sizes, n);
   if (bytes < account->bytes) bytes = account->bytes;
   return bytes > account->minimum ? bytes - account->minimum : 0;
 }
 
-static uint64_t reclaimable(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, MemoryAdmission mode) {
+static uint64_t reclaimable(MemorySlot *const *wanted, const uint64_t *sizes,
+                            size_t n, MemoryAdmission mode) {
   uint64_t total = 0;
   for (MemoryAccount *a = accounts; a; a = a->next) {
     uint64_t possible = 0;
     for (MemorySlot *s = slots; s; s = s->next)
-      if (s->account == a && evictable(s, wanted, n, mode)) possible += s->bytes;
+      if (s->account == a && evictable(s, wanted, n, mode))
+        possible += s->bytes;
     uint64_t room = reclaim_room(a, wanted, sizes, n);
     total += possible < room ? possible : room;
   }
   return total;
 }
 
-static int fits(uint64_t extra) { return usage.committed <= usage.limit && extra <= usage.limit - usage.committed; }
+static int fits(uint64_t extra) {
+  return usage.committed <= usage.limit &&
+         extra <= usage.limit - usage.committed;
+}
 
-static MemorySlot *victim(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, MemoryAdmission mode,
-                          uint64_t need) {
+static MemorySlot *victim(MemorySlot *const *wanted, const uint64_t *sizes,
+                          size_t n, MemoryAdmission mode, uint64_t need) {
   MemorySlot *best = NULL;
   double rank = INFINITY;
   for (MemorySlot *s = slots; s; s = s->next) {
@@ -210,7 +235,8 @@ static MemorySlot *victim(MemorySlot *const *wanted, const uint64_t *sizes, size
     if (!useful) continue;
     if (useful > s->bytes) useful = s->bytes;
     if (useful > need) useful = need;
-    double age = fmax(0, now() - s->touched), score = exp(-age / 30) * (double)s->bytes / useful;
+    double age = fmax(0, now() - s->touched),
+           score = exp(-age / 30) * (double)s->bytes / useful;
     if (!best || score < rank) best = s, rank = score;
   }
   return best;
@@ -231,7 +257,8 @@ static uint64_t evict_slot(MemorySlot *slot) {
 uint64_t memory_reclaim(uint64_t bytes) {
   uint64_t before = usage.allocated;
   while (before - usage.allocated < bytes) {
-    MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED, bytes - (before - usage.allocated));
+    MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED,
+                              bytes - (before - usage.allocated));
     if (!slot) break;
     evict_slot(slot);
   }
@@ -247,7 +274,8 @@ uint64_t memory_unload(MemoryAccount *account) {
   for (int again = 1; again;) {
     again = 0;
     for (MemorySlot *s = slots; s; s = s->next)
-      if (s->account == account && !has_children(s) && evictable(s, NULL, 0, MEMORY_REQUIRED)) {
+      if (s->account == account && !has_children(s) &&
+          evictable(s, NULL, 0, MEMORY_REQUIRED)) {
         evict_slot(s);
         again = 1;
       }
@@ -261,32 +289,40 @@ uint64_t memory_unload(MemoryAccount *account) {
 // cannot make it fit.
 static uint64_t over_limit(uint64_t extra) {
   if (fits(extra)) return 0;
-  return extra == UINT64_MAX || usage.committed > usage.limit ? UINT64_MAX : extra - (usage.limit - usage.committed);
+  return extra == UINT64_MAX || usage.committed > usage.limit
+             ? UINT64_MAX
+             : extra - (usage.limit - usage.committed);
 }
 
-int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, MemoryAdmission mode) {
+int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n,
+                 MemoryAdmission mode) {
   int evicted = 0;
   uint64_t extra = growth(wanted, sizes, n);
   // Bytes needed for the reserve are freed like bytes over the limit.
   // Speculative memory also leaves its own size free, so that small buffers
   // fit later without evicting an expert.
-  uint64_t probe = mode == MEMORY_SPECULATIVE && extra <= UINT64_MAX / 2 ? 2 * extra : extra;
-  uint64_t short_by = extra == UINT64_MAX ? 0 : shortage(probe), over = over_limit(extra);
+  uint64_t probe =
+      mode == MEMORY_SPECULATIVE && extra <= UINT64_MAX / 2 ? 2 * extra : extra;
+  uint64_t short_by = extra == UINT64_MAX ? 0 : shortage(probe),
+           over = over_limit(extra);
   uint64_t need = over > short_by ? over : short_by, freed = 0;
   if (mode == MEMORY_SPECULATIVE && need) {
     usage.refusals++;
     return 0;
   }
-  if (need && (need == UINT64_MAX || need > reclaimable(wanted, sizes, n, mode))) {
+  if (need &&
+      (need == UINT64_MAX || need > reclaimable(wanted, sizes, n, mode))) {
     if (short_by)
-      say("memory: %s: refused %.2f GiB: %.2f GiB short of the %.1f GiB reserve", wanted[0]->name, extra / GIB_F,
-          short_by / GIB_F, reserve / GIB_F);
+      say("memory: %s: refused %.2f GiB: %.2f GiB short of the %.1f GiB "
+          "reserve",
+          wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F);
     usage.refusals++;
     return 0;
   }
   int taken = 0;
   while ((over = over_limit(extra)) || freed < short_by) {
-    uint64_t left = freed < short_by ? short_by - freed : 0, want = over > left ? over : left;
+    uint64_t left = freed < short_by ? short_by - freed : 0,
+             want = over > left ? over : left;
     MemorySlot *best = victim(wanted, sizes, n, mode, want);
     if (!best) die("memory reservation changed during eviction");
     freed += evict_slot(best);
@@ -294,15 +330,20 @@ int memory_admit(MemorySlot *const *wanted, const uint64_t *sizes, size_t n, Mem
     extra = growth(wanted, sizes, n);
   }
   if (short_by && freed >= LOGGED_EVICTION)
-    say("memory: %s: adding %.2f GiB, %.2f GiB short of the %.1f GiB reserve (reading %.1f s old): evicted %d "
+    say("memory: %s: adding %.2f GiB, %.2f GiB short of the %.1f GiB reserve "
+        "(reading %.1f s old): evicted %d "
         "slots, %.2f GiB",
-        wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F, now() - read_at, taken, freed / GIB_F);
-  for (size_t i = 0; i < n; i++) change(wanted[i], sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
+        wanted[0]->name, extra / GIB_F, short_by / GIB_F, reserve / GIB_F,
+        now() - read_at, taken, freed / GIB_F);
+  for (size_t i = 0; i < n; i++)
+    change(wanted[i],
+           sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
   if (evicted && collect_released) collect_released();
   return 1;
 }
 
-int memory_set_minimum(MemoryAccount *account, uint64_t bytes, MemoryAdmission mode) {
+int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
+                       MemoryAdmission mode) {
   uint64_t old = account->minimum, before = counted(account);
   account->minimum = bytes;
   uint64_t after = counted(account);
@@ -332,7 +373,8 @@ int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode) {
   if (UINT64_MAX - slot->payload < bytes) return 0;
   uint64_t wanted_size = slot->payload + bytes;
   MemorySlot *wanted[] = {slot};
-  if (wanted_size > slot->bytes && !memory_admit(wanted, &wanted_size, 1, mode)) return 0;
+  if (wanted_size > slot->bytes && !memory_admit(wanted, &wanted_size, 1, mode))
+    return 0;
   slot->payload += bytes;
   usage.allocated += bytes;
   return 1;
@@ -353,21 +395,26 @@ void memory_state_change(uint64_t bytes, int allocated) {
   int released = 0;
   while (freed < short_by) {
     MemorySlot *slot = victim(NULL, NULL, 0, MEMORY_REQUIRED, short_by - freed);
-    if (!slot) break;  // nothing idle is left; the state's owner frees idle state later
+    // Nothing idle is left; the state's owner frees idle state later.
+    if (!slot) break;
     freed += evict_slot(slot);
     released++;
   }
   if (released && collect_released) collect_released();
   if (short_by && freed >= LOGGED_EVICTION)
-    say("memory: state memory grows %.2f GiB, %.2f GiB short of the %.1f GiB reserve: evicted %d slots, %.2f GiB",
-        bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, released, freed / GIB_F);
+    say("memory: state memory grows %.2f GiB, %.2f GiB short of the %.1f GiB "
+        "reserve: evicted %d slots, %.2f GiB",
+        bytes / GIB_F, short_by / GIB_F, reserve / GIB_F, released,
+        freed / GIB_F);
   usage.state += bytes;
 }
 MemoryUsage memory_usage(void) { return usage; }
 void memory_collect_with(void (*collect)(void)) { collect_released = collect; }
 uint64_t memory_room(const MemoryAccount *account) {
-  uint64_t free = usage.limit > usage.committed ? usage.limit - usage.committed : 0;
-  uint64_t own = account->minimum > account->bytes ? account->minimum - account->bytes : 0;
+  uint64_t free =
+      usage.limit > usage.committed ? usage.limit - usage.committed : 0;
+  uint64_t own =
+      account->minimum > account->bytes ? account->minimum - account->bytes : 0;
   return UINT64_MAX - free < own ? UINT64_MAX : free + own;
 }
 MemorySlot *memory_scope(MemorySlot *slot) {
@@ -419,7 +466,9 @@ void *memory_host_alloc(size_t bytes, int state) {
 
 void *memory_host_required(size_t bytes, int state) {
   void *pointer = memory_host_alloc(bytes, state);
-  if (!pointer) die("cannot allocate %zu bytes of %s memory", bytes, state ? "state" : "model");
+  if (!pointer)
+    die("cannot allocate %zu bytes of %s memory", bytes,
+        state ? "state" : "model");
   return pointer;
 }
 

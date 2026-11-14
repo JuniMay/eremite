@@ -92,7 +92,8 @@ void memory_set_limit(uint64_t bytes);
 // Sets the reserve to keep free for other programs. available() reads the
 // available memory. unwritten(), or null, reads the bytes counted but not yet
 // written, which count as used.
-void memory_set_reserve(uint64_t reserve, uint64_t (*available)(void), uint64_t (*unwritten)(void));
+void memory_set_reserve(uint64_t reserve, uint64_t (*available)(void),
+                        uint64_t (*unwritten)(void));
 
 // The most memory the models may use now, within the limit and the reserve.
 uint64_t memory_current_limit(void);
@@ -102,7 +103,8 @@ void memory_account_init(MemoryAccount *account, const char *name);
 
 // Starts an empty slot. dependency may be null. evict(context) frees its
 // contents; null means the slot is never evicted.
-void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemorySlot *dependency, const char *name,
+void memory_slot_init(MemorySlot *slot, MemoryAccount *account,
+                      MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context);
 
 // Removes the slot and its bytes.
@@ -123,11 +125,13 @@ void memory_set_ready(MemorySlot *slot, int ready);
 
 // Admits the slots: sets each slot's bytes to its size, evicting as mode
 // allows. Returns whether all fit. If not, nothing changes.
-int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count, MemoryAdmission mode);
+int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count,
+                 MemoryAdmission mode);
 
 // Sets the account's minimum, evicting as mode allows. Returns whether it
 // fits.
-int memory_set_minimum(MemoryAccount *account, uint64_t bytes, MemoryAdmission mode);
+int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
+                       MemoryAdmission mode);
 
 // Claims bytes for the slot: adds them to its bytes in use, evicting as mode
 // allows. Returns whether they fit.

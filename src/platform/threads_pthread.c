@@ -20,7 +20,8 @@ struct ThreadsGroup {
   int nevents, events_room;
 };
 
-// A task waits in its priority's queue until a worker of that priority takes it.
+// A task waits in its priority's queue until a worker of that priority takes
+// it.
 typedef struct Task {
   struct Task *next;
   ThreadsGroup *group;
@@ -117,7 +118,8 @@ void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event) {
   if (!listed) {
     if (group->nevents == group->events_room) {
       group->events_room = group->events_room ? 2 * group->events_room : 1;
-      group->events = realloc(group->events, (size_t)group->events_room * sizeof *group->events);
+      group->events = realloc(group->events, (size_t)group->events_room *
+                                                 sizeof *group->events);
       if (!group->events) {
         fputs("threads: out of memory\n", stderr);
         abort();
@@ -154,7 +156,8 @@ static void *worker(void *p) {
 // tasks that block, such as SSD reads, do not hold up the tasks behind them.
 // A worker that the signal has woken still counts as idle until it takes a
 // task.
-void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context, void (*fn)(void *)) {
+void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context,
+                   void (*fn)(void *)) {
   Task *task = xmalloc(sizeof *task);
   *task = (Task){.group = group, .context = context, .fn = fn};
   if (group) threads_group_enter(group);
@@ -182,19 +185,22 @@ typedef struct {
 
 static void run_loop(void *p) {
   Loop *loop = p;
-  for (size_t i; (i = atomic_fetch_add(&loop->next, 1)) < loop->n;) loop->fn(loop->context, i);
+  for (size_t i; (i = atomic_fetch_add(&loop->next, 1)) < loop->n;)
+    loop->fn(loop->context, i);
 }
 
 // The calling thread and one helper task for each further CPU take indexes
 // from a shared counter until none are left.
-void threads_apply(size_t n, ThreadsPriority priority, void *context, void (*fn)(void *, size_t)) {
+void threads_apply(size_t n, ThreadsPriority priority, void *context,
+                   void (*fn)(void *, size_t)) {
   if (!n) return;
   Loop loop = {.n = n, .context = context, .fn = fn};
   long cpus = sysconf(_SC_NPROCESSORS_ONLN);
   size_t helpers = cpus > 1 ? (size_t)cpus - 1 : 0;
   if (helpers > n - 1) helpers = n - 1;
   ThreadsGroup *group = threads_group_new();
-  for (size_t k = 0; k < helpers; k++) threads_async(group, priority, &loop, run_loop);
+  for (size_t k = 0; k < helpers; k++)
+    threads_async(group, priority, &loop, run_loop);
   run_loop(&loop);
   threads_group_wait(group);
   threads_group_free(group);

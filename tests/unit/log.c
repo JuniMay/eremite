@@ -12,9 +12,10 @@ int main(void) {
   log_hook = keep;
   say("loaded %d layers", 40);
   printf("line: %s\n", last);
-  check(strlen(last) == 13 + strlen("loaded 40 layers") && last[2] == ':' && last[5] == ':' && last[8] == '.' &&
-            last[12] == ' ',
+  check(strlen(last) == 13 + strlen("loaded 40 layers") && last[2] == ':' &&
+            last[5] == ':' && last[8] == '.' && last[12] == ' ',
         "a line starts with HH:MM:SS.mmm and a space");
-  check(!strcmp(last + 13, "loaded 40 layers"), "the formatted message follows the time");
+  check(!strcmp(last + 13, "loaded 40 layers"),
+        "the formatted message follows the time");
   return failures != 0;
 }

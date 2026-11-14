@@ -27,9 +27,9 @@ void say(const char *format, ...) {
   va_end(args);
   fputc('\n', stderr);
 }
-#define REQUIRE(test)                                                                                                  \
-  do {                                                                                                                 \
-    if (!(test)) die("%s:%d: %s", __func__, __LINE__, #test);                                                          \
+#define REQUIRE(test)                                                          \
+  do {                                                                         \
+    if (!(test)) die("%s:%d: %s", __func__, __LINE__, #test);                  \
   } while (0)
 
 typedef struct {
@@ -43,9 +43,11 @@ static void evict(void *context) {
   test->evicted++;
   memory_release(&test->slot, test->slot.payload);
 }
-static void test_slot(TestSlot *test, MemoryAccount *account, TestSlot *parent, uint64_t bytes, int id) {
+static void test_slot(TestSlot *test, MemoryAccount *account, TestSlot *parent,
+                      uint64_t bytes, int id) {
   *test = (TestSlot){.id = id};
-  memory_slot_init(&test->slot, account, parent ? &parent->slot : NULL, "fixture", evict, test);
+  memory_slot_init(&test->slot, account, parent ? &parent->slot : NULL,
+                   "fixture", evict, test);
   REQUIRE(memory_claim(&test->slot, bytes, MEMORY_REQUIRED));
   memory_set_ready(&test->slot, 1);
 }
@@ -56,7 +58,8 @@ static int claim(TestSlot *test, uint64_t bytes, MemoryAdmission mode) {
 static void dependents_are_evicted_first(void) {
   memory_set_limit(120);
   MemoryAccount moe, dense, other;
-  memory_account_init(&moe, "MoE"), memory_account_init(&dense, "dense"), memory_account_init(&other, "other");
+  memory_account_init(&moe, "MoE"), memory_account_init(&dense, "dense"),
+      memory_account_init(&other, "other");
   TestSlot core, a, b, fixed, wanted;
   test_slot(&core, &moe, NULL, 20, 1);
   core.slot.touched = -1000;
@@ -69,7 +72,8 @@ static void dependents_are_evicted_first(void) {
   REQUIRE(a.evicted == 1 && b.evicted == 1 && core.evicted == 0);
   REQUIRE(memory_usage().committed == 120);
   REQUIRE(claim(&wanted, 20, MEMORY_REQUIRED));
-  REQUIRE(core.evicted == 1 && fixed.evicted == 0 && order_count == 3 && order[2] == 1);
+  REQUIRE(core.evicted == 1 && fixed.evicted == 0 && order_count == 3 &&
+          order[2] == 1);
   REQUIRE(memory_usage().allocated == 120);
 }
 
@@ -111,7 +115,8 @@ static void minimum_must_fit(void) {
   test_slot(&fixed, &b, NULL, 40, 1);
   memory_pin(&fixed.slot, 1);
   REQUIRE(!memory_set_minimum(&a, 80, MEMORY_REQUIRED));
-  REQUIRE(a.minimum == 60 && memory_usage().committed == 100 && fixed.evicted == 0);
+  REQUIRE(a.minimum == 60 && memory_usage().committed == 100 &&
+          fixed.evicted == 0);
 }
 
 static void speculative_memory_never_evicts(void) {
@@ -174,7 +179,8 @@ static void host_memory_counts_toward_the_limit(void) {
   work.automatic = 1;
   memory_scope(&work);
   void *host = memory_host_alloc(60, 0), *state = memory_host_alloc(250, 1);
-  REQUIRE(host && state && memory_usage().allocated == 60 && memory_usage().state == 250);
+  REQUIRE(host && state && memory_usage().allocated == 60 &&
+          memory_usage().state == 250);
   REQUIRE(memory_host_alloc(50, 0) == NULL);
   REQUIRE(memory_usage().allocated == 60);
   void *more = memory_host_alloc(30, 0);
@@ -182,7 +188,8 @@ static void host_memory_counts_toward_the_limit(void) {
   memory_host_free(state);
   memory_host_free(host);
   memory_host_free(more);
-  REQUIRE(memory_usage().allocated == 0 && memory_usage().state == 0 && memory_usage().committed == 0);
+  REQUIRE(memory_usage().allocated == 0 && memory_usage().state == 0 &&
+          memory_usage().committed == 0);
 }
 
 static void reclaim_evicts_idle_slots(void) {
@@ -219,8 +226,10 @@ static void unload_evicts_one_accounts_idle_slots(void) {
   test_slot(&kept, &other, NULL, 30, 5);
   REQUIRE(memory_unload(&moe) == 40);
   REQUIRE(a.evicted == 1 && b.evicted == 1 && core.evicted == 1);
-  REQUIRE(order_count == 3 && order[2] == 1);  // the weights after the experts on them
-  REQUIRE(held.evicted == 0 && kept.evicted == 0 && memory_usage().allocated == 35);
+  // The weights after the experts on them.
+  REQUIRE(order_count == 3 && order[2] == 1);
+  REQUIRE(held.evicted == 0 && kept.evicted == 0 &&
+          memory_usage().allocated == 35);
   REQUIRE(memory_unload(&moe) == 0);
 }
 
@@ -245,17 +254,25 @@ int main(void) {
     const char *name;
     void (*run)(void);
   } cases[] = {
-      {"slots that depend on others are evicted first", dependents_are_evicted_first},
+      {"slots that depend on others are evicted first",
+       dependents_are_evicted_first},
       {"dense weights are one slot", dense_weights_are_one_slot},
-      {"pinned slots stay, and state memory is counted apart", pinned_slots_and_state_memory},
+      {"pinned slots stay, and state memory is counted apart",
+       pinned_slots_and_state_memory},
       {"a minimum that does not fit is refused", minimum_must_fit},
-      {"speculative memory never evicts, and a cache waits 30 seconds to evict weights",
+      {"speculative memory never evicts, and a cache waits 30 seconds to evict "
+       "weights",
        speculative_memory_never_evicts},
-      {"a refused addition to two slots evicts nothing", refused_addition_evicts_nothing},
-      {"a workspace can evict its own model's cache", workspace_evicts_its_models_cache},
-      {"host memory counts toward the limit, and state memory does not", host_memory_counts_toward_the_limit},
-      {"reclaiming evicts idle slots, dependents first", reclaim_evicts_idle_slots},
-      {"unloading evicts one account's idle slots", unload_evicts_one_accounts_idle_slots},
+      {"a refused addition to two slots evicts nothing",
+       refused_addition_evicts_nothing},
+      {"a workspace can evict its own model's cache",
+       workspace_evicts_its_models_cache},
+      {"host memory counts toward the limit, and state memory does not",
+       host_memory_counts_toward_the_limit},
+      {"reclaiming evicts idle slots, dependents first",
+       reclaim_evicts_idle_slots},
+      {"unloading evicts one account's idle slots",
+       unload_evicts_one_accounts_idle_slots},
       {"a limit holds for accounts added later", limit_holds_for_new_accounts},
   };
   for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {

@@ -27,7 +27,8 @@ static void json_value(Json *out, yyjson_val *value) {
         out->kid[i].key = yyjson_get_str(key);
       }
     } else {
-      yyjson_arr_foreach(value, i, maximum, child) json_value(&out->kid[i], child);
+      yyjson_arr_foreach(value, i, maximum, child)
+          json_value(&out->kid[i], child);
     }
   } else if (yyjson_is_str(value)) {
     size_t length = yyjson_get_len(value);

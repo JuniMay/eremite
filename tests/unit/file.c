@@ -17,7 +17,8 @@ int main(void) {
   size_t len = 0;
   char *p = read_file(path, &len);
   unlink(path);
-  check(len == sizeof bytes && !memcmp(p, bytes, sizeof bytes), "every byte comes back, a NUL among them");
+  check(len == sizeof bytes && !memcmp(p, bytes, sizeof bytes),
+        "every byte comes back, a NUL among them");
   check(p[len] == 0, "a NUL follows the bytes");
   free(p);
   return failures != 0;

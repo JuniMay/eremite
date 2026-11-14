@@ -9,7 +9,8 @@ extern void (*die_hook)(void);
 
 // Ends the program: prints "eremite: " and the message to stderr, then exits
 // with status 1.
-[[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+[[noreturn]] void die(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
 
 // Returns n zeroed bytes; dies when memory runs out.
 void *xmalloc(size_t n);

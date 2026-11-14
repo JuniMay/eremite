@@ -21,7 +21,8 @@ void say(const char *fmt, ...) {
   pthread_mutex_lock(&log_lock);
   if (log_hook) {
     char line[1024];
-    int k = snprintf(line, sizeof line, "%s.%03d ", t, (int)(tv.tv_usec / 1000));
+    int k =
+        snprintf(line, sizeof line, "%s.%03d ", t, (int)(tv.tv_usec / 1000));
     vsnprintf(line + k, sizeof line - k, fmt, ap);
     log_hook(line);
   } else {

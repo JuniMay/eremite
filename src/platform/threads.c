@@ -12,11 +12,13 @@
 
 #ifdef __APPLE__
 static qos_class_t qos_class(ThreadsPriority priority) {
-  return priority == THREADS_INTERACTIVE ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED;
+  return priority == THREADS_INTERACTIVE ? QOS_CLASS_USER_INTERACTIVE
+                                         : QOS_CLASS_USER_INITIATED;
 }
 #endif
 
-void threads_spawn(ThreadsPriority priority, void *(*fn)(void *), void *context) {
+void threads_spawn(ThreadsPriority priority, void *(*fn)(void *),
+                   void *context) {
   pthread_attr_t attributes;
   pthread_attr_init(&attributes);
   pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);

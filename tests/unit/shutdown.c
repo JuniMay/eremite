@@ -35,11 +35,14 @@ static int wait_for_runs(int runs) {
 static int child(int signal_number) {
   shutdown_watch(count_run);
   check(!shutdown_requested(), "no stop is requested at first");
-  check(raise(signal_number) == 0 && shutdown_requested(), "the signal requests a stop");
+  check(raise(signal_number) == 0 && shutdown_requested(),
+        "the signal requests a stop");
   wait_for_runs(1);
-  check(!pthread_equal(hook_thread, pthread_self()), "the hook runs after the signal, on a thread of its own");
+  check(!pthread_equal(hook_thread, pthread_self()),
+        "the hook runs after the signal, on a thread of its own");
   shutdown_watch(NULL);
-  check(shutdown_requested(), "installing the handlers again keeps the request");
+  check(shutdown_requested(),
+        "installing the handlers again keeps the request");
   shutdown_request();
   check(shutdown_requests() == 2, "each request counts");
   check(wait_for_runs(2) == 2, "the hook runs once for each request");
@@ -57,7 +60,8 @@ int main(void) {
     if (!pid) _exit(child(signals[i]));
     int status;
     waitpid(pid, &status, 0);
-    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "every check in the child passed");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "every check in the child passed");
   }
   return failures != 0;
 }

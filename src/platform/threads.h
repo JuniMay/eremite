@@ -38,8 +38,11 @@ THREADS_API void threads_group_enter(ThreadsGroup *group);
 
 // Leaves the group: takes one from its count.
 THREADS_API void threads_group_leave(ThreadsGroup *group);
-THREADS_API int threads_group_done(ThreadsGroup *group);  // without blocking: whether the group is done
-THREADS_API void threads_group_wait(ThreadsGroup *group);  // until the count is zero
+// Returns whether the group is done: whether its count is zero. Does not
+// block.
+THREADS_API int threads_group_done(ThreadsGroup *group);
+// Blocks until the count is zero.
+THREADS_API void threads_group_wait(ThreadsGroup *group);
 
 // An event that one thread waits for and other threads signal. A signal that
 // comes while no thread waits stays for the next wait, and several signals
@@ -64,31 +67,46 @@ THREADS_API void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event);
 
 // Calls fn(context) once on a background thread and returns without waiting
 // for it. Unless group is null, group counts the call until fn returns.
-THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context, void (*fn)(void *));
+THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority,
+                               void *context, void (*fn)(void *));
 
 // Applies fn to each index: calls fn(context, i) once for each i from 0 to
 // n - 1, and blocks until every call has returned.
-THREADS_API void threads_apply(size_t n, ThreadsPriority priority, void *context, void (*fn)(void *, size_t));
+THREADS_API void threads_apply(size_t n, ThreadsPriority priority,
+                               void *context, void (*fn)(void *, size_t));
 
 // Spawns a thread: starts a new thread that runs fn(context).
-void threads_spawn(ThreadsPriority priority, void *(*fn)(void *), void *context);
+void threads_spawn(ThreadsPriority priority, void *(*fn)(void *),
+                   void *context);
 
 // Sets the calling thread's priority.
 void threads_set_priority(ThreadsPriority priority);
 
 #if EREMITE_THREADS_GCD
 // A group is a dispatch group, and a priority selects a global queue.
-static inline dispatch_group_t threads_dispatch(ThreadsGroup *group) { return (dispatch_group_t)(void *)group; }
+static inline dispatch_group_t threads_dispatch(ThreadsGroup *group) {
+  return (dispatch_group_t)(void *)group;
+}
 static inline dispatch_queue_t threads_queue(ThreadsPriority priority) {
-  return dispatch_get_global_queue(
-      priority == THREADS_INTERACTIVE ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED, 0);
+  return dispatch_get_global_queue(priority == THREADS_INTERACTIVE
+                                       ? QOS_CLASS_USER_INTERACTIVE
+                                       : QOS_CLASS_USER_INITIATED,
+                                   0);
 }
 
 THREADS_API const char *threads_backend(void) { return "gcd"; }
-THREADS_API ThreadsGroup *threads_group_new(void) { return (ThreadsGroup *)(void *)dispatch_group_create(); }
-THREADS_API void threads_group_free(ThreadsGroup *group) { dispatch_release(threads_dispatch(group)); }
-THREADS_API void threads_group_enter(ThreadsGroup *group) { dispatch_group_enter(threads_dispatch(group)); }
-THREADS_API void threads_group_leave(ThreadsGroup *group) { dispatch_group_leave(threads_dispatch(group)); }
+THREADS_API ThreadsGroup *threads_group_new(void) {
+  return (ThreadsGroup *)(void *)dispatch_group_create();
+}
+THREADS_API void threads_group_free(ThreadsGroup *group) {
+  dispatch_release(threads_dispatch(group));
+}
+THREADS_API void threads_group_enter(ThreadsGroup *group) {
+  dispatch_group_enter(threads_dispatch(group));
+}
+THREADS_API void threads_group_leave(ThreadsGroup *group) {
+  dispatch_group_leave(threads_dispatch(group));
+}
 THREADS_API int threads_group_done(ThreadsGroup *group) {
   return dispatch_group_wait(threads_dispatch(group), DISPATCH_TIME_NOW) == 0;
 }
@@ -97,19 +115,26 @@ THREADS_API void threads_group_wait(ThreadsGroup *group) {
 }
 
 // Signals the event that threads_group_notify passes.
-static inline void threads_signal_event(void *event) { threads_event_signal(event); }
-
-THREADS_API void threads_group_notify(ThreadsGroup *group, ThreadsEvent *event) {
-  dispatch_group_notify_f(threads_dispatch(group), threads_queue(THREADS_INTERACTIVE), event, threads_signal_event);
+static inline void threads_signal_event(void *event) {
+  threads_event_signal(event);
 }
 
-THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority, void *context, void (*fn)(void *)) {
+THREADS_API void threads_group_notify(ThreadsGroup *group,
+                                      ThreadsEvent *event) {
+  dispatch_group_notify_f(threads_dispatch(group),
+                          threads_queue(THREADS_INTERACTIVE), event,
+                          threads_signal_event);
+}
+THREADS_API void threads_async(ThreadsGroup *group, ThreadsPriority priority,
+                               void *context, void (*fn)(void *)) {
   if (group)
-    dispatch_group_async_f(threads_dispatch(group), threads_queue(priority), context, fn);
+    dispatch_group_async_f(threads_dispatch(group), threads_queue(priority),
+                           context, fn);
   else
     dispatch_async_f(threads_queue(priority), context, fn);
 }
-THREADS_API void threads_apply(size_t n, ThreadsPriority priority, void *context, void (*fn)(void *, size_t)) {
+THREADS_API void threads_apply(size_t n, ThreadsPriority priority,
+                               void *context, void (*fn)(void *, size_t)) {
   dispatch_apply_f(n, threads_queue(priority), context, fn);
 }
 #endif

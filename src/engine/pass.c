@@ -16,18 +16,24 @@
 // here races.
 
 struct Pass {
-  void *stack, *sp;  // the mapping, and the saved stack pointer while not running
+  // The mapping, and the saved stack pointer while not running.
+  void *stack, *sp;
   size_t mapped;
-  char *bottom;  // the stack above the guard page, and its size
+  // The stack above the guard page, and its size.
+  char *bottom;
   size_t size;
-  void *fake;  // AddressSanitizer's state of the stack while the pass does not run
+  // AddressSanitizer's state of the stack while the pass does not run.
+  void *fake;
   void (*body)(void *);
   void *argument;
-  PassWait wait;  // what it waits for; ready is null when it waits for nothing
+  // What it waits for; ready is null when it waits for nothing.
+  PassWait wait;
   int ended;
-  PassVariable *variables;  // copied from pass_set_variables' list
+  // Copied from pass_set_variables' list.
+  PassVariable *variables;
   int nvariables;
-  char *saved, *outer;  // the pass's values while it does not run; the resumer's while it does
+  // The pass's values while it does not run; the resumer's while it does.
+  char *saved, *outer;
   void (*resumed)(void);
 };
 
@@ -69,8 +75,10 @@ static void pass_entry(void) {
 // The stack's lowest page stays unmapped, so that an overflow faults.
 Pass *pass_new(void (*body)(void *), void *argument, size_t stack_bytes) {
   Pass *p = xmalloc(sizeof *p);
-  size_t page = (size_t)getpagesize(), bytes = (stack_bytes + page - 1) / page * page + page;
-  void *stack = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  size_t page = (size_t)getpagesize(),
+         bytes = (stack_bytes + page - 1) / page * page + page;
+  void *stack =
+      mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (stack == MAP_FAILED) die("cannot map a pass's stack");
   if (mprotect(stack, page, PROT_NONE)) die("cannot protect a pass's stack");
   void *sp = context_new((char *)stack + bytes, pass_entry);
@@ -94,10 +102,14 @@ void pass_set_variables(Pass *p, const PassVariable *variables, int count) {
   memcpy(p->variables, variables, (size_t)count * sizeof *p->variables);
   p->nvariables = count;
   char *at = p->saved;
-  for (int i = 0; i < count; i++) memcpy(at, variables[i].address, variables[i].bytes), at += variables[i].bytes;
+  for (int i = 0; i < count; i++)
+    memcpy(at, variables[i].address, variables[i].bytes),
+        at += variables[i].bytes;
 }
 
-void pass_set_resume_callback(Pass *p, void (*resumed)(void)) { p->resumed = resumed; }
+void pass_set_resume_callback(Pass *p, void (*resumed)(void)) {
+  p->resumed = resumed;
+}
 
 void pass_free(Pass *p) {
   if (!p) return;
@@ -133,9 +145,13 @@ int pass_resume(Pass *p) {
   return p->ended;
 }
 
-int pass_ready(const Pass *p) { return !p->wait.ready || p->wait.ready(p->wait.context); }
+int pass_ready(const Pass *p) {
+  return !p->wait.ready || p->wait.ready(p->wait.context);
+}
 
-int pass_waiting_for(const Pass *p) { return p->wait.ready ? p->wait.kind : PASS_WAIT_OTHER; }
+int pass_waiting_for(const Pass *p) {
+  return p->wait.ready ? p->wait.kind : PASS_WAIT_OTHER;
+}
 
 void pass_block(const Pass *p) {
   if (p->wait.block) p->wait.block(p->wait.context);
@@ -160,7 +176,8 @@ int pass_wait_for_any(Pass *const *passes, int n, ThreadsEvent *event) {
     }
     if (!notified) return 0;
     for (int k = 0; k < n; k++)
-      if (passes[k]->wait.notify) passes[k]->wait.notify(passes[k]->wait.context, event);
+      if (passes[k]->wait.notify)
+        passes[k]->wait.notify(passes[k]->wait.context, event);
     threads_event_wait(event);
     return 1;
   }
@@ -184,11 +201,14 @@ void pass_wait(const PassWait *wait) {
 static int group_ready(void *group) { return threads_group_done(group); }
 static void group_block(void *group) { threads_group_wait(group); }
 
-static void group_notify(void *group, ThreadsEvent *event) { threads_group_notify(group, event); }
+static void group_notify(void *group, ThreadsEvent *event) {
+  threads_group_notify(group, event);
+}
 
 void pass_wait_group(ThreadsGroup *group) {
   if (running)
-    pass_wait(&(PassWait){group_ready, group_block, group, PASS_WAIT_READ, group_notify});
+    pass_wait(&(PassWait){group_ready, group_block, group, PASS_WAIT_READ,
+                          group_notify});
   else
     group_block(group);
 }
