@@ -36,8 +36,8 @@ typedef enum {
   // For needed memory. May evict any idle slot.
   MEMORY_REQUIRED,
   // For growing a cache. May evict idle slots of other accounts without a
-  // minimum, except slots that depend on nothing and were used in the last 30
-  // seconds.
+  // minimum, except slots that depend on nothing and were used within the
+  // last keep_recently_used_weights seconds.
   MEMORY_CACHE,
   // For useful but optional memory. Evicts nothing, and is refused unless its
   // own size stays free above the reserve.
@@ -105,8 +105,39 @@ typedef struct {
   uint64_t evictions, refusals;
 } MemoryUsage;
 
+// How the memory follows the system's counts, and how long it keeps weights
+// that were used. A field of 0 takes its default.
+typedef struct {
+  // Seconds that freed memory takes to show in the system's memory counts: no
+  // new reading is taken within this time of a release (default 1.5).
+  double freed_memory_delay;
+  // Seconds between two readings of the system's available memory; a request
+  // of 1 GiB or more reads at once (default 1).
+  double available_memory_reading_interval;
+  // Seconds after which a reading is taken again, even within
+  // freed_memory_delay of a release (default 5).
+  double available_memory_reading_max_age;
+  // Seconds that used weights count as recently used: a growing cache does not
+  // evict them, and the eviction order ages weights on the same scale (default
+  // 30).
+  double keep_recently_used_weights;
+} MemoryTimes;
+
+// The times that a field of 0 takes.
+static constexpr MemoryTimes MEMORY_DEFAULT_TIMES = {
+    .freed_memory_delay = 1.5,
+    .available_memory_reading_interval = 1,
+    .available_memory_reading_max_age = 5,
+    .keep_recently_used_weights = 30};
+
 // Returns a new Memory with no limit and no reserve.
 Memory *memory_new(void);
+
+// Sets the times. A field of 0 takes its default.
+void memory_set_times(Memory *memory, MemoryTimes times);
+
+// Returns the times in use, with the defaults filled in.
+MemoryTimes memory_times(const Memory *memory);
 
 // Sets the limit in bytes. There is none at first.
 void memory_set_limit(Memory *memory, uint64_t bytes);

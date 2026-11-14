@@ -231,6 +231,40 @@ static void minimum_must_fit(void) {
           fixed.evicted == 0);
 }
 
+static void recently_used_weights_stay_for_their_time(void) {
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 100);
+  memory_set_times(memory, (MemoryTimes){.keep_recently_used_weights = 10});
+  MemoryAccount a, b;
+  memory_account_init(memory, &a, "A", 0);
+  memory_account_init(memory, &b, "B", 0);
+  TestSlot dense, wanted;
+  test_slot(&dense, &a, NULL, 80, 1);
+  test_slot(&wanted, &b, NULL, 0, 2);
+  clock_now += 5;
+  REQUIRE(!claim(&wanted, 40, MEMORY_CACHE));
+  clock_now += 5;
+  REQUIRE(claim(&wanted, 40, MEMORY_CACHE));
+  REQUIRE(dense.evicted == 1 && memory_times(memory).freed_memory_delay == 1.5);
+}
+
+static void readings_wait_for_their_interval(void) {
+  Memory *memory = memory_new();
+  memory_set_times(memory,
+                   (MemoryTimes){.available_memory_reading_interval = 2});
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 0);
+  available_bytes = 300;
+  memory_set_reserve(memory, 100, fake_available, NULL);
+  REQUIRE(memory_current_limit(memory) == 200);
+  // Within the period the reading stays; after it, a new one is taken.
+  available_bytes = 150;
+  clock_now += 1;
+  REQUIRE(memory_current_limit(memory) == 200);
+  clock_now += 1;
+  REQUIRE(memory_current_limit(memory) == 50);
+}
+
 static void speculative_memory_never_evicts(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 100);
@@ -495,6 +529,11 @@ int main(void) {
       {"speculative memory never evicts, and a cache waits 30 seconds to evict "
        "weights",
        speculative_memory_never_evicts},
+      {"a cache waits keep_recently_used_weights to evict weights that were "
+       "used, and the other times keep their defaults",
+       recently_used_weights_stay_for_their_time},
+      {"a reading is taken again only after available_memory_reading_interval",
+       readings_wait_for_their_interval},
       {"a refused addition to two slots evicts nothing",
        refused_addition_evicts_nothing},
       {"a workspace can evict its own model's cache",

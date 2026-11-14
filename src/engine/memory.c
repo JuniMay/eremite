@@ -35,6 +35,8 @@ struct Memory {
   uint64_t read_bytes, read_used, read_pending;
   // Times of the last reading and the last release.
   double read_at, released_at;
+  // How the memory follows the system's counts.
+  MemoryTimes times;
   // Records of the host memory in use, and the lock that guards them.
   HostAllocation *host_allocations;
   pthread_mutex_t host_lock;
@@ -51,12 +53,17 @@ static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
 // Evictions that free at least this much at once are logged.
 #define LOGGED_EVICTION (1ull << 30)
 
-// The available memory. A new reading is taken after 1 s, or at once for 1 GiB
-// or more, but not within 1.5 s of a release unless the last is 5 s old.
+// The available memory. A new reading is taken after
+// available_memory_reading_interval, or at once for 1 GiB or more, but not
+// within freed_memory_delay of a release unless the last is
+// available_memory_reading_max_age old.
 static uint64_t available(Memory *memory, uint64_t adding) {
   double t = now();
-  if ((t - memory->released_at >= 1.5 || t - memory->read_at >= 5) &&
-      (adding >= 1ull << 30 || t - memory->read_at >= 1)) {
+  const MemoryTimes *times = &memory->times;
+  if ((t - memory->released_at >= times->freed_memory_delay ||
+       t - memory->read_at >= times->available_memory_reading_max_age) &&
+      (adding >= 1ull << 30 ||
+       t - memory->read_at >= times->available_memory_reading_interval)) {
     memory->read_bytes = memory->read_available();
     memory->read_used = in_use(memory);
     memory->read_at = t;
@@ -109,6 +116,7 @@ Memory *memory_new(void) {
   if (!memory) die("out of memory (%zu bytes)", sizeof *memory);
   memory->usage.limit = UINT64_MAX;
   memory->read_at = memory->released_at = LONG_AGO;
+  memory_set_times(memory, (MemoryTimes){0});
   pthread_mutex_init(&memory->host_lock, NULL);
   memory_account_init(memory, &memory->shared_account, "shared", 0);
   memory_slot_init(&memory->shared, &memory->shared_account, MEMORY_MODEL, NULL,
@@ -120,6 +128,27 @@ Memory *memory_new(void) {
 void memory_set_limit(Memory *memory, uint64_t bytes) {
   memory->usage.limit = bytes;
 }
+
+void memory_set_times(Memory *memory, MemoryTimes times) {
+  const MemoryTimes d = MEMORY_DEFAULT_TIMES;
+  memory->times = (MemoryTimes){
+      .freed_memory_delay = times.freed_memory_delay > 0
+                                ? times.freed_memory_delay
+                                : d.freed_memory_delay,
+      .available_memory_reading_interval =
+          times.available_memory_reading_interval > 0
+              ? times.available_memory_reading_interval
+              : d.available_memory_reading_interval,
+      .available_memory_reading_max_age =
+          times.available_memory_reading_max_age > 0
+              ? times.available_memory_reading_max_age
+              : d.available_memory_reading_max_age,
+      .keep_recently_used_weights = times.keep_recently_used_weights > 0
+                                        ? times.keep_recently_used_weights
+                                        : d.keep_recently_used_weights};
+}
+
+MemoryTimes memory_times(const Memory *memory) { return memory->times; }
 
 void memory_set_reserve(Memory *memory, uint64_t bytes,
                         uint64_t (*reader)(void), uint64_t (*unwritten)(void)) {
@@ -218,8 +247,10 @@ static int evictable(MemorySlot *slot, MemorySlot *const *wanted, size_t n,
     for (size_t i = 0; i < n; i++)
       if (wanted[i]->account == slot->account) return 0;
   }
-  // A growing cache keeps weights used in the last 30 seconds.
-  if (mode == MEMORY_CACHE && !slot->dependency && now() - slot->touched < 30)
+  // A growing cache keeps weights used within keep_recently_used_weights.
+  if (mode == MEMORY_CACHE && !slot->dependency &&
+      now() - slot->touched <
+          slot->account->memory->times.keep_recently_used_weights)
     return 0;
   for (MemorySlot *child = slot->children; child; child = child->sibling)
     if (child->bytes && !evictable(child, wanted, n, mode)) return 0;
@@ -302,7 +333,8 @@ static MemorySlot *victim(Memory *memory, MemorySlot *const *wanted,
     if (useful > s->bytes) useful = s->bytes;
     if (useful > need) useful = need;
     double age = fmax(0, now() - s->touched),
-           score = exp(-age / 30) * (double)s->bytes / useful;
+           score = exp(-age / memory->times.keep_recently_used_weights) *
+                   (double)s->bytes / useful;
     if (!best || score < rank) best = s, rank = score;
   }
   return best;
