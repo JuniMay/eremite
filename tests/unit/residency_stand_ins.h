@@ -10,7 +10,7 @@
 // Buffers made resident, and buffers no longer resident.
 static int added, removed;
 
-static void stand_in_set_resident(const Buf *b, int resident) {
+[[maybe_unused]] static void stand_in_set_resident(const Buf *b, int resident) {
   (void)b;
   if (resident)
     added++;
@@ -18,9 +18,9 @@ static void stand_in_set_resident(const Buf *b, int resident) {
     removed++;
 }
 
-static void stand_in_commit_residency(Gpu *gpu) { (void)gpu; }
+[[maybe_unused]] static void stand_in_commit_residency(Gpu *gpu) { (void)gpu; }
 
-static uint64_t stand_in_working_set(Gpu *gpu) {
+[[maybe_unused]] static uint64_t stand_in_working_set(Gpu *gpu) {
   (void)gpu;
   return 0;
 }
