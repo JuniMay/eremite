@@ -15,16 +15,17 @@ static const char library[] =
     "}\n";
 
 int main(void) {
-  memory_set_limit(1ull << 30);
+  Memory *memory = memory_new();
+  memory_set_limit(memory, 1ull << 30);
   Gpu *gpu = gpu_new(library, sizeof library - 1);
   int add = gpu_find_kernel(gpu, "add");
   check(gpu_find_kernel(gpu, "add") == add,
         "a kernel asked for twice keeps its number");
 
-  uint64_t before = memory_usage().allocated;
-  Buf x = gpu_alloc(gpu, memory_shared(), 4),
-      y = gpu_alloc(gpu, memory_shared(), 4);
-  check(memory_usage().allocated == before + 2 * gpu_round_up_to_pages(4),
+  uint64_t before = memory_usage(memory).allocated;
+  Buf x = gpu_alloc(gpu, memory_shared(memory), 4),
+      y = gpu_alloc(gpu, memory_shared(memory), 4);
+  check(memory_usage(memory).allocated == before + 2 * gpu_round_up_to_pages(4),
         "each buffer is counted as whole pages");
 
   ((uint32_t *)x.ptr)[0] = 41;
@@ -41,7 +42,7 @@ int main(void) {
         "after a sync, the CPU reads what the kernel wrote");
 
   gpu_free(&x), gpu_free(&y);
-  check(!x.obj && memory_usage().allocated == before,
+  check(!x.obj && memory_usage(memory).allocated == before,
         "freed buffers are no longer counted");
   return failures != 0;
 }

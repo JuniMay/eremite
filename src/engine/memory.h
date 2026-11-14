@@ -17,6 +17,8 @@
 // evicted, oldest first. Otherwise state is evicted only once the rest of its
 // model is gone, so that loading experts never evicts state.
 
+// Holds the accounts, the limit, the reserve and the counts.
+typedef struct Memory Memory;
 typedef struct MemoryAccount MemoryAccount;
 typedef struct MemorySlot MemorySlot;
 
@@ -55,6 +57,8 @@ typedef enum {
 } MemoryKind;
 
 struct MemoryAccount {
+  // The Memory that holds the account.
+  Memory *memory;
   // Next account in the list.
   MemoryAccount *next;
   const char *name;
@@ -101,24 +105,30 @@ typedef struct {
   uint64_t evictions, refusals;
 } MemoryUsage;
 
+// Returns a new Memory with no limit and no reserve.
+Memory *memory_new(void);
+
 // Sets the limit in bytes. There is none at first.
-void memory_set_limit(uint64_t bytes);
+void memory_set_limit(Memory *memory, uint64_t bytes);
 
 // Sets the reserve to keep free for other programs. available() reads the
 // available memory. unwritten(), or null, reads the bytes counted but not yet
 // written, which count as used.
-void memory_set_reserve(uint64_t reserve, uint64_t (*available)(void),
+void memory_set_reserve(Memory *memory, uint64_t reserve,
+                        uint64_t (*available)(void),
                         uint64_t (*unwritten)(void));
 
 // The most memory the models may use now, within the limit and the reserve.
-uint64_t memory_current_limit(void);
+uint64_t memory_current_limit(Memory *memory);
 
-// Starts an empty account. Its state slots may hold up to state_limit bytes.
-void memory_account_init(MemoryAccount *account, const char *name,
-                         uint64_t state_limit);
+// Starts an empty account and adds it to memory. Its state slots may hold up
+// to state_limit bytes.
+void memory_account_init(Memory *memory, MemoryAccount *account,
+                         const char *name, uint64_t state_limit);
 
 // Starts an empty slot. dependency may be null. evict(context) frees its
-// contents; null means the slot is never evicted.
+// contents; null means the slot is never evicted. Ends the program if
+// dependency belongs to another Memory.
 void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
                       MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context);
@@ -141,7 +151,7 @@ void memory_set_ready(MemorySlot *slot, int ready);
 
 // Admits the slots: sets each slot's bytes to its size, evicting as mode
 // allows. Returns whether all fit. If not, nothing changes. Ends the program if
-// a slot is a state slot.
+// a slot is a state slot, or if the slots belong to different Memory objects.
 int memory_admit(MemorySlot *const *slots, const uint64_t *bytes, size_t count,
                  MemoryAdmission mode);
 
@@ -163,22 +173,25 @@ void memory_release(MemorySlot *slot, uint64_t bytes);
 void memory_shrink(MemorySlot *slot);
 
 // Returns the counts.
-MemoryUsage memory_usage(void);
+MemoryUsage memory_usage(const Memory *memory);
 
-// Sets a function that runs after evictions.
-void memory_collect_with(void (*collect)(void));
+// Sets a function that runs after slots are evicted, before the call that
+// evicted them returns. Use it to free memory that evict functions had to leave
+// for later, such as GPU buffers that unfinished GPU work still reads.
+void memory_set_eviction_callback(Memory *memory, void (*callback)(void));
 
-// Returns the shared slot: the one slot for memory that no model owns. Its
-// memory counts toward the limit. The slot has no evict function, so it is
-// never evicted, and its memory stops being counted as soon as it is released.
-MemorySlot *memory_shared(void);
+// Returns the shared slot: the slot for memory that the engine itself uses and
+// no model owns.
+// That memory counts toward the limit. The slot is never evicted, and its
+// memory stops being counted as soon as it is freed.
+MemorySlot *memory_shared(Memory *memory);
 
 // Returns the account's room: the bytes it may still add within the limit.
 uint64_t memory_room(const MemoryAccount *account);
 
 // Reclaims memory: evicts idle slots until bytes are freed or none is left.
 // Returns the bytes freed.
-uint64_t memory_reclaim(uint64_t bytes);
+uint64_t memory_reclaim(Memory *memory, uint64_t bytes);
 
 // Unloads the account: evicts its idle slots, its state slots last. Returns the
 // bytes freed.
@@ -192,7 +205,8 @@ void *memory_host_alloc(MemorySlot *slot, size_t bytes);
 // slot is null or the memory does not fit.
 void *memory_host_alloc_required(MemorySlot *slot, size_t bytes);
 
-// Frees host memory, also memory from plain malloc.
-void memory_host_free(void *pointer);
+// Frees host memory counted in slot, also memory from plain malloc. Ends the
+// program if slot is null or the memory was counted in another slot.
+void memory_host_free(MemorySlot *slot, void *pointer);
 
 #endif
