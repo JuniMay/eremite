@@ -18,9 +18,6 @@ static double clock_now = 100;
 static int order[16], order_count;
 // The available memory that the system reports to the reserve.
 static uint64_t available_bytes;
-// The times the eviction callback ran.
-static int callbacks;
-
 // Memory that another program released, and the bytes of it that come back to
 // the system's counts at each sleep.
 static uint64_t coming_back, coming_back_step;
@@ -671,12 +668,14 @@ static void memories_count_separately(void) {
           memory_usage(second).limit == UINT64_MAX);
 }
 
-static void count_callback(void) { callbacks++; }
+// Counts a call in the int at counter.
+static void count_callback(void *counter) { (*(int *)counter)++; }
 
 static void callback_runs_after_evictions(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 100);
-  memory_set_eviction_callback(memory, count_callback);
+  int callbacks = 0;
+  memory_set_eviction_callback(memory, count_callback, &callbacks);
   MemoryAccount a, b, s;
   memory_account_init(memory, &a, "A", 0);
   memory_account_init(memory, &b, "B", 0);

@@ -517,3 +517,12 @@ void gpu_check_finished(Gpu *gpu) {
     count++;
   check_finished(gpu, count);
 }
+
+void gpu_return_freed_memory(Gpu *gpu) {
+  // Check first. The check may free resident buffers. They leave their
+  // residency sets only at the commit below.
+  gpu_check_finished(gpu);
+  gpu_commit_residency(gpu);
+  objc_autoreleasePoolPop(gpu->pool);
+  gpu->pool = objc_autoreleasePoolPush();
+}

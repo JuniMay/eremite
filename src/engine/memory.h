@@ -228,10 +228,13 @@ void memory_shrink(MemorySlot *slot);
 // Returns the counts.
 MemoryUsage memory_usage(const Memory *memory);
 
-// Sets a function that runs after slots are evicted, before the call that
-// evicted them returns. Use it to free memory that evict functions had to leave
-// for later, such as GPU buffers that unfinished GPU work still reads.
-void memory_set_eviction_callback(Memory *memory, void (*callback)(void));
+// Sets the eviction callback and its argument. The Memory object calls
+// callback(context) right after it evicts slots. Use the callback to return
+// freed memory to the system. For example, a residency set or the autorelease
+// pool can still hold the memory of a freed Metal buffer.
+void memory_set_eviction_callback(Memory *memory,
+                                  void (*callback)(void *context),
+                                  void *context);
 
 // Returns the shared slot: the slot for memory that the engine itself uses and
 // no model owns.

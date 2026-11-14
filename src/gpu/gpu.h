@@ -161,4 +161,14 @@ void gpu_sync(Gpu *gpu);
 // command buffers have now all finished.
 void gpu_check_finished(Gpu *gpu);
 
+// Returns the memory of freed buffers to the system. It does three things:
+// - It frees each buffer marked to be freed, if its GPU work has finished.
+// - It commits the residency sets. A residency set holds a freed buffer's
+//   memory until the set is committed.
+// - It empties the autorelease pool. The pool can still hold freed Metal
+//   objects.
+// Call this right after an eviction. Then the freed memory is back before the
+// next allocation.
+void gpu_return_freed_memory(Gpu *gpu);
+
 #endif

@@ -25,8 +25,10 @@ struct Memory {
   MemorySlot *slots;
   // The limit and the counts.
   MemoryUsage usage;
-  // The function that runs after slots are evicted, or null.
-  void (*eviction_callback)(void);
+  // The eviction callback, or null.
+  void (*eviction_callback)(void *context);
+  // The eviction callback's argument.
+  void *eviction_context;
   // The kernel's count of available memory lags behind this program. So each
   // reading is corrected for what this program used since, and bytes counted
   // but not yet written count as used.
@@ -396,7 +398,8 @@ uint64_t memory_reclaim(Memory *memory, uint64_t bytes) {
     evict_slot(slot);
   }
   uint64_t freed = before - usage->allocated;
-  if (freed && memory->eviction_callback) memory->eviction_callback();
+  if (freed && memory->eviction_callback)
+    memory->eviction_callback(memory->eviction_context);
   return freed;
 }
 
@@ -416,7 +419,8 @@ uint64_t memory_unload(MemoryAccount *account) {
       }
   }
   uint64_t freed = before - memory->usage.allocated;
-  if (freed && memory->eviction_callback) memory->eviction_callback();
+  if (freed && memory->eviction_callback)
+    memory->eviction_callback(memory->eviction_context);
   return freed;
 }
 
@@ -496,7 +500,8 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
   for (size_t i = 0; i < n; i++)
     change(wanted[i],
            sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
-  if (evicted && memory->eviction_callback) memory->eviction_callback();
+  if (evicted && memory->eviction_callback)
+    memory->eviction_callback(memory->eviction_context);
   return 1;
 }
 
@@ -621,7 +626,8 @@ static int within_state_limit(MemorySlot *slot, uint64_t bytes) {
     evict_slot(oldest);
     evicted = 1;
   }
-  if (evicted && memory->eviction_callback) memory->eviction_callback();
+  if (evicted && memory->eviction_callback)
+    memory->eviction_callback(memory->eviction_context);
   return 1;
 }
 
@@ -653,8 +659,11 @@ void memory_shrink(MemorySlot *slot) { change(slot, slot->payload); }
 
 MemoryUsage memory_usage(const Memory *memory) { return memory->usage; }
 
-void memory_set_eviction_callback(Memory *memory, void (*callback)(void)) {
+void memory_set_eviction_callback(Memory *memory,
+                                  void (*callback)(void *context),
+                                  void *context) {
   memory->eviction_callback = callback;
+  memory->eviction_context = context;
 }
 
 uint64_t memory_room(const MemoryAccount *account) {
