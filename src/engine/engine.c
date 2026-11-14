@@ -1,0 +1,554 @@
+#include "eremite.h"
+#include "base/error.h"
+#include "base/log.h"
+#include "base/shutdown.h"
+#include "engine/draft_choice.h"
+#include "engine/expert_store.h"
+#include "engine/lookup.h"
+#include "engine/media.h"
+#include "engine/memory.h"
+#include "engine/pass.h"
+#include "engine/sampling.h"
+#include "engine/state_file.h"
+#include "engine/tokenizer.h"
+#include "gpu/gpu.h"
+#include "kernels/library.h"
+#include "model/deepseek/model.h"
+#include "model/model.h"
+#include "platform/system_memory.h"
+#include "platform/threads.h"
+#include <math.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+// The engine behind the C ABI of eremite.h: the process's log and stop, and
+// for each model its loading, its work on states and snapshots, sampling,
+// context-copy drafts, images, statistics and its tokenizer. Requests, their
+// scheduling and the prefix cache are the server's.
+
+struct eremite_sampler {
+  Sampler sp;
+};
+
+struct eremite_model {
+  Model *m;
+  const ModelOps *ops;
+  Tokenizer *tk;
+  Options opt;
+  char *dir;
+  atomic_int loaded;
+  // eremite_state_identity's, once known.
+  uint8_t identity[32];
+  int identified;
+};
+
+struct eremite_media {
+  eremite_model *m;
+  Media *items;
+  int n;
+};
+
+static eremite_process proc;
+static int initialized;
+// The models registered, one of each family.
+static eremite_model *models[8];
+static int nmodels;
+// The memory that every model is counted in, made by eremite_init, and the
+// GPU that the models run on, made when the first model loads.
+static Memory *memory;
+static Gpu *gpu;
+
+// What the engine thread does. The GPU's idle times are split by it.
+enum {
+  // Outside eremite_run_streams.
+  THREAD_OUTSIDE,
+  // Running a pass.
+  THREAD_PASS,
+  // No pass can go on, and one waits for the GPU.
+  THREAD_WAIT_GPU,
+  // No pass can go on, none waits for the GPU, and one waits for reads.
+  THREAD_WAIT_READ,
+  // No pass can go on, and none waits for the GPU or for reads.
+  THREAD_WAIT_OTHER,
+  // The number of states.
+  THREAD_STATES
+};
+
+static_assert(THREAD_STATES <= GPU_THREAD_STATES,
+              "the GPU splits its idle times by every engine-thread state");
+
+// The Memory object's eviction callback.
+static void after_evictions(void *gpu) { gpu_return_freed_memory(gpu); }
+
+// Returns the GPU, made with the kernel library at the first call.
+static Gpu *models_gpu(void) {
+  if (!gpu) {
+    size_t length;
+    const char *source = kernel_library_source(&length);
+    gpu = gpu_new(source, length);
+    if (proc.gpu_timeout_seconds > 0)
+      gpu_set_signal_timeout(gpu, proc.gpu_timeout_seconds);
+    memory_set_eviction_callback(memory, after_evictions, gpu);
+  }
+  return gpu;
+}
+
+// The state memory of every model.
+static uint64_t state_bytes(void) {
+  uint64_t bytes = 0;
+  for (int i = 0; i < nmodels; i++) bytes += models[i]->m->memory.state_bytes;
+  return bytes;
+}
+
+// The log is say(): one line per event, to the caller's on_log (log_hook) or
+// stderr.
+void eremite_log(const char *line) { say("%s", line); }
+
+// ---- the process ----
+
+int eremite_init(const eremite_process *p) {
+  if (!p || p->abi != EREMITE_ABI || initialized) return -1;
+  if (p->reserve_gb && !(p->reserve_gb >= EXPERT_STORE_RESERVE_GIB_MIN &&
+                         p->reserve_gb <= EXPERT_STORE_RESERVE_GIB_MAX))
+    return -1;
+  const double settings[] = {p->gpu_timeout_seconds,
+                             p->freed_memory_delay_seconds,
+                             p->available_memory_reading_interval_seconds,
+                             p->available_memory_reading_max_age_seconds,
+                             p->keep_recently_used_weights_seconds,
+                             p->free_pages_only_after_swapout_seconds,
+                             p->expert_cache_growth_margin_gb,
+                             p->gpu_memory_limit_margin_gb};
+  for (size_t i = 0; i < sizeof settings / sizeof *settings; i++)
+    if (!isfinite(settings[i]) || settings[i] < 0) return -1;
+  memory = memory_new();
+  expert_store_set_memory(
+      memory,
+      (MemorySettings){
+          .model_gib = p->memory_gb,
+          .reserve_gib = p->reserve_gb,
+          .times = {.freed_memory_delay = p->freed_memory_delay_seconds,
+                    .available_memory_reading_interval =
+                        p->available_memory_reading_interval_seconds,
+                    .available_memory_reading_max_age =
+                        p->available_memory_reading_max_age_seconds,
+                    .keep_recently_used_weights =
+                        p->keep_recently_used_weights_seconds},
+          .free_pages_only_after_swapout =
+              p->free_pages_only_after_swapout_seconds,
+          .expert_cache_growth_margin_gib = p->expert_cache_growth_margin_gb,
+          .gpu_memory_limit_margin_gib = p->gpu_memory_limit_margin_gb});
+  proc = *p;
+  die_hook = p->on_die;
+  log_hook = p->on_log;
+  threads_set_priority(
+      THREADS_INTERACTIVE);  // the models' GPU work goes before background work
+  // SIGINT and SIGTERM request a stop, which ends a load and lets the server
+  // save its states.
+  shutdown_watch(p->on_stop);
+  initialized = 1;
+  return 0;
+}
+
+int eremite_is_stopping(void) { return shutdown_requested(); }
+
+int eremite_count_stop_requests(void) { return shutdown_requests(); }
+
+void eremite_request_stop(void) { shutdown_request(); }
+
+// ---- models ----
+
+static char *copy(const char *s) { return s ? strdup(s) : 0; }
+
+eremite_model *eremite_open(const eremite_config *c) {
+  if (!initialized || !c || c->abi != EREMITE_ABI || !c->model) return NULL;
+  const ModelOps *ops = model_find_family(c->model);
+  const eremite_deepseek_config *d = &c->deepseek;
+  Options options = {.ctx = c->ctx,
+                     .lookup = c->lookup,
+                     .dump_fd = -1,
+                     .routes_fd = -1,
+                     .quiet = 1,
+                     .draft = d->draft,
+                     .deepseek.substitute = d->substitute,
+                     .deepseek.experts = d->experts,
+                     .deepseek.ced = d->ced,
+                     .deepseek.prefill_prune = d->prefill_prune};
+  const char *bad = options.ctx < 1 || options.ctx > 1 << 20
+                        ? "ctx takes 1 to 1048576 tokens"
+                    : options.draft < 0 || options.draft > BLOCK
+                        ? "draft exceeds this model's proposal limit"
+                    : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
+                        ? "lookup takes off or 1 to 15 proposals"
+                    : d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
+                        ? "ced takes off or 128 to 1048576 replay tokens"
+                        : NULL;
+  if (bad) {
+    say("%s: %s", c->model, bad);
+    return NULL;
+  }
+  for (int i = 0; i < nmodels; i++)
+    if (models[i]->ops == ops) {
+      say("%s: a %s model is registered already", c->model, ops->family);
+      return NULL;
+    }
+  eremite_model *x = xmalloc(sizeof *x);
+  atomic_init(&x->loaded, 0);
+  x->ops = ops;
+  x->opt = options;
+  x->opt.deepseek.experts = copy(options.deepseek.experts);
+  x->tk = tokenizer_open(c->model, ops->media_token);
+  x->dir = copy(c->model);
+  x->m = model_create(memory, NULL, x->dir);
+  models[nmodels++] = x;
+  say("%s: registered %s; weights load on first inference request", c->model,
+      ops->family);
+  return x;
+}
+
+int eremite_is_loaded(const eremite_model *m) {
+  if (!atomic_load_explicit(&m->loaded, memory_order_acquire)) return 0;
+  MemorySlot *slot =
+      m->ops->dense_weight_slot ? m->ops->dense_weight_slot() : NULL;
+  return !slot || memory_ready(slot);
+}
+
+void eremite_set_request_running(eremite_model *m, int active) {
+  model_set_request_running(m->m, active);
+}
+
+int eremite_load(eremite_model *m) {
+  int was_loaded = eremite_is_loaded(m);
+  m->m->gpu = models_gpu();
+  if (!model_load(m->m, &m->opt)) {
+    model_set_request_running(m->m, 0);
+    MemoryUsage u = memory_usage(memory);
+    uint64_t limit = memory_current_limit(memory);
+    if (shutdown_requested())
+      say("%s: loading stopped", m->dir);
+    else
+      say("%s: not loaded: it does not fit; %.1f GiB more model memory fits "
+          "now (%.1f GiB held, %.1f GiB of state "
+          "memory)",
+          m->dir,
+          (limit > u.committed ? limit - u.committed : 0) / 1073741824.0,
+          u.committed / 1073741824.0, state_bytes() / 1073741824.0);
+    return 0;
+  }
+  model_set_request_running(m->m, 1);
+  atomic_store_explicit(&m->loaded, 1, memory_order_release);
+  if (!was_loaded)
+    say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
+        "prefill: ced_depth=%d (%s), dependency "
+        "pruning=%s",
+        m->dir, m->ops->family, m->opt.ctx, m->ops->drafts_per_pass(),
+        m->ops->rewind_margin(), m->opt.lookup, m->opt.deepseek.ced,
+        m->opt.deepseek.ced ? "approximate" : "off",
+        m->opt.deepseek.prefill_prune ? "on" : "off");
+  return 1;
+}
+
+int eremite_run_idle_work(eremite_model *m) {
+  if (!atomic_load_explicit(&m->loaded, memory_order_acquire)) return 0;
+  ModelCounters c;
+  m->ops->read_counters(&c);
+  int before = c.cache_slots, after = m->ops->run_idle_work();
+  if (after < before)
+    say("idle: memory short, expert cache %d -> %d slots", before, after);
+  return after;
+}
+
+double eremite_idle_work_interval_seconds(void) {
+  return memory ? memory_times(memory).available_memory_reading_interval : 0;
+}
+
+int eremite_max_rows(const eremite_model *m) { return m->ops->max_rows(); }
+
+int eremite_drafts_per_pass(const eremite_model *m) {
+  return eremite_is_loaded(m) ? m->ops->drafts_per_pass() : m->opt.draft;
+}
+
+int eremite_max_verify(const eremite_model *m) { return m->ops->max_verify(); }
+
+int eremite_rewind_margin(const eremite_model *m) {
+  return m->ops->rewind_margin();
+}
+
+int eremite_vocab_size(const eremite_model *m) { return m->ops->vocab_size(); }
+
+int eremite_is_stop_token(const eremite_model *m, int32_t token) {
+  return m->ops->is_stop_token(token);
+}
+
+// ---- saved states ----
+
+static void identity_number(CC_SHA256_CTX *h, int64_t v) {
+  CC_SHA256_Update(h, &v, sizeof v);
+}
+
+void eremite_state_identity(eremite_model *m, uint8_t out[32]) {
+  if (!m->identified) {
+    CC_SHA256_CTX h;
+    CC_SHA256_Init(&h);
+    static const char tag[] = "eremite saved state";
+    CC_SHA256_Update(&h, tag, sizeof tag);
+    CC_SHA256_Update(&h, m->ops->family, (CC_LONG)strlen(m->ops->family) + 1);
+    identity_number(&h, m->ops->state_version);
+    identity_add_folder(&h, m->dir);
+    identity_number(&h, m->opt.draft);
+    identity_number(&h, m->opt.lookup);
+    const DeepSeekOptions *d = &m->opt.deepseek;
+    uint32_t substitute;
+    memcpy(&substitute, &d->substitute, sizeof substitute);
+    identity_number(&h, d->ced);
+    identity_number(&h, d->prefill_prune);
+    identity_number(&h, substitute);
+    identity_number(&h, d->experts != NULL);
+    if (d->experts) identity_add_gguf_set(&h, d->experts);
+    CC_SHA256_Final(m->identity, &h);
+    m->identified = 1;
+  }
+  memcpy(out, m->identity, 32);
+}
+
+// ---- sampling ----
+
+eremite_sampler *eremite_sampler_new(double temperature, double top_p,
+                                     int top_k, uint64_t seed, int seed_set) {
+  Sampler sp = {.temperature = temperature, .top_p = top_p, .top_k = top_k};
+  if (!sampler_is_valid(&sp)) return 0;
+  eremite_sampler *s = xmalloc(sizeof *s);
+  s->sp = sp;
+  if (seed_set)
+    sampler_set_seed(&s->sp, seed);
+  else
+    arc4random_buf(s->sp.seed, sizeof s->sp.seed);
+  return s;
+}
+
+void eremite_sampler_free(eremite_sampler *s) { free(s); }
+
+int32_t eremite_sample(const eremite_model *m, const float *logits,
+                       eremite_sampler *s) {
+  return sample_token(logits, m->ops->vocab_size(), &s->sp);
+}
+
+int32_t eremite_sample_verify_drafts(const eremite_model *m,
+                                     const float *logits, const int32_t *drafts,
+                                     int n, const double *q, eremite_sampler *s,
+                                     int *accepted) {
+  return sample_verify_sampled_drafts(logits, m->ops->vocab_size(), drafts, n,
+                                      q, m->ops->is_stop_token, &s->sp,
+                                      accepted);
+}
+
+// ---- context-copy drafts ----
+
+eremite_lookup *eremite_lookup_new(int capacity) {
+  return context_lookup_new(capacity);
+}
+
+void eremite_lookup_free(eremite_lookup *x) { context_lookup_free(x); }
+
+int eremite_lookup_append(eremite_lookup *x, const int32_t *tokens, int n) {
+  return context_lookup_append(x, tokens, n);
+}
+
+int eremite_lookup_propose(const eremite_lookup *x, int max, int32_t *drafts) {
+  ContextDraft d = context_lookup_propose(x, max);
+  memcpy(drafts, d.tokens, (size_t)d.count * sizeof *drafts);
+  return d.count;
+}
+
+void eremite_lookup_record_verification(eremite_lookup *x, int offered,
+                                        int accepted) {
+  context_lookup_record_verification(x, offered, accepted);
+}
+
+eremite_draft_choice *eremite_draft_choice_new(void) {
+  eremite_draft_choice *x = xmalloc(sizeof *x);
+  draft_choice_init(x);
+  return x;
+}
+
+void eremite_draft_choice_free(eremite_draft_choice *x) { free(x); }
+
+int eremite_draft_choice_next_count(eremite_draft_choice *x, int most) {
+  return draft_choice_next_count(x, most);
+}
+
+void eremite_draft_choice_record_pass(eremite_draft_choice *x, int count,
+                                      int kept, double seconds) {
+  draft_choice_record_pass(x, count, kept, seconds);
+}
+
+// ---- statistics ----
+
+static eremite_cache_counts counts(const ExpertStoreCounts *c) {
+  return (eremite_cache_counts){.hits = c->hits,
+                                .misses = c->misses,
+                                .prefetch_hits = c->prefetch_hits,
+                                .prefetches = c->prefetches,
+                                .bytes = c->bytes,
+                                .evictions = c->evictions,
+                                .late = c->late,
+                                .cancelled = c->cancelled,
+                                .substituted = c->substituted,
+                                .remaps = c->remaps,
+                                .given_back = c->given_back,
+                                .row_own = c->row_own,
+                                .row_ahead = c->row_ahead,
+                                .row_late = c->row_late,
+                                .row_sub = c->row_sub,
+                                .row_ssd = c->row_ssd,
+                                .read_s = c->read_s};
+}
+
+int eremite_read_routes(const eremite_model *m, int row, uint16_t *experts,
+                        uint8_t *sources) {
+  return m->ops->read_routes ? m->ops->read_routes(row, experts, sources) : 0;
+}
+
+static eremite_stats process_stats;
+
+void eremite_refresh_stats(void) {
+  SystemMemoryInfo mi;
+  system_memory_read_info(&mi);
+  uint64_t target =
+      gpu ? gpu_recommended_working_set(gpu) : 0;  // 0 before the GPU is made
+  process_stats =
+      (eremite_stats){.footprint = system_memory_footprint(),
+                      .gpu_in_use = system_memory_gpu_driver(),
+                      .available = system_memory_available(),
+                      .gpu_limit = target ? (int64_t)target : INT64_MAX,
+                      .total = mi.total,
+                      .free = mi.free,
+                      .file = mi.file,
+                      .file_kept = mi.file_kept,
+                      .wired = mi.wired,
+                      .compressor = mi.compressor,
+                      .compressed = mi.compressed,
+                      .swap_used = mi.swap_used,
+                      .swapouts = mi.swapouts,
+                      .pressure = mi.pressure};
+}
+
+uint64_t eremite_reclaim(uint64_t bytes) {
+  return memory_reclaim(memory, bytes);
+}
+
+uint64_t eremite_unload(eremite_model *m) {
+  return memory_unload(&m->m->memory);
+}
+
+eremite_memory_info eremite_read_memory(void) {
+  MemoryUsage usage = memory_usage(memory);
+  return (eremite_memory_info){usage.limit, usage.allocated, state_bytes()};
+}
+
+void eremite_set_memory_limit(uint64_t bytes) {
+  memory_set_limit(memory, bytes);
+}
+
+void eremite_drain(void) {
+  if (gpu) gpu_sync(gpu), gpu_commit_residency(gpu);
+  expert_store_wait_for_all_reads();
+}
+
+void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
+  ModelCounters c = {0};
+  if (atomic_load_explicit(&m->loaded, memory_order_acquire))
+    m->ops->read_counters(&c);
+  *s = process_stats;
+  eremite_stats model = {.decode = counts(&c.decode),
+                         .prefill = counts(&c.prefill),
+                         .decode_rows = c.decode_rows,
+                         .prefill_rows = c.prefill_rows,
+                         .decode_seconds = c.decode_seconds,
+                         .decode_gpu_seconds = c.decode_gpu_seconds,
+                         .prefill_layer = c.prefill_layer,
+                         .prefill_rows_now = c.prefill_rows_now,
+                         .dense_bytes = c.dense_bytes,
+                         .layers = c.layers,
+                         .experts_per_row = c.experts_per_row,
+                         .routed_layers = c.routed_layers,
+                         .experts_per_layer = c.experts_per_layer};
+  s->decode = model.decode;
+  s->prefill = model.prefill;
+  s->decode_rows = model.decode_rows;
+  s->prefill_rows = model.prefill_rows;
+  s->decode_seconds = model.decode_seconds;
+  s->decode_gpu_seconds = model.decode_gpu_seconds;
+  s->prefill_layer = model.prefill_layer;
+  s->prefill_rows_now = model.prefill_rows_now;
+  s->dense_bytes = model.dense_bytes;
+  s->layers = model.layers;
+  s->experts_per_row = model.experts_per_row;
+  s->routed_layers = model.routed_layers;
+  s->experts_per_layer = model.experts_per_layer;
+  MemoryUsage usage = memory_usage(memory);
+  s->model_memory_limit = memory_current_limit(memory);
+  s->model_memory_used = usage.allocated;
+  s->model_memory_committed = usage.committed;
+  s->model_memory_peak = usage.peak;
+  s->state_allocated = state_bytes();
+  s->model_workspace = m->m->memory.bytes - c.dense_bytes - c.cache_bytes;
+  s->cache = counts(&c.cache);
+  s->slots = c.cache_slots;
+  s->mapped = c.mapped;
+  s->cap = c.cap;
+  s->max_slots = c.max_slots;
+  s->experts = c.experts;
+  s->slot_bytes = c.slot_bytes;
+  s->cache_bytes = c.cache_bytes;
+  s->uncached_bytes = c.uncached_bytes;
+  s->uncached = c.uncached;
+  _Static_assert(THREAD_STATES == sizeof s->thread_s / sizeof *s->thread_s,
+                 "one time per engine-thread state");
+  GpuTimes times = gpu ? gpu_times(gpu) : (GpuTimes){0};
+  for (int k = 0; k < THREAD_STATES; k++)
+    s->thread_s[k] = times.thread_seconds[k],
+    s->gpu_idle_s[k] = times.idle_by_state[k];
+  s->gpu_busy_s = times.busy_seconds;
+  expert_store_read_times(&s->ssd_busy_s, &s->demand_read_s,
+                          &s->background_read_s);
+}
+
+// ---- tokenizers, from any thread ----
+
+eremite_tokenizer *eremite_model_tokenizer(const eremite_model *m) {
+  return m->tk;
+}
+
+eremite_tokenizer *eremite_tokenizer_open(const char *dir, const char *image) {
+  return tokenizer_open(dir, image);
+}
+
+int eremite_tokenize(eremite_tokenizer *t, const char *text, size_t len,
+                     int mode, int32_t *out, int max) {
+  if (mode < TOKENIZE_TEXT || mode > TOKENIZE_PROMPT) return -1;
+  int *p = xmalloc((len + 2) * sizeof *p);  // a token takes at least one byte
+  int n =
+      tokenizer_encode_bytes(t, text, len, (TokenizeMode)mode, p, (int)len + 2);
+  if (n <= max) memcpy(out, p, (size_t)n * sizeof *p);
+  free(p);
+  return n <= max ? n : -1;
+}
+
+const char *eremite_token_bytes(const eremite_tokenizer *t, int32_t id,
+                                size_t *len) {
+  int n;
+  const char *s = tokenizer_token_bytes(t, id, &n);
+  *len = (size_t)n;
+  return s;
+}
+
+int eremite_token_kind(const eremite_tokenizer *t, int32_t id) {
+  return tokenizer_token_kind(t, id);
+}
+
+int32_t eremite_find_added_token(const eremite_tokenizer *t, const char *text,
+                                 size_t len) {
+  return tokenizer_find_added(t, text, len);
+}
