@@ -118,6 +118,8 @@ struct Gpu {
   uint64_t begun;
   uint64_t *open;
   int nopen, open_cap;
+  // The open command buffers that were begun in the queue.
+  int open_in_queue;
   // The buffers marked to be freed, which wait for command buffers to finish.
   MarkedBuffer *marked;
   int nmarked, marked_cap;
@@ -402,8 +404,10 @@ static GpuCommandBuffer begin(Gpu *gpu, int in_queue) {
   gpu->open = room_for_one_more(gpu->open, gpu->nopen, &gpu->open_cap,
                                 sizeof *gpu->open);
   gpu->open[gpu->nopen++] = ++gpu->begun;
-  return (GpuCommandBuffer){
-      gpu, buffer, [[buffer computeCommandEncoder] retain], gpu->begun};
+  gpu->open_in_queue += in_queue;
+  return (GpuCommandBuffer){gpu, buffer,
+                            [[buffer computeCommandEncoder] retain], gpu->begun,
+                            in_queue};
 }
 
 GpuCommandBuffer gpu_begin(Gpu *gpu) { return begin(gpu, 1); }
@@ -437,6 +441,7 @@ void gpu_commit(GpuCommandBuffer *c) {
   id<MTLCommandBuffer> buffer = c->buffer;
   [buffer commit];
   move_to_done(c->gpu, buffer, c->number);
+  c->gpu->open_in_queue -= c->in_queue;
   [buffer release];
   c->buffer = NULL;
   c->encoder = NULL;
@@ -627,12 +632,18 @@ void gpu_wait_for_clock_keeper(GpuClockKeeper *keeper) {
   [keeper->last waitUntilCompleted];
 }
 
-// Ends the program for a value not signaled in time: with the error of a
-// failed command buffer if there is one, since its signals never come.
-static void unsignaled(Gpu *gpu, uint64_t value) {
+// Ends the program if a committed command buffer that is not checked yet
+// failed.
+static void check_errors(const Gpu *gpu) {
   for (int i = 0; i < gpu->ndone; i++)
     if ([gpu->done[i].buffer status] == MTLCommandBufferStatusError)
       die("GPU: %s", describe([gpu->done[i].buffer error]));
+}
+
+// Ends the program for a value not signaled in time: with the error of a
+// failed command buffer if there is one, since its signals never come.
+static void unsignaled(Gpu *gpu, uint64_t value) {
+  check_errors(gpu);
   die("GPU: value %llu not signaled in %.1f s", (unsigned long long)value,
       gpu->signal_timeout_ms / 1000.0);
 }
@@ -644,6 +655,15 @@ void gpu_wait_signal(GpuEvent *event, uint64_t value) {
   if (![event->event waitUntilSignaledValue:value
                                   timeoutMS:event->gpu->signal_timeout_ms])
     unsignaled(event->gpu, value);
+}
+
+int gpu_has_signaled(GpuEvent *event, uint64_t value) {
+  if (value > event->signaled)
+    die("GPU: checking for value %llu, which the event never gave out",
+        (unsigned long long)value);
+  if ([event->event signaledValue] >= value) return 1;
+  check_errors(event->gpu);
+  return 0;
 }
 
 void gpu_set_signal_timeout(Gpu *gpu, double seconds) {
@@ -675,6 +695,40 @@ void gpu_check_finished(Gpu *gpu) {
     count++;
   check_finished(gpu, count);
 }
+
+// Returns where the command buffer numbered number is in done, or -1 if it is
+// checked already. Ends the program if it was never begun or is still open.
+static int committed_at(const Gpu *gpu, uint64_t number) {
+  if (number == 0 || number > gpu->begun)
+    die("GPU: command buffer %llu was never begun", (unsigned long long)number);
+  for (int i = 0; i < gpu->nopen; i++)
+    if (gpu->open[i] == number)
+      die("GPU: command buffer %llu is still open", (unsigned long long)number);
+  for (int i = 0; i < gpu->ndone; i++)
+    if (gpu->done[i].number == number) return i;
+  return -1;
+}
+
+int gpu_has_finished(Gpu *gpu, uint64_t number) {
+  int at = committed_at(gpu, number);
+  if (at < 0) return 1;
+  id<MTLCommandBuffer> c = gpu->done[at].buffer;
+  MTLCommandBufferStatus status = [c status];
+  if (status == MTLCommandBufferStatusError)
+    die("GPU: %s", describe([c error]));
+  return status == MTLCommandBufferStatusCompleted;
+}
+
+void gpu_wait_until_finished(Gpu *gpu, uint64_t number) {
+  int at = committed_at(gpu, number);
+  if (at < 0) return;
+  id<MTLCommandBuffer> c = gpu->done[at].buffer;
+  [c waitUntilCompleted];
+  if ([c status] == MTLCommandBufferStatusError)
+    die("GPU: %s", describe([c error]));
+}
+
+int gpu_count_uncommitted_in_queue(Gpu *gpu) { return gpu->open_in_queue; }
 
 GpuTimes gpu_times(Gpu *gpu) { return gpu->times; }
 

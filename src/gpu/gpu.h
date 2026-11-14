@@ -41,6 +41,8 @@ typedef struct {
   void *encoder;
   // Its number: command buffers are numbered in the order they are begun.
   uint64_t number;
+  // Whether it was begun in the queue, rather than detached.
+  int in_queue;
 } GpuCommandBuffer;
 
 // An event: a counter on the GPU. Command buffers raise it as they run, and the
@@ -184,6 +186,11 @@ uint64_t gpu_signal(GpuCommandBuffer *c, GpuEvent *event);
 // signaled within the GPU's signal timeout.
 void gpu_wait_signal(GpuEvent *event, uint64_t value);
 
+// Returns whether the GPU has signaled value on event, without waiting. Ends
+// the program if the event never gave out value, or if a command buffer
+// failed.
+int gpu_has_signaled(GpuEvent *event, uint64_t value);
+
 // Sets how long a wait for a signal lasts, in seconds, before it ends the
 // program. The default is a minute.
 void gpu_set_signal_timeout(Gpu *gpu, double seconds);
@@ -209,6 +216,19 @@ void gpu_sync(Gpu *gpu);
 // Ends the program if one of them failed. Frees the marked buffers whose
 // command buffers have now all finished.
 void gpu_check_finished(Gpu *gpu);
+
+// Returns whether the command buffer numbered number has finished, without
+// waiting. Ends the program if it was never begun, if it is not committed
+// yet, or if it failed.
+int gpu_has_finished(Gpu *gpu, uint64_t number);
+
+// Waits until the command buffer numbered number has finished. Ends the
+// program if it was never begun, if it is not committed yet, or if it failed.
+void gpu_wait_until_finished(Gpu *gpu, uint64_t number);
+
+// Returns how many command buffers begun in the queue are not committed yet.
+// Each one holds back the command buffers begun after it.
+int gpu_count_uncommitted_in_queue(Gpu *gpu);
 
 // The GPU's times, counted when command buffers are checked.
 typedef struct {
