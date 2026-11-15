@@ -62,7 +62,8 @@ int main(int argc, char **argv) {
     snprintf(prompt, sizeof prompt, "[%d] Count from 1 to 100.", r);
     int ids[64], n = tokenizer_encode_with_added(tokenizer, prompt, ids, 64);
     states[r] = ops->state_new();
-    const float *logits = ops->prefill(states[r], ids, n, 0, 0, -1, NULL, NULL);
+    const float *logits =
+        ops->prefill(states[r], ids, n, 0, 0, -1, NULL, NULL, NULL);
     tokens[r] = sample_greedy(logits, ops->vocab_size()), positions[r] = n;
   }
   for (int step = 0; step < STEPS; step++)

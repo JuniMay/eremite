@@ -2636,8 +2636,10 @@ static PrefillPrune decoder_plan(int pos, int count) {
 
 // Runs the prompt's rows through every layer. Quitting stops it before its
 // next batch of rows: it returns 0, and the state's rows from pos0 on are
-// then incomplete.
-static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
+// then incomplete. A non-null wait is waited for before each batch's routed
+// experts, while the prefill holds none.
+static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0,
+                   const PassWait *wait) {
   if (pos0 + n > opt.ctx) die("context full (%d tokens)", opt.ctx);
   ced_active = ced_first != 0;
   prompt_pass = 1;
@@ -2735,6 +2737,7 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0) {
                   : next_rows > BULK_ROWS     ? EXPERTS
                                               : 8;
       if (prefill_prune_active && !next_rows) ahead = 0;
+      if (wait) pass_wait(wait);
       routed_batch(c, &b, l, ahead, 2 * EXPERTS, opt.deepseek.substitute > 0);
       model_commit(c);
     }
@@ -2843,7 +2846,7 @@ static int prepare_rows(int rows, int prompt) {
 
 static const float *forward(GpuCommandBuffer *c, const int *tokens, int n,
                             int pos, int prefix_pos, char *prefix_dst,
-                            int prompt) {
+                            int prompt, const PassWait *wait) {
   if (n < 1 || pos < 0 || n > opt.ctx - pos) die("invalid forward range");
   if (prefix_pos >= 0 && (prefix_pos <= pos || prefix_pos >= pos + n))
     die("invalid prefix snapshot position");
@@ -2871,7 +2874,7 @@ static const float *forward(GpuCommandBuffer *c, const int *tokens, int n,
     if ((k > 1 || prompt) && opt.dump_fd < 0) {
       float *every = all_logits;
       if (every) all_logits = every + (size_t)done * VOCAB;
-      int completed = prefill(c, tokens + done, k, pos + done);
+      int completed = prefill(c, tokens + done, k, pos + done, wait);
       all_logits = every;
       if (!completed) {  // quitting stopped it: no logits, and no snapshot of
                          // its rows
@@ -2898,11 +2901,12 @@ static const float *forward(GpuCommandBuffer *c, const int *tokens, int n,
 
 const float *deepseek_forward(const int *tokens, int n, int pos) {
   GpuCommandBuffer cmd = {0};
-  return forward(&cmd, tokens, n, pos, -1, 0, 0);
+  return forward(&cmd, tokens, n, pos, -1, 0, 0, NULL);
 }
 
 const float *deepseek_prefill(const int *tokens, int n, int from, int replay,
-                              int capture, Snapshot **captured) {
+                              int capture, Snapshot **captured,
+                              const PassWait *wait) {
   GpuCommandBuffer cmd = {0};
   if (from < 0 || from >= n || n > opt.ctx)
     die("invalid prefill of positions %d to %d", from, n);
@@ -2930,7 +2934,7 @@ const float *deepseek_prefill(const int *tokens, int n, int from, int replay,
   }
   deepseek_continue_at(tokens, start);
   const float *lg = forward(&cmd, tokens + start, n - start, start, capture,
-                            x ? x->rows : 0, 1);
+                            x ? x->rows : 0, 1, wait);
   replaying = 0, bounded = 0;
   if (x && !lg)
     deepseek_snapshot_free(x),
@@ -4092,13 +4096,14 @@ static ModelSnapshot *ds_snapshot_alloc(const int32_t *meta, int nmeta,
 
 static const float *ds_prefill(ModelState *s, const int *tokens, int n,
                                int from, int replay, int capture,
-                               ModelSnapshot **captured, float *every) {
+                               ModelSnapshot **captured, float *every,
+                               const PassWait *wait) {
   use(s);
   if (every && replay && from) die("every position's logits of a replay");
   Snapshot *x = 0;
   all_logits = every;
-  const float *lg =
-      deepseek_prefill(tokens, n, from, replay, capture, captured ? &x : 0);
+  const float *lg = deepseek_prefill(tokens, n, from, replay, capture,
+                                     captured ? &x : 0, wait);
   all_logits = 0;
   // a capture of layers 0-20 only (under CED compaction) restores no whole
   // state

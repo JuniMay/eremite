@@ -35,7 +35,8 @@ int main(int argc, char **argv) {
   int tokens[128],
       n = tokenizer_encode_with_added(
           tokenizer, "Describe a blue triangle in one sentence.", tokens, 128);
-  const float *prefill = ops->prefill(state, tokens, n, 0, 0, -1, NULL, NULL);
+  const float *prefill =
+      ops->prefill(state, tokens, n, 0, 0, -1, NULL, NULL, NULL);
   CHECK(prefill != NULL);
   if (ops->read_last_plan) {
     ModelPlan plan;

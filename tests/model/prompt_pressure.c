@@ -78,9 +78,9 @@ int main(int argc, char **argv) {
   if (kept_count > MOST_KEPT) kept_count = MOST_KEPT;
   int prefilled = 1;
   for (int k = 0; k < kept_count; k++)
-    prefilled &= all_finite(
-        ops->prefill(ops->state_new(), ids, KEPT_TOKENS, 0, 0, -1, NULL, NULL),
-        ops->vocab_size());
+    prefilled &= all_finite(ops->prefill(ops->state_new(), ids, KEPT_TOKENS, 0,
+                                         0, -1, NULL, NULL, NULL),
+                            ops->vocab_size());
   check(prefilled, "the kept states' prompts prefill");
   ModelCounters full, small;
   ops->read_counters(&full);
@@ -95,8 +95,9 @@ int main(int argc, char **argv) {
   ops->read_counters(&small);
   printf("%d kept states of %.3f GiB; the cache held %d slots, then %d\n",
          kept_count, state_bytes / GIB, full.cache_slots, small.cache_slots);
-  check(all_finite(ops->prefill(next, ids, SHORT_TOKENS, 0, 0, -1, NULL, NULL),
-                   ops->vocab_size()),
+  check(all_finite(
+            ops->prefill(next, ids, SHORT_TOKENS, 0, 0, -1, NULL, NULL, NULL),
+            ops->vocab_size()),
         "a short prompt prefills beside the kept states with few slots");
   // Above the available memory by all that the cache held, the reserve leaves
   // no room for another state.
@@ -107,7 +108,7 @@ int main(int argc, char **argv) {
   expert_store_set_memory(memory, (MemorySettings){0});
   ModelState *after = ops->state_new();
   check(after && all_finite(ops->prefill(after, ids, SHORT_TOKENS, 0, 0, -1,
-                                         NULL, NULL),
+                                         NULL, NULL, NULL),
                             ops->vocab_size()),
         "a state and its prompt fit once the reserve is back");
   return failures != 0;

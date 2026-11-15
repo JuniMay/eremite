@@ -410,7 +410,7 @@ static void done_with(State *s) {
 static Outcome cold(const int *f, int n) {
   State *c = fresh();
   deepseek_set_state_in_use(c);
-  Outcome o = finish(deepseek_prefill(f, n, 0, 0, -1, 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, 0, 0, -1, 0, 0), n);
   done_with(c);
   return o;
 }
@@ -430,7 +430,7 @@ static void check_branch(State *s, Snapshot *branch, const int *f, int n, int p,
   deepseek_state_copy(q, s, p);
   deepseek_set_state_in_use(q);
   deepseek_snapshot_restore(q, branch);
-  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0, 0), n);
   done_with(q);
   size_t bad = differ_state(&o.t, &first->t, n);
   printf("  %s: its branch snapshot at %d resumed against the %s itself: %zu "
@@ -451,7 +451,8 @@ static Outcome replay(const int *f, int n, int p) {
   deepseek_state_copy(r, source, p);
   deepseek_set_state_in_use(r);
   Snapshot *branch = 0;
-  Outcome o = finish(deepseek_prefill(f, n, p, 1, p > 0 ? p : -1, &branch), n);
+  Outcome o =
+      finish(deepseek_prefill(f, n, p, 1, p > 0 ? p : -1, &branch, 0), n);
   check_branch(r, branch, f, n, p, &o, "replay");
   deepseek_snapshot_free(branch);
   done_with(r);
@@ -468,7 +469,7 @@ static Outcome resume(const int *f, int n, int k, int p) {
   deepseek_snapshot_restore(q, saved[k].snap);
   Snapshot *branch = 0;
   Outcome o = finish(
-      deepseek_prefill(f, n, b, 0, b < p ? p : -1, b < p ? &branch : 0), n);
+      deepseek_prefill(f, n, b, 0, b < p ? p : -1, b < p ? &branch : 0, 0), n);
   check_branch(q, branch, f, n, p, &o, "snapshot resume");
   deepseek_snapshot_free(branch);
   done_with(q);
@@ -483,7 +484,7 @@ static Outcome rewound(const int *f, int n, int k, int p) {
   deepseek_state_copy(q, source, p);
   deepseek_set_state_in_use(q);
   deepseek_snapshot_restore(q, saved[k].snap);
-  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, p, 0, -1, 0, 0), n);
   done_with(q);
   return o;
 }
@@ -503,9 +504,9 @@ static Outcome continued(const int *f, int n, int b) {
   for (int i = prompt1; i < b && i < reply1; i++)
     deepseek_forward(conv + i, 1, i);
   if (b > reply1)
-    deepseek_prefill(conv, b < prompt2 ? b : prompt2, reply1, 0, -1, 0);
+    deepseek_prefill(conv, b < prompt2 ? b : prompt2, reply1, 0, -1, 0, 0);
   for (int i = prompt2; i < b; i++) deepseek_forward(conv + i, 1, i);
-  Outcome o = finish(deepseek_prefill(f, n, b, 0, -1, 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, b, 0, -1, 0, 0), n);
   done_with(c);
   return o;
 }
@@ -542,7 +543,7 @@ static void build(const int *prompt, int n) {
   source = deepseek_state_new();
   deepseek_set_state_in_use(source);
   deepseek_zero_state();
-  const float *lg = deepseek_prefill(conv, n, 0, 0, -1, 0);
+  const float *lg = deepseek_prefill(conv, n, 0, 0, -1, 0, 0);
   prompt1 = n;
   snapshot_source(prompt1, 1);
   if (prompt_only) {  // --prompt-only: the prompt alone, for quick checks of
@@ -565,7 +566,7 @@ static void build(const int *prompt, int n) {
   snapshot_source(reply1, 0);
   memcpy(conv + reply1, extra, (size_t)ne * sizeof *conv);
   prompt2 = reply1 + ne;
-  lg = deepseek_prefill(conv, prompt2, reply1, 0, -1, 0);
+  lg = deepseek_prefill(conv, prompt2, reply1, 0, -1, 0, 0);
   snapshot_source(prompt2, 1);
   for (int i = 0; i < REPLY2; i++) {
     int pos = prompt2 + i;
@@ -728,7 +729,7 @@ static void room_resume(Snapshot *x, const State *rows, int k,
   deepseek_state_copy(q, rows, k);
   deepseek_set_state_in_use(q);
   deepseek_snapshot_restore(q, x);
-  Outcome o = finish(deepseek_prefill(f, n, k, 0, -1, 0), n);
+  Outcome o = finish(deepseek_prefill(f, n, k, 0, -1, 0, 0), n);
   done_with(q);
   Outcome c = cold(f, n);
   size_t bad = differ_state(&o.t, &c.t, n);
@@ -761,7 +762,7 @@ static void check_room(const int *suffix, int ns) {
   int *g = xmalloc((size_t)prompt1 * sizeof *g);
   memcpy(g, conv, (size_t)prompt1 * sizeof *g);
   g[prompt1 - 1] = suffix[0];
-  deepseek_prefill(g, prompt1, prompt1 - 1, 0, -1, 0);
+  deepseek_prefill(g, prompt1, prompt1 - 1, 0, -1, 0, 0);
   Snapshot *x = deepseek_snapshot_take(s, prompt1, 0);
   for (int i = 0; i < 3; i++)
     deepseek_forward(conv + prompt1 + i, 1, prompt1 + i);

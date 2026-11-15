@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
            *captured =
                0;  // the rolling rows at prefix, taken during each prefill
   memcpy(reference,
-         deepseek_prefill(tokens, n, 0, 0, prefix, &captured_reference),
+         deepseek_prefill(tokens, n, 0, 0, prefix, &captured_reference, NULL),
          VOCAB * sizeof(float));
   deepseek_save_rewind_point();
   size_t state_size = saved_bytes();
@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
   deepseek_zero_state();
   opt.deepseek.prefill_prune = 1;
   prefill_chunk = chunk32 ? 32768 : 16384;
-  lg = deepseek_prefill(tokens, n, 0, 0, prefix, &captured);
+  lg = deepseek_prefill(tokens, n, 0, 0, prefix, &captured, NULL);
   int encoder_only = deepseek_snapshot_extent(captured) != LAYERS - 1;
   DeepSeekForwardInfo info = deepseek_last_forward_info();
   int candidates = n;
@@ -163,14 +163,14 @@ int main(int argc, char **argv) {
     opt.deepseek.prefill_prune = 0;
     prefill_chunk = 16384;
     deepseek_snapshot_restore(active, captured_reference);
-    memcpy(reference, deepseek_prefill(tokens, n, prefix, 0, -1, 0),
+    memcpy(reference, deepseek_prefill(tokens, n, prefix, 0, -1, 0, 0),
            VOCAB * sizeof(float));
     opt.deepseek.prefill_prune = 1;
     prefill_chunk = chunk32 ? 32768 : 16384;
     deepseek_snapshot_restore(active, captured);
-    resume_diff =
-        bytes_differ(reference, deepseek_prefill(tokens, n, prefix, 0, -1, 0),
-                     VOCAB * sizeof(float));
+    resume_diff = bytes_differ(reference,
+                               deepseek_prefill(tokens, n, prefix, 0, -1, 0, 0),
+                               VOCAB * sizeof(float));
   }
   deepseek_snapshot_free(captured_reference), deepseek_snapshot_free(captured);
   printf("{\"prefill_prune_check\":{\"rendered_input\":%s,\"last_query_"

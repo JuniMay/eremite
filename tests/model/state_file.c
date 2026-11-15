@@ -249,7 +249,8 @@ int main(int argc, char **argv) {
 
   // the state, its prompt end saved, and decoding: the logits to match
   ModelState *live = ops->state_new();
-  const float *logits = ops->prefill(live, tokens, n, 0, 0, -1, NULL, NULL);
+  const float *logits =
+      ops->prefill(live, tokens, n, 0, 0, -1, NULL, NULL, NULL);
   CHECK(logits);
   ModelSnapshot *prompt_end = ops->snapshot_take(live, n, logits);
   int rows0 = open_new("rows-0"), snap0 = open_new("snap-0"),

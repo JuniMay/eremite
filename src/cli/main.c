@@ -447,13 +447,14 @@ int main(int argc, char **argv) {
   if (check) {  // every position's logits: the batched prefill against
                 // token-by-token decoding
     float *a = xmalloc((size_t)n * V * 4);
-    prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, a));
+    prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, a, 0));
     if (shutdown_requested()) return 0;
     if (n >= 4) {  // two prompt batches, the first of odd length, against one
       ModelState *s2 = new_state(ops);
       int n1 = (n / 2) | 1, diff = 0;
-      prefilled(ops->prefill(s2, tokens, n1, 0, 0, -1, 0, 0));
-      const float *c = prefilled(ops->prefill(s2, tokens, n, n1, 0, -1, 0, 0)),
+      prefilled(ops->prefill(s2, tokens, n1, 0, 0, -1, 0, 0, 0));
+      const float *c = prefilled(
+                      ops->prefill(s2, tokens, n, n1, 0, -1, 0, 0, 0)),
                   *an = a + (size_t)(n - 1) * V;
       for (int k = 0; k < V; k++) diff += c[k] != an[k];
       printf(
@@ -492,9 +493,9 @@ int main(int argc, char **argv) {
     float *alone = xmalloc((size_t)2 * V * 4);
     for (int s = 0; s < 2; s++) {
       if (shutdown_requested()) return 0;
-      next[s] = sample_greedy(
-          prefilled(ops->prefill(both_st[s], tokens, len[s], 0, 0, -1, 0, 0)),
-          V);
+      next[s] = sample_greedy(prefilled(ops->prefill(both_st[s], tokens, len[s],
+                                                     0, 0, -1, 0, 0, 0)),
+                              V);
       at[s] = ops->snapshot_take(both_st[s], len[s], 0);
       memcpy(alone + (size_t)s * V,
              ops->decode_rows(&both_st[s], &next[s], &len[s], 1),
@@ -537,7 +538,7 @@ int main(int argc, char **argv) {
       die("--prefill takes 1 to %d tokens", n - 1);
     const float *lg =
         prefill > 1
-            ? prefilled(ops->prefill(st, tokens, prefill, 0, 0, -1, 0, 0))
+            ? prefilled(ops->prefill(st, tokens, prefill, 0, 0, -1, 0, 0, 0))
             : 0;  // after token prefill - 1
     double nll = 0, t0 = now();
     int top = 0, steps = 0, scored = 0;
@@ -574,7 +575,8 @@ int main(int argc, char **argv) {
   ExpertStoreCounts c0 = counters().cache;
   SystemMemoryCounters m0 = system_memory_read_counters();
   double g0 = gpu_times(model->gpu).busy_seconds, t0 = now();
-  const float *logits = prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, 0));
+  const float *logits =
+      prefilled(ops->prefill(st, tokens, n, 0, 0, -1, 0, 0, 0));
   if (ops->print_report) ops->print_report(stderr, 0, n);
   double t1 = now();
   ExpertStoreCounts c1 = counters().cache;

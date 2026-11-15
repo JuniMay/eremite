@@ -192,9 +192,11 @@ void deepseek_state_copy(State *dst, const State *src, int positions);
 // prefill: after where it starts (from, or a replay's first row) and before
 // n; a replay's branch point is from. Under CED compaction, unless the
 // decoder layers start a ring or more before it, the capture holds layers
-// 0-20 only (extent 20).
+// 0-20 only (extent 20). A non-null wait is waited for before each batch's
+// routed experts, while the prefill holds none.
 const float *deepseek_prefill(const int *tokens, int n, int from, int replay,
-                              int capture, Snapshot **captured);
+                              int capture, Snapshot **captured,
+                              const PassWait *wait);
 // Returns the positions that a replay at k computes again before k, per layer
 // on average, rounded up. With --ced off it is at most k, about 2,613 for long
 // prefixes. With --ced it is the ring: WINDOW plus the rewind margin, 136

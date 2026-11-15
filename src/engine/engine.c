@@ -58,6 +58,9 @@ static int nmodels;
 // GPU that the models run on, made when the first model loads.
 static Memory *memory;
 static Gpu *gpu;
+// The calls posted to streams since the process started. Each stream keeps
+// the number of its call.
+static uint64_t calls_posted;
 // What the engine thread blocks on while no stream's call can go on, made by
 // eremite_init, and whether eremite_wake asked eremite_run_streams to return.
 static ThreadsEvent *wake;
@@ -386,18 +389,20 @@ void eremite_state_identity(eremite_model *m, uint8_t out[32]) {
 
 // ---- running a model ----
 
-const float *eremite_prefill(eremite_model *m, eremite_state *s,
-                             const int32_t *tokens, int n, int from, int replay,
-                             int capture, eremite_snapshot **captured,
-                             eremite_prefill_info *info,
-                             const eremite_media *images) {
+// Prefills positions from to n - 1 of the prompt in s, and returns the last
+// one's logits. A non-null wait is waited for in each layer.
+static const float *
+run_prefill(eremite_model *m, eremite_state *s, const int32_t *tokens, int n,
+            int from, int replay, int capture, eremite_snapshot **captured,
+            eremite_prefill_info *info, const eremite_media *images,
+            const PassWait *wait) {
   if (captured) *captured = 0;
   int start = replay && from > 0 ? m->ops->replay_start(from) : from;
   if (m->ops->set_prefill_media)
     m->ops->set_prefill_media(images ? images->items : NULL,
                               images ? images->n : 0);
   const float *lg =
-      m->ops->prefill(s, tokens, n, from, replay, capture, captured, 0);
+      m->ops->prefill(s, tokens, n, from, replay, capture, captured, 0, wait);
   if (info) {  // the family's plan, or every row through every layer
     ModelPlan p = {
         .chunks = 1, .tokens = n - start, .decoder_tokens = n - start};
@@ -410,6 +415,15 @@ const float *eremite_prefill(eremite_model *m, eremite_state *s,
                                    .prefix_tokens = p.prefix_tokens};
   }
   return lg;
+}
+
+const float *eremite_prefill(eremite_model *m, eremite_state *s,
+                             const int32_t *tokens, int n, int from, int replay,
+                             int capture, eremite_snapshot **captured,
+                             eremite_prefill_info *info,
+                             const eremite_media *images) {
+  return run_prefill(m, s, tokens, n, from, replay, capture, captured, info,
+                     images, NULL);
 }
 
 // ---- streams ----
@@ -425,11 +439,18 @@ typedef enum {
   STREAM_QUIT
 } StreamCall;
 
+// The streams that one eremite_run_streams call advances.
+typedef struct {
+  eremite_stream *const *streams;
+  int count;
+} StreamRun;
+
 struct eremite_stream {
   eremite_model *m;
   Pass *pass;
-  // The call posted and not finished.
+  // The call posted and not finished, and its number among all posted calls.
   StreamCall call;
+  uint64_t call_number;
   // It finished, and eremite_run_streams has not reported that yet.
   int finished;
   // the call's arguments
@@ -446,10 +467,39 @@ struct eremite_stream {
   eremite_prefill_info info;
   int32_t next;
   int accepted;
+  // What the stream's prefill waits for in each layer: the decoding calls in
+  // its run that were posted at the wait's first look. The number of the last
+  // call posted then, or 0 between waits.
+  PassWait wait_for_decoding;
+  uint64_t calls_at_first_look;
+  // The run that advances the stream, while one does.
+  const StreamRun *run;
 };
 
 static int stream_has_call(void *context) {
   return ((eremite_stream *)context)->call != STREAM_NONE;
+}
+
+// Whether the stream's posted call is a decoding call: a decode or a verify.
+static int has_decoding_call(const eremite_stream *x) {
+  return x->call == STREAM_DECODE || x->call == STREAM_VERIFY;
+}
+
+// Whether the decoding calls that the stream's prefill waits for have
+// finished. The prefill waits for those in its run that were posted at the
+// wait's first look.
+static int decoding_calls_finished(void *context) {
+  eremite_stream *x = context;
+  if (!x->run) die("a stream's prefill ran outside eremite_run_streams");
+  if (!x->calls_at_first_look) x->calls_at_first_look = calls_posted;
+  for (int k = 0; k < x->run->count; k++) {
+    const eremite_stream *other = x->run->streams[k];
+    if (has_decoding_call(other) &&
+        other->call_number <= x->calls_at_first_look)
+      return 0;
+  }
+  x->calls_at_first_look = 0;
+  return 1;
 }
 
 static void stream_run(eremite_stream *x) {
@@ -457,9 +507,9 @@ static void stream_run(eremite_stream *x) {
   x->logits = NULL;
   switch (x->call) {
   case STREAM_PREFILL:
-    x->logits =
-        eremite_prefill(m, x->states[0], x->tokens, x->n, x->from, x->replay,
-                        x->capture, &x->captured, &x->info, x->images);
+    x->logits = run_prefill(m, x->states[0], x->tokens, x->n, x->from,
+                            x->replay, x->capture, &x->captured, &x->info,
+                            x->images, &x->wait_for_decoding);
     break;
   case STREAM_DECODE:
     x->logits =
@@ -502,6 +552,8 @@ static void stream_body(void *argument) {
 eremite_stream *eremite_stream_new(eremite_model *m) {
   eremite_stream *x = xmalloc(sizeof *x);
   x->m = m;
+  x->wait_for_decoding =
+      (PassWait){decoding_calls_finished, NULL, x, PASS_WAIT_OTHER, NULL};
   x->pass = m->ops->pass_new(stream_body, x);
   return x;
 }
@@ -514,13 +566,19 @@ void eremite_stream_free(eremite_stream *x) {
   free(x);
 }
 
+// Posts the call whose arguments the stream holds, with the next call number.
+static void post_call(eremite_stream *x, StreamCall call) {
+  x->call = call;
+  x->call_number = ++calls_posted;
+}
+
 void eremite_stream_prefill(eremite_stream *x, eremite_state *s,
                             const int32_t *tokens, int n, int from, int replay,
                             int capture, const eremite_media *images) {
   x->states[0] = s, x->tokens = tokens, x->n = n, x->from = from,
   x->replay = replay, x->capture = capture, x->images = images;
   x->captured = NULL;
-  x->call = STREAM_PREFILL;
+  post_call(x, STREAM_PREFILL);
 }
 
 void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
@@ -532,7 +590,7 @@ void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
   memcpy(x->row_tokens, tokens, (size_t)count * sizeof *tokens);
   memcpy(x->row_pos, pos, (size_t)count * sizeof *pos);
   x->count = count;
-  x->call = STREAM_DECODE;
+  post_call(x, STREAM_DECODE);
 }
 
 void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
@@ -541,7 +599,7 @@ void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
   x->states[0] = s, x->tokens = rows, x->drafts = drafts,
   x->proposed = proposed, x->pos = pos, x->sampler = sampler;
   x->accepted = 0;
-  x->call = STREAM_VERIFY;
+  post_call(x, STREAM_VERIFY);
 }
 
 // What the streams with a call wait for while none can go on (THREAD_*): the
@@ -558,6 +616,12 @@ static int streams_wait_for(eremite_stream *const *streams, int n) {
   return reads ? THREAD_WAIT_READ : THREAD_WAIT_OTHER;
 }
 
+// Sets the run that advances each of the streams, or null.
+static void set_stream_run(eremite_stream *const *streams, int n,
+                           const StreamRun *run) {
+  for (int k = 0; k < n; k++) streams[k]->run = run;
+}
+
 // The streams' calls advance on this thread: each stream that can go on runs
 // until it would wait. When none can go on, the thread waits for any of them.
 int eremite_run_streams(eremite_stream *const *streams, int n) {
@@ -567,6 +631,8 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
   for (int i = 0; i < nmodels; i++)
     if (models[i]->ops->set_other_passes)
       models[i]->ops->set_other_passes(posted - 1);
+  const StreamRun run = {streams, n};
+  set_stream_run(streams, n, &run);
   Pass *waiting[n];
   int finished = -1;
   for (;;) {
@@ -589,6 +655,7 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
       die("the streams' calls wait for each other: none can go on");
   }
   set_thread_state(THREAD_OUTSIDE);
+  set_stream_run(streams, n, NULL);
   return finished;
 }
 

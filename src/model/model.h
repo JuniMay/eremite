@@ -210,9 +210,11 @@ typedef struct {
   // snapshot.
   // A capture of 0 or more takes a snapshot at that position into *captured.
   // A non-null every gets the logits of every position from from to n - 1.
+  // A non-null wait is waited for in each layer, at a point where the prefill
+  // holds no experts.
   const float *(*prefill)(ModelState *s, const int *tokens, int n, int from,
                           int replay, int capture, ModelSnapshot **captured,
-                          float *every);
+                          float *every, const PassWait *wait);
   int (*replay_rows)(int k);
   int (*replay_start)(int k);
   // Runs one token for each of m states, m at most max_rows, and returns rows

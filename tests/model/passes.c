@@ -10,7 +10,8 @@
 // alone, then together, each on its own stack with its own buffers and signals.
 // For DeepSeek, whose passes share some work buffers, those buffers are filled
 // with garbage at every switch: nothing a pass needs may be left in them
-// across a wait.
+// across a wait. Each prefill also yields once in each layer, where the engine
+// lets decoding calls go first.
 //
 // usage: model-passes CHECKPOINT --text FILE [--experts GGUF] [--memory GIB]
 //        [--tokens N] [--decode N] [--rows N] [--draft N] [--no-garbage]
@@ -40,6 +41,10 @@ typedef struct {
   uint64_t digest, proposals;
   int resumes, last, accepted;
   int pos[MAX_ROWS], token[MAX_ROWS];  // what the decoding continues from
+  // What the job's prefills wait for in each layer, and whether it was looked
+  // at once since it was last over.
+  PassWait layer_wait;
+  int looked;
 } Job;
 
 static uint64_t fnv(uint64_t h, const void *data, size_t n) {
@@ -55,12 +60,24 @@ static int best(const float *logits) {
   return b;
 }
 
+// Whether this is the second look since the wait was last over. The first
+// look yields.
+static int is_second_look(void *context) {
+  int *looked = context;
+  *looked = !*looked;
+  return !*looked;
+}
+
 static void job_prefill(Job *j) {
   j->digest = 14695981039346656037ull;
+  j->looked = 0;
+  j->layer_wait =
+      (PassWait){is_second_look, NULL, &j->looked, PASS_WAIT_OTHER, NULL};
   for (int r = 0; r < rows_each; r++) {
     j->pos[r] = j->n - r * 17;
-    const float *logits = ops->prefill(j->state[r], j->tokens + r * 211,
-                                       j->pos[r], 0, 0, -1, 0, 0);
+    const float *logits =
+        ops->prefill(j->state[r], j->tokens + r * 211, j->pos[r], 0, 0, -1, 0,
+                     0, &j->layer_wait);
     if (!logits) die("the prefill did not fit in memory");
     between_calls();
     j->digest = fnv(j->digest, logits, (size_t)vocab * 4);

@@ -351,8 +351,10 @@ void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
                            eremite_sampler *sampler);
 // Advances the streams until a call finishes, and returns that stream's index.
 // It returns -1 when no stream has a call posted, and when eremite_wake asks it
-// to. Only this function runs the streams. A run whose calls can only wait for
-// each other ends the program.
+// to. Only this function runs the streams. A prefill lets decoding calls
+// (decodes and verifies) go first: in each layer, it waits until those posted
+// to the streams before its wait have finished. A run whose calls can only
+// wait for each other ends the program.
 int eremite_run_streams(eremite_stream *const *streams, int n);
 // Makes eremite_run_streams return -1 soon: at once if it waits, or else after
 // the call that runs now waits. A wake that comes outside eremite_run_streams
