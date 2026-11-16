@@ -164,6 +164,8 @@ fn convert_gib_to_target(
 enum Outcome {
     /// The operation owns the yield. It has not resumed or failed.
     Ongoing,
+    /// The operation resumed.
+    Resumed,
     /// The yield failed. The string says why.
     Failed(String),
 }
@@ -263,6 +265,10 @@ impl Control {
                 } else {
                     StatusCode::ACCEPTED.as_u16()
                 }),
+                Outcome::Resumed => Err(Error::new_conflict(
+                    "operation_completed",
+                    "this operation was already resumed; use a new operation_id",
+                )),
                 Outcome::Failed(message) => Err(Error::new_conflict("yield_failed", message)),
             };
         }
@@ -283,6 +289,30 @@ impl Control {
         self.phase = Phase::Yielding;
         self.error = None;
         Ok(StatusCode::ACCEPTED.as_u16())
+    }
+
+    /// Starts the resume of `operation_id`. Returns true when the operation
+    /// ended already. The call then changes nothing. A late retry thus cannot
+    /// resume a later owner's yield. Returns an error for an operation_id that
+    /// never yielded.
+    pub fn start_resume(&mut self, operation_id: &str) -> Result<bool, Error> {
+        check_operation_id(operation_id)?;
+        match self
+            .operations
+            .get(operation_id)
+            .map(|operation| &operation.outcome)
+        {
+            Some(Outcome::Resumed | Outcome::Failed(_)) => return Ok(true),
+            Some(Outcome::Ongoing) => {}
+            None => {
+                return Err(Error::new_conflict(
+                    "operation_conflict",
+                    "operation_id does not own a yield",
+                ));
+            }
+        }
+        self.phase = Phase::Resuming;
+        Ok(false)
     }
 
     /// Takes the next action for the worker, and marks it running. Returns None
@@ -319,6 +349,17 @@ impl Control {
         self.error = Some(
             json!({"operation_id":operation_id, "code":"limits_unreachable", "message":message}),
         );
+        self.phase = Phase::Running;
+        self.effective_limits = self.configured_limits;
+        self.retained = retained;
+        self.is_action_running = false;
+    }
+
+    /// Finishes the resume. The configured limits hold again. `retained` is the
+    /// memory the server holds.
+    pub fn finish_resume(&mut self, retained: MemoryBytes) {
+        let operation_id = self.owner.take().unwrap();
+        self.operations.get_mut(&operation_id).unwrap().outcome = Outcome::Resumed;
         self.phase = Phase::Running;
         self.effective_limits = self.configured_limits;
         self.retained = retained;
@@ -383,10 +424,40 @@ mod tests {
         control.start_yield(make_yield_request("a")).unwrap();
         let before = control.build_status_json();
         assert!(control.start_yield(make_yield_request("b")).is_err());
+        assert!(control.start_resume("b").is_err());
         let mut changed = make_yield_request("a");
         // 3 GiB differs from the first request's 4 GiB.
         changed.memory_gib = Some(3.0);
         assert!(control.start_yield(changed).is_err());
+        assert_eq!(before, control.build_status_json());
+    }
+
+    #[test]
+    fn a_resume_during_a_yield_waits_for_the_running_action() {
+        let mut control = make_control();
+        control.start_yield(make_yield_request("a")).unwrap();
+        control.take_next_action();
+        assert!(!control.start_resume("a").unwrap());
+        assert_eq!(control.take_next_action(), None);
+        control.finish_yield(MemoryBytes::default(), MemoryBytes::default());
+        assert_eq!(control.phase, Phase::Resuming);
+        assert_eq!(control.take_next_action(), Some(Action::Resume));
+        control.finish_resume(MemoryBytes::default());
+        assert_eq!(control.phase, Phase::Running);
+        assert_eq!(control.effective_limits, control.configured_limits);
+    }
+
+    #[test]
+    fn a_retry_of_an_ended_operation_never_yields_again_or_resumes_a_new_owner() {
+        let mut control = make_control();
+        control.start_yield(make_yield_request("a")).unwrap();
+        control.start_resume("a").unwrap();
+        control.take_next_action();
+        control.finish_resume(MemoryBytes::default());
+        assert!(control.start_yield(make_yield_request("a")).is_err());
+        control.start_yield(make_yield_request("b")).unwrap();
+        let before = control.build_status_json();
+        assert!(control.start_resume("a").unwrap());
         assert_eq!(before, control.build_status_json());
     }
 
@@ -418,6 +489,7 @@ mod tests {
         assert_eq!(control.phase, Phase::Running);
         assert_eq!(control.build_status_json()["error"]["operation_id"], "a");
         assert!(control.start_yield(make_yield_request("a")).is_err());
+        assert!(control.start_resume("a").unwrap());
     }
 
     #[test]
