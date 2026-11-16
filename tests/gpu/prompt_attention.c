@@ -8,16 +8,16 @@
 
 // Tests the prompt attention kernel against a reference kernel that stages a
 // slice of a chunk's keys at a time, for its scores and again for its values:
-// every output must be the same bits. Also times them.
+// every output must be the same bits. The kernel reads compressed rows as BF16
+// or packed, and the reference the same values as BF16. Also times them.
 
 #define METAL(...) #__VA_ARGS__
 static const char reference[] = METAL(kernel void attend_m_reference(
     device const bfloat *qb [[buffer(0)]],
     device const bfloat *ring [[buffer(1)]],
-    device const bfloat *comp [[buffer(2)]],
-    device const int *sel [[buffer(3)]], device const float *sink [[buffer(4)]],
-    device float *o [[buffer(5)]], constant Att &at [[buffer(6)]],
-    uint2 gr [[threadgroup_position_in_grid]],
+    device const uchar *comp [[buffer(2)]], device const int *sel [[buffer(3)]],
+    device const float *sink [[buffer(4)]], device float *o [[buffer(5)]],
+    constant Att &at [[buffer(6)]], uint2 gr [[threadgroup_position_in_grid]],
     uint t [[thread_index_in_threadgroup]]) {
   threadgroup bfloat kv[32 * 128], ps[32 * 32];
   threadgroup float ss[32 * 32], mx[32], sum[32], rescale[32];
@@ -57,7 +57,7 @@ static const char reference[] = METAL(kernel void attend_m_reference(
   for (uint16_t i = 0; i < acc0.get_capacity(); i++)
     if (acc0.is_valid_element(i)) acc0[i] = acc1[i] = acc2[i] = acc3[i] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  Keys kc = keys_load(ring, comp, rows, 0, n, 0, t);
+  Keys kc = keys_load(ring, comp, 0, rows, 0, n, 0, t);
   for (uint r0 = 0; r0 < n; r0 += 32) {
     auto sc = sop.get_destination_cooperative_tensor<decltype(tq.slice(0, 0)),
                                                      decltype(tk), float>();
@@ -66,7 +66,7 @@ static const char reference[] = METAL(kernel void attend_m_reference(
     for (uint ds = 0; ds < 4; ds++) {
       keys_store(kv, kc, t);
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      kc = keys_load(ring, comp, rows, r0, n, (ds + 1) % 4, t);
+      kc = keys_load(ring, comp, 0, rows, r0, n, (ds + 1) % 4, t);
       auto qd = tq.slice(ds * 128, 0);
       sop.run(qd, tk, sc);
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -99,9 +99,9 @@ static const char reference[] = METAL(kernel void attend_m_reference(
       keys_store(kv, kc, t);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (ds < 3)
-        kc = keys_load(ring, comp, rows, r0, n, ds + 1, t);
+        kc = keys_load(ring, comp, 0, rows, r0, n, ds + 1, t);
       else if (r0 + 32 < n)
-        kc = keys_load(ring, comp, rows, r0 + 32, n, 0, t);
+        kc = keys_load(ring, comp, 0, rows, r0 + 32, n, 0, t);
       if (ds == 0)
         oop.run(tp, tk, acc0);
       else if (ds == 1)
@@ -126,13 +126,18 @@ static const char reference[] = METAL(kernel void attend_m_reference(
 #undef METAL
 
 typedef struct {
-  uint32_t pos, base, mod, first, comp_rows;
+  uint32_t pos, base, mod, first, comp_rows, packed;
 } Att;
 
 // Query rows, and compressed key rows.
 static constexpr int ROWS = 512, COMP = 8192;
+// A packed compressed row: 512 E2M1 codes, two to a byte, then an E4M3 scale
+// for every 16 of them.
+static constexpr int ROW_BYTES = 288, SCALES = 256;
+// The forms of the compressed rows that the kernel reads.
+static const char *const FORMS[2] = {"BF16", "packed"};
 
-static Buf QB, WIN, KEYS, SEL, SINK, OUT[2];
+static Buf QB, WIN, KEYS, PACKED, SEL, SINK, OUT[2];
 static uint32_t seed = 2463534242u;
 
 static uint32_t next(void) { return seed = seed * 1664525u + 1013904223u; }
@@ -143,13 +148,27 @@ static uint16_t bf16(float v) {  // values of few bits are exact
   return (uint16_t)(u >> 16);
 }
 
-static double run(Gpu *gpu, int kernel, Att at, int rows, const Buf *out,
-                  int repeat) {
+// The value of an E2M1 code: codes 8 and up are the negatives of 0 to 7.
+static float e2m1(unsigned code) {
+  static const float values[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+  return code & 8 ? -values[code & 7] : values[code & 7];
+}
+
+// The value of an E4M3 code that is not negative.
+static float e4m3(unsigned code) {
+  unsigned e = code >> 3 & 15, m = code & 7;
+  return e ? ldexpf(1 + m / 8.0f, (int)e - 7) : ldexpf((float)m, -9);
+}
+
+// Runs kernel over `rows` query rows with the compressed rows `comp`;
+// returns the GPU's microseconds.
+static double run(Gpu *gpu, int kernel, const Buf *comp, Att at, int rows,
+                  const Buf *out, int repeat) {
   double before = gpu_times(gpu).busy_seconds;
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, kernel);
   gpu_bind_buffer(&cmd, 0, &QB, 0), gpu_bind_buffer(&cmd, 1, &WIN, 0),
-      gpu_bind_buffer(&cmd, 2, &KEYS, 0), gpu_bind_buffer(&cmd, 3, &SEL, 0),
+      gpu_bind_buffer(&cmd, 2, comp, 0), gpu_bind_buffer(&cmd, 3, &SEL, 0),
       gpu_bind_buffer(&cmd, 4, &SINK, 0);
   gpu_bind_buffer(&cmd, 5, out, 0), gpu_copy_bytes(&cmd, 6, &at, sizeof at);
   for (int i = 0; i < repeat; i++) gpu_run_kernel(&cmd, 2, rows, 1, 256, 1, 1);
@@ -192,6 +211,7 @@ int main(void) {
   QB = gpu_alloc(gpu, slot, (size_t)ROWS * 32768 * 2),
   WIN = gpu_alloc(gpu, slot, (size_t)(ROWS + 128) * 512 * 2);
   KEYS = gpu_alloc(gpu, slot, (size_t)COMP * 512 * 2),
+  PACKED = gpu_alloc(gpu, slot, (size_t)COMP * ROW_BYTES),
   SEL = gpu_alloc(gpu, slot, (size_t)ROWS * 513 * 4),
   SINK = gpu_alloc(gpu, slot, 64 * 4);
   for (int i = 0; i < 2; i++)
@@ -200,8 +220,17 @@ int main(void) {
     ((uint16_t *)QB.ptr)[i] = bf16((float)((int)(next() >> 27) - 16) / 16);
   for (size_t i = 0; i < (size_t)(ROWS + 128) * 512; i++)
     ((uint16_t *)WIN.ptr)[i] = bf16((float)((int)(next() >> 27) - 16) / 16);
-  for (size_t i = 0; i < (size_t)COMP * 512; i++)
-    ((uint16_t *)KEYS.ptr)[i] = bf16((float)((int)(next() >> 27) - 16) / 16);
+  // Packed rows of random codes and E4M3 scales between 1/8 and 8, and their
+  // values as BF16, which holds each exactly.
+  for (size_t r = 0; r < COMP; r++) {
+    uint8_t *row = (uint8_t *)PACKED.ptr + r * ROW_BYTES;
+    for (int b = 0; b < SCALES; b++) row[b] = (uint8_t)(next() >> 24);
+    for (int s = 0; s < 512 / 16; s++)
+      row[SCALES + s] = (uint8_t)((4 + next() % 6) << 3 | next() % 8);
+    for (int i = 0; i < 512; i++)
+      ((uint16_t *)KEYS.ptr)[r * 512 + i] = bf16(
+          e2m1(row[i / 2] >> (i % 2 * 4) & 15) * e4m3(row[SCALES + i / 16]));
+  }
   for (int i = 0; i < 64; i++)
     ((float *)SINK.ptr)[i] = (float)(next() >> 8) / (1 << 22) - 2;
 
@@ -217,39 +246,43 @@ int main(void) {
       {"a window cut short, 100 to 159 selected rows", 5000, 4990, 1, few, 96},
   };
 
-  for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
-    uint32_t pos = cases[c].pos;
-    Att at = {pos, pos >= 127 ? pos - 127 : 0, 1u << 30, cases[c].first,
-              cases[c].comp};
-    select_rows(cases[c].rows, cases[c].count);
-    memset(OUT[0].ptr, 0xa5, OUT[0].size),
-        memset(OUT[1].ptr, 0xa5, OUT[1].size);
-    run(gpu, before, at, cases[c].rows, &OUT[0], 1),
-        run(gpu, now_kernel, at, cases[c].rows, &OUT[1], 1);
-    const float *a = (const float *)OUT[0].ptr, *b = (const float *)OUT[1].ptr;
-    size_t count = (size_t)cases[c].rows * 32768, nonzero = 0, finite = 1,
-           same = 1;
-    for (size_t i = 0; i < count && same && finite; i++) {
-      if (memcmp(a + i, b + i, 4))
-        same = 0, printf("row %zu, head %zu, column %zu: %g against %g\n",
-                         i / 32768, i % 32768 / 512, i % 512, b[i], a[i]);
-      finite = isfinite(a[i]);
-      nonzero += a[i] != 0;
+  for (uint32_t form = 0; form < 2; form++)
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+      uint32_t pos = cases[c].pos, base = pos >= 127 ? pos - 127 : 0;
+      Att at = {pos, base, 1u << 30, cases[c].first, cases[c].comp, form};
+      select_rows(cases[c].rows, cases[c].count);
+      memset(OUT[0].ptr, 0xa5, OUT[0].size),
+          memset(OUT[1].ptr, 0xa5, OUT[1].size);
+      run(gpu, before, &KEYS, at, cases[c].rows, &OUT[0], 1),
+          run(gpu, now_kernel, form ? &PACKED : &KEYS, at, cases[c].rows,
+              &OUT[1], 1);
+      const float *a = (const float *)OUT[0].ptr,
+                  *b = (const float *)OUT[1].ptr;
+      size_t count = (size_t)cases[c].rows * 32768, nonzero = 0, finite = 1,
+             same = 1;
+      for (size_t i = 0; i < count && same && finite; i++) {
+        if (memcmp(a + i, b + i, 4))
+          same = 0, printf("row %zu, head %zu, column %zu: %g against %g\n",
+                           i / 32768, i % 32768 / 512, i % 512, b[i], a[i]);
+        finite = isfinite(a[i]);
+        nonzero += a[i] != 0;
+      }
+      char what[160];
+      snprintf(what, sizeof what,
+               "%s rows, %s: %zu outputs are equal, finite, and mostly nonzero",
+               FORMS[form], cases[c].name, count);
+      check(same && finite && nonzero >= count / 2, what);
     }
-    char what[160];
-    snprintf(what, sizeof what,
-             "%s: %zu outputs are equal, finite, and mostly nonzero",
-             cases[c].name, count);
-    check(same && finite && nonzero >= count / 2, what);
-  }
-  Att at = {20000, 20000 - 127, 1u << 30, 0, 1};
+  Att at = {20000, 20000 - 127, 1u << 30, 0, 1, 0}, packed = at;
+  packed.packed = 1;
   select_rows(ROWS, all);
-  run(gpu, now_kernel, at, ROWS, &OUT[1], 1);  // raise the GPU's clock
-  double first = run(gpu, before, at, ROWS, &OUT[0], 4),
-         middle = run(gpu, now_kernel, at, ROWS, &OUT[1], 4);
-  double last = run(gpu, before, at, ROWS, &OUT[0], 4);
+  run(gpu, now_kernel, &KEYS, at, ROWS, &OUT[1], 1);  // raise the GPU's clock
+  double first = run(gpu, before, &KEYS, at, ROWS, &OUT[0], 4),
+         bf16_us = run(gpu, now_kernel, &KEYS, at, ROWS, &OUT[1], 4),
+         packed_us = run(gpu, now_kernel, &PACKED, packed, ROWS, &OUT[1], 4);
+  double last = run(gpu, before, &KEYS, at, ROWS, &OUT[0], 4);
   printf("prompt attention of %d rows over 640 keys: a slice at a time %.0f / "
-         "%.0f us, the kernel %.0f us\n",
-         ROWS, first, last, middle);
+         "%.0f us, the kernel %.0f us from BF16 rows, %.0f us from packed\n",
+         ROWS, first, last, bf16_us, packed_us);
   return failures != 0;
 }

@@ -75,13 +75,32 @@ inline uint e2m1_code(float v) {
   uint m = a < 2.0f ? uint(a * 2.0f) : a < 4.0f ? 4u + uint(a >= 3.0f) : 6u + uint(a >= 6.0f);
   return m | (signbit(v) ? 8u : 0u);
 }
+// The E4M3 code of a value of E4M3 that is not negative, and its value.
+inline uint e4m3_code(float v) {
+  int e = exponent(v);
+  return e < -6 ? uint(v * pow2(9)) : uint(e + 7) << 3 | (uint(v * pow2(3 - e)) & 7u);
+}
+inline float e4m3_value(uint c) {
+  return float(as_type<half>(ushort(((c & 0x7Fu) << 7) | ((c & 0x80u) << 8)))) * 256.0f;
+}
 
-// A state keeps its index keys as BF16, or packed as the reference quantizes
-// them: a key's 128 E2M1 codes, two to a byte with the even value in the low
-// nibble, then an E8M0 scale, a power of two, for every 32 of them. BF16 holds
-// each of those values exactly.
+// A state keeps its compressed rows and index keys as BF16, or packed as the
+// reference quantizes them: a row's E2M1 codes, two to a byte with the even
+// value in the low nibble, then its scales. A packed compressed row holds 512
+// codes and an E4M3 scale for every 16 of them; a packed index key holds 128
+// codes and an E8M0 scale, a power of two, for every 32. BF16 holds each value
+// of either exactly.
+#define COMP_ROW_BYTES 288
+#define COMP_SCALES 256
 #define KEY_ROW_BYTES 68
 #define KEY_SCALES 64
+// Values 4i to 4i + 3 of compressed row `row`: packed, or BF16 rows of 512
+// values like the window's.
+inline float4 comp_values(device const uchar *comp, uint row, uint i, uint packed) {
+  if (!packed) return float4(((device const bfloat4 *)comp)[row * 128 + i]);
+  device const uchar *r = comp + row * COMP_ROW_BYTES;
+  return fp4x4(((device const ushort *)r)[i]) * e4m3_value(r[COMP_SCALES + i / 4]);
+}
 
 // Sum over a threadgroup of up to 1024 threads; every thread gets the result.
 inline float tg_sum(float v, threadgroup float *tmp, uint t, uint n) {
@@ -632,15 +651,15 @@ kernel void kv_window(device const float *kv [[buffer(0)]], device const float *
 
 // Compressor: pools a group (ratio 2: softmax-gated over its two rows),
 // normalizes, and writes the latent before RoPE (for the index keys) and the
-// compressed key after RoPE and FP4 quantization (16 per E4M3 scale), as
-// BF16: an E2M1 code times an E4M3 scale has at most 6 significant bits.
-// Group g starts at position start + g ratio; its rows of kv and score are
-// row0 + g ratio (and the next, for ratio 2). One threadgroup per group.
-// packed: whether index_key writes the keys packed, not BF16.
+// compressed key after RoPE and FP4 quantization (16 per E4M3 scale), packed
+// or as BF16. Group g starts at position start + g ratio; its rows of kv and
+// score are row0 + g ratio (and the next, for ratio 2). One threadgroup per
+// group. packed: whether the rows, and index_key's keys, are written packed,
+// not BF16.
 struct Groups { uint ratio, start, row0, packed; };
 kernel void compress(device const float *kv [[buffer(0)]], device const float *score [[buffer(1)]],
                      device const float *w [[buffer(2)]], device const float2 *cs [[buffer(3)]],
-                     device float *latent [[buffer(4)]], device bfloat *rows [[buffer(5)]],
+                     device float *latent [[buffer(4)]], device uchar *rows [[buffer(5)]],
                      constant Groups &g [[buffer(6)]], uint grp [[threadgroup_position_in_grid]],
                      uint t [[thread_index_in_threadgroup]]) {
   threadgroup float tmp[32];
@@ -658,8 +677,16 @@ kernel void compress(device const float *kv [[buffer(0)]], device const float *s
   v = rope1(v, t, 512, cs + p.y * 32, false);
   float amax = fabs(v);  // blocks of 16: half a simdgroup
   for (uint o = 1; o < 16; o <<= 1) amax = max(amax, simd_shuffle_xor(amax, o));
-  float s = e4m3(max(amax, 6.0f * 0x1p-9f) / 6.0f);
-  rows[(p.y / p.x) * 512 + t] = bfloat(e2m1(clamp(v / s, -6.0f, 6.0f)) * s);
+  float s = e4m3(max(amax, 6.0f * 0x1p-9f) / 6.0f), x = e2m1(clamp(v / s, -6.0f, 6.0f));
+  if (!g.packed) {
+    ((device bfloat *)rows)[(p.y / p.x) * 512 + t] = bfloat(x * s);
+    return;
+  }
+  uint code = e2m1_code(x);
+  uint pair = code | simd_shuffle_down(code, 1) << 4;  // with the next value's
+  device uchar *row = rows + (p.y / p.x) * COMP_ROW_BYTES;
+  if (t % 2 == 0) row[t / 2] = uchar(pair);
+  if (t % 16 == 0) row[COMP_SCALES + t / 16] = uchar(e4m3_code(s));
 }
 
 // Index key: k_norm, RoPE and FP4 quantization (32 per power of two),
@@ -864,7 +891,9 @@ kernel void cand_topk(device const float *score [[buffer(0)]], device uint *cand
 // Query row r at position pos + r attends to the window rows of positions
 // pos + r - 127 .. pos + r (from position `first` on), and to its selected
 // compressed rows if `comp_rows` is set.
-struct Att { Win win; uint first, comp_rows; };
+// comp_rows: whether the row attends selected compressed rows; packed: whether
+// those rows are packed, not BF16.
+struct Att { Win win; uint first, comp_rows, packed; };
 
 // Decoding attention of one row over the rows it sees: the window, then the
 // selected compressed rows, up to 640, in chunks of 64 and three passes: the
@@ -890,7 +919,7 @@ inline uint att_index(uint r, uint lo, uint nwin, constant Att &at, device const
 // Scores: a threadgroup takes 4 heads and two chunks; each of its 16
 // simdgroups takes two rows at a time, which share the loads of the queries.
 kernel void attend_scores(device const float *q [[buffer(0)]], device const bfloat *ring [[buffer(1)]],
-                          device const bfloat *comp [[buffer(2)]], device const int *sel [[buffer(3)]],
+                          device const uchar *comp [[buffer(2)]], device const int *sel [[buffer(3)]],
                           device const float2 *cs [[buffer(4)]], device float *sc [[buffer(5)]],
                           device float *cmax [[buffer(6)]], constant Att &at [[buffer(7)]],
                           uint2 gr [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
@@ -908,12 +937,13 @@ kernel void attend_scores(device const float *q [[buffer(0)]], device const bflo
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = r0 + 2 * sg; r < r1; r += 32) {  // rows r and r + 1 (r again, not stored, past r1)
-    uint r2 = min(r + 1, r1 - 1);
-    device const bfloat4 *k0 = (device const bfloat4 *)((r < nwin ? ring : comp) + rows[r - r0] * 512);
-    device const bfloat4 *k1 = (device const bfloat4 *)((r2 < nwin ? ring : comp) + rows[r2 - r0] * 512);
+    uint r2 = min(r + 1, r1 - 1), row0 = rows[r - r0], row1 = rows[r2 - r0];
+    device const bfloat4 *w0 = (device const bfloat4 *)(ring + row0 * 512), *w1 = (device const bfloat4 *)(ring + row1 * 512);
     float4 d0 = 0, d1 = 0;
     for (uint i = lane; i < 128; i += 32) {
-      float4 q0 = qs[0][i], q1 = qs[1][i], q2 = qs[2][i], q3 = qs[3][i], a = float4(k0[i]), b = float4(k1[i]);
+      float4 q0 = qs[0][i], q1 = qs[1][i], q2 = qs[2][i], q3 = qs[3][i];
+      float4 a = r < nwin ? float4(w0[i]) : comp_values(comp, row0, i, at.packed);
+      float4 b = r2 < nwin ? float4(w1[i]) : comp_values(comp, row1, i, at.packed);
       d0 += float4(dot(q0, a), dot(q1, a), dot(q2, a), dot(q3, a));
       d1 += float4(dot(q0, b), dot(q1, b), dot(q2, b), dot(q3, b));
     }
@@ -933,19 +963,20 @@ kernel void attend_scores(device const float *q [[buffer(0)]], device const bflo
 
 // Adds rows j .. j1 - 1, of one buffer, of the chunk from row r0, times their
 // probabilities p (4 heads per float4), to the sums acc of 4 columns of the
-// heads of hq, row after row, loading 8 rows at a time.
-inline void att_values(device const bfloat *base, threadgroup const uint *rows, uint j, uint j1, uint r0,
-                       threadgroup const float4 (*p)[4], uint hq, uint col, thread float4 *acc) {
+// heads of hq, row after row, loading 8 rows at a time. The rows are packed
+// compressed rows, or BF16 rows of 512 values.
+inline void att_values(device const uchar *base, uint packed, threadgroup const uint *rows, uint j, uint j1,
+                       uint r0, threadgroup const float4 (*p)[4], uint hq, uint col, thread float4 *acc) {
   for (; j + 8 <= j1; j += 8) {
     float4 x[8];
-    for (uint u = 0; u < 8; u++) x[u] = float4(*(device const bfloat4 *)(base + rows[j + u - r0] * 512 + col));
+    for (uint u = 0; u < 8; u++) x[u] = comp_values(base, rows[j + u - r0], col / 4, packed);
     for (uint u = 0; u < 8; u++) {
       float4 pv = p[j + u - r0][hq];
       acc[0] += pv.x * x[u], acc[1] += pv.y * x[u], acc[2] += pv.z * x[u], acc[3] += pv.w * x[u];
     }
   }
   for (; j < j1; j++) {
-    float4 x = float4(*(device const bfloat4 *)(base + rows[j - r0] * 512 + col)), pv = p[j - r0][hq];
+    float4 x = comp_values(base, rows[j - r0], col / 4, packed), pv = p[j - r0][hq];
     acc[0] += pv.x * x, acc[1] += pv.y * x, acc[2] += pv.z * x, acc[3] += pv.w * x;
   }
 }
@@ -953,7 +984,7 @@ inline void att_values(device const bfloat *base, threadgroup const uint *rows, 
 // A chunk's part per head: 512 sums of probability times value, then the sum
 // of its probabilities. A threadgroup takes 16 heads, two chunks and half of
 // the columns; thread t takes chunk t / 256 and 4 columns of 4 heads.
-kernel void attend_values(device const bfloat *ring [[buffer(0)]], device const bfloat *comp [[buffer(1)]],
+kernel void attend_values(device const uchar *ring [[buffer(0)]], device const uchar *comp [[buffer(1)]],
                           device const int *sel [[buffer(2)]], device const float *sc [[buffer(3)]],
                           device const float *cmax [[buffer(4)]], device float *part [[buffer(5)]],
                           constant Att &at [[buffer(6)]],
@@ -986,8 +1017,8 @@ kernel void attend_values(device const bfloat *ring [[buffer(0)]], device const 
   uint r0 = rc + c * ATT_CHUNK, r1 = min(n, r0 + ATT_CHUNK);
   if (r0 >= n) return;
   float4 acc[4] = {0, 0, 0, 0};
-  att_values(ring, rows + c * ATT_CHUNK, r0, min(r1, nwin), r0, p[c], hq, col, acc);
-  att_values(comp, rows + c * ATT_CHUNK, max(r0, nwin), r1, r0, p[c], hq, col, acc);
+  att_values(ring, 0, rows + c * ATT_CHUNK, r0, min(r1, nwin), r0, p[c], hq, col, acc);
+  att_values(comp, at.packed, rows + c * ATT_CHUNK, max(r0, nwin), r1, r0, p[c], hq, col, acc);
   device float *out = part + ((gr.y * 2 + c) * 64 + g * 16 + hq * 4) * 514 + col;
   for (uint k = 0; k < 4; k++)
     *(device float2 *)(out + k * 514) = acc[k].xy, *(device float2 *)(out + k * 514 + 2) = acc[k].zw;
@@ -1036,12 +1067,14 @@ kernel void q_rope(device const float *q [[buffer(0)]], device const float2 *cs 
   qb[i.y * 32768 + i.x] = bfloat(rope1(q[i.y * 32768 + i.x], i.x % 512, 512, cs + (pos + i.y) * 32, false));
 }
 struct Keys { bfloat4 v[4]; };  // a thread's share of a chunk's slice: rows t / 32 + 8 i, columns 4 (t % 32)..
-inline Keys keys_load(device const bfloat *ring, device const bfloat *comp, threadgroup const uint *rows, uint r0,
-                      uint n, uint ds, uint t) {
+inline Keys keys_load(device const bfloat *ring, device const uchar *comp, uint packed, threadgroup const uint *rows,
+                      uint r0, uint n, uint ds, uint t) {
   Keys c;
   for (uint i = 0; i < 4; i++) {
-    uint r = r0 + t / 32 + 8 * i, row = r < n ? rows[r] : 0;
-    c.v[i] = r < n ? *(device const bfloat4 *)((row < 0x80000000u ? ring + row * 512 : comp + (row & 0x7FFFFFFFu) * 512) + ds * 128 + (t % 32) * 4) : bfloat4(0);
+    uint r = r0 + t / 32 + 8 * i, row = r < n ? rows[r] : 0, col = ds * 32 + t % 32;
+    c.v[i] = r >= n ? bfloat4(0)
+             : row < 0x80000000u ? ((device const bfloat4 *)(ring + row * 512))[col]
+                                 : bfloat4(comp_values(comp, row & 0x7FFFFFFFu, col, packed));
   }
   return c;
 }
@@ -1049,7 +1082,7 @@ inline void keys_store(threadgroup bfloat *kv, Keys c, uint t) {
   for (uint i = 0; i < 4; i++) *(threadgroup bfloat4 *)(kv + (t / 32 + 8 * i) * 128 + (t % 32) * 4) = c.v[i];
 }
 kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat *ring [[buffer(1)]],
-                     device const bfloat *comp [[buffer(2)]], device const int *sel [[buffer(3)]],
+                     device const uchar *comp [[buffer(2)]], device const int *sel [[buffer(3)]],
                      device const float *sink [[buffer(4)]], device float *o [[buffer(5)]],
                      constant Att &at [[buffer(6)]], uint2 gr [[threadgroup_position_in_grid]],
                      uint t [[thread_index_in_threadgroup]]) {
@@ -1077,7 +1110,7 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
   for (uint16_t i = 0; i < acc0.get_capacity(); i++)
     if (acc0.is_valid_element(i)) acc0[i] = acc1[i] = acc2[i] = acc3[i] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  Keys ka = keys_load(ring, comp, rows, 0, n, 0, t), kb = keys_load(ring, comp, rows, 0, n, 1, t);
+  Keys ka = keys_load(ring, comp, at.packed, rows, 0, n, 0, t), kb = keys_load(ring, comp, at.packed, rows, 0, n, 1, t);
   for (uint r0 = 0; r0 < n; r0 += 32) {
     auto sc = sop.get_destination_cooperative_tensor<decltype(tq.slice(0, 0)), decltype(tk), float>();
     for (uint16_t i = 0; i < sc.get_capacity(); i++)
@@ -1086,7 +1119,7 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
       keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       // the next pair; after the last, the first again, for the values
-      ka = keys_load(ring, comp, rows, r0, n, (ds + 2) % 4, t), kb = keys_load(ring, comp, rows, r0, n, (ds + 3) % 4, t);
+      ka = keys_load(ring, comp, at.packed, rows, r0, n, (ds + 2) % 4, t), kb = keys_load(ring, comp, at.packed, rows, r0, n, (ds + 3) % 4, t);
       auto q0 = tq.slice(ds * 128, 0), q1 = tq.slice(ds * 128 + 128, 0);
       sop.run(q0, tk, sc);
       sop.run(q1, tk1, sc);
@@ -1121,7 +1154,7 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (r0 + 32 < n) ka = keys_load(ring, comp, rows, r0 + 32, n, 0, t), kb = keys_load(ring, comp, rows, r0 + 32, n, 1, t);
+    if (r0 + 32 < n) ka = keys_load(ring, comp, at.packed, rows, r0 + 32, n, 0, t), kb = keys_load(ring, comp, at.packed, rows, r0 + 32, n, 1, t);
     oop.run(tp, tk, acc0);
     oop.run(tp, tk1, acc1);
     threadgroup_barrier(mem_flags::mem_threadgroup);

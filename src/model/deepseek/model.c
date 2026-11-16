@@ -1263,7 +1263,8 @@ typedef struct {
   uint32_t pos, base, mod;
 } Win;
 
-// packed: whether index_key writes the keys packed, not BF16.
+// packed: whether the compressor writes the rows, and index_key the keys,
+// packed, not BF16.
 typedef struct {
   uint32_t ratio, start, row0, packed;
 } Groups;
@@ -1280,7 +1281,9 @@ static constexpr int CAND_LAYER = 20, CAND_TOP = 2048;
 
 typedef struct {
   Win win;
-  uint32_t first, comp_rows;
+  // comp_rows: whether the row attends selected compressed rows; packed:
+  // whether those rows are a state's packed ones, not BF16.
+  uint32_t first, comp_rows, packed;
 } Att;
 
 // Of the experts predicted for each of the next two layers, the top 3 are
@@ -1509,7 +1512,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
   }
   if (small_rows(m)) {  // one row or a verify pass, each as decoding runs it
     for (int r = 0; r < m; r++) {
-      Att ar = {{p32 + r, base, mod}, 0, visible > 0};
+      Att ar = {{p32 + r, base, mod}, 0, visible > 0, 0};
       ar.first = window_lower(l, p32 + r);
       attend_one(c, &Q, q + (size_t)r * HEADS * HEAD_DIM * 4, win,
                  y->ratio ? &src->comp : win, &SEL,
@@ -1521,7 +1524,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
     for (int r = 0; r < m;) {
       uint32_t rows = m - r < QB_ROWS ? m - r : QB_ROWS, p = p32 + r;
       size_t qr = q + (size_t)r * HEADS * HEAD_DIM * 4;
-      Att ar = {{p, base, mod}, 0, visible > 0};
+      Att ar = {{p, base, mod}, 0, visible > 0, 0};
       // Prefix queries stay unchanged. Retained queries cannot read them.
       // Split at the boundary so first never exceeds a dispatched query
       // position.
@@ -3195,7 +3198,7 @@ static void draft_stage(GpuCommandBuffer *c, int d, int pos) {
       gpu_bind_buffer(c, 2, &cs_base, 0), gpu_bind_buffer(c, 3, &BLK, 0),
       gpu_copy_bytes(c, 4, &bw, sizeof bw);
   gpu_run_kernel(c, BLOCK, 1, 1, 512, 1, 1);
-  Att at = {{(uint32_t)pos - 1, 0, WINDOW}, 0, 1};
+  Att at = {{(uint32_t)pos - 1, 0, WINDOW}, 0, 1, 0};  // the draft's BF16 rows
   for (int r = 0; r < m; r++)  // the window up to pos - 1; the angle table from
                                // row r's position pos + r
     attend_one(c, &Q, (size_t)r * HEADS * HEAD_DIM * 4, &y->ring, &BLK, &DSEL,
@@ -3432,7 +3435,7 @@ static void bench_hc(GpuCommandBuffer *c, int r) {
 
 static void bench_attend(GpuCommandBuffer *c, int r) {
   (void)r;
-  Att at = {{1000, 0, RING}, 0, 1};
+  Att at = {{1000, 0, RING}, 0, 1, 0};
   ((int *)SEL.ptr)[0] = 512;
   attend_one(c, &Q, 0, &L[5].ring, &L[2].comp, &SEL, 0, &L[5].sink, &cs_comp, 0,
              &O, 0, &at);
