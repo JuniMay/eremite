@@ -429,6 +429,7 @@ name = "eremite-server"
 version = "0.1.0"
 dependencies = [
  "deepseek-recipe",
+ "serde",
  "serde_json",
 ]
 
