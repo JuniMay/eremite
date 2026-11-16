@@ -1,7 +1,7 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; a model
 //! with its tokenizer; and the model's states, snapshots, saved states, calls,
-//! media and sampling. A
+//! drafts, media and sampling. A
 //! [`Model`] is one registered checkpoint, whose weights load on demand. Its
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
@@ -90,6 +90,18 @@ struct RawSampler {
     _opaque: [u8; 0],
 }
 
+/// Context-copy proposals (eremite_lookup).
+#[repr(C)]
+struct RawLookup {
+    _opaque: [u8; 0],
+}
+
+/// The choice of how many drafts a pass runs (eremite_draft_choice).
+#[repr(C)]
+struct RawDraftChoice {
+    _opaque: [u8; 0],
+}
+
 /// A prompt's decoded media (eremite_media).
 #[repr(C)]
 struct RawMedia {
@@ -138,6 +150,8 @@ unsafe extern "C" {
     fn eremite_drain();
     fn eremite_set_request_running(m: *mut RawModel, active: c_int);
     fn eremite_max_rows(m: *const RawModel) -> c_int;
+    fn eremite_drafts_per_pass(m: *const RawModel) -> c_int;
+    fn eremite_max_verify(m: *const RawModel) -> c_int;
     fn eremite_vocab_size(m: *const RawModel) -> c_int;
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
@@ -205,6 +219,16 @@ unsafe extern "C" {
         pos: *const i32,
         count: c_int,
     );
+    fn eremite_stream_verify(
+        x: *mut RawStream,
+        s: *mut RawState,
+        rows: *mut i32,
+        drafts: c_int,
+        proposed: c_int,
+        pos: c_int,
+        sampler: *mut RawSampler,
+    );
+    fn eremite_stream_next_token(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
     fn eremite_stream_logits(x: *const RawStream) -> *const f32;
     fn eremite_stream_captured_snapshot(x: *const RawStream) -> *mut RawSnapshot;
@@ -218,6 +242,20 @@ unsafe extern "C" {
     ) -> *mut RawSampler;
     fn eremite_sampler_free(s: *mut RawSampler);
     fn eremite_sample(m: *const RawModel, logits: *const f32, s: *mut RawSampler) -> i32;
+    fn eremite_lookup_new(capacity: c_int) -> *mut RawLookup;
+    fn eremite_lookup_free(x: *mut RawLookup);
+    fn eremite_lookup_append(x: *mut RawLookup, tokens: *const i32, n: c_int) -> c_int;
+    fn eremite_lookup_propose(x: *const RawLookup, max: c_int, drafts: *mut i32) -> c_int;
+    fn eremite_lookup_record_verification(x: *mut RawLookup, offered: c_int, accepted: c_int);
+    fn eremite_draft_choice_new() -> *mut RawDraftChoice;
+    fn eremite_draft_choice_free(x: *mut RawDraftChoice);
+    fn eremite_draft_choice_next_count(x: *mut RawDraftChoice, most: c_int) -> c_int;
+    fn eremite_draft_choice_record_pass(
+        x: *mut RawDraftChoice,
+        count: c_int,
+        kept: c_int,
+        seconds: f64,
+    );
     fn eremite_media_open(
         m: *mut RawModel,
         data: *const *const u8,
@@ -366,6 +404,11 @@ pub struct Options {
     pub model: String,
     /// The context's capacity in tokens.
     pub ctx: i32,
+    /// The most proposals of the model's draft head that a pass verifies; 0:
+    /// none.
+    pub draft: i32,
+    /// The most context-copy proposals that a pass verifies; 0: none.
+    pub lookup: i32,
     /// The family's own settings.
     pub backend: BackendOptions,
 }
@@ -583,15 +626,13 @@ impl Model {
             abi: ABI,
             model: model.as_ptr(),
             ctx: o.ctx,
-            // No context-copy proposals.
-            lookup: 0,
+            lookup: o.lookup,
             deepseek: RawDeepSeekConfig {
                 experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 // The engine's approximate substitution stays off: it is for
                 // the engine's tests only.
                 substitute: 0.0,
-                // No proposals of the draft head.
-                draft: 0,
+                draft: o.draft,
                 ced: deepseek.ced,
                 prefill_prune: deepseek.prefill_prune.into(),
                 packed_state_rows: deepseek.packed_state_rows.into(),
@@ -642,6 +683,18 @@ impl Model {
     /// most.
     pub fn max_rows(&self) -> usize {
         unsafe { eremite_max_rows(self.raw) as usize }
+    }
+
+    /// Returns how many drafts the model makes itself for one pass: the
+    /// draft setting, at most its draft head's.
+    pub fn drafts_per_pass(&self) -> usize {
+        unsafe { eremite_drafts_per_pass(self.raw) as usize }
+    }
+
+    /// Returns how many rows one verify call takes at most: the token and its
+    /// drafts.
+    pub fn max_verify(&self) -> usize {
+        unsafe { eremite_max_verify(self.raw) as usize }
     }
 
     /// Returns the number of floats in a row of logits: the vocabulary's size.
@@ -922,6 +975,81 @@ impl Drop for Sampler {
     }
 }
 
+/// Context-copy proposals: drafts copied from where the context's last tokens
+/// appeared before.
+pub struct Lookup(*mut RawLookup);
+
+impl Lookup {
+    /// Returns a lookup for `capacity` tokens, or None if it cannot hold that
+    /// many.
+    pub fn new(capacity: usize) -> Option<Lookup> {
+        let x = unsafe { eremite_lookup_new(capacity as c_int) };
+        (!x.is_null()).then_some(Lookup(x))
+    }
+
+    /// Appends `tokens` to the context. Returns false when the lookup is full.
+    pub fn append(&mut self, tokens: &[i32]) -> bool {
+        unsafe { eremite_lookup_append(self.0, tokens.as_ptr(), tokens.len() as c_int) != 0 }
+    }
+
+    /// Writes up to `max` proposals into `drafts`, and returns how many.
+    pub fn propose(&self, max: usize, drafts: &mut [i32]) -> usize {
+        unsafe {
+            eremite_lookup_propose(self.0, max.min(drafts.len()) as c_int, drafts.as_mut_ptr())
+                .max(0) as usize
+        }
+    }
+
+    /// Records how many of the `offered` proposals a verify call kept.
+    pub fn record_verification(&mut self, offered: usize, accepted: usize) {
+        unsafe { eremite_lookup_record_verification(self.0, offered as c_int, accepted as c_int) }
+    }
+}
+
+impl Drop for Lookup {
+    fn drop(&mut self) {
+        unsafe { eremite_lookup_free(self.0) }
+    }
+}
+
+/// How many of the draft head's drafts each pass of one request runs: the
+/// count with the most expected tokens per second, from the drafts kept and
+/// the times of earlier passes. The tokens do not depend on it.
+pub struct DraftChoice(*mut RawDraftChoice);
+
+impl DraftChoice {
+    /// Returns a choice with no passes recorded.
+    pub fn new() -> DraftChoice {
+        DraftChoice(unsafe { eremite_draft_choice_new() })
+    }
+
+    /// Returns how many drafts the next pass runs, 0 to `most`.
+    pub fn next_count(&mut self, most: usize) -> usize {
+        unsafe {
+            eremite_draft_choice_next_count(self.0, most.min(c_int::MAX as usize) as c_int).max(0)
+                as usize
+        }
+    }
+
+    /// Records a pass with `count` drafts that kept the first `kept` of them
+    /// and took `seconds`, with no other call beside it.
+    pub fn record_pass(&mut self, count: usize, kept: usize, seconds: f64) {
+        unsafe { eremite_draft_choice_record_pass(self.0, count as c_int, kept as c_int, seconds) }
+    }
+}
+
+impl Default for DraftChoice {
+    fn default() -> DraftChoice {
+        DraftChoice::new()
+    }
+}
+
+impl Drop for DraftChoice {
+    fn drop(&mut self) {
+        unsafe { eremite_draft_choice_free(self.0) }
+    }
+}
+
 /// A prompt's decoded media. Dropping it closes them and gives their memory
 /// back.
 pub struct Media(*mut RawMedia);
@@ -1038,6 +1166,39 @@ impl Stream {
                 states.len() as c_int,
             )
         }
+    }
+
+    /// Posts one verify call in `s`: the token `rows[0]` at `pos` and its
+    /// drafts in the other rows, decoded together and sampled with
+    /// `sampler`. Without `proposed`, the model's draft head fills the other
+    /// rows; with it, they hold the caller's proposals.
+    pub fn verify(
+        &self,
+        s: StateHandle,
+        rows: &mut [i32],
+        proposed: bool,
+        pos: usize,
+        sampler: &mut Sampler,
+    ) {
+        unsafe {
+            eremite_stream_verify(
+                self.0,
+                s.0.as_ptr(),
+                rows.as_mut_ptr(),
+                rows.len() as c_int - 1,
+                proposed.into(),
+                pos as c_int,
+                sampler.0,
+            )
+        }
+    }
+
+    /// Returns the finished verify call's next token, and how many of its
+    /// drafts it kept.
+    pub fn next_token(&self) -> (i32, usize) {
+        let mut accepted = 0;
+        let token = unsafe { eremite_stream_next_token(self.0, &mut accepted) };
+        (token, accepted.max(0) as usize)
     }
 
     /// Returns the finished call's logits, or None when the call did not fit
@@ -1172,6 +1333,34 @@ mod tests {
         let index = r#"{"weight_map": {"w": "part.safetensors"}}"#;
         std::fs::write(dir.0.join("model.safetensors.index.json"), index).unwrap();
         assert_eq!(validate_weight_files(dir.path()), Ok(()));
+    }
+
+    #[test]
+    fn a_lookup_proposes_what_followed_the_last_tokens_before() {
+        // A match needs the last 12 tokens.
+        let repeated: Vec<i32> = (1..=12).collect();
+        let mut lookup = Lookup::new(32).expect("a lookup for 32 tokens");
+        assert!(lookup.append(&repeated));
+        assert!(lookup.append(&[100, 101, 102]));
+        let mut drafts = [0; 4];
+        assert_eq!(lookup.propose(3, &mut drafts), 0, "no earlier match yet");
+        assert!(lookup.append(&repeated));
+        let count = lookup.propose(3, &mut drafts);
+        assert_eq!(&drafts[..count], &[100, 101, 102], "what followed 1 to 12");
+        lookup.record_verification(count, 2);
+        assert!(!lookup.append(&[1; 6]), "33 tokens do not fit");
+    }
+
+    #[test]
+    fn the_draft_choice_stays_within_its_most() {
+        let mut choice = DraftChoice::new();
+        for most in 0..4 {
+            assert!(choice.next_count(most) <= most);
+        }
+        for _ in 0..8 {
+            choice.record_pass(2, 2, 0.05);
+        }
+        assert!(choice.next_count(2) <= 2);
     }
 
     #[test]
