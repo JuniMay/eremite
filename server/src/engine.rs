@@ -1,11 +1,12 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
-//! the process's settings, its log and its stop; a model's settings; and a
-//! model with its tokenizer. A [`Model`] is one registered checkpoint, whose
-//! weights load on demand. Its functions run on the engine's thread only; the
-//! tokenizer's run on any thread.
+//! the process's settings, its log and its stop; a model's settings; a model
+//! with its tokenizer; and the model's states, calls and sampling. A
+//! [`Model`] is one registered checkpoint, whose weights load on demand. Its
+//! functions and its streams run on the engine's thread only; the tokenizer's
+//! run on any thread.
 
 use std::ffi::{CString, c_char, c_int};
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
@@ -64,6 +65,30 @@ struct RawTokenizer {
     _opaque: [u8; 0],
 }
 
+/// A state of one model (eremite_state).
+#[repr(C)]
+struct RawState {
+    _opaque: [u8; 0],
+}
+
+/// A stream of one model's calls (eremite_stream).
+#[repr(C)]
+struct RawStream {
+    _opaque: [u8; 0],
+}
+
+/// A sampler (eremite_sampler).
+#[repr(C)]
+struct RawSampler {
+    _opaque: [u8; 0],
+}
+
+/// A prompt's decoded media (eremite_media).
+#[repr(C)]
+struct RawMedia {
+    _opaque: [u8; 0],
+}
+
 /// eremite_tokenize's mode that also takes the added tokens' spellings as
 /// those tokens.
 const TOKENIZE_ADDED_TOKENS: c_int = 1;
@@ -87,6 +112,38 @@ unsafe extern "C" {
     fn eremite_max_rows(m: *const RawModel) -> c_int;
     fn eremite_vocab_size(m: *const RawModel) -> c_int;
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
+    fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
+    fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
+    fn eremite_stream_new(m: *mut RawModel) -> *mut RawStream;
+    fn eremite_stream_free(x: *mut RawStream);
+    fn eremite_stream_prefill(
+        x: *mut RawStream,
+        s: *mut RawState,
+        tokens: *const i32,
+        n: c_int,
+        from: c_int,
+        replay: c_int,
+        capture: c_int,
+        images: *const RawMedia,
+    );
+    fn eremite_stream_decode_rows(
+        x: *mut RawStream,
+        states: *mut *mut RawState,
+        tokens: *const i32,
+        pos: *const i32,
+        count: c_int,
+    );
+    fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
+    fn eremite_stream_logits(x: *const RawStream) -> *const f32;
+    fn eremite_sampler_new(
+        temperature: f64,
+        top_p: f64,
+        top_k: c_int,
+        seed: u64,
+        seed_set: c_int,
+    ) -> *mut RawSampler;
+    fn eremite_sampler_free(s: *mut RawSampler);
+    fn eremite_sample(m: *const RawModel, logits: *const f32, s: *mut RawSampler) -> i32;
     fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
     fn eremite_tokenize(
         t: *mut RawTokenizer,
@@ -282,6 +339,28 @@ impl Options {
     }
 }
 
+/// The handle of a state that Model::state_new made. It stays valid until
+/// Model::state_free frees the state.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateHandle(NonNull<RawState>);
+
+/// Logits of one row or more, from a finished call. They stay valid until the
+/// stream's next call.
+#[derive(Clone, Copy, Debug)]
+pub struct Logits(NonNull<f32>);
+
+impl Logits {
+    /// Returns the logits of row `row`, where each row holds `vocab` floats.
+    ///
+    /// # Safety
+    ///
+    /// The logits hold more than `row` rows of `vocab` floats.
+    pub unsafe fn row(self, row: usize, vocab: usize) -> Logits {
+        Logits(unsafe { self.0.add(row * vocab) })
+    }
+}
+
 /// A registered model whose weights may still be unloaded. It stays on the
 /// engine's thread.
 pub struct Model {
@@ -467,6 +546,22 @@ impl Model {
         unsafe { eremite_is_stop_token(self.raw, token) != 0 }
     }
 
+    /// Makes a new state, or returns None when its memory does not fit.
+    pub fn state_new(&self) -> Option<StateHandle> {
+        let s = unsafe { eremite_state_new(self.raw) };
+        NonNull::new(s).map(StateHandle)
+    }
+
+    /// Frees a state that no call uses.
+    pub fn state_free(&self, s: StateHandle) {
+        unsafe { eremite_state_free(self.raw, s.0.as_ptr()) }
+    }
+
+    /// Returns a token sampled from one row of logits.
+    pub fn sample(&self, logits: Logits, sampler: &mut Sampler) -> i32 {
+        unsafe { eremite_sample(self.raw, logits.0.as_ptr(), sampler.0) }
+    }
+
     /// Returns the model's tokenizer.
     pub fn tokenizer(&self) -> Tokenizer {
         Tokenizer(unsafe { eremite_model_tokenizer(self.raw) })
@@ -537,6 +632,104 @@ impl Tokenizer {
             unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }
         }
     }
+}
+
+/// How a model picks a token from a row of logits.
+pub struct Sampler(*mut RawSampler);
+
+impl Sampler {
+    /// Returns a sampler, or None for settings the engine refuses. A
+    /// temperature of 0 is greedy, top_k 0 takes every token, and no seed
+    /// gives a random one.
+    pub fn new(temperature: f64, top_p: f64, top_k: u32, seed: Option<u64>) -> Option<Sampler> {
+        let s = unsafe {
+            eremite_sampler_new(
+                temperature,
+                top_p,
+                top_k as c_int,
+                seed.unwrap_or(0),
+                seed.is_some().into(),
+            )
+        };
+        (!s.is_null()).then_some(Sampler(s))
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe { eremite_sampler_free(self.0) }
+    }
+}
+
+/// One model's calls, one after another, on their own stack and working
+/// buffers (eremite_stream). The calls of several streams run at the same
+/// time. A posted call runs when run_streams advances its stream. What the
+/// call was given must stay valid until it finishes.
+pub struct Stream(*mut RawStream);
+
+impl Stream {
+    /// Makes a stream for `model`'s calls.
+    pub fn new(model: &Model) -> Stream {
+        Stream(unsafe { eremite_stream_new(model.raw) })
+    }
+
+    /// Posts the prefill of a prompt's `tokens` from position `from` on, in
+    /// `s`, which holds every position before `from`.
+    pub fn prefill(&self, s: StateHandle, tokens: &[i32], from: usize) {
+        unsafe {
+            eremite_stream_prefill(
+                self.0,
+                s.0.as_ptr(),
+                tokens.as_ptr(),
+                tokens.len() as c_int,
+                from as c_int,
+                // No replay, no snapshot and no images.
+                0,
+                -1,
+                ptr::null(),
+            )
+        }
+    }
+
+    /// Posts one decoding call: for each state, its token at its position.
+    pub fn decode_rows(&self, states: &[StateHandle], tokens: &[i32], pos: &[i32]) {
+        assert!(
+            tokens.len() == states.len() && pos.len() == states.len(),
+            "a decoding call has a token and a position for each state"
+        );
+        // The engine copies the handles and writes none of them.
+        let handles = states.as_ptr().cast::<*mut RawState>().cast_mut();
+        unsafe {
+            eremite_stream_decode_rows(
+                self.0,
+                handles,
+                tokens.as_ptr(),
+                pos.as_ptr(),
+                states.len() as c_int,
+            )
+        }
+    }
+
+    /// Returns the finished call's logits, or None when the call did not fit
+    /// in memory.
+    pub fn logits(&self) -> Option<Logits> {
+        let lg = unsafe { eremite_stream_logits(self.0) };
+        NonNull::new(lg.cast_mut()).map(Logits)
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe { eremite_stream_free(self.0) }
+    }
+}
+
+/// Advances the streams until a call finishes, and returns that stream's
+/// index. Returns None when no stream has a call posted.
+pub fn run_streams(streams: &[&Stream]) -> Option<usize> {
+    let raw: Vec<*mut RawStream> = streams.iter().map(|x| x.0).collect();
+    let i = unsafe { eremite_run_streams(raw.as_ptr(), raw.len() as c_int) };
+    (i >= 0).then_some(i as usize)
 }
 
 #[cfg(test)]
