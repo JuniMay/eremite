@@ -9,6 +9,8 @@
 use std::ffi::{CString, c_char, c_int};
 use std::ptr::{self, NonNull};
 
+use deepseek_recipe::stream::StreamTokenizer;
+
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
 const ABI: c_int = 2;
@@ -440,6 +442,8 @@ unsafe extern "C" {
     fn eremite_media_encode(x: *mut RawMedia, from: c_int) -> c_int;
     fn eremite_media_close(x: *mut RawMedia);
     fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
+    #[cfg(test)]
+    fn eremite_tokenizer_open(dir: *const c_char, image: *const c_char) -> *mut RawTokenizer;
     fn eremite_tokenize(
         t: *mut RawTokenizer,
         text: *const c_char,
@@ -905,6 +909,13 @@ impl Model {
         unsafe { eremite_max_verify(self.raw) as usize }
     }
 
+    /// Returns the most rows that one prefill call takes, or None when one
+    /// call takes the whole prompt, as it does for every family the engine
+    /// runs.
+    pub fn prefill_rows(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns the number of floats in a row of logits: the vocabulary's size.
     pub fn vocab_size(&self) -> usize {
         unsafe { eremite_vocab_size(self.raw) as usize }
@@ -1100,6 +1111,22 @@ unsafe impl Send for Tokenizer {}
 unsafe impl Sync for Tokenizer {}
 
 impl Tokenizer {
+    /// Opens the tokenizer of the checkpoint in `dir` without its model, for
+    /// the tests. `image` is the spelling of its model's image token, if it
+    /// has one. A tokenizer that the engine cannot run ends the process with
+    /// a message.
+    #[cfg(test)]
+    pub fn open(dir: &str, image: Option<&str>) -> Tokenizer {
+        let dir = c_string(dir);
+        let image = image.map(c_string);
+        Tokenizer(unsafe {
+            eremite_tokenizer_open(
+                dir.as_ptr(),
+                image.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            )
+        })
+    }
+
     /// Returns the token ids of `text` in eremite_tokenize's `mode`.
     fn tokenize_in_mode(&self, text: &[u8], mode: c_int) -> Vec<i32> {
         // A token holds one byte at least, and the tokenizer may add one
@@ -1180,6 +1207,31 @@ impl Sampler {
 impl Drop for Sampler {
     fn drop(&mut self) {
         unsafe { eremite_sampler_free(self.0) }
+    }
+}
+
+/// The tokenizer as deepseek-recipe's stream processor reads it: a token's text
+/// is its bytes, and the special tokens are the tokenizer's added tokens.
+impl StreamTokenizer for Tokenizer {
+    fn decode_ids(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        for &id in ids {
+            if skip_special_tokens && self.is_special_token(id) {
+                continue;
+            }
+            bytes.extend_from_slice(self.token_bytes(id as i32));
+        }
+        // An unfinished character at the end becomes U+FFFD, so the processor
+        // waits for the token that finishes it.
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Some(self.tokenize(text).len())
+    }
+
+    fn is_special_token(&self, id: u32) -> bool {
+        self.is_added(id as i32)
     }
 }
 
@@ -1542,6 +1594,33 @@ mod tests {
         let index = r#"{"weight_map": {"w": "part.safetensors"}}"#;
         std::fs::write(dir.0.join("model.safetensors.index.json"), index).unwrap();
         assert_eq!(validate_weight_files(dir.path()), Ok(()));
+    }
+
+    /// The test reads the tokenizer of the checkpoint that EREMITE_CHECKPOINT
+    /// names. Without it, the test returns at once without checking.
+    #[test]
+    fn the_stream_processor_reads_tokens_as_their_bytes() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = Tokenizer::open(&dir, Some("<｜deepseek_image｜>"));
+        let image = tokenizer.find_added_token("<｜deepseek_image｜>").unwrap();
+        let mut ids: Vec<u32> = tokenizer
+            .tokenize("Hello")
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        ids.push(image as u32);
+        assert!(tokenizer.is_special_token(image as u32));
+        assert_eq!(tokenizer.decode_ids(&ids, true), Ok("Hello".into()));
+        assert_eq!(
+            tokenizer.decode_ids(&ids, false),
+            Ok("Hello<｜deepseek_image｜>".into())
+        );
+        assert_eq!(
+            tokenizer.count_tokens("Hello, world"),
+            Some(tokenizer.tokenize("Hello, world").len())
+        );
     }
 
     #[test]
