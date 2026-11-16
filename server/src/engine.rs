@@ -1,8 +1,8 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; and a
-//! model with its tokenizer. A [`Model`] is one registered checkpoint. Its
-//! functions run on the engine's thread only; the tokenizer's run on any
-//! thread.
+//! model with its tokenizer. A [`Model`] is one registered checkpoint, whose
+//! weights load on demand. Its functions run on the engine's thread only; the
+//! tokenizer's run on any thread.
 
 use std::ffi::{CString, c_char, c_int};
 use std::ptr;
@@ -79,8 +79,14 @@ unsafe extern "C" {
     fn eremite_count_stop_requests() -> c_int;
     fn eremite_log(line: *const c_char);
     fn eremite_open(c: *const RawConfig) -> *mut RawModel;
+    fn eremite_load(m: *mut RawModel) -> c_int;
+    fn eremite_is_loaded(m: *const RawModel) -> c_int;
+    fn eremite_unload(m: *mut RawModel) -> u64;
+    fn eremite_drain();
+    fn eremite_set_request_running(m: *mut RawModel, active: c_int);
     fn eremite_max_rows(m: *const RawModel) -> c_int;
     fn eremite_vocab_size(m: *const RawModel) -> c_int;
+    fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
     fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
     fn eremite_tokenize(
         t: *mut RawTokenizer,
@@ -164,6 +170,11 @@ pub fn request_stop() {
 /// Returns how many stops were requested.
 pub fn count_stop_requests() -> u32 {
     unsafe { eremite_count_stop_requests().max(0) as u32 }
+}
+
+/// Waits for the GPU's work and the expert reads to finish.
+pub fn drain() {
+    unsafe { eremite_drain() };
 }
 
 /// Writes a line to the log, with the time: on stderr, or to init's on_log.
@@ -275,6 +286,89 @@ impl Options {
 /// engine's thread.
 pub struct Model {
     raw: *mut RawModel,
+    /// The checkpoint's directory.
+    directory: String,
+    /// Whether the weight files passed validate_weight_files.
+    validated: std::cell::Cell<bool>,
+}
+
+/// The largest safetensors header that validate_weight_files reads. A larger
+/// one is taken as damaged. The reason for this value is unknown.
+const MAX_WEIGHT_HEADER_BYTES: u64 = 64 << 20;
+
+/// Checks that every weight of the checkpoint in `directory` lies inside its
+/// safetensors file: the files of model.safetensors.index.json's weight_map,
+/// or model.safetensors alone. Returns what is missing or damaged.
+fn validate_weight_files(directory: &str) -> Result<(), String> {
+    use std::io::Read;
+    let root = std::path::Path::new(directory);
+    let index = root.join("model.safetensors.index.json");
+    let bytes = if index.exists() {
+        std::fs::read(&index).map_err(|e| format!("model weight index is unavailable: {e}"))?
+    } else {
+        b"null".to_vec()
+    };
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid model weight index: {e}"))?;
+    let mut files = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    if json.is_null() {
+        files.insert("model.safetensors", Vec::new());
+    } else {
+        let weights = json
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .filter(|m| !m.is_empty())
+            .ok_or("model weight index has no weight_map")?;
+        for (name, file) in weights {
+            files
+                .entry(file.as_str().ok_or("weight shard name is not text")?)
+                .or_default()
+                .push(name);
+        }
+    }
+    for (name, tensors) in files {
+        let mut file = std::fs::File::open(root.join(name))
+            .map_err(|e| format!("model weight shard {name} is unavailable: {e}"))?;
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        // A safetensors file starts with its header's length, 8 bytes.
+        let mut prefix = [0u8; 8];
+        file.read_exact(&mut prefix)
+            .map_err(|e| format!("cannot read weight shard {name}: {e}"))?;
+        let header = u64::from_le_bytes(prefix);
+        if header > MAX_WEIGHT_HEADER_BYTES || header > size.saturating_sub(8) {
+            return Err(format!("invalid weight header in {name}"));
+        }
+        let mut data = vec![0; header as usize];
+        file.read_exact(&mut data)
+            .map_err(|e| format!("cannot read weight header {name}: {e}"))?;
+        let values: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| format!("invalid weight header {name}: {e}"))?;
+        let tensors = if tensors.is_empty() {
+            values
+                .as_object()
+                .ok_or("weight header is not an object")?
+                .keys()
+                .filter(|key| key.as_str() != "__metadata__")
+                .map(String::as_str)
+                .collect()
+        } else {
+            tensors
+        };
+        for tensor in tensors {
+            let offsets = values
+                .get(tensor)
+                .and_then(|v| v.get("data_offsets"))
+                .and_then(serde_json::Value::as_array)
+                .filter(|v| v.len() == 2)
+                .ok_or_else(|| format!("missing weight {tensor} in {name}"))?;
+            let start = offsets[0].as_u64().ok_or("invalid weight offset")?;
+            let end = offsets[1].as_u64().ok_or("invalid weight offset")?;
+            if start > end || end > size - header - 8 {
+                return Err(format!("weight {tensor} extends past {name}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Model {
@@ -316,7 +410,44 @@ impl Model {
             },
         };
         let m = unsafe { eremite_open(&raw) };
-        (!m.is_null()).then_some(Model { raw: m })
+        (!m.is_null()).then_some(Model {
+            raw: m,
+            directory: o.model.clone(),
+            validated: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Loads the model's weights, or loads them again after they were given
+    /// back. The first load checks the weight files first. After a load, the
+    /// model runs admitted requests. Returns why the model did not load.
+    pub fn load(&self) -> Result<(), String> {
+        if !self.validated.get() {
+            validate_weight_files(&self.directory)?;
+            self.validated.set(true);
+        }
+        if unsafe { eremite_load(self.raw) != 0 } {
+            Ok(())
+        } else {
+            Err("the model could not be loaded".into())
+        }
+    }
+
+    /// Returns whether the model is loaded and its weights are in memory.
+    pub fn is_loaded(&self) -> bool {
+        unsafe { eremite_is_loaded(self.raw) != 0 }
+    }
+
+    /// Sets whether the model runs admitted requests. While it does, its
+    /// weights stay in memory.
+    pub fn set_request_running(&self, active: bool) {
+        unsafe { eremite_set_request_running(self.raw, active.into()) };
+    }
+
+    /// Gives the model's expert cache and weights back to the system while
+    /// the model runs no request. Its states stay, and the next load reads
+    /// the weights again. Returns the bytes given back.
+    pub fn unload(&self) -> u64 {
+        unsafe { eremite_unload(self.raw) }
     }
 
     /// Returns how many rows of different states one decoding call takes at
@@ -328,6 +459,12 @@ impl Model {
     /// Returns the number of floats in a row of logits: the vocabulary's size.
     pub fn vocab_size(&self) -> usize {
         unsafe { eremite_vocab_size(self.raw) as usize }
+    }
+
+    /// Returns whether a token ends a reply. The loaded model knows its end
+    /// token.
+    pub fn is_stop_token(&self, token: i32) -> bool {
+        unsafe { eremite_is_stop_token(self.raw, token) != 0 }
     }
 
     /// Returns the model's tokenizer.
@@ -462,6 +599,43 @@ mod tests {
         let mut unset = Options::default();
         unset.configure(Architecture::DeepSeek).unwrap();
         assert_eq!(unset.deepseek(), Some(&DeepSeekOptions::default()));
+    }
+
+    /// Writes a safetensors file `name` in `dir`: its header's length, the
+    /// header `header`, then `data_bytes` bytes of data.
+    fn write_safetensors(dir: &TestDir, name: &str, header: &str, data_bytes: usize) {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.resize(bytes.len() + data_bytes, 0);
+        std::fs::write(dir.0.join(name), bytes).unwrap();
+    }
+
+    #[test]
+    fn every_weight_must_lie_inside_its_file() {
+        let dir = TestDir::new("weights");
+        let error = validate_weight_files(dir.path()).unwrap_err();
+        assert!(
+            error.contains("model.safetensors is unavailable"),
+            "{error}"
+        );
+        let header = r#"{"w": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}}"#;
+        write_safetensors(&dir, "model.safetensors", header, 8);
+        assert_eq!(validate_weight_files(dir.path()), Ok(()));
+        write_safetensors(&dir, "model.safetensors", header, 4);
+        let error = validate_weight_files(dir.path()).unwrap_err();
+        assert_eq!(error, "weight w extends past model.safetensors");
+        std::fs::write(dir.0.join("model.safetensors"), 1u64.to_le_bytes()).unwrap();
+        let error = validate_weight_files(dir.path()).unwrap_err();
+        assert_eq!(error, "invalid weight header in model.safetensors");
+        // With an index, each shard holds the weights the index names.
+        write_safetensors(&dir, "part.safetensors", header, 8);
+        let index = r#"{"weight_map": {"w": "part.safetensors", "v": "part.safetensors"}}"#;
+        std::fs::write(dir.0.join("model.safetensors.index.json"), index).unwrap();
+        let error = validate_weight_files(dir.path()).unwrap_err();
+        assert_eq!(error, "missing weight v in part.safetensors");
+        let index = r#"{"weight_map": {"w": "part.safetensors"}}"#;
+        std::fs::write(dir.0.join("model.safetensors.index.json"), index).unwrap();
+        assert_eq!(validate_weight_files(dir.path()), Ok(()));
     }
 
     #[test]
