@@ -4,8 +4,10 @@
 #   make                build/liberemite.a, build/eremite and every test program
 #   make test           run the tests that need neither a GPU nor model files
 #   make gpu-test       run the tests that need a GPU but no model files
-#   make format         format the sources in place with clang-format
-#   make format-check   fail if clang-format would change a source
+#   make server-test    run the tests of the server in server/
+#   make format         format the sources in place with clang-format and
+#                       rustfmt
+#   make format-check   fail if clang-format or rustfmt would change a source
 #   make clean          remove build/ and compile_commands.json
 #
 #   THREADS=pthread     build the threads layer on POSIX threads instead of
@@ -73,6 +75,7 @@ TESTS := $(foreach t,$(TEST_SRC),$(BUILD)/tests/$(subst /,-,$(t:tests/%.c=%)))
 group_tests = $(filter $(BUILD)/tests/$(1)-%,$(TESTS))
 # Each test runs with a time limit, so that a hang fails the run: after
 # TEST_SECONDS, the test and the processes it started end. 0 sets no limit.
+# The server's tests run under one limit together.
 TEST_SECONDS ?= 600
 TIME_LIMIT := $(BUILD)/tests/time-limit
 
@@ -84,7 +87,7 @@ TEST_CFLAGS =
 
 FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.m' -o -name '*.h' 2>/dev/null)
 
-.PHONY: all test gpu-test format format-check clean
+.PHONY: all test gpu-test server-test format format-check clean
 all: $(LIB) $(CLI) $(TESTS) $(TIME_LIMIT) compile_commands.json
 
 # Each compiled file writes its entry of the compilation database beside its
@@ -116,7 +119,7 @@ $(foreach g,$(TEST_GROUPS),$(eval $(call test_rule,$(g))))
 # clangd's compilation database, from the entries beside each object and program.
 compile_commands.json: $(LIB_OBJ) $(CLI) $(TESTS)
 	@mkdir -p $(BUILD)
-	@{ echo '['; find $(BUILD) -name '*.json' -exec cat {} + | sed '$$ s/,$$//'; echo ']'; } > $@
+	@{ echo '['; find $(OBJ) $(BUILD)/tests -name '*.json' -exec cat {} + | sed '$$ s/,$$//'; echo ']'; } > $@
 
 $(TIME_LIMIT): tests/time_limit.c
 	@mkdir -p $(@D)
@@ -128,11 +131,22 @@ test: $(TIME_LIMIT) $(CLI) $(call group_tests,unit)
 gpu-test: $(TIME_LIMIT) $(call group_tests,gpu)
 	@set -e; for t in $(call group_tests,gpu); do echo "== $$t"; $(TIME_LIMIT) $(TEST_SECONDS) $$t; done
 
+# The server, in Rust. cargo builds it in build/cargo, which
+# server/.cargo/config.toml also sets for cargo commands inside server/, and
+# links build/liberemite.a.
+CARGO ?= cargo
+SERVER := $(wildcard server/Cargo.toml)
+
+server-test: $(LIB) $(TIME_LIMIT)
+	$(TIME_LIMIT) $(TEST_SECONDS) $(CARGO) test --release --locked --manifest-path server/Cargo.toml --target-dir $(BUILD)/cargo
+
 format:
 	$(if $(FORMAT_SRC),clang-format -i $(FORMAT_SRC))
+	$(if $(SERVER),$(CARGO) fmt --manifest-path server/Cargo.toml)
 
 format-check:
 	$(if $(FORMAT_SRC),clang-format --dry-run --Werror $(FORMAT_SRC))
+	$(if $(SERVER),$(CARGO) fmt --check --manifest-path server/Cargo.toml)
 
 clean:
 	rm -rf $(BUILD) compile_commands.json

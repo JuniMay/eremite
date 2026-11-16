@@ -1,0 +1,6 @@
+[package]
+name = "eremite-server"
+version = "0.1.0"
+edition = "2024"
+description = "eremite's HTTP server over the engine's C interface, src/eremite.h"
+publish = false

@@ -1,0 +1,50 @@
+// Builds the engine, build/liberemite.a, with the repository's Makefile, and
+// links it with the frameworks and libraries its C code uses.
+use std::path::Path;
+use std::process::Command;
+
+fn main() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let root = Path::new(&manifest)
+        .parent()
+        .expect("server/ is inside the repository");
+    let status = Command::new("make")
+        .arg("-C")
+        .arg(root)
+        .arg("build/liberemite.a")
+        .status()
+        .expect("make runs");
+    assert!(status.success(), "make build/liberemite.a failed");
+
+    println!(
+        "cargo:rustc-link-search=native={}",
+        root.join("build").display()
+    );
+    println!("cargo:rustc-link-lib=static=eremite");
+    for framework in ["Metal", "Foundation", "IOKit", "ImageIO", "CoreGraphics"] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
+    println!("cargo:rustc-link-lib=objc");
+    println!("cargo:rustc-link-lib=icucore"); // the tokenizer's regexes and NFC
+    // The native parser and image decoder use the same libraries as Make.
+    let libs = Command::new("pkg-config")
+        .args(["--libs", "yyjson", "libjpeg"])
+        .output()
+        .expect("pkg-config runs");
+    assert!(
+        libs.status.success(),
+        "pkg-config requires yyjson and libjpeg"
+    );
+    for flag in String::from_utf8_lossy(&libs.stdout).split_whitespace() {
+        if let Some(dir) = flag.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={dir}");
+        } else if let Some(lib) = flag.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    }
+
+    // Cargo scans a directory's whole tree for changes.
+    for path in ["Makefile", "src"] {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
+    }
+}
