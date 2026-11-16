@@ -1,7 +1,11 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
-//! the process's settings, its log and its stop, and a model's settings.
+//! the process's settings, its log and its stop; a model's settings; and a
+//! model with its tokenizer. A [`Model`] is one registered checkpoint. Its
+//! functions run on the engine's thread only; the tokenizer's run on any
+//! thread.
 
 use std::ffi::{CString, c_char, c_int};
+use std::ptr;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
@@ -26,6 +30,47 @@ struct RawProcess {
     on_stop: Option<extern "C" fn()>,
 }
 
+/// DeepSeek's settings (eremite_deepseek_config).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawDeepSeekConfig {
+    experts: *const c_char,
+    substitute: f32,
+    draft: c_int,
+    ced: c_int,
+    prefill_prune: c_int,
+    packed_state_rows: c_int,
+}
+
+/// A model's settings (eremite_config).
+#[repr(C)]
+struct RawConfig {
+    abi: c_int,
+    model: *const c_char,
+    ctx: c_int,
+    lookup: c_int,
+    deepseek: RawDeepSeekConfig,
+}
+
+/// A registered model (eremite_model).
+#[repr(C)]
+struct RawModel {
+    _opaque: [u8; 0],
+}
+
+/// A checkpoint's tokenizer (eremite_tokenizer).
+#[repr(C)]
+struct RawTokenizer {
+    _opaque: [u8; 0],
+}
+
+/// eremite_tokenize's mode that also takes the added tokens' spellings as
+/// those tokens.
+const TOKENIZE_ADDED_TOKENS: c_int = 1;
+/// eremite_tokenize's mode for a rendered prompt: as TOKENIZE_ADDED_TOKENS,
+/// with the byte 0xFF for an image's place.
+const TOKENIZE_PROMPT: c_int = 2;
+
 unsafe extern "C" {
     fn eremite_init(p: *const RawProcess) -> c_int;
     fn eremite_idle_work_interval_seconds() -> f64;
@@ -33,6 +78,21 @@ unsafe extern "C" {
     fn eremite_request_stop();
     fn eremite_count_stop_requests() -> c_int;
     fn eremite_log(line: *const c_char);
+    fn eremite_open(c: *const RawConfig) -> *mut RawModel;
+    fn eremite_max_rows(m: *const RawModel) -> c_int;
+    fn eremite_vocab_size(m: *const RawModel) -> c_int;
+    fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
+    fn eremite_tokenize(
+        t: *mut RawTokenizer,
+        text: *const c_char,
+        len: usize,
+        mode: c_int,
+        out: *mut i32,
+        max: c_int,
+    ) -> c_int;
+    fn eremite_token_bytes(t: *const RawTokenizer, id: i32, len: *mut usize) -> *const c_char;
+    fn eremite_token_kind(t: *const RawTokenizer, id: i32) -> c_int;
+    fn eremite_find_added_token(t: *const RawTokenizer, text: *const c_char, len: usize) -> i32;
 }
 
 /// Returns `s` as a C string. A NUL byte would end the string early, so the
@@ -211,6 +271,137 @@ impl Options {
     }
 }
 
+/// A registered model whose weights may still be unloaded. It stays on the
+/// engine's thread.
+pub struct Model {
+    raw: *mut RawModel,
+}
+
+impl Model {
+    /// Registers the checkpoint's model with settings `o`: its metadata and
+    /// its tokenizer, without its weights. None, with the reason in the log,
+    /// for a checkpoint or settings the engine refuses.
+    pub fn open(o: &Options) -> Option<Model> {
+        let architecture = match Architecture::of(&o.model) {
+            Ok(architecture) => architecture,
+            Err(error) => {
+                log(&error);
+                return None;
+            }
+        };
+        let mut o = o.clone();
+        if let Err(error) = o.configure(architecture) {
+            log(&error);
+            return None;
+        }
+        let deepseek = o.deepseek().cloned().unwrap_or_default();
+        let model = c_string(&o.model);
+        let experts = deepseek.experts.as_deref().map(c_string);
+        let raw = RawConfig {
+            abi: ABI,
+            model: model.as_ptr(),
+            ctx: o.ctx,
+            // No context-copy proposals.
+            lookup: 0,
+            deepseek: RawDeepSeekConfig {
+                experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                // The engine's approximate substitution stays off: it is for
+                // the engine's tests only.
+                substitute: 0.0,
+                // No proposals of the draft head.
+                draft: 0,
+                ced: deepseek.ced,
+                prefill_prune: deepseek.prefill_prune.into(),
+                packed_state_rows: deepseek.packed_state_rows.into(),
+            },
+        };
+        let m = unsafe { eremite_open(&raw) };
+        (!m.is_null()).then_some(Model { raw: m })
+    }
+
+    /// Returns how many rows of different states one decoding call takes at
+    /// most.
+    pub fn max_rows(&self) -> usize {
+        unsafe { eremite_max_rows(self.raw) as usize }
+    }
+
+    /// Returns the number of floats in a row of logits: the vocabulary's size.
+    pub fn vocab_size(&self) -> usize {
+        unsafe { eremite_vocab_size(self.raw) as usize }
+    }
+
+    /// Returns the model's tokenizer.
+    pub fn tokenizer(&self) -> Tokenizer {
+        Tokenizer(unsafe { eremite_model_tokenizer(self.raw) })
+    }
+}
+
+/// A checkpoint's tokenizer. It lives as long as the process, and any thread
+/// may use it.
+#[derive(Clone, Copy)]
+pub struct Tokenizer(*mut RawTokenizer);
+
+// Safety: each engine tokenizer has its own lock, and it is never freed.
+unsafe impl Send for Tokenizer {}
+unsafe impl Sync for Tokenizer {}
+
+impl Tokenizer {
+    /// Returns the token ids of `text` in eremite_tokenize's `mode`.
+    fn tokenize_in_mode(&self, text: &[u8], mode: c_int) -> Vec<i32> {
+        // A token holds one byte at least, and the tokenizer may add one
+        // token before the text and one after it.
+        let mut out = vec![0i32; text.len() + 2];
+        let n = unsafe {
+            eremite_tokenize(
+                self.0,
+                text.as_ptr().cast(),
+                text.len(),
+                mode,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        out.truncate(n.max(0) as usize);
+        out
+    }
+
+    /// Returns the token ids of `text`, in which the added tokens' spellings
+    /// are those tokens.
+    pub fn tokenize(&self, text: &str) -> Vec<i32> {
+        self.tokenize_in_mode(text.as_bytes(), TOKENIZE_ADDED_TOKENS)
+    }
+
+    /// Returns the token ids of a rendered prompt: the added tokens'
+    /// spellings are those tokens, and the byte 0xFF is an image's place.
+    pub fn tokenize_prompt(&self, prompt: &[u8]) -> Vec<i32> {
+        self.tokenize_in_mode(prompt, TOKENIZE_PROMPT)
+    }
+
+    /// Returns the id of the added token spelled `text`, if there is one.
+    pub fn find_added_token(&self, text: &str) -> Option<i32> {
+        let id = unsafe { eremite_find_added_token(self.0, text.as_ptr().cast(), text.len()) };
+        (id >= 0).then_some(id)
+    }
+
+    /// Returns whether a token is one of the tokenizer's added tokens.
+    pub fn is_added(&self, id: i32) -> bool {
+        unsafe { eremite_token_kind(self.0, id) != 0 }
+    }
+
+    /// Returns a token's bytes, or none for an unknown id.
+    pub fn token_bytes(&self, id: i32) -> &'static [u8] {
+        let mut n = 0usize;
+        // Safety: the tokenizer and its bytes stay loaded while the process
+        // runs.
+        let p = unsafe { eremite_token_bytes(self.0, id, &mut n) };
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +462,27 @@ mod tests {
         let mut unset = Options::default();
         unset.configure(Architecture::DeepSeek).unwrap();
         assert_eq!(unset.deepseek(), Some(&DeepSeekOptions::default()));
+    }
+
+    #[test]
+    fn a_model_stays_on_its_thread() {
+        // Resolves to the first impl unless T is Send; then both impls apply
+        // and the call is ambiguous, which fails to compile.
+        trait NotSend<Marker> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSend<()> for T {}
+        struct SendMarker;
+        impl<T: ?Sized + Send> NotSend<SendMarker> for T {}
+        let _ = <Model as NotSend<_>>::check;
+
+        // The same for Sync.
+        trait NotSync<Marker> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSync<()> for T {}
+        struct SyncMarker;
+        impl<T: ?Sized + Sync> NotSync<SyncMarker> for T {}
+        let _ = <Model as NotSync<_>>::check;
     }
 }
