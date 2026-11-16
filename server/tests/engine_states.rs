@@ -84,7 +84,7 @@ fn a_state_s_rows_carry_over_to_other_states() {
             // The original: the whole prompt, with a snapshot captured at half
             // of it and one taken at its end.
             let original = model.state_new().unwrap();
-            stream.prefill(original, &prompt, 0, false, Some(half));
+            stream.prefill(original, &prompt, 0, false, Some(half), None);
             run(&stream);
             let info = stream.prefill_info();
             assert_eq!(info.tokens as usize, n, "the prefill ran every row");
@@ -124,7 +124,7 @@ fn a_state_s_rows_carry_over_to_other_states() {
             // A copy of half the prompt, then a prefill that replays.
             let replayed = model.state_new().unwrap();
             model.state_copy(replayed, original, half);
-            stream.prefill(replayed, &prompt, half, true, None);
+            stream.prefill(replayed, &prompt, half, true, None, None);
             run(&stream);
             assert!(stream.prefill_info().tokens as usize >= n - half);
             let logits = stream.logits().unwrap();
@@ -139,7 +139,7 @@ fn a_state_s_rows_carry_over_to_other_states() {
             let resumed = model.state_new().unwrap();
             model.state_copy(resumed, original, half);
             model.snapshot_restore(resumed, at_half);
-            stream.prefill(resumed, &prompt, half, false, None);
+            stream.prefill(resumed, &prompt, half, false, None, None);
             run(&stream);
             let info = stream.prefill_info();
             assert_eq!(info.tokens as usize, n - half, "only the rest");

@@ -103,7 +103,7 @@ fn a_state_read_from_files_continues_as_the_original() {
             let (n, half) = (prompt.len(), prompt.len() / 2);
             let stream = Stream::new(&model);
             let original = model.state_new().unwrap();
-            stream.prefill(original, &prompt, 0, false, None);
+            stream.prefill(original, &prompt, 0, false, None, None);
             run(&stream);
             let logits = stream.logits().unwrap();
             let kept = model.snapshot_take(original, n, Some(logits));

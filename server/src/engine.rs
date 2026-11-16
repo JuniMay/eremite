@@ -1,7 +1,7 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; a model
-//! with its tokenizer; and the model's states, snapshots, saved states, calls
-//! and sampling. A
+//! with its tokenizer; and the model's states, snapshots, saved states, calls,
+//! media and sampling. A
 //! [`Model`] is one registered checkpoint, whose weights load on demand. Its
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
@@ -218,6 +218,23 @@ unsafe extern "C" {
     ) -> *mut RawSampler;
     fn eremite_sampler_free(s: *mut RawSampler);
     fn eremite_sample(m: *const RawModel, logits: *const f32, s: *mut RawSampler) -> i32;
+    fn eremite_media_open(
+        m: *mut RawModel,
+        data: *const *const u8,
+        len: *const usize,
+        n: c_int,
+        message: *mut c_char,
+        cap: usize,
+    ) -> *mut RawMedia;
+    fn eremite_media_expand(
+        x: *mut RawMedia,
+        input: *const i32,
+        n: c_int,
+        out: *mut i32,
+        max: c_int,
+    ) -> c_int;
+    fn eremite_media_encode(x: *mut RawMedia, from: c_int) -> c_int;
+    fn eremite_media_close(x: *mut RawMedia);
     fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
     fn eremite_tokenize(
         t: *mut RawTokenizer,
@@ -459,6 +476,9 @@ pub struct Model {
     /// Whether the weight files passed validate_weight_files.
     validated: std::cell::Cell<bool>,
 }
+
+/// The room for the message that says why a media input cannot be decoded.
+const MEDIA_MESSAGE_BYTES: usize = 256;
 
 /// The largest safetensors header that validate_weight_files reads. A larger
 /// one is taken as damaged. The reason for this value is unknown.
@@ -779,6 +799,30 @@ impl Model {
         unsafe { eremite_sample(self.raw, logits.0.as_ptr(), sampler.0) }
     }
 
+    /// Decodes a prompt's media files, in the prompt's order, for this
+    /// model's encoder. Returns why a file cannot be decoded.
+    pub fn open_media(&self, media: &[Vec<u8>]) -> Result<Media, String> {
+        let data: Vec<*const u8> = media.iter().map(|i| i.as_ptr()).collect();
+        let len: Vec<usize> = media.iter().map(|i| i.len()).collect();
+        let mut message = [0 as c_char; MEDIA_MESSAGE_BYTES];
+        let x = unsafe {
+            eremite_media_open(
+                self.raw,
+                data.as_ptr(),
+                len.as_ptr(),
+                media.len() as c_int,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        if x.is_null() {
+            return Err(unsafe { std::ffi::CStr::from_ptr(message.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        Ok(Media(x))
+    }
+
     /// Returns the model's tokenizer.
     pub fn tokenizer(&self) -> Tokenizer {
         Tokenizer(unsafe { eremite_model_tokenizer(self.raw) })
@@ -878,6 +922,64 @@ impl Drop for Sampler {
     }
 }
 
+/// A prompt's decoded media. Dropping it closes them and gives their memory
+/// back.
+pub struct Media(*mut RawMedia);
+
+/// Why the media's spans could not be put in a prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpandError {
+    /// The prompt has another number of image places than there are media.
+    PlacesAndMediaDiffer,
+    /// With the spans, the prompt has this many tokens, more than allowed.
+    TooLong(usize),
+}
+
+impl Media {
+    /// Returns the prompt with each image place replaced by its image's span,
+    /// at most `max` tokens.
+    pub fn expand(&mut self, prompt: &[i32], max: usize) -> Result<Vec<i32>, ExpandError> {
+        let mut out = vec![0i32; max];
+        let n = unsafe {
+            eremite_media_expand(
+                self.0,
+                prompt.as_ptr(),
+                prompt.len() as c_int,
+                out.as_mut_ptr(),
+                max as c_int,
+            )
+        };
+        let Ok(n) = usize::try_from(n) else {
+            return Err(ExpandError::PlacesAndMediaDiffer);
+        };
+        if n > max {
+            return Err(ExpandError::TooLong(n));
+        }
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// Encodes the media at positions from `from` on, for the next prefill.
+    /// Returns how many it encoded, or why the encoder does not fit.
+    pub fn encode(&mut self, from: usize) -> Result<usize, String> {
+        let count = unsafe { eremite_media_encode(self.0, from as c_int) };
+        if count < 0 {
+            Err(
+                "the global model-memory budget cannot fit the image encoder and its workspace"
+                    .into(),
+            )
+        } else {
+            Ok(count as usize)
+        }
+    }
+}
+
+impl Drop for Media {
+    fn drop(&mut self) {
+        unsafe { eremite_media_close(self.0) }
+    }
+}
+
 /// One model's calls, one after another, on their own stack and working
 /// buffers (eremite_stream). The calls of several streams run at the same
 /// time. A posted call runs when run_streams advances its stream. What the
@@ -895,7 +997,7 @@ impl Stream {
     /// it, `s` holds only the rows that Model::state_copy copies, and the
     /// prefill computes the rest again. With `capture`, the prefill also takes
     /// a snapshot at that position, from `from` on and before the prompt's
-    /// end.
+    /// end. `media` gives the encoded media of the prompt's images.
     pub fn prefill(
         &self,
         s: StateHandle,
@@ -903,6 +1005,7 @@ impl Stream {
         from: usize,
         replay: bool,
         capture: Option<usize>,
+        media: Option<&Media>,
     ) {
         unsafe {
             eremite_stream_prefill(
@@ -913,8 +1016,7 @@ impl Stream {
                 from as c_int,
                 replay.into(),
                 capture.map_or(-1, |p| p as c_int),
-                // No images.
-                ptr::null(),
+                media.map_or(ptr::null(), |media| media.0),
             )
         }
     }
