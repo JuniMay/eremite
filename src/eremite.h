@@ -23,7 +23,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 1
+#define EREMITE_ABI 2
 
 // ---- the process ----
 
@@ -103,6 +103,9 @@ typedef struct {
   int draft;
   int ced;
   int prefill_prune;
+  // Whether a state keeps its compressed rows and index keys packed, as the
+  // reference rounds them: the same values in about 28% of BF16's bytes.
+  int packed_state_rows;
 } eremite_deepseek_config;
 
 // Common settings and DeepSeek's options.
@@ -248,7 +251,8 @@ eremite_snapshot *eremite_snapshot_read(eremite_model *m, int fd);
 // Writes the identity of m's saved states: what they depend on. It is known
 // before the weights load. It covers the family's state layout, the
 // checkpoint's weights, the experts' GGUF set, and the options that change a
-// state's rows or shapes: draft, lookup, ced, prefill_prune and substitute.
+// state's rows or shapes: draft, lookup, ced, prefill_prune, substitute and
+// packed_state_rows.
 // The weights are the folder's config.json, .safetensors and .gguf files, by
 // name, size, and first and last 64 KiB. A state saved with another identity
 // is not read.

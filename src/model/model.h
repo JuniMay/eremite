@@ -30,6 +30,9 @@ typedef struct {
   // Whether prefill skips the decoder batches that neither the last row nor a
   // saved prefix depends on.
   int prefill_prune;
+  // Whether a state keeps its compressed rows and index keys packed, as the
+  // reference rounds them: the same values in about 28% of BF16's bytes.
+  int packed_state_rows;
 } DeepSeekOptions;
 
 // Common execution settings and family-specific options.

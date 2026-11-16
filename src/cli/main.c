@@ -47,6 +47,9 @@ static void usage(void) {
       "  --prefill-prune  skip decoder batches outside required history "
       "(default off); CED and\n"
       "                substitution must be off\n"
+      "  --packed-state-rows  keep a state's compressed rows and index keys "
+      "packed: the same values\n"
+      "                in about 28% of BF16's bytes (default off)\n"
       "  --ced off|N   approximate prefill: replay N decoder tokens, "
       "128-1048576 (default off);\n"
       "                keeps the verification rewind margin; decoding uses all "
@@ -238,6 +241,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(a, "--prefill-prune")) {
       o.deepseek.prefill_prune = 1;
+      continue;
+    }
+    if (!strcmp(a, "--packed-state-rows")) {
+      o.deepseek.packed_state_rows = 1;
       continue;
     }
     if (!v) usage();

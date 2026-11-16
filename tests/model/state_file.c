@@ -24,7 +24,7 @@
 // of the logits it compares.
 //
 // usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] [--lookup N]
-//        [--experts GGUF] [--image] [--unload]
+//        [--experts GGUF] [--image] [--unload] [--packed-state-rows]
 
 #define CHECK(x)                                                               \
   do {                                                                         \
@@ -169,7 +169,7 @@ static void flip(int fd, off_t at) {
 
 int main(int argc, char **argv) {
   double memory = 32;
-  int draft = 0, lookup = 0, unload = 0, image = 0;
+  int draft = 0, lookup = 0, unload = 0, image = 0, packed = 0;
   const char *experts = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--memory") && i + 1 < argc)
@@ -184,13 +184,15 @@ int main(int argc, char **argv) {
       image = 1;
     else if (!strcmp(argv[i], "--unload"))
       unload = 1;
+    else if (!strcmp(argv[i], "--packed-state-rows"))
+      packed = 1;
     else
       argc = 0;
   }
   if (argc < 2)
     die("usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] "
-        "[--lookup N] [--experts GGUF] [--image] "
-        "[--unload]  (--image: a test image in the prompt)");
+        "[--lookup N] [--experts GGUF] [--image] [--unload] "
+        "[--packed-state-rows]  (--image: a test image in the prompt)");
   const char *base = getenv("TMPDIR");
   if (!base || !*base) base = "/tmp";
   snprintf(directory, sizeof directory, "%s/eremite-state-file-model.XXXXXX",
@@ -208,6 +210,7 @@ int main(int argc, char **argv) {
                .draft = draft,
                .lookup = lookup};
   if (experts) o.deepseek.experts = experts;
+  o.deepseek.packed_state_rows = packed;
   Model *model =
       model_open(process_memory, open_gpu(process_memory), argv[1], &o);
   CHECK(model);

@@ -348,6 +348,24 @@ static void base_state(void), reserve(int need, int keep), shrink(void);
 // state holds compressed rows and index keys for cap positions: at first
 // CAP (or the context, if less), doubling as positions need them.
 static constexpr int CAP = 16384;
+// With --packed-state-rows, a state keeps its compressed rows and index keys
+// packed, as the reference quantizes them: a row's E2M1 codes, two to a byte,
+// then its scales. A packed compressed row holds 512 codes and an E4M3 scale
+// for every 16 of them; a packed index key holds 128 codes and an E8M0 scale,
+// a power of two, for every 32. Otherwise they are BF16, which holds each of
+// those values exactly.
+static constexpr int PACKED_COMP_ROW_BYTES = HEAD_DIM / 2 + HEAD_DIM / 16,
+                     PACKED_KEY_ROW_BYTES = IDX_DIM / 2 + IDX_DIM / 32;
+
+// The bytes of a state's compressed row, in the form the options set.
+static int comp_row_bytes(void) {
+  return opt.deepseek.packed_state_rows ? PACKED_COMP_ROW_BYTES : HEAD_DIM * 2;
+}
+
+// The bytes of a state's index key, in the form the options set.
+static int key_row_bytes(void) {
+  return opt.deepseek.packed_state_rows ? PACKED_KEY_ROW_BYTES : IDX_DIM * 2;
+}
 
 struct State {
   Buf ring[LAYERS], comp[LAYERS], keys[LAYERS], cstate[LAYERS], dring[DRAFTS];
@@ -1402,6 +1420,8 @@ static void bind(const State *s);
 static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
                         int srow) {
   Layer *y = &L[l], *src = &L[y->src];
+  // Whether the compressed rows that the rows attend are packed.
+  uint32_t packed = y->ratio && opt.deepseek.packed_state_rows;
   const Buf *cs = y->ratio ? &cs_comp : &cs_base;
   uint32_t p32 = pos;
   // The window keys: the ring when decoding; for a prompt batch, rows of WIN
@@ -1456,7 +1476,8 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       }
     }
     if (groups) {
-      Groups g = {(uint32_t)y->ratio, g0, g0 - pos + 2, 0};
+      Groups g = {(uint32_t)y->ratio, g0, g0 - pos + 2,
+                  opt.deepseek.packed_state_rows != 0};
       gpu_select_kernel(c, K_compress);
       gpu_bind_buffer(c, 0, &CK, 0), gpu_bind_buffer(c, 1, &CS, 0),
           gpu_bind_buffer(c, 2, &y->c_norm, 0), gpu_bind_buffer(c, 3, cs, 0);
@@ -1482,7 +1503,8 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       uint32_t rows = m - t0 < sc_rows ? m - t0 : sc_rows,
                seen = (pos + t0 + rows) / y->ratio;
       Index ix = {p32 + t0, (uint32_t)y->ratio, (uint32_t)opt.ctx,
-                  cand && l > CAND_LAYER ? cand_words : 0, 0};
+                  cand && l > CAND_LAYER ? cand_words : 0,
+                  opt.deepseek.packed_state_rows != 0};
       // Layer 20 writes once; later indexers reuse the same prompt row,
       // even when decoder compaction starts partway through a batch.
       size_t cand_off = (size_t)(srow + t0) * cand_words * 4;
@@ -1512,7 +1534,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
   }
   if (small_rows(m)) {  // one row or a verify pass, each as decoding runs it
     for (int r = 0; r < m; r++) {
-      Att ar = {{p32 + r, base, mod}, 0, visible > 0, 0};
+      Att ar = {{p32 + r, base, mod}, 0, visible > 0, packed};
       ar.first = window_lower(l, p32 + r);
       attend_one(c, &Q, q + (size_t)r * HEADS * HEAD_DIM * 4, win,
                  y->ratio ? &src->comp : win, &SEL,
@@ -1524,7 +1546,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
     for (int r = 0; r < m;) {
       uint32_t rows = m - r < QB_ROWS ? m - r : QB_ROWS, p = p32 + r;
       size_t qr = q + (size_t)r * HEADS * HEAD_DIM * 4;
-      Att ar = {{p, base, mod}, 0, visible > 0, 0};
+      Att ar = {{p, base, mod}, 0, visible > 0, packed};
       // Prefix queries stay unchanged. Retained queries cannot read them.
       // Split at the boundary so first never exceeds a dispatched query
       // position.
@@ -3435,7 +3457,7 @@ static void bench_hc(GpuCommandBuffer *c, int r) {
 
 static void bench_attend(GpuCommandBuffer *c, int r) {
   (void)r;
-  Att at = {{1000, 0, RING}, 0, 1, 0};
+  Att at = {{1000, 0, RING}, 0, 1, opt.deepseek.packed_state_rows != 0};
   ((int *)SEL.ptr)[0] = 512;
   attend_one(c, &Q, 0, &L[5].ring, &L[2].comp, &SEL, 0, &L[5].sink, &cs_comp, 0,
              &O, 0, &at);
@@ -3685,10 +3707,10 @@ static int grown(int cap, int need) {
   return cap < opt.ctx ? cap : opt.ctx;
 }
 
-static size_t
-rows_bytes(int l, int cap,
-           int keys) {  // a KV source's compressed rows or index keys, BF16
-  return (size_t)(cap / L[l].ratio + 1) * (keys ? IDX_DIM : HEAD_DIM) * 2;
+// A KV source's compressed rows or index keys for cap positions.
+static size_t rows_bytes(int l, int cap, int keys) {
+  return (size_t)(cap / L[l].ratio + 1) *
+         (size_t)(keys ? key_row_bytes() : comp_row_bytes());
 }
 
 // The rows later positions overwrite: every window ring, the compressor
@@ -3938,10 +3960,10 @@ static int state_regions(State *s, int positions, int fill, StateRegion *out) {
   int n = 0;
   for (int l = 0; l < LAYERS; l++) {
     if (!L[l].kv_source) continue;
-    out[n++] =
-        (StateRegion){s->comp[l].ptr, HEAD_DIM * 2, (uint32_t)L[l].ratio, 1, 0};
-    out[n++] =
-        (StateRegion){s->keys[l].ptr, IDX_DIM * 2, (uint32_t)L[l].ratio, 1, 0};
+    out[n++] = (StateRegion){s->comp[l].ptr, (uint32_t)comp_row_bytes(),
+                             (uint32_t)L[l].ratio, 1, 0};
+    out[n++] = (StateRegion){s->keys[l].ptr, (uint32_t)key_row_bytes(),
+                             (uint32_t)L[l].ratio, 1, 0};
   }
   return n;
 }

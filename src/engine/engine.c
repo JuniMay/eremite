@@ -187,7 +187,8 @@ eremite_model *eremite_open(const eremite_config *c) {
                      .deepseek.substitute = d->substitute,
                      .deepseek.experts = d->experts,
                      .deepseek.ced = d->ced,
-                     .deepseek.prefill_prune = d->prefill_prune};
+                     .deepseek.prefill_prune = d->prefill_prune,
+                     .deepseek.packed_state_rows = d->packed_state_rows};
   const char *bad = options.ctx < 1 || options.ctx > 1 << 20
                         ? "ctx takes 1 to 1048576 tokens"
                     : options.draft < 0 || options.draft > BLOCK
@@ -254,11 +255,12 @@ int eremite_load(eremite_model *m) {
   if (!was_loaded)
     say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
         "prefill: ced_depth=%d (%s), dependency "
-        "pruning=%s",
+        "pruning=%s; packed state rows %s",
         m->dir, m->ops->family, m->opt.ctx, m->ops->drafts_per_pass(),
         m->ops->rewind_margin(), m->opt.lookup, m->opt.deepseek.ced,
         m->opt.deepseek.ced ? "approximate" : "off",
-        m->opt.deepseek.prefill_prune ? "on" : "off");
+        m->opt.deepseek.prefill_prune ? "on" : "off",
+        m->opt.deepseek.packed_state_rows ? "on" : "off");
   return 1;
 }
 
@@ -378,6 +380,7 @@ void eremite_state_identity(eremite_model *m, uint8_t out[32]) {
     memcpy(&substitute, &d->substitute, sizeof substitute);
     identity_number(&h, d->ced);
     identity_number(&h, d->prefill_prune);
+    identity_number(&h, d->packed_state_rows != 0);
     identity_number(&h, substitute);
     identity_number(&h, d->experts != NULL);
     if (d->experts) identity_add_gguf_set(&h, d->experts);

@@ -5,17 +5,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 // Tests the engine's C interface on a DeepSeek V4.1 Flash checkpoint without
 // loading its weights: the process's start and its idle work's interval, the
 // options eremite_open refuses, one model per family, the model's limits and
 // tokenizer, samplers, context lookups, the draft-count chooser, a saved
-// state's identity, and the statistics before a load.
+// state's identity, and the statistics before a load. A child process opens
+// the same model with packed state rows, since a process holds one model of
+// each family: its identity must differ.
 //
 // usage: model-engine CHECKPOINT
 
 int main(int argc, char **argv) {
   if (argc != 2) die("usage: model-engine CHECKPOINT");
+  uint8_t packed_identity[32] = {0};
+  int identity_pipe[2];
+  if (pipe(identity_pipe)) die("cannot make a pipe");
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    eremite_config packed = {.abi = EREMITE_ABI,
+                             .model = argv[1],
+                             .ctx = 4096,
+                             .lookup = 15,
+                             .deepseek = {.draft = 2, .packed_state_rows = 1}};
+    eremite_model *p = eremite_init(&(eremite_process){.abi = EREMITE_ABI}) == 0
+                           ? eremite_open(&packed)
+                           : NULL;
+    if (p) eremite_state_identity(p, packed_identity);
+    _exit(write(identity_pipe[1], packed_identity, 32) == 32 ? 0 : 1);
+  }
+  close(identity_pipe[1]);
+  int got = child > 0 && read(identity_pipe[0], packed_identity, 32) == 32;
+  close(identity_pipe[0]);
+  if (child > 0) waitpid(child, NULL, 0);
   check(eremite_init(&(eremite_process){.abi = EREMITE_ABI + 1}) == -1,
         "a process of another ABI is refused");
   check(eremite_idle_work_interval_seconds() == 0,
@@ -112,6 +137,9 @@ int main(int argc, char **argv) {
   eremite_state_identity(m, second);
   check(!memcmp(first, second, 32) && memcmp(first, zero, 32),
         "a saved state's identity is known and stable");
+  check(got && memcmp(packed_identity, zero, 32) &&
+            memcmp(packed_identity, first, 32),
+        "packed state rows give another identity");
 
   eremite_refresh_stats();
   eremite_stats s;
