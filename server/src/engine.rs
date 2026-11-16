@@ -1,7 +1,7 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; a model
-//! with its tokenizer; and the model's states, snapshots, saved states, calls,
-//! drafts, media and sampling. A
+//! with its tokenizer; the model's states, snapshots, saved states, calls,
+//! drafts, media and sampling; and the statistics and memory. A
 //! [`Model`] is one registered checkpoint, whose weights load on demand. Its
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
@@ -129,6 +129,165 @@ pub struct PrefillInfo {
     pub prefix_tokens: c_int,
 }
 
+/// An expert cache's counts (eremite_cache_counts).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheCounts {
+    /// Experts that a row found in memory.
+    pub hits: u64,
+    /// Experts that a row had to read.
+    pub misses: u64,
+    /// Experts that a read ahead brought in time.
+    pub prefetch_hits: u64,
+    /// Experts read ahead.
+    pub prefetches: u64,
+    /// Bytes read.
+    pub bytes: u64,
+    /// Experts evicted from the cache.
+    pub evictions: u64,
+    /// Reads ahead that came too late.
+    pub late: u64,
+    /// Reads ahead that were cancelled.
+    pub cancelled: u64,
+    /// Experts replaced by a substitute.
+    pub substituted: u64,
+    /// Slots mapped to another expert.
+    pub remaps: u64,
+    /// Slots given back to the system.
+    pub given_back: u64,
+    /// Decoded rows' experts that were in memory.
+    pub row_own: u64,
+    /// Decoded rows' experts that a read ahead brought.
+    pub row_ahead: u64,
+    /// Decoded rows' experts that came late.
+    pub row_late: u64,
+    /// Decoded rows' experts that were substituted.
+    pub row_sub: u64,
+    /// Decoded rows' experts read from the SSD.
+    pub row_ssd: u64,
+    /// Seconds spent waiting for reads.
+    pub read_s: f64,
+}
+
+/// A model's counters and the process's memory (eremite_stats).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    /// All of the expert cache's counts.
+    pub cache: CacheCounts,
+    /// The counts of decoded rows.
+    pub decode: CacheCounts,
+    /// The counts of prompt rows.
+    pub prefill: CacheCounts,
+    /// Rows decoded.
+    pub decode_rows: u64,
+    /// Prompt rows computed.
+    pub prefill_rows: u64,
+    /// Seconds of decoding calls.
+    pub decode_seconds: f64,
+    /// GPU seconds of decoding calls.
+    pub decode_gpu_seconds: f64,
+    /// The running prefill's layer; 0: none.
+    pub prefill_layer: c_int,
+    /// The running prefill's rows.
+    pub prefill_rows_now: c_int,
+    /// The expert cache's slots.
+    pub slots: c_int,
+    /// The slots that hold an expert.
+    pub mapped: c_int,
+    /// The slots that the cache may have now.
+    pub cap: c_int,
+    /// The slots that the cache may have at most.
+    pub max_slots: c_int,
+    /// The experts in all.
+    pub experts: c_int,
+    /// The experts on the SSD only.
+    pub uncached: c_int,
+    /// Bytes of one slot.
+    pub slot_bytes: u64,
+    /// Bytes of the experts on the SSD only.
+    pub uncached_bytes: u64,
+    /// Bytes of the expert cache.
+    pub cache_bytes: u64,
+    /// Bytes of the dense weights.
+    pub dense_bytes: u64,
+    /// The process's memory footprint.
+    pub footprint: u64,
+    /// Bytes that the GPU has in use.
+    pub gpu_in_use: u64,
+    /// Bytes available to the process.
+    pub available: u64,
+    /// Metal's working-set recommendation; i64::MAX before the GPU starts.
+    pub gpu_limit: i64,
+    /// The system's memory in all.
+    pub total: u64,
+    /// Free memory.
+    pub free: u64,
+    /// File-backed memory.
+    pub file: u64,
+    /// File-backed memory that is kept.
+    pub file_kept: u64,
+    /// Wired memory.
+    pub wired: u64,
+    /// The compressor's memory.
+    pub compressor: u64,
+    /// The memory that the compressor holds compressed.
+    pub compressed: u64,
+    /// Swap in use.
+    pub swap_used: u64,
+    /// Pages swapped out since the system started.
+    pub swapouts: u64,
+    /// The system's memory pressure: 1 normal, 2 warn, 4 critical.
+    pub pressure: c_int,
+    /// The model's layers.
+    pub layers: c_int,
+    /// The experts that a row chooses; 0 without routed experts.
+    pub experts_per_row: c_int,
+    /// The layers with routed experts.
+    pub routed_layers: c_int,
+    /// Each such layer's experts.
+    pub experts_per_layer: c_int,
+    /// The most model memory now.
+    pub model_memory_limit: u64,
+    /// What the models hold, state memory included.
+    pub model_memory_used: u64,
+    /// What is counted for the models.
+    pub model_memory_committed: u64,
+    /// The most ever counted.
+    pub model_memory_peak: u64,
+    /// Bytes allocated for states.
+    pub state_allocated: u64,
+    /// Bytes of the model's working buffers.
+    pub model_workspace: u64,
+    /// Seconds since the start: the engine thread outside run_streams,
+    /// running a pass, and with no pass ready while one waits for the GPU,
+    /// for reads, or for something else.
+    pub thread_s: [f64; 5],
+    /// Seconds that the GPU's main queue was busy.
+    pub gpu_busy_s: f64,
+    /// Seconds that the GPU's main queue was idle between command buffers, in
+    /// each of thread_s's five states of the engine thread.
+    pub gpu_idle_s: [f64; 5],
+    /// Seconds with an expert read in flight.
+    pub ssd_busy_s: f64,
+    /// The summed seconds of demand reads.
+    pub demand_read_s: f64,
+    /// The summed seconds of background reads.
+    pub background_read_s: f64,
+}
+
+/// The process's memory (eremite_memory_info).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemoryInfo {
+    /// The memory limit in bytes.
+    pub limit: u64,
+    /// The bytes counted for the models, their state memory included.
+    pub model_bytes: u64,
+    /// The bytes of the models' state memory.
+    pub state_bytes: u64,
+}
+
 /// eremite_tokenize's mode that also takes the added tokens' spellings as
 /// those tokens.
 const TOKENIZE_ADDED_TOKENS: c_int = 1;
@@ -149,6 +308,13 @@ unsafe extern "C" {
     fn eremite_unload(m: *mut RawModel) -> u64;
     fn eremite_drain();
     fn eremite_set_request_running(m: *mut RawModel, active: c_int);
+    fn eremite_run_idle_work(m: *mut RawModel) -> c_int;
+    fn eremite_reclaim(bytes: u64) -> u64;
+    fn eremite_read_memory() -> MemoryInfo;
+    fn eremite_set_memory_limit(bytes: u64);
+    fn eremite_refresh_stats();
+    fn eremite_read_stats(m: *const RawModel, s: *mut Stats);
+    fn eremite_wake();
     fn eremite_max_rows(m: *const RawModel) -> c_int;
     fn eremite_drafts_per_pass(m: *const RawModel) -> c_int;
     fn eremite_max_verify(m: *const RawModel) -> c_int;
@@ -361,6 +527,33 @@ pub fn count_stop_requests() -> u32 {
 /// Waits for the GPU's work and the expert reads to finish.
 pub fn drain() {
     unsafe { eremite_drain() };
+}
+
+/// Reads the process's memory once, for every model's statistics.
+pub fn refresh_stats() {
+    unsafe { eremite_refresh_stats() };
+}
+
+/// Evicts idle memory until `bytes` are freed or none is left. Returns the
+/// bytes freed.
+pub fn reclaim(bytes: u64) -> u64 {
+    unsafe { eremite_reclaim(bytes) }
+}
+
+/// Returns the memory limit, the bytes counted for the models and their state
+/// memory's bytes.
+pub fn read_memory() -> MemoryInfo {
+    unsafe { eremite_read_memory() }
+}
+
+/// Sets the memory limit in bytes.
+pub fn set_memory_limit(bytes: u64) {
+    unsafe { eremite_set_memory_limit(bytes) };
+}
+
+/// Makes run_streams return None soon. Any thread may call it.
+pub fn wake() {
+    unsafe { eremite_wake() }
 }
 
 /// Writes a line to the log, with the time: on stderr, or to init's on_log.
@@ -683,6 +876,21 @@ impl Model {
     /// most.
     pub fn max_rows(&self) -> usize {
         unsafe { eremite_max_rows(self.raw) as usize }
+    }
+
+    /// Gives memory back to other programs if they need it, while the model
+    /// runs no request. Returns the model's expert cache slots after that, or
+    /// 0 without a cache.
+    pub fn run_idle_work(&self) -> i32 {
+        unsafe { eremite_run_idle_work(self.raw) }
+    }
+
+    /// Returns the model's counters and the process's memory, as
+    /// refresh_stats last read it.
+    pub fn read_stats(&self) -> Stats {
+        let mut stats = Stats::default();
+        unsafe { eremite_read_stats(self.raw, &mut stats) };
+        stats
     }
 
     /// Returns how many drafts the model makes itself for one pass: the
@@ -1229,7 +1437,8 @@ impl Drop for Stream {
 }
 
 /// Advances the streams until a call finishes, and returns that stream's
-/// index. Returns None when no stream has a call posted.
+/// index. Returns None when no stream has a call posted, and when wake asks
+/// it to return.
 pub fn run_streams(streams: &[&Stream]) -> Option<usize> {
     let raw: Vec<*mut RawStream> = streams.iter().map(|x| x.0).collect();
     let i = unsafe { eremite_run_streams(raw.as_ptr(), raw.len() as c_int) };
