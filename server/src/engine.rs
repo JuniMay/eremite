@@ -1,6 +1,7 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; a model
-//! with its tokenizer; and the model's states, snapshots, calls and sampling. A
+//! with its tokenizer; and the model's states, snapshots, saved states, calls
+//! and sampling. A
 //! [`Model`] is one registered checkpoint, whose weights load on demand. Its
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
@@ -162,6 +163,29 @@ unsafe extern "C" {
     fn eremite_replay_rows(m: *const RawModel, k: c_int) -> c_int;
     fn eremite_replay_start(m: *const RawModel, k: c_int) -> c_int;
     fn eremite_set_history(m: *mut RawModel, s: *mut RawState, tokens: *const i32, pos: c_int);
+    fn eremite_state_write(
+        m: *mut RawModel,
+        s: *mut RawState,
+        from: c_int,
+        to: c_int,
+        fd: c_int,
+    ) -> i64;
+    fn eremite_state_read(
+        m: *mut RawModel,
+        s: *mut RawState,
+        positions: c_int,
+        fds: *const c_int,
+        count: c_int,
+    ) -> c_int;
+    fn eremite_snapshot_write(
+        m: *mut RawModel,
+        x: *const RawSnapshot,
+        s: *mut RawState,
+        pos: c_int,
+        fd: c_int,
+    ) -> i64;
+    fn eremite_snapshot_read(m: *mut RawModel, fd: c_int) -> *mut RawSnapshot;
+    fn eremite_state_identity(m: *mut RawModel, out: *mut u8);
     fn eremite_stream_new(m: *mut RawModel) -> *mut RawStream;
     fn eremite_stream_free(x: *mut RawStream);
     fn eremite_stream_prefill(
@@ -395,8 +419,8 @@ impl Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateHandle(NonNull<RawState>);
 
-/// The handle of a snapshot that the engine took. It stays valid until
-/// Model::snapshot_free frees the snapshot.
+/// The handle of a snapshot that the engine took or read. It stays valid
+/// until Model::snapshot_free frees the snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotHandle(NonNull<RawSnapshot>);
 
@@ -693,6 +717,61 @@ impl Model {
     /// before `pos`, for a state that continues without a prefill.
     pub fn set_history(&self, s: StateHandle, tokens: &[i32], pos: usize) {
         unsafe { eremite_set_history(self.raw, s.0.as_ptr(), tokens.as_ptr(), pos as c_int) }
+    }
+
+    /// Writes one part of a saved state into `fd`: the rows of `s` that
+    /// positions from `from` on wrote, up to `to`. Returns the bytes written,
+    /// or None when a write failed or a second stop request ended it. With
+    /// `fd` -1, it writes nothing and returns the bytes it would write.
+    pub fn state_write(&self, s: StateHandle, from: usize, to: usize, fd: c_int) -> Option<u64> {
+        let n =
+            unsafe { eremite_state_write(self.raw, s.0.as_ptr(), from as c_int, to as c_int, fd) };
+        (n >= 0).then_some(n as u64)
+    }
+
+    /// Fills `s`, a new state, with the rows before `positions` from a saved
+    /// state's parts in `fds`, the first written first. Returns false when a
+    /// part is short, damaged or of another shape; `s` is then of no use.
+    pub fn state_read(&self, s: StateHandle, positions: usize, fds: &[c_int]) -> bool {
+        unsafe {
+            eremite_state_read(
+                self.raw,
+                s.0.as_ptr(),
+                positions as c_int,
+                fds.as_ptr(),
+                fds.len() as c_int,
+            ) == 0
+        }
+    }
+
+    /// Writes snapshot `x` without its logits into `fd`, or for None, the
+    /// rolling rows of `s` as they are at its end, `pos`. Returns the bytes
+    /// written, or None when a write failed.
+    pub fn snapshot_write(
+        &self,
+        x: Option<SnapshotHandle>,
+        s: StateHandle,
+        pos: usize,
+        fd: c_int,
+    ) -> Option<u64> {
+        let x = x.map_or(ptr::null_mut(), |x| x.0.as_ptr());
+        let n = unsafe { eremite_snapshot_write(self.raw, x, s.0.as_ptr(), pos as c_int, fd) };
+        (n >= 0).then_some(n as u64)
+    }
+
+    /// Returns the snapshot that snapshot_write wrote into `fd`, or None when
+    /// the file is short, damaged or of another shape.
+    pub fn snapshot_read(&self, fd: c_int) -> Option<SnapshotHandle> {
+        NonNull::new(unsafe { eremite_snapshot_read(self.raw, fd) }).map(SnapshotHandle)
+    }
+
+    /// Returns the identity of this model's saved states: a hash of what
+    /// they depend on, the weights and the settings that change a state's
+    /// rows. A state saved with another identity is not read.
+    pub fn state_identity(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        unsafe { eremite_state_identity(self.raw, out.as_mut_ptr()) };
+        out
     }
 
     /// Returns a token sampled from one row of logits.
