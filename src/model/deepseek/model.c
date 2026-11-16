@@ -1263,13 +1263,16 @@ typedef struct {
   uint32_t pos, base, mod;
 } Win;
 
+// packed: whether index_key writes the keys packed, not BF16.
 typedef struct {
-  uint32_t ratio, start, row0;
+  uint32_t ratio, start, row0, packed;
 } Groups;
 
+// cand: words of a row's candidate bits, 0: none; packed: whether the index
+// keys are packed, not BF16.
 typedef struct {
-  uint32_t pos, ratio, stride, cand;
-} Index;  // cand: words of a row's candidate bits, 0: none
+  uint32_t pos, ratio, stride, cand, packed;
+} Index;
 
 // inference/config.json: candidate_source_layer, candidate_topk_blocks (of
 // candidate_block_size 8 positions). Up to CAND_TOP blocks, all are candidates.
@@ -1450,7 +1453,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       }
     }
     if (groups) {
-      Groups g = {(uint32_t)y->ratio, g0, g0 - pos + 2};
+      Groups g = {(uint32_t)y->ratio, g0, g0 - pos + 2, 0};
       gpu_select_kernel(c, K_compress);
       gpu_bind_buffer(c, 0, &CK, 0), gpu_bind_buffer(c, 1, &CS, 0),
           gpu_bind_buffer(c, 2, &y->c_norm, 0), gpu_bind_buffer(c, 3, cs, 0);
@@ -1476,7 +1479,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       uint32_t rows = m - t0 < sc_rows ? m - t0 : sc_rows,
                seen = (pos + t0 + rows) / y->ratio;
       Index ix = {p32 + t0, (uint32_t)y->ratio, (uint32_t)opt.ctx,
-                  cand && l > CAND_LAYER ? cand_words : 0};
+                  cand && l > CAND_LAYER ? cand_words : 0, 0};
       // Layer 20 writes once; later indexers reuse the same prompt row,
       // even when decoder compaction starts partway through a batch.
       size_t cand_off = (size_t)(srow + t0) * cand_words * 4;
@@ -3531,7 +3534,7 @@ void deepseek_run_bench(void) {
       for (int i = 0; i < n; i++)
         sc[i] = tied ? (float)((i * 7919) % 13)
                      : (float)((i * 2654435761u) % 100003) - 50000;
-      Index ix = {n - 1, 1, (uint32_t)opt.ctx, 0};
+      Index ix = {n - 1, 1, (uint32_t)opt.ctx, 0, 0};
       cmd = gpu_begin(gpu);
       gpu_select_kernel(&cmd, K_index_topk);
       gpu_bind_buffer(&cmd, 0, &SC, 0), gpu_bind_buffer(&cmd, 1, &SEL, 0),
@@ -3572,7 +3575,7 @@ void deepseek_run_bench(void) {
           *sorted = xmalloc(n * 4);
     for (int i = 0; i < n; i++)
       sc[i] = (float)((i * 2654435761u) % 100003) - 50000;
-    Index ix = {n - 1, 1, n, (nb + 31) / 32};
+    Index ix = {n - 1, 1, n, (nb + 31) / 32, 0};
     cmd = gpu_begin(gpu);
     gpu_select_kernel(&cmd, K_cand_topk);
     gpu_bind_buffer(&cmd, 0, &SC, 0), gpu_bind_buffer(&cmd, 1, &CAND, 0),

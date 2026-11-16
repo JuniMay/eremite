@@ -8,7 +8,8 @@
 
 // Tests the index scores with candidate blocks against a reference kernel that
 // scores every position: a candidate's score must be the same bits, and no
-// other position may be written. Also times them.
+// other position may be written. The kernel reads index keys as BF16 or
+// packed, and the reference the same values as BF16. Also times them.
 
 #define METAL(...) #__VA_ARGS__
 // Every position's score, a thread per position, without candidate blocks.
@@ -43,8 +44,11 @@ static const char reference[] = METAL(kernel void index_score_reference(
 #undef METAL
 
 typedef struct {
-  uint32_t pos, ratio, stride, cand;
+  uint32_t pos, ratio, stride, cand, packed;
 } Index;
+
+// The forms of the index keys that the kernel reads.
+static const char *const FORMS[2] = {"BF16", "packed"};
 
 // Query rows, key positions, and the 32-bit words of a row's candidate bits:
 // one bit for each block of 8 positions, and one word more.
@@ -52,21 +56,31 @@ static constexpr int ROWS = 256, POSITIONS = 65536, WORDS = POSITIONS / 256 + 1;
 
 // A NaN that no score takes, in every score the kernel must not write.
 static constexpr uint32_t untouched = 0x7fc0beefu;
+// A packed index key: 128 E2M1 codes, two to a byte, then an E8M0 scale for
+// every 32 of them.
+static constexpr int KEY_BYTES = 68, SCALES = 64;
 
-static Buf Q, W, KEYS, CS, CAND, SCORE[2];
+static Buf Q, W, KEYS, PACKED, CS, CAND, SCORE[2];
 static uint32_t seed = 12345;
 
 static uint32_t next(void) { return seed = seed * 1664525u + 1013904223u; }
 
-// Rows `rows` of queries from position pos; returns the GPU's microseconds.
-static double run(Gpu *gpu, int kernel, Index ix, int rows, const Buf *score,
-                  int repeat) {
+// The value of an E2M1 code: codes 8 and up are the negatives of 0 to 7.
+static float e2m1(unsigned code) {
+  static const float values[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+  return code & 8 ? -values[code & 7] : values[code & 7];
+}
+
+// Rows `rows` of queries from position pos, over the index keys `keys`;
+// returns the GPU's microseconds.
+static double run(Gpu *gpu, int kernel, const Buf *keys, Index ix, int rows,
+                  const Buf *score, int repeat) {
   uint32_t seen = (ix.pos + rows) / ix.ratio;
   double before = gpu_times(gpu).busy_seconds;
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, kernel);
   gpu_bind_buffer(&cmd, 0, &Q, 0), gpu_bind_buffer(&cmd, 1, &W, 0),
-      gpu_bind_buffer(&cmd, 2, &KEYS, 0), gpu_bind_buffer(&cmd, 3, &CS, 0),
+      gpu_bind_buffer(&cmd, 2, keys, 0), gpu_bind_buffer(&cmd, 3, &CS, 0),
       gpu_bind_buffer(&cmd, 4, score, 0);
   gpu_copy_bytes(&cmd, 5, &ix, sizeof ix), gpu_bind_buffer(&cmd, 6, &CAND, 0);
   for (int i = 0; i < repeat; i++)
@@ -118,6 +132,7 @@ int main(void) {
   Q = gpu_alloc(gpu, slot, (size_t)ROWS * 4096 * 4),
   W = gpu_alloc(gpu, slot, ROWS * 32 * 4);
   KEYS = gpu_alloc(gpu, slot, (size_t)POSITIONS * 128 * 2),
+  PACKED = gpu_alloc(gpu, slot, (size_t)POSITIONS * KEY_BYTES),
   CS = gpu_alloc(gpu, slot, (size_t)(POSITIONS + ROWS) * 32 * 8);
   CAND = gpu_alloc(gpu, slot, (size_t)ROWS * WORDS * 4);
   for (int i = 0; i < 2; i++)
@@ -126,12 +141,20 @@ int main(void) {
     ((float *)Q.ptr)[i] = (float)(next() >> 8) / (1 << 23) - 1;
   for (int i = 0; i < ROWS * 32; i++)
     ((float *)W.ptr)[i] = (float)(next() >> 8) / (1 << 24) - 0.25f;
-  for (size_t i = 0; i < (size_t)POSITIONS * 128;
-       i++) {  // keys of few bits, exact in BF16
-    float v = (float)((int)(next() >> 26) - 32) / 8;
-    uint32_t u;
-    memcpy(&u, &v, 4);
-    ((uint16_t *)KEYS.ptr)[i] = (uint16_t)(u >> 16);
+  // Packed keys of random codes and scales from 1/8 to 4, and their values as
+  // BF16, which holds each exactly.
+  for (size_t p = 0; p < POSITIONS; p++) {
+    uint8_t *key = (uint8_t *)PACKED.ptr + p * KEY_BYTES;
+    for (int b = 0; b < SCALES; b++) key[b] = (uint8_t)(next() >> 24);
+    for (int s = 0; s < 128 / 32; s++)
+      key[SCALES + s] = (uint8_t)(124 + next() % 6);
+    for (int i = 0; i < 128; i++) {
+      float v = ldexpf(e2m1(key[i / 2] >> (i % 2 * 4) & 15),
+                       key[SCALES + i / 32] - 127);
+      uint32_t u;
+      memcpy(&u, &v, 4);
+      ((uint16_t *)KEYS.ptr)[p * 128 + i] = (uint16_t)(u >> 16);
+    }
   }
   for (size_t p = 0; p < POSITIONS + ROWS; p++)
     for (int i = 0; i < 32; i++) {
@@ -144,66 +167,71 @@ int main(void) {
                  *b = (const uint32_t *)SCORE[1].ptr;
   // Without candidate blocks: every position, as before.
   int starts[][2] = {{0, 1}, {300, 1}, {5000, 2}, {20000, 1}, {40001, 2}};
-  for (size_t c = 0; c < sizeof starts / sizeof *starts; c++) {
-    Index ix = {(uint32_t)starts[c][0], (uint32_t)starts[c][1], POSITIONS, 0};
-    int rows = 48;
-    clear(&SCORE[0]), clear(&SCORE[1]);
-    run(gpu, every, ix, rows, &SCORE[0], 1),
-        run(gpu, scored, ix, rows, &SCORE[1], 1);
-    uint64_t written = 0;
-    for (int r = 0; r < rows; r++)
-      for (uint32_t i = 0; i < (ix.pos + r + 1) / ix.ratio; i++)
-        written += b[(size_t)r * POSITIONS + i] != untouched;
-    char what[128];
-    snprintf(what, sizeof what,
-             "without candidates, from position %u with ratio %u, every score "
-             "is equal",
-             ix.pos, ix.ratio);
-    check(!memcmp(a, b, (size_t)ROWS * POSITIONS * 4) && written, what);
-  }
+  for (uint32_t form = 0; form < 2; form++)
+    for (size_t c = 0; c < sizeof starts / sizeof *starts; c++) {
+      Index ix = {(uint32_t)starts[c][0], (uint32_t)starts[c][1], POSITIONS, 0,
+                  form};
+      int rows = 48;
+      clear(&SCORE[0]), clear(&SCORE[1]);
+      run(gpu, every, &KEYS, ix, rows, &SCORE[0], 1),
+          run(gpu, scored, form ? &PACKED : &KEYS, ix, rows, &SCORE[1], 1);
+      uint64_t written = 0;
+      for (int r = 0; r < rows; r++)
+        for (uint32_t i = 0; i < (ix.pos + r + 1) / ix.ratio; i++)
+          written += b[(size_t)r * POSITIONS + i] != untouched;
+      char what[128];
+      snprintf(what, sizeof what,
+               "%s keys without candidates, from position %u with ratio %u, "
+               "every score is equal",
+               FORMS[form], ix.pos, ix.ratio);
+      check(!memcmp(a, b, (size_t)ROWS * POSITIONS * 4) && written, what);
+    }
   // With candidate blocks: the candidates' scores, bit for bit, and nothing
   // else.
-  for (int kind = 0; kind < 6; kind++) {
-    Index ix = {20000 - 5 * kind, 1, POSITIONS, WORDS};
-    int rows = 48;
-    uint64_t kept = 0, skipped = 0;
-    for (int r = 0; r < rows; r++)
-      candidates((uint32_t *)CAND.ptr + (size_t)r * WORDS,
-                 (int)(ix.pos + r + 1 + 7) / 8, kind);
-    clear(&SCORE[0]), clear(&SCORE[1]);
-    Index all = ix;
-    all.cand = 0;
-    run(gpu, every, all, rows, &SCORE[0], 1),
-        run(gpu, scored, ix, rows, &SCORE[1], 1);
-    int same = 1;
-    for (int r = 0; same && r < rows; r++) {
-      const uint32_t *bits = (const uint32_t *)CAND.ptr + (size_t)r * WORDS;
-      uint32_t n = ix.pos + r + 1;
-      for (uint32_t i = 0; same && i < POSITIONS; i++) {
-        int in = i < n && (bits[i >> 8] >> ((i >> 3) & 31) & 1);
-        uint32_t want = in ? a[(size_t)r * POSITIONS + i] : untouched,
-                 got = b[(size_t)r * POSITIONS + i];
-        if ((in && want == untouched) || got != want) {
-          printf("row %d, position %u: %s\n", r, i,
-                 in && want == untouched
-                     ? "the reference left a candidate unscored"
-                 : in ? "a candidate's score differs"
-                      : "a score outside the candidates was written");
-          same = 0;
+  for (uint32_t form = 0; form < 2; form++)
+    for (int kind = 0; kind < 6; kind++) {
+      Index ix = {20000 - 5 * kind, 1, POSITIONS, WORDS, form};
+      int rows = 48;
+      uint64_t kept = 0, skipped = 0;
+      for (int r = 0; r < rows; r++)
+        candidates((uint32_t *)CAND.ptr + (size_t)r * WORDS,
+                   (int)(ix.pos + r + 1 + 7) / 8, kind);
+      clear(&SCORE[0]), clear(&SCORE[1]);
+      Index all = ix;
+      all.cand = 0;
+      run(gpu, every, &KEYS, all, rows, &SCORE[0], 1),
+          run(gpu, scored, form ? &PACKED : &KEYS, ix, rows, &SCORE[1], 1);
+      int same = 1;
+      for (int r = 0; same && r < rows; r++) {
+        const uint32_t *bits = (const uint32_t *)CAND.ptr + (size_t)r * WORDS;
+        uint32_t n = ix.pos + r + 1;
+        for (uint32_t i = 0; same && i < POSITIONS; i++) {
+          int in = i < n && (bits[i >> 8] >> ((i >> 3) & 31) & 1);
+          uint32_t want = in ? a[(size_t)r * POSITIONS + i] : untouched,
+                   got = b[(size_t)r * POSITIONS + i];
+          if ((in && want == untouched) || got != want) {
+            printf("row %d, position %u: %s\n", r, i,
+                   in && want == untouched
+                       ? "the reference left a candidate unscored"
+                   : in ? "a candidate's score differs"
+                        : "a score outside the candidates was written");
+            same = 0;
+          }
+          kept += in, skipped += !in && i < n;
         }
-        kept += in, skipped += !in && i < n;
       }
+      char what[128];
+      snprintf(what, sizeof what,
+               "%s keys with candidates of kind %d, %llu scores are equal and "
+               "%llu positions left out",
+               FORMS[form], kind, (unsigned long long)kept,
+               (unsigned long long)skipped);
+      check(same, what);
     }
-    char what[128];
-    snprintf(what, sizeof what,
-             "with candidates of kind %d, %llu scores are equal and %llu "
-             "positions left out",
-             kind, (unsigned long long)kept, (unsigned long long)skipped);
-    check(same, what);
-  }
   // Time: every position, then 2,048 candidate blocks of 8,190, spread and in
   // runs.
-  Index ix = {POSITIONS - ROWS, 1, POSITIONS, 0};
+  Index ix = {POSITIONS - ROWS, 1, POSITIONS, 0, 0}, packed = ix;
+  packed.packed = 1;
   for (int spread = 0; spread < 3; spread++) {
     for (int r = 0; r < ROWS && spread; r++) {
       uint32_t *bits = (uint32_t *)CAND.ptr + (size_t)r * WORDS;
@@ -213,20 +241,20 @@ int main(void) {
         if (spread == 1 ? b % 4 == r % 4 : (b / 64) % 4 == r % 4)
           bits[b / 32] |= 1u << (b % 32);
     }
-    ix.cand = spread ? WORDS : 0;
-    run(gpu, scored, ix, ROWS, &SCORE[1], 1);  // raise the GPU's clock
-    double before =
-        run(gpu, every, (Index){ix.pos, 1, POSITIONS, 0}, ROWS, &SCORE[0], 4);
-    double middle = run(gpu, scored, ix, ROWS, &SCORE[1], 4);
-    double after =
-        run(gpu, every, (Index){ix.pos, 1, POSITIONS, 0}, ROWS, &SCORE[0], 4);
+    ix.cand = packed.cand = spread ? WORDS : 0;
+    run(gpu, scored, &KEYS, ix, ROWS, &SCORE[1], 1);  // raise the GPU's clock
+    Index all = {ix.pos, 1, POSITIONS, 0, 0};
+    double before = run(gpu, every, &KEYS, all, ROWS, &SCORE[0], 4);
+    double bf16 = run(gpu, scored, &KEYS, ix, ROWS, &SCORE[1], 4);
+    double packed_us = run(gpu, scored, &PACKED, packed, ROWS, &SCORE[1], 4);
+    double after = run(gpu, every, &KEYS, all, ROWS, &SCORE[0], 4);
     printf("index scores of %d rows over %d positions, %s: every position %.0f "
-           "/ %.0f us, scored %.0f us\n",
+           "/ %.0f us, scored %.0f us from BF16 keys, %.0f us from packed\n",
            ROWS, POSITIONS,
            spread == 0   ? "no candidates"
            : spread == 1 ? "a quarter of the blocks, spread"
                          : "a quarter of the blocks, in runs of 64",
-           before, after, middle);
+           before, after, bf16, packed_us);
   }
   return failures != 0;
 }

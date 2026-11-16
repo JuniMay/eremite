@@ -35,9 +35,13 @@ inline float fp8_act(float v) {
   float s = pow2_scale(max(simd_max(fabs(v)), 1e-4f), 1.0f / 448.0f);
   return e4m3(clamp(v / s, -448.0f, 448.0f)) * s;
 }
-// FP4 quantization with a power-of-two scale per 32 (the indexer's).
+// The power-of-two scale of FP4 quantization per 32 (the indexer's): its
+// block of 32 is the simdgroup.
+inline float fp4_scale(float v) {
+  return pow2_scale(max(simd_max(fabs(v)), 6.0f * 0x1p-126f), 1.0f / 6.0f);
+}
 inline float fp4_act(float v) {
-  float s = pow2_scale(max(simd_max(fabs(v)), 6.0f * 0x1p-126f), 1.0f / 6.0f);
+  float s = fp4_scale(v);
   return e2m1(clamp(v / s, -6.0f, 6.0f)) * s;
 }
 // Four E4M3 codes to floats.
@@ -59,6 +63,25 @@ inline void fp4x8(uint u, thread float4 &a, thread float4 &b) {
   a = float4(float2(h0), float2(h1)) * 16384.0f;
   b = float4(float2(h2), float2(h3)) * 16384.0f;
 }
+// Four E2M1 codes, the low 16 bits of p, low nibble first, to floats.
+inline float4 fp4x4(uint p) {
+  half2 a = e2m1x2((p & 0xFu) | ((p & 0xF0u) << 12)), b = e2m1x2(((p >> 8) & 0xFu) | ((p & 0xF000u) << 4));
+  return float4(float2(a), float2(b)) * 16384.0f;
+}
+// The E2M1 code of an E2M1 value: its sign bit, then its magnitude's place
+// among 0, 0.5, 1, 1.5, 2, 3, 4 and 6.
+inline uint e2m1_code(float v) {
+  float a = fabs(v);
+  uint m = a < 2.0f ? uint(a * 2.0f) : a < 4.0f ? 4u + uint(a >= 3.0f) : 6u + uint(a >= 6.0f);
+  return m | (signbit(v) ? 8u : 0u);
+}
+
+// A state keeps its index keys as BF16, or packed as the reference quantizes
+// them: a key's 128 E2M1 codes, two to a byte with the even value in the low
+// nibble, then an E8M0 scale, a power of two, for every 32 of them. BF16 holds
+// each of those values exactly.
+#define KEY_ROW_BYTES 68
+#define KEY_SCALES 64
 
 // Sum over a threadgroup of up to 1024 threads; every thread gets the result.
 inline float tg_sum(float v, threadgroup float *tmp, uint t, uint n) {
@@ -613,7 +636,8 @@ kernel void kv_window(device const float *kv [[buffer(0)]], device const float *
 // BF16: an E2M1 code times an E4M3 scale has at most 6 significant bits.
 // Group g starts at position start + g ratio; its rows of kv and score are
 // row0 + g ratio (and the next, for ratio 2). One threadgroup per group.
-struct Groups { uint ratio, start, row0; };
+// packed: whether index_key writes the keys packed, not BF16.
+struct Groups { uint ratio, start, row0, packed; };
 kernel void compress(device const float *kv [[buffer(0)]], device const float *score [[buffer(1)]],
                      device const float *w [[buffer(2)]], device const float2 *cs [[buffer(3)]],
                      device float *latent [[buffer(4)]], device bfloat *rows [[buffer(5)]],
@@ -638,10 +662,10 @@ kernel void compress(device const float *kv [[buffer(0)]], device const float *s
   rows[(p.y / p.x) * 512 + t] = bfloat(e2m1(clamp(v / s, -6.0f, 6.0f)) * s);
 }
 
-// Index key: k_norm, RoPE and FP4 quantization (32 per power of two), as
-// BF16. 128 threads.
+// Index key: k_norm, RoPE and FP4 quantization (32 per power of two),
+// packed or as BF16 (Groups.packed). 128 threads.
 kernel void index_key(device const float *k [[buffer(0)]], device const float *w [[buffer(1)]],
-                      device const float2 *cs [[buffer(2)]], device bfloat *keys [[buffer(3)]],
+                      device const float2 *cs [[buffer(2)]], device uchar *keys [[buffer(3)]],
                       constant Groups &g [[buffer(4)]], uint grp [[threadgroup_position_in_grid]],
                       uint t [[thread_index_in_threadgroup]]) {
   threadgroup float tmp[32];
@@ -649,7 +673,16 @@ kernel void index_key(device const float *k [[buffer(0)]], device const float *w
   float v = k[grp * 128 + t];
   float r = rsqrt(tg_sum(v * v, tmp, t, 128) / 128 + 1e-20f);
   v = rope1(bf(w[t] * (v * r)), t, 128, cs + pos * 32, false);
-  keys[(pos / ratio) * 128 + t] = bfloat(fp4_act(v));
+  float s = fp4_scale(v), x = e2m1(clamp(v / s, -6.0f, 6.0f));
+  if (!g.packed) {
+    ((device bfloat *)keys)[(pos / ratio) * 128 + t] = bfloat(x * s);
+    return;
+  }
+  uint code = e2m1_code(x);
+  uint pair = code | simd_shuffle_down(code, 1) << 4;  // with the next value's
+  device uchar *key = keys + (pos / ratio) * KEY_ROW_BYTES;
+  if (t % 2 == 0) key[t / 2] = uchar(pair);
+  if (t % 32 == 0) key[KEY_SCALES + t / 32] = uchar(as_type<uint>(s) >> 23);
 }
 
 // Index scores of one query over n compressed positions:
@@ -659,13 +692,15 @@ kernel void index_key(device const float *k [[buffer(0)]], device const float *w
 // row's candidate bits. With candidate blocks it scores only its word's
 // candidates, since index_topk reads no other score. The candidates take the
 // threadgroup's first threads, so that the simdgroups beyond them do nothing.
-struct Index { uint pos, ratio, stride, cand; };  // cand: words of a row's candidate bits, 0: none
+// cand: words of a row's candidate bits, 0: none; packed: whether the index
+// keys are packed, not BF16.
+struct Index { uint pos, ratio, stride, cand, packed; };
 inline uint nth_set_bit(uint bits, uint n) {  // the place of the bit that has n set bits below it
   for (uint i = 0; i < n; i++) bits &= bits - 1;
   return ctz(bits);
 }
 kernel void index_score(device const float *q [[buffer(0)]], device const float *wts [[buffer(1)]],
-                        device const bfloat *keys [[buffer(2)]], device const float2 *cs [[buffer(3)]],
+                        device const uchar *keys [[buffer(2)]], device const float2 *cs [[buffer(3)]],
                         device float *score [[buffer(4)]], constant Index &ix [[buffer(5)]],
                         device const uint *cand [[buffer(6)]],
                         uint2 g [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
@@ -685,11 +720,14 @@ kernel void index_score(device const float *q [[buffer(0)]], device const float 
   if (blocks != ~0u) block = nth_set_bit(blocks, block);
   uint gid = (g.x * 32 + block) * 8 + t % 8;
   if (gid >= p.x) return;
-  device const bfloat4 *kr = (device const bfloat4 *)(keys + gid * 128);
+  device const uchar *key = keys + gid * (ix.packed ? KEY_ROW_BYTES : 128 * 2);
+  device const uint *kr = (device const uint *)key;
+  uint scales = ix.packed ? kr[KEY_SCALES / 4] : 0;
   float acc[32];
   for (uint h = 0; h < 32; h++) acc[h] = 0;
   for (uint d = 0; d < 32; d++) {
-    float4 k = float4(kr[d]);
+    float4 k = ix.packed ? fp4x4(kr[d / 2] >> (d % 2 * 16)) * e8m0(uchar(scales >> (d / 8 * 8)))
+                         : float4(((device const bfloat4 *)key)[d]);
     for (uint h = 0; h < 32; h++) acc[h] += dot(qs[h * 32 + d], k);
   }
   float total = 0;
