@@ -1,6 +1,6 @@
 //! The engine's C interface (src/eremite.h) and thin safe wrappers over it:
 //! the process's settings, its log and its stop; a model's settings; a model
-//! with its tokenizer; and the model's states, calls and sampling. A
+//! with its tokenizer; and the model's states, snapshots, calls and sampling. A
 //! [`Model`] is one registered checkpoint, whose weights load on demand. Its
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
@@ -71,6 +71,12 @@ struct RawState {
     _opaque: [u8; 0],
 }
 
+/// A snapshot of a state's rolling rows (eremite_snapshot).
+#[repr(C)]
+struct RawSnapshot {
+    _opaque: [u8; 0],
+}
+
 /// A stream of one model's calls (eremite_stream).
 #[repr(C)]
 struct RawStream {
@@ -87,6 +93,27 @@ struct RawSampler {
 #[repr(C)]
 struct RawMedia {
     _opaque: [u8; 0],
+}
+
+/// What a prefill ran (eremite_prefill_info).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefillInfo {
+    /// The chunks that the prefill ran its rows in.
+    pub chunks: c_int,
+    /// The rows that the prefill ran from its first row, the replayed ones
+    /// included.
+    pub tokens: c_int,
+    /// The rows that the later layers ran: fewer than tokens when the
+    /// approximate prefill or the pruning skipped some.
+    pub decoder_tokens: c_int,
+    /// Whether the approximate prefill applied.
+    pub ced_applied: c_int,
+    /// Whether the pruning applied.
+    pub prune_applied: c_int,
+    /// The position at which the prefill captured a snapshot; 0 when it
+    /// captured none.
+    pub prefix_tokens: c_int,
 }
 
 /// eremite_tokenize's mode that also takes the added tokens' spellings as
@@ -114,6 +141,27 @@ unsafe extern "C" {
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
+    fn eremite_state_bytes(m: *const RawModel, s: *const RawState, positions: c_int) -> usize;
+    fn eremite_state_copy(
+        m: *mut RawModel,
+        dst: *mut RawState,
+        src: *const RawState,
+        positions: c_int,
+    );
+    fn eremite_rewind_margin(m: *const RawModel) -> c_int;
+    fn eremite_snapshot_take(
+        m: *mut RawModel,
+        s: *mut RawState,
+        pos: c_int,
+        logits: *const f32,
+    ) -> *mut RawSnapshot;
+    fn eremite_snapshot_restore(m: *mut RawModel, s: *mut RawState, x: *const RawSnapshot);
+    fn eremite_snapshot_free(m: *mut RawModel, x: *mut RawSnapshot);
+    fn eremite_snapshot_bytes(m: *const RawModel, with_logits: c_int) -> usize;
+    fn eremite_snapshot_logits(m: *const RawModel, x: *const RawSnapshot) -> *const f32;
+    fn eremite_replay_rows(m: *const RawModel, k: c_int) -> c_int;
+    fn eremite_replay_start(m: *const RawModel, k: c_int) -> c_int;
+    fn eremite_set_history(m: *mut RawModel, s: *mut RawState, tokens: *const i32, pos: c_int);
     fn eremite_stream_new(m: *mut RawModel) -> *mut RawStream;
     fn eremite_stream_free(x: *mut RawStream);
     fn eremite_stream_prefill(
@@ -135,6 +183,8 @@ unsafe extern "C" {
     );
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
     fn eremite_stream_logits(x: *const RawStream) -> *const f32;
+    fn eremite_stream_captured_snapshot(x: *const RawStream) -> *mut RawSnapshot;
+    fn eremite_stream_prefill_info(x: *const RawStream, info: *mut PrefillInfo);
     fn eremite_sampler_new(
         temperature: f64,
         top_p: f64,
@@ -345,8 +395,14 @@ impl Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateHandle(NonNull<RawState>);
 
-/// Logits of one row or more, from a finished call. They stay valid until the
-/// stream's next call.
+/// The handle of a snapshot that the engine took. It stays valid until
+/// Model::snapshot_free frees the snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotHandle(NonNull<RawSnapshot>);
+
+/// Logits of one row or more, from a finished call or a snapshot. A call's
+/// logits stay valid until the stream's next call, and a snapshot's until the
+/// snapshot is freed.
 #[derive(Clone, Copy, Debug)]
 pub struct Logits(NonNull<f32>);
 
@@ -358,6 +414,15 @@ impl Logits {
     /// The logits hold more than `row` rows of `vocab` floats.
     pub unsafe fn row(self, row: usize, vocab: usize) -> Logits {
         Logits(unsafe { self.0.add(row * vocab) })
+    }
+
+    /// Returns a copy of the first row's `vocab` floats.
+    ///
+    /// # Safety
+    ///
+    /// The logits hold a row of `vocab` floats.
+    pub unsafe fn copy_row(self, vocab: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr(), vocab) }.to_vec()
     }
 }
 
@@ -557,6 +622,79 @@ impl Model {
         unsafe { eremite_state_free(self.raw, s.0.as_ptr()) }
     }
 
+    /// Returns the bytes that `s`, or a new state for None, takes when it
+    /// holds `positions` positions.
+    pub fn state_bytes(&self, s: Option<StateHandle>, positions: usize) -> u64 {
+        let s = s.map_or(ptr::null_mut(), |s| s.0.as_ptr());
+        unsafe { eremite_state_bytes(self.raw, s, positions as c_int) as u64 }
+    }
+
+    /// Copies the rows of `src` before `positions` that later positions do
+    /// not change into `dst`. `src` may be a running request's state.
+    pub fn state_copy(&self, dst: StateHandle, src: StateHandle, positions: usize) {
+        unsafe { eremite_state_copy(self.raw, dst.0.as_ptr(), src.0.as_ptr(), positions as c_int) }
+    }
+
+    /// Returns how many positions before a snapshot's position a state may
+    /// continue at.
+    pub fn rewind_margin(&self) -> usize {
+        unsafe { eremite_rewind_margin(self.raw) as usize }
+    }
+
+    /// Returns a snapshot of the rolling rows of `s` as they are at `pos`,
+    /// with the logits that `pos`'s token is sampled from, if given.
+    pub fn snapshot_take(
+        &self,
+        s: StateHandle,
+        pos: usize,
+        logits: Option<Logits>,
+    ) -> SnapshotHandle {
+        let logits = logits.map_or(ptr::null_mut(), |lg| lg.0.as_ptr());
+        let x = unsafe { eremite_snapshot_take(self.raw, s.0.as_ptr(), pos as c_int, logits) };
+        SnapshotHandle(NonNull::new(x).expect("the engine takes every snapshot asked for"))
+    }
+
+    /// Restores the rolling rows of snapshot `x` into `s`, which then
+    /// continues at the snapshot's position.
+    pub fn snapshot_restore(&self, s: StateHandle, x: SnapshotHandle) {
+        unsafe { eremite_snapshot_restore(self.raw, s.0.as_ptr(), x.0.as_ptr()) }
+    }
+
+    /// Frees a snapshot.
+    pub fn snapshot_free(&self, x: SnapshotHandle) {
+        unsafe { eremite_snapshot_free(self.raw, x.0.as_ptr()) }
+    }
+
+    /// Returns the bytes that a snapshot takes, with its logits or without.
+    pub fn snapshot_bytes(&self, with_logits: bool) -> u64 {
+        unsafe { eremite_snapshot_bytes(self.raw, with_logits.into()) as u64 }
+    }
+
+    /// Returns the logits that a snapshot keeps, if it keeps any.
+    pub fn snapshot_logits(&self, x: SnapshotHandle) -> Option<Logits> {
+        let lg = unsafe { eremite_snapshot_logits(self.raw, x.0.as_ptr()) };
+        NonNull::new(lg.cast_mut()).map(Logits)
+    }
+
+    /// Returns how many rows before position `k` a replay at `k` computes
+    /// again, per layer on average. Returns None for a model that resumes
+    /// only from snapshots.
+    pub fn replay_rows(&self, k: usize) -> Option<usize> {
+        let n = unsafe { eremite_replay_rows(self.raw, k as c_int) };
+        (n >= 0).then_some(n as usize)
+    }
+
+    /// Returns the first position that a replay at `k` computes again.
+    pub fn replay_start(&self, k: usize) -> usize {
+        unsafe { eremite_replay_start(self.raw, k as c_int).max(0) as usize }
+    }
+
+    /// Sets the token history of `s` at `pos` from `tokens`, the tokens
+    /// before `pos`, for a state that continues without a prefill.
+    pub fn set_history(&self, s: StateHandle, tokens: &[i32], pos: usize) {
+        unsafe { eremite_set_history(self.raw, s.0.as_ptr(), tokens.as_ptr(), pos as c_int) }
+    }
+
     /// Returns a token sampled from one row of logits.
     pub fn sample(&self, logits: Logits, sampler: &mut Sampler) -> i32 {
         unsafe { eremite_sample(self.raw, logits.0.as_ptr(), sampler.0) }
@@ -674,8 +812,19 @@ impl Stream {
     }
 
     /// Posts the prefill of a prompt's `tokens` from position `from` on, in
-    /// `s`, which holds every position before `from`.
-    pub fn prefill(&self, s: StateHandle, tokens: &[i32], from: usize) {
+    /// `s`. Without `replay`, `s` holds every position before `from`. With
+    /// it, `s` holds only the rows that Model::state_copy copies, and the
+    /// prefill computes the rest again. With `capture`, the prefill also takes
+    /// a snapshot at that position, from `from` on and before the prompt's
+    /// end.
+    pub fn prefill(
+        &self,
+        s: StateHandle,
+        tokens: &[i32],
+        from: usize,
+        replay: bool,
+        capture: Option<usize>,
+    ) {
         unsafe {
             eremite_stream_prefill(
                 self.0,
@@ -683,9 +832,9 @@ impl Stream {
                 tokens.as_ptr(),
                 tokens.len() as c_int,
                 from as c_int,
-                // No replay, no snapshot and no images.
-                0,
-                -1,
+                replay.into(),
+                capture.map_or(-1, |p| p as c_int),
+                // No images.
                 ptr::null(),
             )
         }
@@ -715,6 +864,19 @@ impl Stream {
     pub fn logits(&self) -> Option<Logits> {
         let lg = unsafe { eremite_stream_logits(self.0) };
         NonNull::new(lg.cast_mut()).map(Logits)
+    }
+
+    /// Returns the snapshot that the finished prefill captured, if it took
+    /// one.
+    pub fn captured_snapshot(&self) -> Option<SnapshotHandle> {
+        NonNull::new(unsafe { eremite_stream_captured_snapshot(self.0) }).map(SnapshotHandle)
+    }
+
+    /// Returns what the finished prefill ran.
+    pub fn prefill_info(&self) -> PrefillInfo {
+        let mut info = PrefillInfo::default();
+        unsafe { eremite_stream_prefill_info(self.0, &mut info) };
+        info
     }
 }
 

@@ -21,7 +21,7 @@ fn continue_prompt(model: &Model, states: &[StateHandle], prompt: &[i32]) -> Vec
     let vocab = model.vocab_size();
     let mut tokens = Vec::new();
     for &state in states {
-        stream.prefill(state, prompt, 0);
+        stream.prefill(state, prompt, 0, false, None);
         run(&stream);
         let logits = stream.logits().expect("the prefill's logits");
         tokens.push(model.sample(logits, &mut greedy));
