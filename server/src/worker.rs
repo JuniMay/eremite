@@ -1498,7 +1498,7 @@ impl WorkerModel {
             return;
         }
         if decoding_count > 0 {
-            self.start_decode_calls(states);
+            self.start_decode_calls(shared, states);
         }
         let progress_log_s = shared.budgets.progress_log_s;
         for generation in &mut self.generations {
@@ -1533,6 +1533,40 @@ impl WorkerModel {
             "decode"
         };
         self.update_status(shared, phase);
+    }
+
+    /// Makes room in the state cache for state `state_id` to hold `positions`
+    /// positions, before a pass grows it. The cache counts the state's new size
+    /// now. The worker frees what the cache evicts for it. With only decoding
+    /// states left, the cache can go over its limit. The worker then logs the
+    /// sizes.
+    fn make_room_to_grow(
+        &mut self,
+        shared: &Shared,
+        state_id: state_cache::StateId,
+        positions: usize,
+        states: &mut States,
+    ) {
+        let before = states.cache.entries[&state_id].bytes;
+        let evicted = states.cache.grow_state(
+            state_id,
+            self.model
+                .state_bytes(Some(states.handles[&state_id].engine_state), positions),
+        );
+        states.free_evicted(evicted);
+        let after = states.cache.entries[&state_id].bytes;
+        if after > before && states.cache.count_bytes_over_limit() > 0 {
+            engine::log(&format!(
+                "{}: a decoding state grows to {:.2} GiB at {positions} positions; with only decoding states left, the state cache takes {:.2} GiB of the {:.1} GiB it allows",
+                self.settings.id,
+                after as f64 / GIB,
+                states.cache.count_bytes() as f64 / GIB,
+                states.cache.byte_limit as f64 / GIB
+            ));
+        }
+        if after > before {
+            states.publish_states(shared);
+        }
     }
 
     /// Updates the model's status: its phase, its counts and the request it
@@ -2396,7 +2430,7 @@ impl WorkerModel {
     /// Starts decoding calls for the decoding requests with no call running.
     /// Several requests run together, at most the model's rows per call. Each
     /// row then gives what it would give alone.
-    fn start_decode_calls(&mut self, states: &mut States) {
+    fn start_decode_calls(&mut self, shared: &Shared, states: &mut States) {
         // The call chooser sets how many calls run at once and the rows of
         // each. A call starts as soon as its requests are free and the chooser
         // allows one more call. Groups of requests run independently. The GPU
@@ -2459,6 +2493,9 @@ impl WorkerModel {
             let index = decoding_indices[0];
             let state_id = self.generations[index].state_id;
             let engine_state = states.handles[&state_id].engine_state;
+            let pos = self.generations[index].pos;
+            // The row that the call writes: the token's.
+            self.make_room_to_grow(shared, state_id, pos + 1, states);
             let stream = self.take_decode_stream();
             let generation = &mut self.generations[index];
             generation.in_call = true;
@@ -2480,6 +2517,11 @@ impl WorkerModel {
             .chunks(rows_per_call)
             .take(allowed - running)
         {
+            for &i in group {
+                let (state_id, positions) =
+                    (self.generations[i].state_id, self.generations[i].pos + 1);
+                self.make_room_to_grow(shared, state_id, positions, states);
+            }
             let engine_states: Vec<StateHandle> = group
                 .iter()
                 .map(|&i| states.handles[&self.generations[i].state_id].engine_state)

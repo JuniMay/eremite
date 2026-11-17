@@ -14,6 +14,8 @@
 //! design: the replay is bounded to a ring, and their tokens are printed. The
 //! other cache tests check the cache's budget (--state-cache).
 //!
+//! A growing generation frees room in the cache before it grows.
+//!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
 //! tests run one model process at a time (they share a lock):
@@ -735,8 +737,15 @@ struct Status {
     states: f64,
     /// The GiB that the cache allows.
     limit: f64,
+    /// What the model does.
+    phase: String,
     /// The positions of each state.
     sessions: Vec<i64>,
+}
+
+/// Reads what the server's status tells of the cache.
+fn status(server: &Server) -> Status {
+    read_status(&server.status())
 }
 
 /// Reads what the model's status `status` tells of the cache.
@@ -744,6 +753,7 @@ fn read_status(status: &Value) -> Status {
     Status {
         states: status["state_cache_gib"].as_f64().unwrap_or(f64::NAN),
         limit: status["state_cache_limit_gib"].as_f64().unwrap_or(f64::NAN),
+        phase: status["phase"].as_str().unwrap_or("").to_string(),
         sessions: status["sessions"]
             .as_array()
             .map(|sessions| {
@@ -976,6 +986,107 @@ fn the_status_follows_a_running_prefill() {
         grew,
         "the status showed the same seconds in calls until the prefill ended"
     );
+}
+
+/// A generation that takes its state past the room it started with (16,384
+/// positions) gets that growth counted before the state grows. So an idle state
+/// goes then, not after the generation. The cache stays within --state-cache
+/// all along.
+#[test]
+fn a_growing_generation_frees_room_before_it_grows() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let short = short_prompt();
+    let (long, count) = sized_prompt(&setup, 16_330, 16_376);
+    let body = request(&long, (16_384 - count + 150) as u32);
+    // Leaves the short conversation's state idle, then sends the long request
+    // and reads the status until its answer comes. Each status read waits for
+    // the worker to publish: the samples follow its turns. Returns what the
+    // idle state took, the tokens generated and the samples.
+    let run = |server: &Server| {
+        chat(server, &request(&short, 1));
+        let idle = settled(server, 1).states;
+        let (port, key, body) = (server.port, server.key.clone(), body.clone());
+        let job = std::thread::spawn(move || {
+            http(port, &key, "POST", "/v1/chat/completions", Some(&body))
+        });
+        let mut samples = Vec::new();
+        while !job.is_finished() {
+            samples.push(status(server));
+        }
+        let (code, answer) = job.join().expect("the long request");
+        assert_eq!(
+            code,
+            200,
+            "the long request: {}",
+            String::from_utf8_lossy(&answer)
+        );
+        let answer: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+        let generated = answer["usage"]["completion_tokens"].as_i64().unwrap_or(0) as usize;
+        (idle, generated, samples)
+    };
+    // With no limit, the idle state stays beside the long one: the cache's
+    // largest size while the long one decodes, with its growth counted.
+    let (idle, both) = {
+        let server = start_server(&setup, &[]);
+        let (idle, _, samples) = run(&server);
+        let both = samples
+            .iter()
+            .filter(|sample| sample.phase == "decode")
+            .map(|sample| sample.states)
+            .fold(0.0, f64::max);
+        (idle, both)
+    };
+    // Room for the idle state, the long state as it starts (its first room, as
+    // the idle one's) and half of the long state's growth.
+    let growth = both - 2.0 * idle;
+    let limit = format!("{:.4}", 2.0 * idle + growth / 2.0);
+    let server = start_server(&setup, &["--state-cache", &limit]);
+    let (_, generated, samples) = run(&server);
+    // Samples published after the long state grew: it holds more than 16,384
+    // positions.
+    let grown: Vec<&Status> = samples
+        .iter()
+        .filter(|sample| {
+            sample.phase == "decode" && sample.sessions.iter().any(|&tokens| tokens > 16_384)
+        })
+        .collect();
+    let over = samples
+        .iter()
+        .filter(|sample| sample.states > sample.limit)
+        .count();
+    println!(
+        "growing generation: {count} prompt tokens, {generated} generated; with no limit the idle state took {idle:.4} GiB \
+         and both {both:.4} GiB, a growth of {growth:.4} GiB; --state-cache {limit}; {} samples, {} while decoding past \
+         16,384 positions, of which {} with the idle state still kept; {over} over the limit",
+        samples.len(),
+        grown.len(),
+        grown
+            .iter()
+            .filter(|sample| sample.sessions.len() > 1)
+            .count()
+    );
+    assert!(
+        growth > 0.0,
+        "the long state took no more than its first room"
+    );
+    assert!(
+        count + generated > 16_390,
+        "the reply ended at {} positions, before the state grew",
+        count + generated
+    );
+    assert!(
+        !grown.is_empty(),
+        "no status sample while it decoded past 16,384 positions"
+    );
+    assert!(
+        grown.iter().all(|sample| sample.sessions.len() == 1),
+        "the idle state stayed while the generation grew past its room"
+    );
+    assert_eq!(over, 0, "the cache took more than --state-cache");
 }
 
 /// Quitting stops a long prompt's prefill. SIGTERM 5 s into the prefill of
