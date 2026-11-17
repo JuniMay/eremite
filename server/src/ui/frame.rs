@@ -97,6 +97,8 @@ pub struct Screen<'a> {
     pub statuses: &'a [ModelStatus],
     /// The samples of the history window.
     pub samples: &'a Samples,
+    /// The home folder, which the views show as ~.
+    pub home: &'a str,
 }
 
 /// The keys that the keys row names: each key, and what it does.
@@ -549,6 +551,7 @@ mod tests {
             models: &models,
             statuses: &statuses,
             samples: &Samples::new(WINDOWS),
+            home: "",
         };
         let (mut keys, last) = list_chrome_keys(choices);
         if choices.view == View::Models {
@@ -737,6 +740,7 @@ mod tests {
             models: &models,
             statuses: &statuses,
             samples: &Samples::new(WINDOWS),
+            home: "",
         };
         for chosen in [0, 6, 11] {
             let mut choices = Choices {

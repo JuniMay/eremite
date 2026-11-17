@@ -1,16 +1,20 @@
-//! The view 1 Overview: the work of the whole system.
+//! The view 1 Overview: the work and the memory of the whole system.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 use super::draw::{
-    build_section_rule, build_sparkline, colored, fit_line, format_percent, label, plain, strong,
+    build_gauge, build_section_rule, build_sparkline, colored, fit_line, format_percent, label,
+    pad_spans, plain, strong,
 };
 use super::frame::Screen;
 use super::samples::{CHART_COLUMNS, Sample, find_gpu_busy_since_start, find_ssd_read_since_start};
-use super::theme::Rgb;
+use super::theme::{Rgb, Theme};
 
+/// The bytes of one GiB.
+const GIB: f64 = (1u64 << 30) as f64;
 /// The columns of a figure's name in the System table.
 const NAME_COLUMNS: usize = 24;
 /// The columns of each figure in the System table.
@@ -18,6 +22,18 @@ const FIGURE_COLUMNS: usize = 16;
 /// The history's sparkline takes two samples a column: half the columns of the
 /// history charts.
 const SAMPLES_PER_SPARKLINE_COLUMN: usize = 2;
+
+/// The cells of a memory row's gauge on a wide terminal, and on a narrow one.
+const GAUGE_CELLS: (usize, usize) = (24, 10);
+/// A terminal at least this wide takes the wide gauges. A memory row with a
+/// wide gauge then has room for its figures.
+const WIDE_COLUMNS: usize = 110;
+/// The columns of a memory row's main figure.
+const MAIN_FIGURE_COLUMNS: usize = 18;
+/// The memory pressure that warns, as the engine reports it.
+const PRESSURE_WARNS: u64 = 2;
+/// The memory pressure that is critical, as the engine reports it.
+const PRESSURE_CRITICAL: u64 = 4;
 
 /// A row of the System table: a figure now, recently, since the start, and
 /// its history.
@@ -47,7 +63,8 @@ pub fn draw_overview(buf: &mut Buffer, area: Rect, screen: &Screen) {
 }
 
 /// Builds the System section in `width` columns: the GPU's busy share and the
-/// SSD's reads now, recently, since the start and in the history.
+/// SSD's reads now, recently, since the start and in the history; then the
+/// memory of the GPU, of the server, of the saved states and of the Mac.
 fn build_system_lines(screen: &Screen, width: usize) -> Vec<Line<'static>> {
     let theme = screen.theme;
     let samples = screen.samples;
@@ -105,7 +122,220 @@ fn build_system_lines(screen: &Screen, width: usize) -> Vec<Line<'static>> {
         line.push(colored(theme, figure.tone, sparkline));
         lines.push(Line::from(line));
     }
+    let gauge_cells = if width >= WIDE_COLUMNS {
+        GAUGE_CELLS.0
+    } else {
+        GAUGE_CELLS.1
+    };
+    lines.extend([
+        build_gpu_row(screen, gauge_cells),
+        build_ram_row(screen, gauge_cells),
+        build_ssd_row(screen, gauge_cells),
+        build_mac_row(screen, gauge_cells),
+    ]);
     lines
+}
+
+/// Returns `bytes` in GiB with one decimal.
+fn format_gib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / GIB)
+}
+
+/// Returns `part` as a share of `whole`, or 0 for an empty whole.
+fn share(part: u64, whole: u64) -> f64 {
+    if whole > 0 {
+        part as f64 / whole as f64
+    } else {
+        0.0
+    }
+}
+
+/// Returns the start of a memory row: its name and its gauge of `parts`.
+fn start_memory_row(
+    theme: &Theme,
+    name: &str,
+    gauge_cells: usize,
+    parts: &[(f64, Style)],
+) -> Vec<Span<'static>> {
+    let mut spans = vec![plain(" "), strong(name.to_string()), plain("  ")];
+    spans.extend(build_gauge(theme, gauge_cells, parts));
+    spans.push(plain("  "));
+    spans
+}
+
+/// Returns a part of a memory row's legend: a square in `rgb`, the part's
+/// name and its GiB.
+fn build_legend_part(theme: &Theme, rgb: Rgb, name: &str, bytes: u64) -> Vec<Span<'static>> {
+    vec![
+        colored(theme, rgb, "■"),
+        plain(" "),
+        label(theme, name.to_string()),
+        plain(format!(" {}   ", format_gib(bytes))),
+    ]
+}
+
+/// Builds the GPU's row: the GPU's memory in use by all programs against its
+/// limit. Its parts are all models' experts mapped for the GPU, all models'
+/// weights, and the other memory in use.
+fn build_gpu_row(screen: &Screen, gauge_cells: usize) -> Line<'static> {
+    let theme = screen.theme;
+    let Some(first) = screen.statuses.first() else {
+        return Line::default();
+    };
+    let memory = &first.engine_counters.memory;
+    let experts: u64 = screen
+        .statuses
+        .iter()
+        .map(|status| status.engine_counters.mapped_expert_bytes)
+        .sum();
+    let weights: u64 = first.model_memory.iter().map(|model| model.weights).sum();
+    let other = memory.gpu_in_use.saturating_sub(experts + weights);
+    let limit = memory.gpu_limit.unwrap_or(0);
+    let style = |rgb: Rgb| Style::new().fg(theme.color(rgb));
+    let mut spans = start_memory_row(
+        theme,
+        "GPU",
+        gauge_cells,
+        &[
+            (share(experts, limit), style(theme.sources[0])),
+            (share(weights, limit), style(theme.sources[1])),
+            (share(other, limit), Style::new()),
+        ],
+    );
+    let mut figure = vec![strong(format_gib(memory.gpu_in_use))];
+    if limit > 0 {
+        figure.push(plain(format!(" / {} GiB", format_gib(limit))));
+    } else {
+        figure.push(plain(" GiB"));
+    }
+    spans.extend(pad_spans(figure, MAIN_FIGURE_COLUMNS));
+    spans.extend(build_legend_part(
+        theme,
+        theme.sources[0],
+        "experts",
+        experts,
+    ));
+    spans.extend(build_legend_part(
+        theme,
+        theme.sources[1],
+        "weights",
+        weights,
+    ));
+    spans.extend([
+        label(theme, "other"),
+        plain(format!(" {}", format_gib(other))),
+    ]);
+    Line::from(spans)
+}
+
+/// Builds the RAM's row: the server's memory against the Mac's. Its parts are
+/// all models' experts and the rest.
+fn build_ram_row(screen: &Screen, gauge_cells: usize) -> Line<'static> {
+    let theme = screen.theme;
+    let Some(first) = screen.statuses.first() else {
+        return Line::default();
+    };
+    let memory = &first.engine_counters.memory;
+    let experts: u64 = first.model_memory.iter().map(|model| model.experts).sum();
+    let rest = memory.footprint.saturating_sub(experts);
+    let style = |rgb: Rgb| Style::new().fg(theme.color(rgb));
+    let mut spans = start_memory_row(
+        theme,
+        "RAM",
+        gauge_cells,
+        &[
+            (share(experts, memory.total), style(theme.sources[0])),
+            (share(rest, memory.total), style(theme.sources[1])),
+        ],
+    );
+    let figure = vec![
+        label(theme, "eremite"),
+        plain(" "),
+        strong(format_gib(memory.footprint)),
+        plain(" GiB"),
+    ];
+    spans.extend(pad_spans(figure, MAIN_FIGURE_COLUMNS));
+    spans.extend(build_legend_part(
+        theme,
+        theme.sources[0],
+        "experts",
+        experts,
+    ));
+    spans.extend(build_legend_part(theme, theme.sources[1], "rest", rest));
+    Line::from(spans)
+}
+
+/// Builds the SSD's row: the saved states' GiB against their limit, and their
+/// folder, with the home folder as ~.
+fn build_ssd_row(screen: &Screen, gauge_cells: usize) -> Line<'static> {
+    let theme = screen.theme;
+    let disk = screen
+        .statuses
+        .first()
+        .and_then(|status| status.state_disk.as_ref());
+    let Some(disk) = disk else {
+        let mut spans = start_memory_row(theme, "SSD", gauge_cells, &[]);
+        spans.push(label(theme, "no saved states"));
+        return Line::from(spans);
+    };
+    let used = if disk.limit_gib > 0.0 {
+        disk.gib / disk.limit_gib
+    } else {
+        0.0
+    };
+    let mut spans = start_memory_row(theme, "SSD", gauge_cells, &[(used, Style::new())]);
+    let figure = vec![
+        strong(format!("{:.2}", disk.gib)),
+        plain(format!(" / {:.1} GiB", disk.limit_gib)),
+    ];
+    spans.extend(pad_spans(figure, MAIN_FIGURE_COLUMNS));
+    spans.extend([
+        label(theme, "saved states in "),
+        plain(shorten_home(&disk.dir, screen.home)),
+    ]);
+    Line::from(spans)
+}
+
+/// Builds the Mac's row: a gauge of the memory in use, the memory available
+/// and the memory pressure.
+fn build_mac_row(screen: &Screen, gauge_cells: usize) -> Line<'static> {
+    let theme = screen.theme;
+    let Some(first) = screen.statuses.first() else {
+        return Line::default();
+    };
+    let memory = &first.engine_counters.memory;
+    let in_use = memory.total.saturating_sub(memory.available);
+    let mut spans = start_memory_row(
+        theme,
+        "Mac",
+        gauge_cells,
+        &[(share(in_use, memory.total), Style::new())],
+    );
+    let pressure = if memory.pressure >= PRESSURE_CRITICAL {
+        colored(theme, theme.red, "critical")
+    } else if memory.pressure >= PRESSURE_WARNS {
+        colored(theme, theme.amber, "warning")
+    } else {
+        colored(theme, theme.green, "normal")
+    };
+    spans.extend([
+        label(theme, "available "),
+        strong(format_gib(memory.available)),
+        plain(" GiB   "),
+        label(theme, "pressure "),
+        pressure,
+    ]);
+    Line::from(spans)
+}
+
+/// Returns `path` with the home folder `home` at its start shown as ~.
+fn shorten_home(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
+        _ => path.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +391,7 @@ mod tests {
             models: &models,
             statuses: &statuses,
             samples: &samples,
+            home: "/home/me",
         };
         draw_on_terminal(width, height, |buf, area| draw_overview(buf, area, &screen))
     }
@@ -184,6 +415,39 @@ mod tests {
         assert_eq!(buf[(73 + 59, 3)].symbol(), "█");
         assert_eq!(buf[(73 + 59, 3)].fg, DARK.color(DARK.sources[4]));
         assert_eq!(buf[(73 + 58, 3)].symbol(), " ");
+    }
+
+    #[test]
+    fn the_system_shows_the_memory_of_all_models() {
+        let buf = draw(160, 45);
+        let gpu = read_row(&buf, 4);
+        assert!(
+            gpu.contains("  52.8 / 107.5 GiB  ■ experts 42.6   ■ weights 7.2   other 3.0"),
+            "{gpu}"
+        );
+        // the gauge: experts in blue, weights in light blue, the rest empty
+        assert_eq!(buf[(6, 4)].fg, DARK.color(DARK.sources[0]));
+        assert_eq!(buf[(16, 4)].fg, DARK.color(DARK.sources[1]));
+        assert_eq!(buf[(29, 4)].symbol(), "░");
+        assert!(read_row(&buf, 5).contains("eremite 52.1 GiB  ■ experts 44.1   ■ rest 8.0"));
+        let ssd = read_row(&buf, 6);
+        assert!(
+            ssd.contains("0.00 / 32.0 GiB   saved states in ~/.cache/eremite/states"),
+            "{ssd}"
+        );
+        let mac = read_row(&buf, 7);
+        assert!(
+            mac.contains("available 10.7 GiB   pressure normal"),
+            "{mac}"
+        );
+        let normal = find_in_row(&buf, 7, "normal").unwrap();
+        assert_eq!(buf[(normal, 7)].fg, DARK.color(DARK.green));
+        // ten cells at 100 columns: 42.6 GiB of experts and 7.2 of weights
+        // of 107.5 GiB
+        let buf = draw(100, 30);
+        assert!(read_row(&buf, 4).starts_with(" GPU  █████░░░░░  52.8"));
+        assert_eq!(shorten_home("/home/me2/x", "/home/me"), "/home/me2/x");
+        assert_eq!(shorten_home("/home/me", "/home/me"), "~");
     }
 
     #[test]

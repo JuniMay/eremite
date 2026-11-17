@@ -323,6 +323,7 @@ mod tests {
             models: &models,
             statuses: &[],
             samples: &Samples::new(WINDOWS),
+            home: "",
         };
         draw_on_terminal(160, height, |buf, area| {
             draw_log(buf, area, &screen, lines, choices);
