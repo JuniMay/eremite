@@ -76,6 +76,8 @@ const USAGE: &str =
   --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the
                   most)
   DeepSeek only:
+  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus
+                  the rewind margin (8)
   --prefill-prune  skip decoder batches outside required history; CED and substitution must be
                   off (default off)
   --experts GGUF  read the routed experts from a GGUF file or set of shards
@@ -241,6 +243,8 @@ fn one_model_takes_its_options_from_the_command_line() {
             "/m/d",
             "--prefill-prune",
             "--packed-state-rows",
+            "--ced",
+            "off",
             "--serve",
             "8008",
         ]
@@ -249,6 +253,7 @@ fn one_model_takes_its_options_from_the_command_line() {
     let model = &parsed.models[0];
     assert!(model.engine.deepseek().unwrap().prefill_prune);
     assert!(model.engine.deepseek().unwrap().packed_state_rows);
+    assert_eq!(model.engine.deepseek().unwrap().ced, 0);
     assert_eq!(
         (
             model.temperature,

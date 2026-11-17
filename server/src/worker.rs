@@ -679,6 +679,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "prompt_tokens": status.total_prompt_tokens,
             "generated_tokens": status.total_generated_tokens,
         },
+        "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
         "rows_per_call": shared_model.settings.rows_per_call,
         "split_decoding_calls": status.split_calls,
@@ -2004,7 +2005,17 @@ impl WorkerModel {
         if reused_tokens < prompt_tokens {
             let replayed = if prefill.replays {
                 format!(
-                    "; an exact replay at {reused_tokens}: up to {} earlier rows computed again",
+                    "; {} replay at {reused_tokens}: up to {} earlier rows computed again",
+                    if self
+                        .settings
+                        .options
+                        .deepseek()
+                        .is_some_and(|deepseek| deepseek.ced > 0)
+                    {
+                        "a bounded"
+                    } else {
+                        "an exact"
+                    },
                     (info.tokens as usize).saturating_sub(prompt_tokens - reused_tokens)
                 )
             } else {

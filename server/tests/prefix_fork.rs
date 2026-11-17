@@ -9,9 +9,10 @@
 //! the cheaper way: a replay at the shared prefix, or a snapshot before it that
 //! leaves fewer rows to compute. So a fork reuses at least its shared prefix
 //! less what a replay there computes again, and never more than the prefix.
-//! Each fork must give the tokens that the same prompt gives a server that
-//! starts without a cache. The other cache tests check the cache's budget
-//! (--state-cache).
+//! Without --ced, each fork must give the tokens that the same prompt gives a
+//! server that starts without a cache. With --ced, forks are approximate by
+//! design: the replay is bounded to a ring, and their tokens are printed. The
+//! other cache tests check the cache's budget (--state-cache).
 //!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
@@ -54,6 +55,12 @@ fn replay_rows(k: usize) -> usize {
         .map(|layer| k.min(137 + 128 * layer))
         .sum::<usize>()
         .div_ceil(40)
+}
+
+/// Returns what a bounded replay at `k` computes again (--ced): a ring's
+/// positions.
+fn bounded_rows(k: usize) -> usize {
+    k.min(136)
 }
 
 /// What the tests run: the checkpoint, its experts, and the server's and the
@@ -268,6 +275,25 @@ fn content(answer: &Value) -> String {
         .to_string()
 }
 
+/// Returns the reply's reasoning and its content.
+fn reply(answer: &Value) -> String {
+    let message = &answer["choices"][0]["message"];
+    format!(
+        "{}|{}",
+        message["reasoning_content"].as_str().unwrap_or(""),
+        message["content"].as_str().unwrap_or("")
+    )
+}
+
+/// Returns the rows that the server's last prefill computed (the model's
+/// status): the prompt's new tokens, and with a replay also the earlier rows it
+/// computed again.
+fn last_prefill(server: &Server) -> i64 {
+    server.status()["last_prefill"]["tokens"]
+        .as_i64()
+        .unwrap_or(-1)
+}
+
 /// Returns the conversation's text, from the repository's own documents: a long
 /// system prompt and a long user turn.
 fn texts() -> (String, String) {
@@ -341,14 +367,19 @@ struct Forked {
     text: String,
 }
 
-/// Runs the forks, one after another on one server, while the conversation
-/// decodes there. A fork whose reuse lies outside
-/// [shared - replay_rows(shared), shared] is added to `wrong`.
-fn run_forks(setup: &Setup, wrong: &mut Vec<String>) -> Vec<Forked> {
+/// Runs the forks, one after another on one server with the `extra` options,
+/// while the conversation decodes there. A fork whose reuse lies outside
+/// [shared - rows(shared), shared] is added to `wrong`.
+fn run_forks(
+    setup: &Setup,
+    extra: &[&str],
+    rows: fn(usize) -> usize,
+    wrong: &mut Vec<String>,
+) -> Vec<Forked> {
     let (conversation, forks) = conversation_and_forks();
     let source = tokens(setup, &conversation);
     let mut results = Vec::new();
-    let server = start_server(setup, &[]);
+    let server = start_server(setup, extra);
     let port = server.port;
     let key = server.key.clone();
     let mut long = request(&conversation, 6000);
@@ -360,7 +391,7 @@ fn run_forks(setup: &Setup, wrong: &mut Vec<String>) -> Vec<Forked> {
     for (what, messages) in forks {
         let shared = count_shared(&tokens(setup, &messages), &source);
         let answer = chat(&server, &request(&messages, 16));
-        let (reused, least) = (hit(&answer), shared - replay_rows(shared));
+        let (reused, least) = (hit(&answer), shared - rows(shared));
         println!("{what}: shares {shared} tokens, reused {reused} (at least {least})");
         if reused < least as i64 || reused > shared as i64 {
             wrong.push(format!(
@@ -389,7 +420,7 @@ fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
     };
     let _one = one_model();
     let mut wrong = Vec::new();
-    let results = run_forks(&setup, &mut wrong);
+    let results = run_forks(&setup, &[], replay_rows, &mut wrong);
     // The same prompts on servers that start without a cache.
     for fork in &results {
         let cold = start_server(&setup, &[]);
@@ -417,6 +448,109 @@ fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
     assert!(
         wrong.is_empty(),
         "forks that reused too little or changed the output:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// With --ced 128 a fork resumes by a bounded replay or by a snapshot at most a
+/// ring before its shared prefix. A bounded replay computes a ring's positions
+/// again, with their windows cut off there.
+#[test]
+fn ced_forks_reuse_the_shared_prefix_less_a_ring() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let mut wrong = Vec::new();
+    for fork in run_forks(&setup, &["--ced", "128"], bounded_rows, &mut wrong) {
+        println!("{}: {:?}", fork.what, fork.text);
+    }
+    assert!(
+        wrong.is_empty(),
+        "forks that reused too little:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A thinking prompt ends with <think>. The next turn renders that reply with
+/// </think> there. So it shares all of the prompt but its last token. It
+/// resumes from the turn's prompt-end snapshot one position back, without
+/// computing any earlier rows again, with --ced too. Without --ced it gives the
+/// tokens that a server starting without a cache gives.
+#[test]
+fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let (system, user) = texts();
+    let first = json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
+    let second = json!([{"role": "system", "content": system}, {"role": "user", "content": user},
+                        {"role": "assistant", "content": "It describes how the server is started and checked."},
+                        {"role": "user", "content": "Which of those options change the output?"}]);
+    let (first_tokens, second_tokens) = (
+        rendered_tokens(&setup, &first, true),
+        rendered_tokens(&setup, &second, true),
+    );
+    let shared = count_shared(&first_tokens, &second_tokens);
+    assert_eq!(
+        shared,
+        first_tokens.len() - 1,
+        "the next turn parts at the first turn's last token"
+    );
+    let mut wrong = Vec::new();
+    for extra in [&[][..], &["--ced", "128"][..]] {
+        let what = if extra.is_empty() {
+            "without --ced"
+        } else {
+            "with --ced 128"
+        };
+        let server = start_server(&setup, extra);
+        chat(&server, &body(&first, 16, true));
+        let answer = chat(&server, &body(&second, 16, true));
+        let (reused, computed) = (hit(&answer), last_prefill(&server));
+        println!(
+            "{what}: the next turn shares {shared} of its {} tokens, reused {reused}, computed {computed} rows",
+            second_tokens.len()
+        );
+        if answer["usage"]["prompt_tokens"].as_i64() != Some(second_tokens.len() as i64) {
+            wrong.push(format!(
+                "{what}: the server's prompt has {} tokens, the test's {}",
+                answer["usage"]["prompt_tokens"],
+                second_tokens.len()
+            ));
+        }
+        if reused != shared as i64 || computed != (second_tokens.len() - shared) as i64 {
+            wrong.push(format!(
+                "{what}: reused {reused} and computed {computed} rows; {shared} and {} expected",
+                second_tokens.len() - shared
+            ));
+        }
+        if extra.is_empty() {
+            let text = reply(&answer);
+            drop(server);
+            let cold = start_server(&setup, &[]);
+            let reference = reply(&chat(&cold, &body(&second, 16, true)));
+            println!(
+                "{what}: tokens {}",
+                if text == reference {
+                    "equal to the cold server's"
+                } else {
+                    "DIFFERENT from the cold server's"
+                }
+            );
+            if text != reference {
+                wrong.push(format!(
+                    "{what}: {text:?} against the cold server's {reference:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the next thinking turn:\n{}",
         wrong.join("\n")
     );
 }

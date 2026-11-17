@@ -13,6 +13,9 @@ use crate::engine;
 /// The most tokens that a context holds. A model also takes at most its own
 /// context.
 const MAX_CONTEXT_TOKENS: i32 = 1 << 20;
+/// The fewest decoder tokens that a bounded replay (ced) computes again.
+/// The reason for this value is unknown.
+const MIN_CED_TOKENS: i32 = 128;
 /// The most GiB that a memory budget takes. The reason for this value is
 /// unknown.
 const MAX_MEMORY_GIB: f64 = 1024.0;
@@ -95,6 +98,15 @@ impl ModelConfig {
             "id" => self.id = Some(text()?),
             "experts" => options.deepseek_mut()?.experts = Some(text()?),
             "ctx" => options.ctx = integer()?,
+            "ced" => options.deepseek_mut()?.ced = match value {
+                Value::String(text) if text == "off" => 0,
+                _ => integer()
+                    .ok()
+                    .filter(|tokens| (MIN_CED_TOKENS..=MAX_CONTEXT_TOKENS).contains(tokens))
+                    .ok_or(format!(
+                        "ced takes off or {MIN_CED_TOKENS} to {MAX_CONTEXT_TOKENS} replay tokens"
+                    ))?,
+            },
             "prefill_prune" => options.deepseek_mut()?.prefill_prune = switch()?,
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
             "memory"
@@ -580,7 +592,7 @@ mod tests {
     #[test]
     fn a_file_gives_each_model_its_own_options() {
         let config = parse(&json!({"memory": 72, "state_cache": 16, "models": [
-            {"model": "/m/deepseek"},
+            {"model": "/m/deepseek", "ced": 128},
             {"model": "/m/small", "id": "small", "ctx": 32768, "top_k": 20, "think": 0}
         ]}))
         .unwrap();
@@ -591,9 +603,10 @@ mod tests {
             (
                 deepseek.engine.model.as_str(),
                 config.budgets.memory_gb,
+                deepseek.engine.deepseek().unwrap().ced,
                 config.budgets.state_cache_gb
             ),
-            ("/m/deepseek", 72.0, 16.0)
+            ("/m/deepseek", 72.0, 128, 16.0)
         );
         assert_eq!(deepseek.id.as_deref(), None);
         assert_eq!(
@@ -671,6 +684,29 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_options_stay_through_the_family_check() {
+        let mut models = parse(&json!({"models": [
+            {"model": "/models/deepseek", "ced": 128}, {"model": "/models/plain"}
+        ]}))
+        .unwrap()
+        .models;
+        models[0]
+            .engine
+            .configure(engine::Architecture::DeepSeek)
+            .unwrap();
+        assert_eq!(models[0].engine.deepseek().unwrap().ced, 128);
+        assert!(models[1].engine.deepseek().is_none());
+        models[1]
+            .engine
+            .configure(engine::Architecture::DeepSeek)
+            .unwrap();
+        assert_eq!(
+            models[1].engine.deepseek(),
+            Some(&engine::DeepSeekOptions::default())
+        );
+    }
+
+    #[test]
     fn unknown_or_invalid_options_are_refused() {
         assert!(parse(&json!({"models": []})).is_err());
         assert!(parse(&json!({"models": [{"cache": 1}]})).is_err());
@@ -679,6 +715,7 @@ mod tests {
                 .unwrap_err()
                 .contains("cahce")
         );
+        assert!(parse(&json!({"models": [{"model": "/m", "ced": 64}]})).is_err());
         assert!(parse(&json!({"models": [{"model": "/m", "top_p": 2}]})).is_err());
         assert!(parse(&json!({"prt": 8008, "models": [{"model": "/m"}]})).is_err());
         for timeout in [json!(0), json!(-1), json!("long")] {
@@ -706,6 +743,16 @@ mod tests {
         assert_eq!(
             timeout(json!({"gpu_timeout": 120, "models": [{"model": "/m"}]})),
             120.0
+        );
+        assert_eq!(
+            parse(&json!({"models": [{"model": "/m", "ced": "off"}]}))
+                .unwrap()
+                .models[0]
+                .engine
+                .deepseek()
+                .unwrap()
+                .ced,
+            0
         );
     }
 }
