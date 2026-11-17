@@ -241,6 +241,7 @@ mod tests {
             statuses: &statuses,
             samples: &samples,
             home: "",
+            session_text: None,
         };
         let choices = Choices {
             model: 1,

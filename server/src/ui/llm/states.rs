@@ -13,6 +13,7 @@ use crate::ui::draw::{
     colored, fit_line, format_count, format_duration, format_percent, label, plain, strong,
 };
 use crate::ui::frame::{Choices, ClickTarget, Screen, Target};
+use crate::ui::llm::text::{SessionText, wrap_text};
 use crate::ui::status::{Activity, ModelStatus, Session};
 use crate::ui::theme::{Rgb, Theme, mix};
 
@@ -223,7 +224,8 @@ fn describe_session(theme: &Theme, status: &ModelStatus, index: usize) -> Vec<Sp
 
 /// Draws the States of the model chosen in `choices` in `area`: the first
 /// line, the axis of positions and the tree of the sessions, and the text
-/// panel's frame at the right. The places of the sessions go to `choices`.
+/// panel at the right. The panel shows the chosen session's text, once it is
+/// read. The places of the sessions go to `choices`.
 pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &mut Choices) {
     let theme = screen.theme;
     let Some(status) = screen.statuses.get(choices.model) else {
@@ -503,6 +505,52 @@ pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &mut 
         );
         let title = fit_line(theme, Line::from(spans), panel.saturating_sub(2) as usize);
         buf.set_line(panel_x + 2, axis_y, &title, panel.saturating_sub(2));
+        let text = screen
+            .session_text
+            .filter(|text| text.session == sessions[index].number);
+        if let Some(text) = text {
+            let top = Rect {
+                x: panel_x + 2,
+                y: axis_y + 2,
+                width: panel.saturating_sub(3),
+                height: area.bottom().saturating_sub(axis_y + 2),
+            };
+            draw_session_text(buf, top, theme, text, choices);
+        }
+    }
+}
+
+/// Draws `text` in `area`: each message under its role, a row apart,
+/// scrolled by the lines that `choices` says. The scroll stays within the
+/// lines, and `choices` keeps the rows of a page.
+fn draw_session_text(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    text: &SessionText,
+    choices: &mut Choices,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for message in &text.messages {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        if !message.role.is_empty() {
+            lines.push(Line::from(label(theme, message.role.clone())));
+        }
+        let wrapped = wrap_text(&message.text, area.width as usize);
+        lines.extend(wrapped.into_iter().map(|line| Line::from(plain(line))));
+    }
+    let rows = area.height as usize;
+    choices.text_page = rows.max(1);
+    choices.text_scroll = choices.text_scroll.min(lines.len().saturating_sub(rows));
+    for (row, line) in lines
+        .iter()
+        .skip(choices.text_scroll)
+        .take(rows)
+        .enumerate()
+    {
+        buf.set_line(area.x, area.y + row as u16, line, area.width);
     }
 }
 
@@ -553,6 +601,7 @@ mod tests {
             statuses: &statuses,
             samples: &samples,
             home: "",
+            session_text: None,
         };
         draw_on_terminal(width, height, |buf, area| {
             draw_states(buf, area, &screen, choices);
@@ -625,6 +674,97 @@ mod tests {
         // without a choice, the session used last
         let status: ModelStatus = serde_json::from_str(STATUS).unwrap();
         assert_eq!(find_chosen_session(&status, &Choices::default()), Some(0));
+    }
+
+    #[test]
+    fn the_panel_shows_the_chosen_sessions_messages_and_scrolls() {
+        let messages = [
+            ("user", "Below is a short note about our garden. Read it and list the three jobs it asks for."),
+            ("assistant", "1. Stake the tomatoes.\n2. Fix the leak at the tap.\n3. Dry the compost."),
+        ]
+        .map(|(role, text)| crate::ui::llm::text::Message {
+            role: role.into(),
+            text: text.into(),
+        });
+        let text = SessionText {
+            session: 2,
+            tokens: 550,
+            messages: messages.to_vec(),
+        };
+        let models = [ModelInfo {
+            name: "deepseek-v4.1-flash".into(),
+            kind: Kind::Llm,
+        }];
+        let statuses = [serde_json::from_str(STATUS).unwrap()];
+        let samples = Samples::new(WINDOWS);
+        let screen = Screen {
+            theme: &DARK,
+            address: "127.0.0.1:52878",
+            uptime_seconds: 60.0,
+            models: &models,
+            statuses: &statuses,
+            samples: &samples,
+            home: "",
+            session_text: Some(&text),
+        };
+        let mut choices = Choices {
+            session: Some(2),
+            ..Choices::default()
+        };
+        let buf = draw_on_terminal(160, 40, |buf, area| {
+            draw_states(buf, area, &screen, &mut choices);
+        });
+        // the panel's text starts two columns after its rule
+        let panel_text =
+            |buf: &Buffer, y: u16| -> String { read_row(buf, y).chars().skip(102).collect() };
+        assert_eq!(
+            panel_text(&buf, 4).trim_end(),
+            "user",
+            "{}",
+            read_screen(&buf)
+        );
+        let first = panel_text(&buf, 5);
+        assert!(first.starts_with("Below is a short note about our garden. Read it and"));
+        assert_eq!(buf[(102, 4)].fg, DARK.color(DARK.label));
+        assert!(read_row(&buf, 8).contains("assistant"));
+        assert!(read_row(&buf, 9).contains("1. Stake the tomatoes."));
+        assert_eq!(choices.text_page, 36);
+        // a text of one page does not scroll
+        choices.text_scroll = 4;
+        draw_on_terminal(160, 40, |buf, area| {
+            draw_states(buf, area, &screen, &mut choices);
+        });
+        assert_eq!(choices.text_scroll, 0);
+        // a longer text scrolls, no further than its last page
+        let long = SessionText {
+            messages: vec![crate::ui::llm::text::Message {
+                role: "assistant".into(),
+                text: (1..=50).map(|i| format!("line {i}\n")).collect(),
+            }],
+            ..text.clone()
+        };
+        let screen = Screen {
+            session_text: Some(&long),
+            ..screen
+        };
+        choices.session = Some(2);
+        choices.text_scroll = 5;
+        let buf = draw_on_terminal(160, 40, |buf, area| {
+            draw_states(buf, area, &screen, &mut choices);
+        });
+        assert_eq!(panel_text(&buf, 4).trim_end(), "line 5");
+        choices.text_scroll = usize::MAX;
+        draw_on_terminal(160, 40, |buf, area| {
+            draw_states(buf, area, &screen, &mut choices);
+        });
+        // the role, and the text's 50 lines and the empty one after them
+        assert_eq!(choices.text_scroll, 52 - 36);
+        // another session's text waits for its own
+        choices.session = Some(3);
+        let buf = draw_on_terminal(160, 40, |buf, area| {
+            draw_states(buf, area, &screen, &mut choices);
+        });
+        assert!(!read_screen(&buf).contains("Below is"));
     }
 
     #[test]

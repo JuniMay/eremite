@@ -533,6 +533,7 @@ mod tests {
             statuses: &statuses,
             samples: &samples,
             home: "/home/me",
+            session_text: None,
         };
         draw_on_terminal(width, height, |buf, area| {
             draw_overview(buf, area, &screen, &[], &mut Choices::default());
@@ -644,6 +645,7 @@ mod tests {
             statuses: &statuses,
             samples: &samples,
             home: "",
+            session_text: None,
         };
         let log: Vec<LogLine> = (0..50)
             .map(|i| LogLine {

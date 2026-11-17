@@ -484,6 +484,7 @@ mod tests {
             statuses: &statuses,
             samples: &samples,
             home: "",
+            session_text: None,
         };
         draw_on_terminal(width, height, |buf, area| draw_history(buf, area, &screen))
     }

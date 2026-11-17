@@ -3,3 +3,4 @@
 //! Every LLM shows them.
 
 pub mod states;
+pub mod text;

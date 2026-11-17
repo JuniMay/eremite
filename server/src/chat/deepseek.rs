@@ -103,6 +103,21 @@ fn build_special_tokens() -> SpecialTokensMap {
     }
 }
 
+/// Returns the role whose message `token` starts: system, user or
+/// assistant. `token` is a special token's text. Returns None for another
+/// token. The terminal UI shows a session's text by its messages.
+pub fn find_role_of_token(token: &str) -> Option<&'static str> {
+    let tokens = build_special_tokens();
+    [
+        (SpecialToken::System, "system"),
+        (SpecialToken::User, "user"),
+        (SpecialToken::Assistant, "assistant"),
+    ]
+    .into_iter()
+    .find(|&(special, _)| tokens.token(special) == token)
+    .map(|(_, role)| role)
+}
+
 /// Gets the V4.1 prompt encoding with the server's special tokens.
 /// The first call creates it.
 fn get_encoding() -> &'static DeepseekV41Encoding {
@@ -1229,6 +1244,15 @@ mod tests {
 
     /// The id of `</think>` in the DeepSeek V4.1 tokenizer.
     const THINK_END_TOKEN: u32 = 128_822;
+
+    #[test]
+    fn the_role_tokens_start_the_messages_of_their_roles() {
+        assert_eq!(find_role_of_token("<｜User｜>"), Some("user"));
+        assert_eq!(find_role_of_token("<｜Assistant｜>"), Some("assistant"));
+        assert_eq!(find_role_of_token("<｜System｜>"), Some("system"));
+        assert_eq!(find_role_of_token("</think>"), None);
+        assert_eq!(find_role_of_token("<｜end▁of▁sentence｜>"), None);
+    }
 
     /// Builds the defaults that the tests use: thinking on at effort 75.
     fn build_test_defaults() -> Defaults {

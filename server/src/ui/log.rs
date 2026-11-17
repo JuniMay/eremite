@@ -324,6 +324,7 @@ mod tests {
             statuses: &[],
             samples: &Samples::new(WINDOWS),
             home: "",
+            session_text: None,
         };
         draw_on_terminal(160, height, |buf, area| {
             draw_log(buf, area, &screen, lines, choices);

@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use super::draw::{colored, fit_line, format_duration, label, plain, strong};
+use super::llm::text::SessionText;
 use super::log::LogFilter;
 use super::samples::Samples;
 use super::status::{ModelStatus, Phase};
@@ -99,6 +100,8 @@ pub struct Screen<'a> {
     pub samples: &'a Samples,
     /// The home folder, which the views show as ~.
     pub home: &'a str,
+    /// The text of the session chosen in States, once it is read.
+    pub session_text: Option<&'a SessionText>,
 }
 
 /// The keys that the keys row names: each key, and what it does.
@@ -151,6 +154,10 @@ pub struct Choices {
     /// The session chosen in States, by its number. None takes the session
     /// used last.
     pub session: Option<u64>,
+    /// The lines of the session's text that the panel scrolled past.
+    pub text_scroll: usize,
+    /// The rows of the text panel, in the frame drawn last.
+    pub text_page: usize,
     /// The places that a click acts on, in the frame drawn last.
     pub targets: Vec<ClickTarget>,
 }
@@ -166,6 +173,8 @@ impl Default for Choices {
             log_back: 0,
             log_page: 0,
             session: None,
+            text_scroll: 0,
+            text_page: 0,
             targets: Vec::new(),
         }
     }
@@ -558,6 +567,7 @@ mod tests {
             statuses: &statuses,
             samples: &Samples::new(WINDOWS),
             home: "",
+            session_text: None,
         };
         let (mut keys, last) = list_chrome_keys(choices);
         if choices.view == View::Models {
@@ -747,6 +757,7 @@ mod tests {
             statuses: &statuses,
             samples: &Samples::new(WINDOWS),
             home: "",
+            session_text: None,
         };
         for chosen in [0, 6, 11] {
             let mut choices = Choices {
