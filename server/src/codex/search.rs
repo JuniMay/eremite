@@ -5,6 +5,7 @@
 //!
 //! - `open` shows a page from a reference or a URL, and `click` follows one
 //!   of its links.
+//! - `find` shows the lines of a page that contain a text.
 //! - The system curl fetches pages.
 //!   Pages on loopback, private, link-local and other non-public addresses are
 //!   refused, at every redirect.
@@ -15,12 +16,15 @@
 //!   Later calls name these ids in their commands.
 //!   Sessions live in memory: after a restart the model is told to open a URL
 //!   instead of an unknown reference.
+//! - `time` is answered.
+//!   The other commands (images, papers, screenshots, finance, weather, sports)
+//!   are not available and say so.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -69,12 +73,36 @@ pub struct SearchRequest {
 /// The model's commands in one call. Each kind holds a list of commands.
 #[derive(Deserialize, Default)]
 pub struct Commands {
+    /// Searches for papers: not available.
+    #[serde(default)]
+    literature_search_query: Option<Vec<Value>>,
+    /// Searches for images: not available.
+    #[serde(default)]
+    image_query: Option<Vec<Value>>,
     /// Pages to open.
     #[serde(default)]
     open: Option<Vec<OpenCommand>>,
     /// Links to follow.
     #[serde(default)]
     click: Option<Vec<ClickCommand>>,
+    /// Texts to find in pages.
+    #[serde(default)]
+    find: Option<Vec<FindCommand>>,
+    /// Screenshots of pages: not available.
+    #[serde(default)]
+    screenshot: Option<Vec<Value>>,
+    /// Financial data: not available.
+    #[serde(default)]
+    finance: Option<Vec<Value>>,
+    /// Weather forecasts: not available.
+    #[serde(default)]
+    weather: Option<Vec<Value>>,
+    /// Sports results: not available.
+    #[serde(default)]
+    sports: Option<Vec<Value>>,
+    /// Requests for the time at a UTC offset.
+    #[serde(default)]
+    time: Option<Vec<TimeCommand>>,
     /// How much the call returns: "short", "medium" or "long".
     #[serde(default)]
     response_length: Option<String>,
@@ -98,6 +126,22 @@ struct ClickCommand {
     /// The link's number on the page: Codex's `id`.
     #[serde(rename = "id")]
     link_number: u64,
+}
+
+/// Finds a text in a page.
+#[derive(Deserialize)]
+struct FindCommand {
+    /// The page's reference id or URL.
+    ref_id: String,
+    /// The text to find, case ignored.
+    pattern: String,
+}
+
+/// Asks for the time at a UTC offset.
+#[derive(Deserialize)]
+struct TimeCommand {
+    /// The offset, such as "+03:00".
+    utc_offset: String,
 }
 
 /// Codex's web settings.
@@ -147,6 +191,15 @@ impl ResponseLength {
             ResponseLength::Short => 60,
             ResponseLength::Medium => 120,
             ResponseLength::Long => 250,
+        }
+    }
+
+    /// Returns the matches that each find shows at most.
+    fn max_matches_per_find(self) -> usize {
+        match self {
+            ResponseLength::Short => 10,
+            ResponseLength::Medium => 20,
+            ResponseLength::Long => 40,
         }
     }
 }
@@ -315,7 +368,8 @@ impl Service {
         };
 
         let pages = commands.open.as_ref().map_or(0, Vec::len)
-            + commands.click.as_ref().map_or(0, Vec::len);
+            + commands.click.as_ref().map_or(0, Vec::len)
+            + commands.find.as_ref().map_or(0, Vec::len);
         // Codex cuts longer output: share its budget among the sections.
         // A token counts as 3 bytes. The reason for the default of 2500
         // tokens and for the bounds of 2000 and 60,000 bytes is unknown.
@@ -325,6 +379,33 @@ impl Service {
         let section_budget = budget / pages.max(1);
 
         let mut sections: Vec<String> = Vec::new();
+        for (name, given) in [
+            (
+                "literature_search_query",
+                commands
+                    .literature_search_query
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+            (
+                "image_query",
+                commands.image_query.as_ref().map_or(0, Vec::len),
+            ),
+            (
+                "screenshot",
+                commands.screenshot.as_ref().map_or(0, Vec::len),
+            ),
+            ("finance", commands.finance.as_ref().map_or(0, Vec::len)),
+            ("weather", commands.weather.as_ref().map_or(0, Vec::len)),
+            ("sports", commands.sports.as_ref().map_or(0, Vec::len)),
+        ] {
+            if given > 0 {
+                sections.push(format!("{name}: not available with this search service."));
+            }
+        }
+        for command in commands.time.iter().flatten() {
+            sections.push(format_time_at_offset(&command.utc_offset, read_unix_time()));
+        }
         for command in commands.open.iter().flatten() {
             let text = match self
                 .open_page(&mut call, &command.ref_id, may_fetch, &allowed_domains)
@@ -348,6 +429,18 @@ impl Service {
             {
                 Ok((id, page)) => format_view(&id, &page, 0, length, section_budget),
                 Err(e) => format!("click {} {}: {e}", command.ref_id, command.link_number),
+            };
+            sections.push(text);
+        }
+        for command in commands.find.iter().flatten() {
+            let text = match self
+                .open_page(&mut call, &command.ref_id, may_fetch, &allowed_domains)
+                .await
+            {
+                Ok((id, page)) => {
+                    find_in_page(&id, &page, &command.pattern, length, section_budget)
+                }
+                Err(e) => format!("find in {}: {e}", command.ref_id),
             };
             sections.push(text);
         }
@@ -1153,6 +1246,96 @@ fn format_view(
     out.trim_end().to_string()
 }
 
+/// The page's lines containing the pattern, case ignored.
+fn find_in_page(
+    id: &str,
+    page: &Page,
+    pattern: &str,
+    length: ResponseLength,
+    budget: usize,
+) -> String {
+    let needle = pattern.to_lowercase();
+    let mut out = String::new();
+    let mut count = 0;
+    let mut shown = 0;
+    for (line_number, line) in page.lines.iter().enumerate() {
+        if needle.is_empty() || !line.to_lowercase().contains(&needle) {
+            continue;
+        }
+        count += 1;
+        let entry = format!("L{line_number}: {line}\n");
+        if shown < length.max_matches_per_find() && out.len() + entry.len() < budget {
+            out.push_str(&entry);
+            shown += 1;
+        }
+    }
+    let head = format!(
+        "Find \"{pattern}\" in [{id}] {} ({}):",
+        page.title, page.url
+    );
+    match count {
+        0 => format!("{head} no match."),
+        _ if shown < count => format!(
+            "{head} {count} matches, the first {shown} shown.\n{}",
+            out.trim_end()
+        ),
+        _ => format!("{head} {count} matches.\n{}", out.trim_end()),
+    }
+}
+
+/// Returns the seconds since 1970-01-01 UTC, or 0 for a clock before then.
+fn read_unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The time at a UTC offset such as "+03:00".
+fn format_time_at_offset(utc_offset: &str, unix_time: i64) -> String {
+    let parsed = (|| {
+        let (sign, rest) = match utc_offset.trim().as_bytes().first()? {
+            b'+' => (1, &utc_offset.trim()[1..]),
+            b'-' => (-1, &utc_offset.trim()[1..]),
+            _ => (1, utc_offset.trim()),
+        };
+        let (hours, minutes) = rest.split_once(':').unwrap_or((rest, "0"));
+        let (hours, minutes): (i64, i64) = (hours.parse().ok()?, minutes.parse().ok()?);
+        // UTC offsets go up to +14:00.
+        (hours <= 14 && minutes < 60).then_some(sign * (hours * 3600 + minutes * 60))
+    })();
+    let Some(shift) = parsed else {
+        return format!("time: {utc_offset:?} is not a UTC offset such as +03:00.");
+    };
+    let local_seconds = unix_time + shift;
+    // A day has 86,400 seconds.
+    let (days, seconds_of_day) = (
+        local_seconds.div_euclid(86_400),
+        local_seconds.rem_euclid(86_400),
+    );
+    // civil date from days since 1970-01-01 (Howard Hinnant's algorithm)
+    let days_from_0000_03_01 = days + 719_468;
+    let era = days_from_0000_03_01.div_euclid(146_097);
+    let day_of_era = days_from_0000_03_01 - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "Time at UTC{}: {year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        utc_offset.trim(),
+        seconds_of_day / 3600,
+        seconds_of_day % 3600 / 60,
+        seconds_of_day % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,7 +1491,10 @@ mod tests {
         let request: SearchRequest = serde_json::from_value(serde_json::json!({
             "id": "s",
             "commands": {
+                "find": [{"ref_id": "turn0view0", "pattern": "pattern"}],
                 "open": [{"ref_id": "turn0view0", "lineno": 1}, {"ref_id": "turn9search9"}],
+                "image_query": [{"q": "cats"}],
+                "time": [{"utc_offset": "+00:00"}],
             },
             "settings": {"external_web_access": true},
             "max_output_tokens": 2500,
@@ -1316,6 +1502,7 @@ mod tests {
         .unwrap();
         let out = s.answer_call(request).await;
         assert!(out.starts_with(UNTRUSTED_CONTENT_NOTICE), "{out}");
+        assert!(out.contains("Find \"pattern\" in [turn0view0] Example (https://example.com/a): 1 matches.\nL1: the Pattern here"), "{out}");
         assert!(
             out.contains("[turn0view0] Example\nhttps://example.com/a\nLines 1 to 2 of 3."),
             "{out}"
@@ -1325,6 +1512,8 @@ mod tests {
             out.contains("open turn9search9: the reference turn9search9 is not known here"),
             "{out}"
         );
+        assert!(out.contains("image_query: not available"), "{out}");
+        assert!(out.contains("Time at UTC+00:00: "), "{out}");
     }
 
     /// With Codex's web_search = "cached", the commands that need the web say
@@ -1360,6 +1549,21 @@ mod tests {
         let small = format_view("turn0view0", &p, 100, ResponseLength::Long, 300);
         assert!(small.contains("Lines 100 to "), "{small}");
         assert!(small.len() < 600, "{}", small.len());
+    }
+
+    #[test]
+    fn utc_offsets_give_the_local_date_and_time() {
+        // 2026-11-12 21:00:00 UTC
+        let now = 1_794_517_200;
+        assert_eq!(
+            format_time_at_offset("+03:00", now),
+            "Time at UTC+03:00: 2026-11-13 00:00:00"
+        );
+        assert_eq!(
+            format_time_at_offset("-08:00", now),
+            "Time at UTC-08:00: 2026-11-12 13:00:00"
+        );
+        assert!(format_time_at_offset("noon", now).contains("is not a UTC offset"));
     }
 
     #[test]
@@ -1437,6 +1641,12 @@ mod tests {
             out.contains("[turn1view0]") && out.contains("L1: second line"),
             "{out}"
         );
+        let out = s
+            .answer_call(request(
+                serde_json::json!({"find": [{"ref_id": "turn1view0", "pattern": "PLAIN"}]}),
+            ))
+            .await;
+        assert!(out.contains("L0: plain text"), "{out}");
         let out = s.answer_call(request(serde_json::json!({"open": [{"ref_id": format!("http://127.0.0.1:{port}/missing")}]}))).await;
         assert!(out.contains("HTTP 404"), "{out}");
     }
