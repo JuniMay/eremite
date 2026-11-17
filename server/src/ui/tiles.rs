@@ -2,13 +2,27 @@
 //! in proportion to its size. It is the squarified layout of Bruls, Huizing
 //! and van Wijk. Each row of rectangles goes along the shorter side of the
 //! room left. A rectangle joins the row while it makes the row's worst aspect
-//! ratio no worse.
+//! ratio no worse. The module also draws the tiles. A model's tile holds its
+//! parts under its title.
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use unicode_width::UnicodeWidthStr;
+
+use super::draw::clip_text;
+use super::theme::{Rgb, Theme, mix};
 
 /// A cell is about twice as tall as it is wide. The layout counts a cell's
 /// height as this many widths, so that a square looks square.
 const CELL_HEIGHT_IN_WIDTHS: f64 = 2.0;
+/// The bytes of one GiB.
+const GIB: f64 = (1u64 << 30) as f64;
+/// A tile's color blends halfway to the background, so that its text stays
+/// readable.
+pub const TILE_TINT: f64 = 0.5;
+/// A model's title row blends its text color this far into the background.
+pub const TITLE_TINT: f64 = 0.18;
 
 /// Lays out one rectangle for each of `sizes`, in their order, that together
 /// tile `area`. Each rectangle's cells follow its size. A size of 0, and one
@@ -88,6 +102,164 @@ fn round_to_cells(area: Rect, start: (f64, f64), size: (f64, f64)) -> Rect {
     Rect::new(area.x + x0, area.y + y0, x1 - x0, y1 - y0)
 }
 
+/// A tile of the map. A model's tile holds its parts under its title.
+pub struct Tile {
+    /// The tile's name.
+    pub name: String,
+    /// Its bytes.
+    pub bytes: u64,
+    /// Its color.
+    pub tone: Rgb,
+    /// The parts of a model's tile. Empty for another tile.
+    pub parts: Vec<Tile>,
+    /// The bytes that a model's title names: its memory without its states.
+    pub title_bytes: u64,
+    /// Whether it is the model chosen in 4 Models.
+    pub chosen: bool,
+}
+
+impl Tile {
+    /// Returns a tile without parts.
+    pub fn part(name: &str, bytes: u64, tone: Rgb) -> Tile {
+        Tile {
+            name: name.into(),
+            bytes,
+            tone,
+            parts: Vec::new(),
+            title_bytes: bytes,
+            chosen: false,
+        }
+    }
+}
+
+/// Formats `bytes` in GiB: with two decimals under 1 GiB, else with one.
+fn format_tile_gib(bytes: u64) -> String {
+    let gib = bytes as f64 / GIB;
+    if gib < 1.0 {
+        format!("{gib:.2} GiB")
+    } else {
+        format!("{gib:.1} GiB")
+    }
+}
+
+/// Fills `rect` of `buf` with `background`.
+fn fill_rect(buf: &mut Buffer, theme: &Theme, rect: Rect, background: Rgb) {
+    let style = Style::new()
+        .fg(theme.color(theme.ink))
+        .bg(theme.color(background));
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            buf[(x, y)].set_symbol(" ").set_style(style);
+        }
+    }
+}
+
+/// Writes a tile's name and size inside `rect`: on one row when they fit,
+/// else on two rows, else the size alone. Returns false when not even the
+/// size fits.
+fn write_tile_name(
+    buf: &mut Buffer,
+    theme: &Theme,
+    rect: Rect,
+    tile: &Tile,
+    background: Rgb,
+) -> bool {
+    let style = Style::new()
+        .fg(theme.color(theme.ink))
+        .bg(theme.color(background));
+    let (width, size) = (rect.width as usize, format_tile_gib(tile.bytes));
+    let one_row = format!(" {} {size}", tile.name);
+    if one_row.width() <= width {
+        buf.set_string(rect.x, rect.y, one_row, style);
+    } else if rect.height >= 2 && size.width() < width {
+        let name = format!(" {}", clip_text(&tile.name, width - 1));
+        buf.set_string(rect.x, rect.y, name, style);
+        buf.set_string(rect.x, rect.y + 1, format!(" {size}"), style);
+    } else if size.width() < width {
+        buf.set_string(rect.x, rect.y, format!(" {size}"), style);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Draws `tile` in `rect`. A tile with no room for its size goes to
+/// `unlabeled`, with the name of the model that it belongs to, or none.
+pub fn draw_tile(
+    buf: &mut Buffer,
+    theme: &Theme,
+    rect: Rect,
+    tile: &Tile,
+    owner: &str,
+    unlabeled: &mut Vec<(String, String)>,
+) {
+    let named = || {
+        let what = format!("{} {}", tile.name, format_tile_gib(tile.bytes));
+        (owner.to_string(), what)
+    };
+    if rect.width == 0 || rect.height == 0 {
+        unlabeled.push(named());
+        return;
+    }
+    if tile.parts.is_empty() {
+        let background = mix(theme.ground, tile.tone, TILE_TINT);
+        fill_rect(buf, theme, rect, background);
+        if !write_tile_name(buf, theme, rect, tile, background) {
+            unlabeled.push(named());
+        }
+        return;
+    }
+    // A model: its name and size on its title row, its parts below. A column
+    // of the background at its right keeps its parts apart from the next
+    // model's. A long name gives way to the size. The parts too small for
+    // their size follow on the title row when they fit there.
+    let rect = Rect {
+        width: if rect.width > 2 {
+            rect.width - 1
+        } else {
+            rect.width
+        },
+        ..rect
+    };
+    let below = Rect {
+        y: rect.y + 1,
+        height: rect.height - 1,
+        ..rect
+    };
+    let sizes: Vec<u64> = tile.parts.iter().map(|part| part.bytes).collect();
+    let mut small = Vec::new();
+    let placed = lay_out_tiles(&sizes, below);
+    for (part, part_rect) in tile.parts.iter().zip(placed) {
+        draw_tile(buf, theme, part_rect, part, &tile.name, &mut small);
+    }
+    let (fg, bg) = if tile.chosen {
+        (theme.on_accent, theme.accent)
+    } else {
+        (theme.ink, mix(theme.ground, theme.ink, TITLE_TINT))
+    };
+    fill_rect(buf, theme, Rect { height: 1, ..rect }, bg);
+    let size = format_tile_gib(tile.title_bytes);
+    let room = (rect.width as usize).saturating_sub(size.width() + 2);
+    let mut title = if room >= 4 {
+        format!(" {} {size}", clip_text(&tile.name, room))
+    } else {
+        clip_text(&format!(" {size}"), rect.width as usize)
+    };
+    for (i, (part_owner, what)) in small.into_iter().enumerate() {
+        let gap = if i == 0 { "   " } else { " · " };
+        if title.width() + gap.width() + what.width() <= rect.width as usize {
+            title = format!("{title}{gap}{what}");
+        } else {
+            unlabeled.push((part_owner, what));
+        }
+    }
+    let style = Style::new()
+        .fg(theme.color(fg))
+        .bg(theme.color(bg))
+        .add_modifier(Modifier::BOLD);
+    buf.set_string(rect.x, rect.y, title, style);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +336,47 @@ mod tests {
         for rect in rects {
             assert_eq!((rect.width, rect.height), (20, 10), "{rect:?}");
         }
+    }
+
+    #[test]
+    fn a_models_tile_holds_its_parts_under_its_title() {
+        let theme = &crate::ui::theme::DARK;
+        let gib = |value: f64| (value * GIB) as u64;
+        let model = Tile {
+            name: "deepseek-v4.1-flash".into(),
+            bytes: gib(51.35),
+            tone: theme.ink,
+            parts: vec![
+                Tile::part("experts", gib(44.1), theme.sources[0]),
+                Tile::part("weights", gib(7.2), theme.sources[2]),
+                Tile::part("states", gib(0.05), theme.prefill),
+            ],
+            title_bytes: gib(51.3),
+            chosen: true,
+        };
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let mut unlabeled = Vec::new();
+        draw_tile(&mut buf, theme, area, &model, "", &mut unlabeled);
+        let row = |y: u16| -> String { (0..60).map(|x| buf[(x, y)].symbol()).collect() };
+        // the title names the memory without the states, on the accent
+        assert!(
+            row(0).starts_with(" deepseek-v4.1-flash 51.3 GiB"),
+            "{}",
+            row(0)
+        );
+        assert_eq!(buf[(1, 0)].bg, theme.color(theme.accent));
+        assert!(row(1).starts_with(" experts 44.1 GiB"), "{}", row(1));
+        assert_eq!(
+            buf[(1, 1)].bg,
+            theme.color(mix(theme.ground, theme.sources[0], TILE_TINT))
+        );
+        // the last column keeps the model apart from the next tile
+        assert_eq!(buf[(59, 1)].bg, ratatui::style::Color::Reset);
+        // the states have no room for their size: the title takes them
+        assert!(unlabeled.is_empty());
+        assert!(row(0).contains("states 0.05 GiB"), "{}", row(0));
+        assert_eq!(format_tile_gib(gib(0.33)), "0.33 GiB");
+        assert_eq!(format_tile_gib(gib(15.2)), "15.2 GiB");
     }
 }
