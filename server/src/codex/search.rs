@@ -2,14 +2,17 @@
 //! (`web.run`, Codex 0.167).
 //!
 //! - The system curl fetches pages.
+//!   Pages on loopback, private, link-local and other non-public addresses are
+//!   refused, at every redirect.
 //! - HTML pages become numbered lines, and their links are numbered too.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use url::Url;
+use url::{Host, Url};
 
 use crate::http::{KIB, MIB};
 
@@ -40,6 +43,105 @@ pub struct Page {
 }
 
 // ---- fetching ----
+
+/// Which addresses pages may be fetched from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AddressPolicy {
+    /// Public addresses only.
+    Public,
+    /// Any address, for tests against a local server.
+    Any,
+}
+
+/// Whether pages may be fetched from the address: public addresses only,
+/// unless the policy allows any.
+fn is_address_allowed(ip: IpAddr, policy: AddressPolicy) -> bool {
+    policy == AddressPolicy::Any || is_public(ip)
+}
+
+/// Whether the address is public. An IPv4 address in IPv6 form counts as the
+/// IPv4 address.
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_public_v4(v4),
+            None => is_public_v6(v6),
+        },
+    }
+}
+
+/// Whether the IPv4 address is public: outside every special range.
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [first_octet, second_octet, ..] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // this network
+        || first_octet == 0
+        // shared address space
+        || (first_octet == 100 && (64..128).contains(&second_octet))
+        // IETF protocols
+        || (first_octet == 192 && second_octet == 0 && ip.octets()[2] == 0)
+        // benchmarking
+        || (first_octet == 198 && (18..20).contains(&second_octet))
+        // reserved
+        || first_octet >= 240)
+}
+
+/// Whether the IPv6 address is public: outside every special range.
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00 // unique local
+        || (first & 0xffc0) == 0xfe80 // link-local
+        || first == 0x2001 && ip.segments()[1] == 0x0db8) // documentation
+}
+
+/// The address the URL's host is fetched from, checked against the policy:
+/// None for a literal address, else the name, port and pinned address.
+async fn resolve_and_check_host(
+    url: &Url,
+    policy: AddressPolicy,
+) -> Result<Option<(String, u16, IpAddr)>, String> {
+    let port = url.port_or_known_default().ok_or("the URL has no port")?;
+    match url.host() {
+        Some(Host::Ipv4(ip)) => check_address(IpAddr::V4(ip), policy).map(|_| None),
+        Some(Host::Ipv6(ip)) => check_address(IpAddr::V6(ip), policy).map(|_| None),
+        Some(Host::Domain(name)) => {
+            let addrs: Vec<IpAddr> = tokio::net::lookup_host((name, port))
+                .await
+                .map_err(|e| format!("cannot resolve {name}: {e}"))?
+                .map(|a| a.ip())
+                .collect();
+            let Some(&first) = addrs.first() else {
+                return Err(format!("{name} has no address"));
+            };
+            for &ip in &addrs {
+                check_address(ip, policy)?;
+            }
+            Ok(Some((name.to_string(), port, first)))
+        }
+        None => Err("the URL has no host".into()),
+    }
+}
+
+/// Refuses an address that the policy does not allow.
+fn check_address(ip: IpAddr, policy: AddressPolicy) -> Result<(), String> {
+    if is_address_allowed(ip, policy) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ip} is not a public address; pages on local and private networks are not fetched"
+        ))
+    }
+}
 
 /// Whether the URL's host is one of the domains or inside one. Any host is
 /// when no domain is given.
@@ -78,7 +180,12 @@ impl FetchedResponse {
 
 /// One GET with curl: no redirect followed, the body read up to
 /// [`MAX_PAGE_BYTES`].
-async fn get_with_curl(url: &Url, timeout: Duration) -> Result<FetchedResponse, String> {
+/// curl connects to the pinned address when one is given.
+async fn get_with_curl(
+    url: &Url,
+    pinned: Option<&(String, u16, IpAddr)>,
+    timeout: Duration,
+) -> Result<FetchedResponse, String> {
     let mut command = Command::new(CURL_PATH);
     command
         .args([
@@ -92,6 +199,13 @@ async fn get_with_curl(url: &Url, timeout: Duration) -> Result<FetchedResponse, 
         ])
         .arg(timeout.as_secs_f64().to_string())
         .args(["-A", USER_AGENT, "-D", "-"]);
+    if let Some((name, port, ip)) = pinned {
+        let ip = match ip {
+            IpAddr::V6(v6) => format!("[{v6}]"),
+            IpAddr::V4(v4) => v4.to_string(),
+        };
+        command.arg("--resolve").arg(format!("{name}:{port}:{ip}"));
+    }
     let mut child = command
         .arg("--")
         .arg(url.as_str())
@@ -175,6 +289,7 @@ fn parse_curl_output(output: Vec<u8>, is_cut: bool) -> Result<FetchedResponse, S
 /// Each request may take `timeout`.
 pub async fn fetch_page(
     url_text: &str,
+    policy: AddressPolicy,
     allowed_domains: &[String],
     timeout: Duration,
 ) -> Result<Page, String> {
@@ -192,7 +307,8 @@ pub async fn fetch_page(
                 url.host_str().unwrap_or("")
             ));
         }
-        let response = get_with_curl(&url, timeout).await?;
+        let pinned = resolve_and_check_host(&url, policy).await?;
+        let response = get_with_curl(&url, pinned.as_ref(), timeout).await?;
         if (300..400).contains(&response.status) {
             let Some(location) = response.find_header("location") else {
                 return Err(format!("HTTP {} without a location", response.status));
@@ -700,6 +816,33 @@ mod tests {
     }
 
     #[test]
+    fn only_public_addresses_are_fetched() {
+        for blocked in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(!is_public(ip), "{blocked}");
+            assert!(is_address_allowed(ip, AddressPolicy::Any));
+        }
+        for open in ["93.184.215.14", "1.1.1.1", "2606:4700::1111"] {
+            assert!(is_public(open.parse().unwrap()), "{open}");
+        }
+        // numeric hosts in other forms parse to the address they name
+        let u = Url::parse("http://0x7f.1/").unwrap();
+        assert_eq!(u.host(), Some(Host::Ipv4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
     fn curl_output_parses_past_a_1xx_response() {
         let data = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 301 Moved\r\nLocation: /b\r\nContent-Type: text/html\r\n\r\nbody".to_vec();
         let r = parse_curl_output(data, false).unwrap();
@@ -711,19 +854,36 @@ mod tests {
 
     /// Pages on a local server, through curl: a redirect, a text page, a host
     /// outside the allowed domains and a missing page.
+    /// The local server is refused, by its address and by its name, unless
+    /// the policy allows any address.
     #[tokio::test]
     async fn pages_are_fetched_through_curl() {
         let port = serve_test_pages().await;
         let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
-        let page = fetch_page(&url("/old"), &[], TEST_TIMEOUT).await.unwrap();
+        let refused = fetch_page(&url("/page"), AddressPolicy::Public, &[], TEST_TIMEOUT).await;
+        assert!(refused.unwrap_err().contains("not a public address"));
+        let by_name = format!("http://localhost:{port}/page");
+        let refused = fetch_page(&by_name, AddressPolicy::Public, &[], TEST_TIMEOUT).await;
+        assert!(refused.unwrap_err().contains("not a public address"));
+        let page = fetch_page(&url("/old"), AddressPolicy::Any, &[], TEST_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!((page.url, page.title), (url("/page"), "Page".to_string()));
         assert_eq!(page.lines, ["Hello 【0†next page】"]);
         assert_eq!(page.links, [url("/next")]);
-        let text = fetch_page(&url("/next"), &[], TEST_TIMEOUT).await.unwrap();
+        let text = fetch_page(&url("/next"), AddressPolicy::Any, &[], TEST_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(text.lines, ["plain text", "second line"]);
-        let outside = fetch_page(&url("/page"), &["example.com".into()], TEST_TIMEOUT).await;
+        let outside = fetch_page(
+            &url("/page"),
+            AddressPolicy::Any,
+            &["example.com".into()],
+            TEST_TIMEOUT,
+        )
+        .await;
         assert!(outside.unwrap_err().contains("outside the allowed domains"));
-        let missing = fetch_page(&url("/missing"), &[], TEST_TIMEOUT).await;
+        let missing = fetch_page(&url("/missing"), AddressPolicy::Any, &[], TEST_TIMEOUT).await;
         assert!(missing.unwrap_err().contains("HTTP 404"));
     }
 }
