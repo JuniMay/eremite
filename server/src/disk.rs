@@ -9,13 +9,20 @@
 //! kind, the stale rows and the bytes. A SHA-256 sum in the index covers every
 //! byte after it.
 //!
+//! Each file is written under a temporary name that ends in `.tmp`. Then it is
+//! synced and renamed. The index is written last. So after a crash, each saved
+//! state is as it was before the save, or as the save left it. The folder may
+//! also hold files that no index names. The next start deletes them. The store
+//! never deletes a file that is not its own.
+//!
 //! The files have mode 0600 and the folder 0700: only their owner may use them.
 //! One server at a time uses the folder. It holds a lock on the folder's `lock`
 //! file. Another server runs without saved states.
 
 use crate::engine::{self, Model};
 use crate::state_cache::{
-    Cache, Part, SavedSnapshot, SavedState, SavedStateId, Snapshot, SnapshotKind,
+    Cache, Entry, Part, SaveDecision, SavedSnapshot, SavedState, SavedStateId, Snapshot,
+    SnapshotKind,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -24,7 +31,7 @@ use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// The first bytes of every index.
 const INDEX_MAGIC: &[u8; 8] = b"EREMITEI";
@@ -63,6 +70,8 @@ const TOKEN_BYTES: usize = 4;
 /// The most digits of a number in a file name. Every 19-digit number fits in a
 /// u64.
 const MAX_NUMBER_DIGITS: usize = 19;
+/// The bytes of one GiB.
+const GIB_BYTES: u64 = 1 << 30;
 /// Only the owner may list, read and write the folder.
 const FOLDER_MODE: u32 = 0o700;
 /// Only the owner may read and write the files.
@@ -159,6 +168,8 @@ pub struct Store {
     folder: PathBuf,
     /// The open `lock` file. The lock lasts while the store exists.
     _lock: File,
+    /// The id that the next new saved state gets.
+    next_id: SavedStateId,
     /// The saved states loaded in this run.
     pub load_count: u64,
     /// The states saved in this run.
@@ -428,6 +439,7 @@ impl Store {
         }
         let mut indexes = Vec::new();
         let mut files = Vec::new();
+        let mut next_id = 1;
         for folder_entry in fs::read_dir(dir)
             .map_err(|e| format!("cannot read {shown}: {e}"))?
             .flatten()
@@ -436,6 +448,7 @@ impl Store {
             match parse_file_name(&name) {
                 Some((FileName::Index(id), false)) => indexes.push(id),
                 Some((FileName::Index(id) | FileName::Part(id) | FileName::Snapshot(id), _)) => {
+                    next_id = next_id.max(id + 1);
                     files.push((name, id));
                 }
                 None => {}
@@ -446,6 +459,7 @@ impl Store {
         // saved states of another format version: their files stay
         let mut other_versions = HashSet::new();
         for id in indexes {
+            next_id = next_id.max(id + 1);
             let path = dir.join(format_index_file_name(id));
             let last_used_time = fs::metadata(&path)
                 .and_then(|metadata| metadata.modified())
@@ -511,6 +525,7 @@ impl Store {
         let store = Store {
             folder: dir.to_path_buf(),
             _lock: lock,
+            next_id,
             load_count: 0,
             save_count: 0,
             bytes_written: 0,
@@ -523,6 +538,79 @@ impl Store {
         &self.folder
     }
 
+    /// Creates file `name` under its temporary name, `name.tmp`. It first
+    /// deletes an old file of that temporary name. Returns the open file, its
+    /// temporary path and its final path.
+    fn create_temporary_file(&self, name: &str) -> Result<(File, PathBuf, PathBuf), String> {
+        let (final_path, temporary_path) = (
+            self.folder.join(name),
+            self.folder.join(format!("{name}.tmp")),
+        );
+        let _ = fs::remove_file(&temporary_path);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&temporary_path)
+            .map_err(|e| format!("cannot create {}: {e}", temporary_path.display()))?;
+        Ok((file, temporary_path, final_path))
+    }
+
+    /// Syncs `file` and renames it from `temporary_path` to `final_path`.
+    fn sync_and_rename(file: File, temporary_path: &Path, final_path: &Path) -> Result<(), String> {
+        file.sync_all()
+            .map_err(|e| format!("cannot sync {}: {e}", temporary_path.display()))?;
+        fs::rename(temporary_path, final_path)
+            .map_err(|e| format!("cannot rename {}: {e}", temporary_path.display()))
+    }
+
+    /// Writes file `name` under its temporary name. Then it syncs and renames
+    /// the file. `write_contents` writes to a file descriptor and returns the
+    /// bytes it wrote, or None. Returns those bytes. After a failure it deletes
+    /// the temporary file.
+    fn write_file(
+        &self,
+        name: &str,
+        write_contents: impl FnOnce(c_int) -> Option<u64>,
+    ) -> Result<u64, String> {
+        let (file, temporary_path, final_path) = self.create_temporary_file(name)?;
+        let Some(bytes) = write_contents(file.as_raw_fd()) else {
+            drop(file);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(format!(
+                "cannot write {name}, or a second stop request ended the write"
+            ));
+        };
+        Self::sync_and_rename(file, &temporary_path, &final_path).inspect_err(|_| {
+            let _ = fs::remove_file(&temporary_path);
+        })?;
+        Ok(bytes)
+    }
+
+    /// Writes the index of saved state `id` under its temporary name. Then it
+    /// syncs and renames the index. Last it syncs the folder. The rename then
+    /// reaches the SSD before any old file is deleted.
+    fn write_index(
+        &self,
+        id: SavedStateId,
+        identity: &[u8; IDENTITY_BYTES],
+        saved_state: &SavedState,
+    ) -> Result<(), String> {
+        let (mut file, temporary_path, final_path) =
+            self.create_temporary_file(&format_index_file_name(id))?;
+        let written = std::io::Write::write_all(&mut file, &encode_index(identity, saved_state))
+            .map_err(|e| format!("cannot write {}: {e}", temporary_path.display()))
+            .and_then(|_| Self::sync_and_rename(file, &temporary_path, &final_path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        if let Ok(folder) = File::open(&self.folder) {
+            unsafe { libc::fsync(folder.as_raw_fd()) };
+        }
+        written
+    }
+
     /// Sets the last use of saved state `id` to `when`. Its index's
     /// modification time keeps it for the next start.
     fn set_last_used(&self, id: SavedStateId, when: SystemTime) {
@@ -532,6 +620,194 @@ impl Store {
         {
             let _ = index.set_modified(when);
         }
+    }
+
+    /// Deletes the files of parts `parts` and snapshots `snapshots` of saved
+    /// state `id`.
+    fn delete_files(&self, id: SavedStateId, parts: &[Part], snapshots: &[SavedSnapshot]) {
+        for part in parts {
+            let _ = fs::remove_file(self.folder.join(format_part_file_name(id, part)));
+        }
+        for snapshot in snapshots {
+            let _ = fs::remove_file(self.folder.join(format_snapshot_file_name(id, snapshot)));
+        }
+    }
+
+    /// Deletes saved state `id`: its index first, then its other files. Removes
+    /// it from `cache`.
+    pub fn delete_saved_state(&mut self, cache: &mut Cache, id: SavedStateId) {
+        if let Some(saved_state) = cache.saved_states.remove(&id) {
+            let _ = fs::remove_file(self.folder.join(format_index_file_name(id)));
+            self.delete_files(id, &saved_state.parts, &saved_state.snapshots);
+        }
+    }
+
+    /// Saves the evicted state `entry` to the SSD, as the cache decides. At
+    /// quit, `entry` may be an idle state instead. `io` writes the state's
+    /// rows. `find_snapshot` returns its snapshot at a position, or None.
+    /// `others_stay` tells whether the states in the cache stay in memory. The
+    /// saved state keeps the state's last use, `last_used_time`, also as its
+    /// index's modification time. The save then deletes the saved states that
+    /// the new one replaces or covers. Records the saved state in `cache`.
+    /// Returns the log's line, if any.
+    pub fn save_state<S: StateIo>(
+        &mut self,
+        cache: &mut Cache,
+        io: &S,
+        find_snapshot: &dyn Fn(usize) -> Option<S::SnapshotHandle>,
+        entry: &Entry,
+        last_used_time: SystemTime,
+        others_stay: bool,
+    ) -> Option<String> {
+        let len = entry.tokens.len();
+        let number = entry.number;
+        let decision = cache.decide_save(entry, others_stay);
+        let (target, from, version, mut parts, replaced_positions, old_snapshots) = match decision {
+            SaveDecision::Skip => {
+                return (len >= cache.min_unshared_tokens && cache.saved_byte_limit > 0).then(|| {
+                    format!(
+                        "state {number} ({len} tokens) not saved: it has fewer than {} unshared tokens",
+                        cache.min_unshared_tokens
+                    )
+                });
+            }
+            SaveDecision::Append { saved_id, from } => {
+                let saved_state = &cache.saved_states[&saved_id];
+                let replaced_positions =
+                    saved_state.replaced_positions + saved_state.tokens.len().saturating_sub(from);
+                (
+                    saved_id,
+                    from,
+                    saved_state.version + 1,
+                    saved_state.parts.clone(),
+                    replaced_positions,
+                    saved_state.snapshots.clone(),
+                )
+            }
+            SaveDecision::New { .. } => {
+                let id = self.next_id;
+                self.next_id += 1;
+                // a new saved state: its rows from position 0, version 1, no
+                // replaced positions
+                (id, 0, 1, Vec::new(), 0, Vec::new())
+            }
+        };
+        // It writes the rows from `from`, the newest prompt-end and branch
+        // snapshots, and a snapshot at the state's end.
+        let find_newest_snapshot = |kind: SnapshotKind| {
+            entry
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.kind == kind)
+                .max_by_key(|snapshot| snapshot.pos)
+                .copied()
+        };
+        let mut snapshots: Vec<(Snapshot, Option<S::SnapshotHandle>)> = [
+            find_newest_snapshot(SnapshotKind::PromptEnd),
+            find_newest_snapshot(SnapshotKind::Branch),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|snapshot| find_snapshot(snapshot.pos).map(|handle| (snapshot, Some(handle))))
+        .collect();
+        if !snapshots.iter().any(|(snapshot, _)| snapshot.pos == len) {
+            let end = Snapshot {
+                pos: len,
+                kind: SnapshotKind::GenerationEnd,
+                // the write gives its bytes
+                bytes: 0,
+                stale_rows: entry.stale_rows,
+            };
+            snapshots.push((end, None));
+        }
+        let started = Instant::now();
+        let mut part = Part {
+            from,
+            to: len,
+            // the write gives its bytes
+            bytes: 0,
+            // a new saved state's first part is file 0
+            file_number: parts.last().map_or(0, |last| last.file_number + 1),
+        };
+        let written = self.write_file(&format_part_file_name(target, &part), |fd| {
+            io.write_rows(from, len, fd)
+        });
+        match written {
+            Ok(bytes) => part.bytes = bytes,
+            Err(message) => return Some(format!("state {number} not saved: {message}")),
+        }
+        let mut saved_snapshots = Vec::new();
+        for (snapshot, handle) in &snapshots {
+            let mut saved_snapshot = SavedSnapshot {
+                snapshot: *snapshot,
+                version,
+            };
+            let name = format_snapshot_file_name(target, &saved_snapshot);
+            match self.write_file(&name, |fd| io.write_snapshot(*handle, snapshot.pos, fd)) {
+                Ok(bytes) => {
+                    saved_snapshot.snapshot.bytes = bytes;
+                    saved_snapshots.push(saved_snapshot);
+                }
+                Err(message) => {
+                    self.delete_files(target, &[part], &saved_snapshots);
+                    return Some(format!("state {number} not saved: {message}"));
+                }
+            }
+        }
+        parts.push(part);
+        let saved_state = SavedState {
+            model: Some(entry.model),
+            tokens: entry.tokens.clone(),
+            parts,
+            snapshots: saved_snapshots,
+            replaced_positions,
+            // the cache sets it when it adds the saved state
+            last_used: 0,
+            version,
+        };
+        if let Err(message) = self.write_index(target, &io.read_model_identity(), &saved_state) {
+            self.delete_files(target, &[part], &saved_state.snapshots);
+            return Some(format!("state {number} not saved: {message}"));
+        }
+        self.set_last_used(target, last_used_time);
+        // Once the index is written, it deletes the old snapshots and the saved
+        // state it replaces.
+        self.delete_files(target, &[], &old_snapshots);
+        if let SaveDecision::New {
+            replaces: Some(replaced_id),
+        } = decision
+        {
+            self.delete_saved_state(cache, replaced_id);
+        }
+        let bytes = part.bytes
+            + saved_state
+                .snapshots
+                .iter()
+                .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
+                .sum::<u64>();
+        cache.add_saved_state(target, saved_state);
+        if let Some(saved_state) = cache.saved_states.get_mut(&target) {
+            // the saved state keeps the state's last use on the cache's use
+            // clock
+            saved_state.last_used = entry.last_used;
+        }
+        for id in cache.find_covered_saved_states(target) {
+            self.delete_saved_state(cache, id);
+        }
+        self.save_count += 1;
+        self.bytes_written += bytes;
+        Some(format!(
+            "state {number} saved to the SSD as {target}: {len} tokens{}, {:.2} GiB written in {:.2} s; saved states take {:.1} of {:.1} GiB",
+            if from > 0 {
+                format!(" (from position {from})")
+            } else {
+                String::new()
+            },
+            bytes as f64 / GIB_BYTES as f64,
+            started.elapsed().as_secs_f64(),
+            cache.count_saved_bytes() as f64 / GIB_BYTES as f64,
+            cache.saved_byte_limit as f64 / GIB_BYTES as f64
+        ))
     }
 
     /// Loads saved state `id` into a new state through `io`. It reads the saved
@@ -831,6 +1107,64 @@ mod tests {
         cache.add_saved_state(id, saved_state);
     }
 
+    /// Makes an idle entry of model 0 that holds `tokens` and was last used at
+    /// `last_used`.
+    fn make_idle_entry(tokens: std::ops::Range<i32>, last_used: u64) -> Entry {
+        Entry {
+            model: 0,
+            tokens: tokens.collect(),
+            busy: false,
+            last_used,
+            bytes: 0,
+            stale_rows: 0,
+            snapshots: Vec::new(),
+            reserved_snapshots: Vec::new(),
+            number: 1,
+            saved_link: None,
+        }
+    }
+
+    #[test]
+    fn a_saved_state_deletes_the_one_it_covers_and_is_found_at_the_next_start() {
+        let (dir, mut store, mut cache) = open_test_store("save");
+        let io = FakeState {
+            row_bytes: 300,
+            snapshot_bytes: 500,
+            fails_writes: false,
+        };
+        let entry = make_idle_entry(0..500, 100);
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
+        assert!(line.unwrap_or_default().contains("saved to the SSD as 1:"));
+        // the same tokens and 300 more: it covers saved state 1
+        let entry = make_idle_entry(0..800, 200);
+        // whole seconds, so that the file system keeps the time exactly
+        let last_used_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, last_used_time, false);
+        assert!(line.unwrap_or_default().contains("saved to the SSD as 2:"));
+        assert!(
+            !dir.join("1.state").exists() && !dir.join("1-0.rows").exists(),
+            "the saved state it covers is deleted"
+        );
+        assert_eq!(
+            (store.save_count, store.bytes_written),
+            (2, 2 * (300 + 500))
+        );
+        drop(store);
+        let (_, found) = Store::open(&dir).expect("the store");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (
+                found[0].id,
+                found[0].identity,
+                found[0].saved_state.tokens.len(),
+                found[0].saved_state.count_bytes(),
+                found[0].last_used_time
+            ),
+            (2, [3; IDENTITY_BYTES], 800, 300 + 500, last_used_time)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_saved_state_that_cannot_be_opened_now_is_not_damaged() {
         use std::os::unix::fs::PermissionsExt;
@@ -875,6 +1209,7 @@ mod tests {
         fs::write(dir.join("9-7-100.snap"), vec![0u8; 77]).unwrap();
         let (store, found) = Store::open(&dir).expect("the store");
         assert!(found.is_empty(), "this server does not read it");
+        assert!(store.next_id >= 10, "nor reuses its number");
         for name in ["9.state", "9-0.rows", "9-7-100.snap"] {
             assert!(dir.join(name).exists(), "{name} is kept");
         }
@@ -906,6 +1241,7 @@ mod tests {
             assert_eq!(store.get_folder(), dir);
             assert_eq!(found.len(), 1);
             assert_eq!((found[0].id, found[0].identity), (5, [1; IDENTITY_BYTES]));
+            assert!(store.next_id >= 8);
             assert!(
                 Store::open(&dir).is_err(),
                 "a second server is refused while the first holds the lock"
