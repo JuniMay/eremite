@@ -9,13 +9,13 @@
 //! the cheaper way: a replay at the shared prefix, or a snapshot before it that
 //! leaves fewer rows to compute. So a fork reuses at least its shared prefix
 //! less what a replay there computes again, and never more than the prefix.
-//! Without --ced, each fork must give the tokens that the same prompt gives a
-//! server that starts without a cache. With --ced, forks are approximate by
+//! Without ced, each fork must give the tokens that the same prompt gives a
+//! server that starts without a cache. With ced, forks are approximate by
 //! design: the replay is bounded to a ring, and their tokens are printed. The
-//! other cache tests check the cache's budget (--state-cache).
+//! other cache tests check the cache's budget (state_cache).
 //!
 //! A growing generation frees room in the cache before it grows. A session
-//! stays while its idle model unloads (--idle-unload).
+//! stays while its idle model unloads (idle_unload).
 //!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
@@ -52,7 +52,7 @@ const DECODING_TOKENS: u32 = 500;
 /// Returns at least the rows that an exact replay at `k` computes again, on
 /// average per layer (the cache's cost of a replay, eremite_replay_rows). Layer
 /// 39 starts a ring before `k`: 136 positions, the window and the rewind margin
-/// of 8, with the default --lookup. Each layer below starts at most 128
+/// of 8, with the default lookup. Each layer below starts at most 128
 /// positions earlier: 127, plus a ratio-2 compressor's pair.
 fn replay_rows(k: usize) -> usize {
     (0..40)
@@ -61,7 +61,7 @@ fn replay_rows(k: usize) -> usize {
         .div_ceil(40)
 }
 
-/// Returns what a bounded replay at `k` computes again (--ced): a ring's
+/// Returns what a bounded replay at `k` computes again (ced): a ring's
 /// positions.
 fn bounded_rows(k: usize) -> usize {
     k.min(136)
@@ -444,7 +444,7 @@ fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
     );
 }
 
-/// With --ced 128 a fork resumes by a bounded replay or by a snapshot at most a
+/// With ced 128 a fork resumes by a bounded replay or by a snapshot at most a
 /// ring before its shared prefix. A bounded replay computes a ring's positions
 /// again, with their windows cut off there.
 #[test]
@@ -468,7 +468,7 @@ fn ced_forks_reuse_the_shared_prefix_less_a_ring() {
 /// A thinking prompt ends with <think>. The next turn renders that reply with
 /// </think> there. So it shares all of the prompt but its last token. It
 /// resumes from the turn's prompt-end snapshot one position back, without
-/// computing any earlier rows again, with --ced too. Without --ced it gives the
+/// computing any earlier rows again, with ced too. Without ced it gives the
 /// tokens that a server starting without a cache gives.
 #[test]
 fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
@@ -720,7 +720,7 @@ fn a_prompt_with_an_image_that_does_not_fit_is_refused_with_its_token_count() {
     );
 }
 
-// ---- the cache's budget (--state-cache) ----
+// ---- the cache's budget (state_cache) ----
 
 /// What the model's status tells of the cache.
 struct Status {
@@ -771,7 +771,7 @@ fn short_prompt() -> Value {
 
 /// A retry of a saved prompt resumes at its prompt end from the snapshot there.
 /// It takes no snapshot of its own. So it fits a cache that the first try
-/// filled to within less than a snapshot (5.3 MiB) of --state-cache.
+/// filled to within less than a snapshot (5.3 MiB) of state_cache.
 #[test]
 fn a_saved_prompt_again_fits_a_full_state_cache() {
     let Some(setup) = setup() else {
@@ -793,7 +793,7 @@ fn a_saved_prompt_again_fits_a_full_state_cache() {
     let again = chat(&server, &request(&prompt, 1));
     let cache = settled(&server, 2);
     println!(
-        "saved prompt again: the first try took {first:.3} GiB, --state-cache {limit}; the retry reused {} of {count}; the cache takes {:.3} GiB",
+        "saved prompt again: the first try took {first:.3} GiB, state_cache {limit}; the retry reused {} of {count}; the cache takes {:.3} GiB",
         hit(&again),
         cache.states
     );
@@ -842,7 +842,7 @@ fn a_prompt_runs_in_place_of_the_state_whose_reuse_does_not_fit() {
     let answer = chat(&server, &request(&second, 8));
     let cache = settled(&server, 2);
     println!(
-        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, --state-cache {limit}; \
+        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, state_cache {limit}; \
          the second reused {} tokens; the cache holds states of {:?} positions in {:.3} GiB",
         hit(&answer),
         cache.sessions,
@@ -981,7 +981,7 @@ fn the_status_follows_a_running_prefill() {
 
 /// A generation that takes its state past the room it started with (16,384
 /// positions) gets that growth counted before the state grows. So an idle state
-/// goes then, not after the generation. The cache stays within --state-cache
+/// goes then, not after the generation. The cache stays within state_cache
 /// all along.
 #[test]
 fn a_growing_generation_frees_room_before_it_grows() {
@@ -1051,7 +1051,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
         .count();
     println!(
         "growing generation: {count} prompt tokens, {generated} generated; with no limit the idle state took {idle:.4} GiB \
-         and both {both:.4} GiB, a growth of {growth:.4} GiB; --state-cache {limit}; {} samples, {} while decoding past \
+         and both {both:.4} GiB, a growth of {growth:.4} GiB; state_cache {limit}; {} samples, {} while decoding past \
          16,384 positions, of which {} with the idle state still kept; {over} over the limit",
         samples.len(),
         grown.len(),
@@ -1077,7 +1077,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
         grown.iter().all(|sample| sample.sessions.len() == 1),
         "the idle state stayed while the generation grew past its room"
     );
-    assert_eq!(over, 0, "the cache took more than --state-cache");
+    assert_eq!(over, 0, "the cache took more than state_cache");
 }
 
 /// Quitting stops a long prompt's prefill. SIGTERM 5 s into the prefill of

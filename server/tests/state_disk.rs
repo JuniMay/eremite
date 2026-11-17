@@ -1,5 +1,5 @@
-//! States saved on the SSD through HTTP (--state-disk, --state-dir,
-//! --state-disk-tokens). A state evicted from memory, or idle at quit, is
+//! States saved on the SSD through HTTP (state_disk, state_dir,
+//! state_disk_tokens). A state evicted from memory, or idle at quit, is
 //! written to the SSD. A later prompt that starts like it continues from
 //! it as it would from memory, byte for byte in its greedy replies. A saved
 //! state damaged after the start is refused when it is read: the prompt is
@@ -353,7 +353,7 @@ fn a_saved_state_damaged_after_the_start_is_refused_when_read() {
     assert!(folder.files(".state").is_empty());
 }
 
-/// Saved states stay within --state-disk. At quit the most recently used are
+/// Saved states stay within state_disk. At quit the most recently used are
 /// written first, and an older one does not take their room.
 #[test]
 fn saved_states_stay_within_their_budget_most_recent_first() {
@@ -418,7 +418,7 @@ fn saved_states_stay_within_their_budget_most_recent_first() {
         .map(|prompt| hit(&chat(&server, prompt, 1)))
         .collect();
     println!(
-        "saved states of {sizes:.4?} GiB, --state-disk {limit}: {:?} at the start; the prompts again reused {hits:?}",
+        "saved states of {sizes:.4?} GiB, state_disk {limit}: {:?} at the start; the prompts again reused {hits:?}",
         disk(&start)
     );
     assert_eq!(disk(&start).0, 2, "two saved states fit");

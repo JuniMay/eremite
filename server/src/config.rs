@@ -1,9 +1,6 @@
-//! The server's settings.
-//!
-//! `-m DIR` serves one model, with its options on the command line. `--config
-//! FILE` serves the models that a JSON file lists. Each model there has its own
-//! options. They take the command line's names without the dashes, with `_` for
-//! `-`. The file's root holds the server-wide settings.
+//! The server's settings, from a JSON configuration file. The file's root holds
+//! the server-wide settings. Its models list holds the models that the server
+//! serves, each with its own options.
 
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -80,9 +77,9 @@ impl ModelConfig {
         }
     }
 
-    /// Sets the option `name` to `value`. The name is the command line's,
-    /// without the dashes and with `_` for `-`. Returns the option's message
-    /// when the name or the value is invalid.
+    /// Sets the option `name`, a key of the model's entry in the configuration
+    /// file, to `value`. Returns the option's message when the name or the
+    /// value is invalid.
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
         let options = &mut self.engine;
         let number = || value.as_f64().ok_or(format!("{name} takes a number"));
@@ -197,8 +194,7 @@ impl ModelConfig {
 /// The server-wide settings besides the budgets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Server {
-    /// The port that the server listens on. Without one, the server shows its
-    /// usage and exits.
+    /// The port that the server listens on. The server needs one.
     pub port: Option<u16>,
     /// The IPv4 address that the server listens on, or localhost.
     pub host: String,
@@ -542,13 +538,12 @@ pub struct Config {
 }
 
 /// Returns $HOME/.config/eremite/server.json: the configuration file that the
-/// server reads when its arguments give neither --config nor -m. Returns an
-/// error when HOME is unset.
+/// server reads without --config. Returns an error when HOME is unset.
 pub fn default_path() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".config/eremite/server.json"))
-        .ok_or("HOME is unset; specify --config FILE or -m DIR".into())
+        .ok_or("HOME is unset; give the configuration file with --config FILE".into())
 }
 
 /// Reads the server settings and the models they serve from the JSON file at
@@ -802,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn server_settings_are_global_and_cli_values_can_override_them() {
+    fn server_settings_take_values_in_their_range_only() {
         let mut config = parse(
             &json!({"port": 8008, "host": "localhost", "api_key_file": "key-file",
                     "models": [{"model": "/models/deepseek"}]}),
@@ -857,7 +852,7 @@ mod tests {
         ] {
             assert!(config.server.set(name, &value).is_err(), "{name} {value}");
         }
-        // the terminal UI's settings, from a file and from the command line
+        // the terminal UI's settings
         let mut config = parse(&json!({"tui": true, "tui_theme": "dark",
             "tui_history_window": 120, "models": [{"model": "/models/deepseek"}]}))
         .unwrap();

@@ -1,4 +1,4 @@
-//! Drafts and context-copy proposals through HTTP (--draft, --lookup). A greedy
+//! Drafts and context-copy proposals through HTTP (draft, lookup). A greedy
 //! reply with them has the tokens of the reply without them. The log counts
 //! the passes that ran them and the drafts that the passes kept.
 //!

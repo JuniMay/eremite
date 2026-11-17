@@ -40,7 +40,7 @@
 //!   position 0.
 //!
 //! A snapshot plan and a replay plan fork the source state. Every plan gives
-//! exact rows, except a replay under --ced. The --ced option is DeepSeek's
+//! exact rows, except a replay under ced. The ced option is DeepSeek's
 //! approximate prefill. Under it, a replay recomputes only the last ring of
 //! positions.
 //!
@@ -81,7 +81,7 @@ use std::collections::BTreeMap;
 /// How many tokens one slice comparison takes. Slices compare faster than
 /// single tokens.
 const SHARED_PREFIX_BLOCK: usize = 1024;
-/// The default of --state-disk-tokens. The worker sets the configured value.
+/// The default of state_disk_tokens. The worker sets the configured value.
 const DEFAULT_MIN_UNSHARED_TOKENS: usize = 8192;
 /// The most parts a saved state has. A load opens one file for each part.
 const MAX_PARTS: usize = 64;
@@ -465,17 +465,17 @@ pub struct Evicted {
 pub struct Cache {
     /// The states in memory, by id.
     pub entries: BTreeMap<StateId, Entry>,
-    /// The bytes that states and snapshots may take (--state-cache).
+    /// The bytes that states and snapshots may take (state_cache).
     pub byte_limit: u64,
-    /// The most states that the cache keeps (--max-cached-states).
+    /// The most states that the cache keeps (max_cached_states).
     pub max_states: usize,
     /// The saved states, by id.
     pub saved_states: BTreeMap<SavedStateId, SavedState>,
-    /// The bytes that saved states may take on the SSD (--state-disk). With 0,
+    /// The bytes that saved states may take on the SSD (state_disk). With 0,
     /// no state is saved.
     pub saved_byte_limit: u64,
     /// The fewest unshared tokens that make a state worth keeping on the SSD
-    /// (--state-disk-tokens).
+    /// (state_disk_tokens).
     pub min_unshared_tokens: usize,
     /// The saved state that an admitted request loads next. Until then, no save
     /// appends to it, replaces it or deletes it.
@@ -560,7 +560,7 @@ impl Cache {
     /// Lists the plans that resume `prompt` for model `model`, the cheapest
     /// first. The list ends at the cold start. A plan that reuses a state in
     /// memory keeps that state. That state may not fit beside the prompt's new
-    /// state. Every plan gives exact rows, except a replay under --ced.
+    /// state. Every plan gives exact rows, except a replay under ced.
     pub fn list_plans(&self, model: usize, prompt: &[i32], limits: PlanLimits<'_>) -> Vec<Plan> {
         let prompt_len = prompt.len();
         // each plan with its cost and rank
@@ -1750,7 +1750,7 @@ mod tests {
             ),
             0
         );
-        // also with the bounded replay (--ced): it recomputes a ring
+        // also with the bounded replay (ced): it recomputes a ring
         let ced = PlanLimits {
             replay_cost: &|pos| pos.min(RING_ROWS),
             ..PLAN_LIMITS
@@ -1983,7 +1983,7 @@ mod tests {
 
     #[test]
     fn under_ced_a_bounded_replay_beats_a_snapshot_more_than_a_ring_back() {
-        // the bounded replay's cost under --ced with PLAN_LIMITS' margin of 5:
+        // the bounded replay's cost under ced with PLAN_LIMITS' margin of 5:
         // the ring, 133 positions
         let ced = PlanLimits {
             replay_cost: &|pos| pos.min(RING_ROWS),

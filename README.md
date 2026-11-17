@@ -49,10 +49,10 @@ model memory, state memory included. `build/eremite` alone lists the options.
 
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
 Completions and Responses APIs at `http://HOST:PORT/v1`, and Codex's model
-catalog at `/v1/codex/models`. `--tui` shows its status in the terminal.
+catalog at `/v1/codex/models`.
 
-Its settings are in a JSON file: `--config FILE`, or else
-`~/.config/eremite/server.json`. For example:
+Its settings are in a JSON file: `build/eremite-server --config FILE`, or
+`~/.config/eremite/server.json` without `--config`. For example:
 
 ```json
 {
@@ -67,9 +67,64 @@ Its settings are in a JSON file: `--config FILE`, or else
 }
 ```
 
-The API key file holds the key that clients send, 16 to 256 characters. Each
-option that `build/eremite-server --help` lists is a key of the same name, with
-`_` for `-`. A model's own options go in its entry under `models`.
+The API key file holds the key that clients send, 16 to 256 characters.
+Without `api_key_file`, the server takes the key from the environment variable
+`EREMITE_API_KEY`.
+
+The file's root holds the server-wide settings:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `port` | the port to serve on | required |
+| `host` | the IPv4 address to serve on, or `localhost` | `127.0.0.1` |
+| `api_key_file` | the file that holds the API key | `EREMITE_API_KEY` |
+| `memory` | GiB of memory for all models together, their states included; 0: the memory that other programs leave, less `reserve` | 0 |
+| `reserve` | GiB of memory kept available to other programs, 2 to 1024 | 10 |
+| `state_cache` | GiB of states and snapshots kept in memory, for all models together | 8 |
+| `max_cached_states` | the most states kept in memory, for all models together | 256 |
+| `state_disk` | GiB on the SSD for states evicted from memory or idle at quit; a prompt that starts like a saved state continues from it; 0: off | 32 |
+| `state_dir` | the folder of the saved states | `~/.cache/eremite/states` |
+| `state_disk_tokens` | a state is saved only when it holds at least this many tokens that no other kept state holds | 8192 |
+| `snapshot_interval` | positions between the snapshots of a long prompt, for a model that resumes only from snapshots | 2048 |
+| `idle_unload` | seconds without requests before a model's weights and experts unload; its states stay; 0: never | 600 |
+| `max_waiting_requests` | the most requests that wait for one model; another gets HTTP 429 | 16 |
+| `gpu_timeout` | seconds that a wait for the GPU may last before the server ends | 60 |
+| `progress_log` | seconds between a decoding request's progress lines in the log; 0: none | 10 |
+| `http_timeout` | seconds that a request's head, each part of its body and a stalled write may take | 60 |
+| `keepalive` | seconds between the comment lines of a streamed response that waits for its first token | 15 |
+| `searxng_dir` | the folder of eremite's SearXNG, for Codex's web tool | `~/.local/share/eremite/searxng` |
+| `searxng_socket` | the Unix socket that SearXNG runs on | `eremite.sock` in `searxng_dir` |
+| `search_timeout` | seconds that each fetch, search and health check of the web tool may take, and SearXNG's start | 30 |
+| `searxng_idle` | seconds without a search before SearXNG stops | 600 |
+| `search_session_idle` | seconds without a call before the web tool forgets a session's references | 7200 |
+| `tui` | `true` shows the terminal UI on stderr's terminal instead of the log: the server's status, its requests, its memory and its log; `q` stops the server, and the log prints on exit | `false` |
+| `tui_theme` | the terminal UI's colors: `auto` (by the terminal's background), `light` or `dark` | `auto` |
+| `tui_background_answer_wait` | seconds that the terminal UI waits for the terminal to tell its background color | 1 |
+| `tui_now_window` | seconds that the terminal UI's "now" figures average | 5 |
+| `tui_recent_window` | seconds that its "recent" figures average | 60 |
+| `tui_history_window` | seconds that its history charts span, one sample a column | 60 |
+| `tui_expert_map_tokens` | the latest tokens of a decoding request whose experts its expert map shows | 12 |
+
+Each entry under `models` holds one model's settings:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `model` | the checkpoint's folder | required |
+| `id` | the name that requests give in `model` | `deepseek-v4.1-flash` |
+| `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
+| `ctx` | the context in tokens, at most 1048576 and the model's own | the most |
+| `rows_per_call` | the most rows of one decoding call, at most the model's own; fewer rows per call run more calls beside each other | the model's own, 6 for DeepSeek |
+| `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
+| `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | `off` |
+| `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin (8) | `off` |
+| `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; needs `ced` off | `false` |
+| `packed_state_rows` | DeepSeek: a state keeps its compressed rows and index keys packed: the same values in about 28% of BF16's bytes | `false` |
+| `idle_unload` | the model's own `idle_unload` | the server-wide one |
+| `temperature` | the temperature of requests that set none | 1 |
+| `top_p` | the top_p of requests that set none, 0 to 1 | 1 |
+| `top_k` | the top_k of requests that set none; 0: every token | 0 |
+| `seed` | the seed of requests that set none | random for each request |
+| `think` | the thinking effort of requests that set none, 1 to 100; 0: thinking off | the format's default |
 
 Codex's web tool searches through eremite's own SearXNG.
 `scripts/setup-searxng.sh` sets it up in `~/.local/share/eremite/searxng`, the

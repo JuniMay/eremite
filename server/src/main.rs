@@ -9,8 +9,11 @@
 //!   requests.
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
-//! - With --tui, the terminal UI (ui/) shows the server's status, its requests,
-//!   its memory and its log on stderr's terminal instead of the log.
+//! - With the setting tui, the terminal UI (ui/) shows the server's status, its
+//!   requests, its memory and its log on stderr's terminal instead of the log.
+//!
+//! The configuration file (config.rs) holds every setting. The command line
+//! names only that file.
 
 use eremite_server::{chat, codex, config, control, engine, http, ui, worker};
 
@@ -28,11 +31,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use clap::Parser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use eremite_server::chat::{Api, Family, deepseek};
-use eremite_server::config::ModelConfig;
 
 /// The fewest characters that the API key has.
 /// The reason for this value is unknown.
@@ -41,428 +44,20 @@ const MIN_KEY_CHARS: usize = 16;
 /// The reason for this value is unknown.
 const MAX_KEY_CHARS: usize = 256;
 
-/// The command line's help.
-const USAGE: &str =
-    "usage: eremite-server [--config FILE | -m MODEL [model options]] [server options]
-  Without --config or -m, read ~/.config/eremite/server.json.
-  -m DIR          a supported model checkpoint directory, with its options below
-  --config FILE   server settings and models in JSON; a request's model field picks its model
-  --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
-  --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
-  --api-key-file FILE  the API key clients must send (16 to 256 characters)
-  --http-timeout S   seconds a request's head, each part of its body and a stalled write may take
-                  (default 60)
-  --keepalive S   seconds between the comment lines of a streamed response that waits for its
-                  first token (default 15)
-  --search-timeout S  seconds each fetch, search and health check of Codex's web tool may take,
-                  and SearXNG's start (default 30)
-  --searxng-idle S    seconds without a search before SearXNG stops (default 600)
-  --search-session-idle S  seconds without a call before the web tool forgets a session's
-                  references (default 7200)
-  --memory GB     an upper limit of model memory for every model, state memory included
-                  (default: none; the memory that other programs leave, less --reserve, decides)
-  --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
-  --gpu-timeout S seconds a wait for the GPU may last before the server ends (default 60)
-  --progress-log S   seconds between a decoding request's progress lines in the log, 0 none
-                  (default 10)
-  --state-cache GB   total states and snapshots across all models, GiB (default 8)
-  --state-disk GB    room on the SSD for evicted states, written when evicted and at quit and
-                  read back for a prompt that starts like one, GiB; 0 off (default 32)
-  --state-dir DIR    the saved states' folder (default ~/.cache/eremite/states)
-  --state-disk-tokens N  save a state only when it holds at least N tokens no other kept state
-                  holds (default 8192)
-  --idle-unload S seconds a model may go without requests before its weights and experts
-                  unload (its states stay; the next request loads it again), 0 never
-                  (default 600; a model's own setting wins)
-  --max-waiting-requests N  requests that may wait for one model; another gets HTTP 429
-                  (default 16)
-  --max-cached-states N  states that the state cache keeps, for all models together
-                  (default 256)
-  --snapshot-interval N  positions between the snapshots of a long prompt, for a model that
-                  resumes only from snapshots (default 2048)
-  --tui           the terminal UI on stderr's terminal instead of the log: the server's status,
-                  its requests, its memory and its log; q stops the server, and the log's lines
-                  print on exit
-  --no-tui        the log on stderr even when the configuration file turns the terminal UI on
-  --tui-theme T   the terminal UI's colors: auto (by the terminal's background; light without an
-                  answer), light or dark (default auto)
-  --tui-background-answer-wait S  seconds that the terminal UI waits for the terminal to tell
-                  its background color, with --tui-theme auto (default 1)
-  --tui-now-window S  seconds that the terminal UI's \"now\" figures average (default 5)
-  --tui-recent-window S  seconds that its \"recent\" figures average (default 60)
-  --tui-history-window S  seconds that its history charts span, a sample a column (default 60)
-  --tui-expert-map-tokens N  the latest tokens of a decoding request whose experts its expert
-                  map shows (default 12)
- a model's options:
-  --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
-  --rows-per-call N  rows of one decoding call at most, at most the model's own; fewer rows per
-                  call run more calls beside each other (default: the model's own, 6 for
-                  DeepSeek)
-  -t T, --temperature T  the temperature of requests that set none (default 1)
-  --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
-  --top-k K       the top_k of requests that set none, 0 for all (default 0)
-  --seed N        the seed of requests that set none (default: random for each)
-  --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off
-  --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the
-                  most)
-  --draft N       at most N DSpark proposals per pass, 0-5; each pass runs the count that has
-                  given the most tokens per second
-  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
-  DeepSeek only:
-  --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus
-                  the rewind margin (8)
-  --prefill-prune  skip decoder batches outside required history; CED and substitution must be
-                  off (default off)
-  --experts GGUF  read the routed experts from a GGUF file or set of shards
-  --packed-state-rows  keep a state's compressed rows and index keys packed: the same values in
-                  about 28% of BF16's bytes (default off)
-";
-
-/// Prints the command line's help and ends the process with status 2.
-fn exit_with_usage() -> ! {
-    eprint!("{USAGE}");
-    exit(2)
+/// eremite-server serves the models that a configuration file lists, over the
+/// OpenAI and Codex APIs. The file holds every setting.
+#[derive(Parser)]
+struct Arguments {
+    /// The configuration file in JSON: the server's settings and the models it
+    /// serves [default: ~/.config/eremite/server.json]
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 /// Prints `message` and ends the process with status 1.
 fn die(message: &str) -> ! {
     eprintln!("eremite-server: {message}");
     exit(1)
-}
-
-/// The settings that the command line gives.
-struct Arguments {
-    /// -m's model and its options, or --config's models.
-    models: Vec<ModelConfig>,
-    /// The server-wide budgets and limits.
-    budgets: config::Budgets,
-    /// The server-wide settings besides the budgets.
-    server: config::Server,
-}
-
-/// Parses the command line's arguments `args`, without the program's name.
-/// Without -m and --config, it reads the default configuration file. The
-/// command line's server settings override the file's. An invalid argument ends
-/// the process with the help or a message.
-fn parse_arguments(args: &[String]) -> Arguments {
-    let mut parsed = Arguments {
-        models: Vec::new(),
-        budgets: config::Budgets::default(),
-        server: config::Server::default(),
-    };
-    let mut model: Option<ModelConfig> = None;
-    // -m's options, in their order.
-    let mut options: Vec<(String, Value)> = Vec::new();
-    let mut budgets: Vec<(String, Value)> = Vec::new();
-    let mut server: Vec<(String, Value)> = Vec::new();
-    let mut file: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        let switch = |name: &str| (name.to_string(), Value::Bool(true));
-        match flag {
-            "--prefill-prune" | "--packed-state-rows" => {
-                options.push(switch(&flag[2..].replace('-', "_")))
-            }
-            "--tui" | "--no-tui" => server.push(("tui".into(), Value::Bool(flag == "--tui"))),
-            _ => {
-                let Some(text) = args.get(i + 1) else {
-                    exit_with_usage()
-                };
-                i += 1;
-                match flag {
-                    "-m" => {
-                        if model.is_some() {
-                            die("-m serves one model; several go in a --config file");
-                        }
-                        model = Some(ModelConfig::new(text));
-                    }
-                    "--config" => file = Some(text.into()),
-                    "--memory"
-                    | "--reserve"
-                    | "--gpu-timeout"
-                    | "--progress-log"
-                    | "--state-cache"
-                    | "--state-disk"
-                    | "--state-disk-tokens"
-                    | "--max-waiting-requests"
-                    | "--max-cached-states"
-                    | "--snapshot-interval"
-                    | "--idle-unload" => {
-                        let name = flag[2..].replace('-', "_");
-                        let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
-                        budgets.push((name, value));
-                    }
-                    "--serve" => {
-                        let port: u16 = text
-                            .parse()
-                            .unwrap_or_else(|_| die(&format!("--serve: not a port: {text}")));
-                        server.push(("port".into(), Value::from(port)));
-                    }
-                    "--host" | "--api-key-file" | "--state-dir" | "--tui-theme" => {
-                        server.push((flag[2..].replace('-', "_"), Value::String(text.clone())))
-                    }
-                    "--http-timeout"
-                    | "--keepalive"
-                    | "--search-timeout"
-                    | "--searxng-idle"
-                    | "--search-session-idle"
-                    | "--tui-background-answer-wait"
-                    | "--tui-now-window"
-                    | "--tui-recent-window"
-                    | "--tui-history-window"
-                    | "--tui-expert-map-tokens" => {
-                        let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
-                        server.push((flag[2..].replace('-', "_"), value));
-                    }
-                    _ => {
-                        let name = match flag {
-                            "-t" => "temperature".to_string(),
-                            long if long.starts_with("--") => long[2..].replace('-', "_"),
-                            _ => exit_with_usage(),
-                        };
-                        // Numbers stay numbers. The rest, such as off, paths
-                        // and names, is text.
-                        let value = serde_json::from_str::<Value>(text)
-                            .ok()
-                            .filter(Value::is_number)
-                            .unwrap_or(Value::String(text.clone()));
-                        options.push((name, value));
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    if model.is_none() && file.is_none() {
-        file = Some(config::default_path().unwrap_or_else(|error| die(&error)));
-    }
-    match (model, file) {
-        (Some(_), Some(_)) => {
-            die("-m and --config: give one model with -m, or several in the file")
-        }
-        (Some(mut model), None) => {
-            for (name, value) in &options {
-                model
-                    .set(name, value)
-                    .unwrap_or_else(|error| die(&format!("--{}: {error}", name.replace('_', "-"))));
-            }
-            parsed.models.push(model);
-        }
-        (None, Some(file)) => {
-            if let Some((name, _)) = options.first() {
-                die(&format!(
-                    "--{}: with --config, each model's options are in the file",
-                    name.replace('_', "-")
-                ));
-            }
-            let config = config::read(&file).unwrap_or_else(|error| die(&error));
-            parsed.models = config.models;
-            parsed.budgets = config.budgets;
-            parsed.server = config.server;
-        }
-        (None, None) => {}
-    }
-    for (name, value) in budgets {
-        parsed
-            .budgets
-            .set(&name, &value)
-            .unwrap_or_else(|error| die(&error));
-    }
-    for (name, value) in server {
-        parsed
-            .server
-            .set(&name, &value)
-            .unwrap_or_else(|error| die(&error));
-    }
-    parsed
-}
-
-#[test]
-fn one_model_takes_its_options_from_the_command_line() {
-    let parsed = parse_arguments(
-        &[
-            "-m",
-            "/m/d",
-            "--prefill-prune",
-            "--packed-state-rows",
-            "--lookup",
-            "15",
-            "--draft",
-            "2",
-            "--ced",
-            "off",
-            "--serve",
-            "8008",
-        ]
-        .map(String::from),
-    );
-    let model = &parsed.models[0];
-    assert!(model.engine.deepseek().unwrap().prefill_prune);
-    assert!(model.engine.deepseek().unwrap().packed_state_rows);
-    assert_eq!(
-        (
-            model.engine.lookup,
-            model.engine.draft,
-            model.engine.deepseek().unwrap().ced
-        ),
-        (15, 2, 0)
-    );
-    assert_eq!(
-        (
-            model.temperature,
-            model.top_p,
-            parsed.budgets.state_cache_gb
-        ),
-        (None, None, 8.0)
-    );
-    assert_eq!(parsed.server.port, Some(8008));
-    let parsed = parse_arguments(
-        &[
-            "-m",
-            "/m/small",
-            "-t",
-            "0.6",
-            "--top-k",
-            "20",
-            "--id",
-            "small",
-            "--state-cache",
-            "4",
-        ]
-        .map(String::from),
-    );
-    let model = &parsed.models[0];
-    assert_eq!(
-        (
-            model.temperature,
-            model.top_k,
-            model.id.as_deref(),
-            parsed.budgets.state_cache_gb
-        ),
-        (Some(0.6), Some(20), Some("small"), 4.0)
-    );
-}
-
-#[test]
-fn the_queue_and_state_limits_come_from_the_command_line() {
-    let parsed = parse_arguments(
-        &[
-            "-m",
-            "/m/d",
-            "--max-waiting-requests",
-            "4",
-            "--max-cached-states",
-            "32",
-            "--snapshot-interval",
-            "1024",
-        ]
-        .map(String::from),
-    );
-    let budgets = &parsed.budgets;
-    assert_eq!(
-        (
-            budgets.max_waiting_requests,
-            budgets.max_cached_states,
-            budgets.snapshot_interval
-        ),
-        (4, 32, 1024)
-    );
-}
-
-/// A file that a test writes. It is removed when the test ends.
-#[cfg(test)]
-struct TestFile(PathBuf);
-
-#[cfg(test)]
-impl Drop for TestFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-#[test]
-fn command_line_server_settings_override_the_file_in_either_order() {
-    let path = std::env::temp_dir().join(format!("eremite-server-{}.json", std::process::id()));
-    let config = json!({"port": 8008, "host": "127.0.0.1", "api_key_file": "/dev/null",
-                        "reserve": 10, "state_cache": 8, "models": [{"model": "unused-model"}]});
-    std::fs::write(&path, config.to_string()).unwrap();
-    let written = TestFile(path);
-    let file = written.0.to_string_lossy().into_owned();
-    let parsed = parse_arguments(&["--config".into(), file.clone()]);
-    assert_eq!(parsed.server.port, Some(8008));
-    assert_eq!(parsed.server.api_key_file.as_deref(), Some("/dev/null"));
-    for before in [false, true] {
-        let flags: Vec<String> = [
-            "--serve",
-            "9008",
-            "--host",
-            "127.0.0.2",
-            "--api-key-file",
-            "override-key",
-            "--reserve",
-            "12",
-            "--state-cache",
-            "16",
-            "--idle-unload",
-            "30",
-        ]
-        .map(String::from)
-        .into();
-        let config = vec!["--config".into(), file.clone()];
-        let parsed = parse_arguments(&if before {
-            [flags, config].concat()
-        } else {
-            [config, flags].concat()
-        });
-        assert_eq!(
-            (
-                parsed.server.port,
-                parsed.server.host.as_str(),
-                parsed.server.api_key_file.as_deref()
-            ),
-            (Some(9008), "127.0.0.2", Some("override-key"))
-        );
-        assert_eq!(
-            (
-                parsed.budgets.reserve_gb,
-                parsed.budgets.state_cache_gb,
-                parsed.budgets.idle_unload_s
-            ),
-            (12.0, 16.0, 30.0)
-        );
-    }
-}
-
-#[test]
-fn the_terminal_uis_settings_come_from_the_command_line() {
-    let flags: Vec<String> = [
-        "-m",
-        "/m/d",
-        "--serve",
-        "8008",
-        "--tui",
-        "--tui-theme",
-        "dark",
-        "--tui-history-window",
-        "120",
-        "--tui-expert-map-tokens",
-        "20",
-    ]
-    .map(String::from)
-    .into();
-    let parsed = parse_arguments(&flags);
-    assert_eq!(
-        (
-            parsed.server.tui,
-            parsed.server.tui_theme,
-            parsed.server.tui_history_window_s,
-            parsed.server.tui_expert_map_tokens
-        ),
-        (true, ui::terminal::ThemeChoice::Dark, 120.0, 20)
-    );
-    let parsed = parse_arguments(&[flags, vec!["--no-tui".into()]].concat());
-    assert!(!parsed.server.tui);
 }
 
 /// A served model: its names, its context, its tokenizer and its family's chat
@@ -930,11 +525,17 @@ async fn refuse_other_than_post() -> Response {
 /// the models, and serves the routes until the stop.
 fn main() {
     let started = Instant::now();
-    let arguments = parse_arguments(&std::env::args().skip(1).collect::<Vec<_>>());
-    let (Some(port), false) = (arguments.server.port, arguments.models.is_empty()) else {
-        exit_with_usage()
+    let path = Arguments::parse()
+        .config
+        .unwrap_or_else(|| config::default_path().unwrap_or_else(|error| die(&error)));
+    let configuration = config::read(&path).unwrap_or_else(|error| die(&error));
+    let Some(port) = configuration.server.port else {
+        die(&format!(
+            "{}: no port; port sets the port to serve on",
+            path.display()
+        ))
     };
-    let key = match &arguments.server.api_key_file {
+    let key = match &configuration.server.api_key_file {
         Some(file) => {
             std::fs::read_to_string(file).unwrap_or_else(|_| die(&format!("cannot open {file}")))
         }
@@ -943,16 +544,16 @@ fn main() {
     let key = key.trim_end_matches(['\n', '\r', ' ']);
     if !(MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key.len()) {
         die(&format!(
-            "the API key (EREMITE_API_KEY or --api-key-file) must have {MIN_KEY_CHARS} to {MAX_KEY_CHARS} characters"
+            "the API key (EREMITE_API_KEY or api_key_file) must have {MIN_KEY_CHARS} to {MAX_KEY_CHARS} characters"
         ));
     }
-    let host: Ipv4Addr = if arguments.server.host == "localhost" {
+    let host: Ipv4Addr = if configuration.server.host == "localhost" {
         Ipv4Addr::LOCALHOST
     } else {
-        arguments.server.host.parse().unwrap_or_else(|_| {
+        configuration.server.host.parse().unwrap_or_else(|_| {
             die(&format!(
                 "host takes an IPv4 address: {}",
-                arguments.server.host
+                configuration.server.host
             ))
         })
     };
@@ -967,7 +568,7 @@ fn main() {
     // Each model's family, name and context.
     let mut served = Vec::new();
     let mut families = Vec::new();
-    for model in &arguments.models {
+    for model in &configuration.models {
         let family = Family::of(&model.engine.model).unwrap_or_else(|error| die(&error));
         let mut options = model.engine.clone();
         options
@@ -986,15 +587,17 @@ fn main() {
             id,
             options,
             rows_per_call: model.rows_per_call,
-            idle_unload: model.idle_unload.unwrap_or(arguments.budgets.idle_unload_s),
+            idle_unload: model
+                .idle_unload
+                .unwrap_or(configuration.budgets.idle_unload_s),
         });
         families.push(family);
     }
     // The folder of the saved states. There is none without a folder, or with
-    // --state-disk 0.
-    let state_dir = (arguments.budgets.state_disk_gb > 0.0)
+    // state_disk 0.
+    let state_dir = (configuration.budgets.state_disk_gb > 0.0)
         .then(|| {
-            arguments
+            configuration
                 .server
                 .state_dir
                 .as_ref()
@@ -1003,12 +606,12 @@ fn main() {
         })
         .flatten();
     // The terminal UI takes the terminal before the engine starts to log.
-    let settings = &arguments.server;
+    let settings = &configuration.server;
     let opened = if settings.tui {
         let wait = Duration::from_secs_f64(settings.tui_background_answer_wait_s);
         let opened = ui::terminal::enter(settings.tui_theme, wait);
         if opened.is_none() {
-            engine::log("--tui: stderr is not a terminal that can show the terminal UI");
+            engine::log("tui: stderr is not a terminal that can show the terminal UI");
         }
         opened
     } else {
@@ -1027,7 +630,7 @@ fn main() {
     };
     if !worker::start(
         served.clone(),
-        arguments.budgets.clone(),
+        configuration.budgets.clone(),
         state_dir,
         on_log,
         on_die,
@@ -1038,7 +641,7 @@ fn main() {
     }
     let loaded = worker::list_models();
     let mut served_models = Vec::new();
-    for ((model, settings), family) in arguments.models.iter().zip(&served).zip(&families) {
+    for ((model, settings), family) in configuration.models.iter().zip(&served).zip(&families) {
         let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults {
@@ -1124,7 +727,7 @@ fn main() {
         arrivals: AtomicU64::new(0),
         models: served_models,
         search: {
-            let dir = arguments
+            let dir = configuration
                 .server
                 .searxng_dir
                 .as_deref()
@@ -1132,7 +735,7 @@ fn main() {
                 .or_else(config::default_searxng_dir);
             // Without HOME, the folder is relative to the current one.
             let dir = dir.unwrap_or_else(|| PathBuf::from(".local/share/eremite/searxng"));
-            let socket = arguments
+            let socket = configuration
                 .server
                 .searxng_socket
                 .as_deref()
@@ -1142,17 +745,19 @@ fn main() {
                 socket,
                 codex::search::AddressPolicy::Public,
                 codex::search::Times {
-                    timeout: Duration::from_secs_f64(arguments.server.search_timeout_s),
-                    searxng_idle: Duration::from_secs_f64(arguments.server.searxng_idle_s),
-                    session_idle: Duration::from_secs_f64(arguments.server.search_session_idle_s),
+                    timeout: Duration::from_secs_f64(configuration.server.search_timeout_s),
+                    searxng_idle: Duration::from_secs_f64(configuration.server.searxng_idle_s),
+                    session_idle: Duration::from_secs_f64(
+                        configuration.server.search_session_idle_s,
+                    ),
                 },
             )
         },
         limits: http::Limits {
-            timeout: Duration::from_secs_f64(arguments.server.http_timeout_s),
+            timeout: Duration::from_secs_f64(configuration.server.http_timeout_s),
             ..http::DEFAULT_LIMITS
         },
-        keepalive: Duration::from_secs_f64(arguments.server.keepalive_s),
+        keepalive: Duration::from_secs_f64(configuration.server.keepalive_s),
     });
     let (stopper, limits) = (shared.clone(), shared.limits);
     let app = Router::new()

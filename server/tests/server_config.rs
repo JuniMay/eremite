@@ -1,5 +1,5 @@
-//! Startup settings without model loading. An empty key or an occupied
-//! listener stops startup before the engine opens a checkpoint.
+//! Startup settings without model loading. A missing port, an empty key or an
+//! occupied listener stops startup before the engine opens a checkpoint.
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -91,62 +91,14 @@ fn no_arguments_loads_the_default_home_config() {
 }
 
 #[test]
-fn command_line_key_file_overrides_the_default_config() {
-    let error = run(
-        "key-file-override",
-        &["--api-key-file".into(), "missing-override-key".into()],
-        None,
-    );
-    assert!(
-        error.contains("cannot open missing-override-key"),
-        "{error}"
-    );
-}
-
-#[test]
-fn explicit_config_and_cli_listener_override_stop_before_model_loading() {
+fn a_config_file_s_port_must_be_free() {
     let guard = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = guard.local_addr().unwrap().port();
-    let base = json!({"port": port, "host": "127.0.0.1",
-                      "models": [{"model": "unused-model"}]});
+    let config = json!({"port": port, "host": "127.0.0.1",
+                        "models": [{"model": "unused-model"}]});
     let error = run(
-        "listener-override",
+        "occupied-port",
         &["--config".into(), "/dev/stdin".into()],
-        Some(base.clone()),
-    );
-    assert!(
-        error.contains(&format!("cannot listen on 127.0.0.1:{port}")),
-        "{error}"
-    );
-    for before in [false, true] {
-        let mut config = base.clone();
-        config["port"] = json!(0);
-        config["api_key_file"] = json!("missing-config-key");
-        let cli = vec![
-            "--serve".into(),
-            port.to_string(),
-            "--api-key-file".into(),
-            "/dev/null".into(),
-        ];
-        let file = vec!["--config".into(), "/dev/stdin".into()];
-        let args = if before {
-            [cli, file].concat()
-        } else {
-            [file, cli].concat()
-        };
-        let error = run("listener-override", &args, Some(config));
-        assert!(error.contains("must have 16 to 256 characters"), "{error}");
-    }
-    let mut config = base;
-    config["port"] = json!(0);
-    let error = run(
-        "listener-override",
-        &[
-            "--config".into(),
-            "/dev/stdin".into(),
-            "--serve".into(),
-            port.to_string(),
-        ],
         Some(config),
     );
     assert!(
@@ -156,21 +108,23 @@ fn explicit_config_and_cli_listener_override_stop_before_model_loading() {
 }
 
 #[test]
-fn an_explicit_model_uses_cli_settings_without_the_default_file() {
-    let guard = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = guard.local_addr().unwrap().port();
+fn a_config_file_without_a_port_is_refused() {
+    let config = json!({"models": [{"model": "unused-model"}]});
     let error = run(
-        "explicit-model",
-        &[
-            "-m".into(),
-            "unused-model".into(),
-            "--serve".into(),
-            port.to_string(),
-        ],
+        "no-port",
+        &["--config".into(), "/dev/stdin".into()],
+        Some(config),
+    );
+    assert!(error.contains("no port"), "{error}");
+}
+
+#[test]
+fn the_command_line_takes_only_the_config_file() {
+    let error = run(
+        "other-argument",
+        &["-m".into(), "unused-model".into()],
         None,
     );
-    assert!(
-        error.contains(&format!("cannot listen on 127.0.0.1:{port}")),
-        "{error}"
-    );
+    assert!(error.contains("unexpected argument '-m'"), "{error}");
+    assert!(error.contains("Usage: eremite-server"), "{error}");
 }
