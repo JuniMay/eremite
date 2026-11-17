@@ -59,12 +59,17 @@
 //! what changed: the states, snapshots and tokens it added, and the rows that a
 //! pass rejected. The cache holds no engine handles. So its tests need no
 //! model.
+//!
+//! **Saved states** are states written to the SSD by server/src/disk.rs. The
+//! cache holds their tokens, their parts' positions and their snapshots.
 
 use std::collections::BTreeMap;
 
 /// How many tokens one slice comparison takes. Slices compare faster than
 /// single tokens.
 const SHARED_PREFIX_BLOCK: usize = 1024;
+/// The default of --state-disk-tokens. The worker sets the configured value.
+const DEFAULT_MIN_UNSHARED_TOKENS: usize = 8192;
 
 // The order of plans at equal cost. The cost counts only prefilled tokens. A
 // copy takes time it does not count. So in place comes first.
@@ -75,6 +80,9 @@ const RANK_COLD: usize = 3;
 
 /// The id of a state in memory. The worker maps it to the engine's state.
 pub type StateId = u64;
+
+/// The id of a saved state. Its files' names start with it.
+pub type SavedStateId = u64;
 
 /// Where a snapshot was taken. Saved states' index files store these numbers.
 /// They never change.
@@ -137,6 +145,65 @@ pub struct Entry {
     pub reserved_snapshots: Vec<Snapshot>,
     /// Its number in the log and the status.
     pub number: u64,
+}
+
+/// One part of a saved state: one file of rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    /// The first position whose rows the part holds.
+    pub from: usize,
+    /// The position after the last one.
+    pub to: usize,
+    /// The bytes of the part's file.
+    pub bytes: u64,
+    /// The N in the part's file name, `ID-N.rows`.
+    pub file_number: u32,
+}
+
+/// A snapshot of a saved state, in its own file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SavedSnapshot {
+    /// The snapshot. Its bytes are its file's bytes.
+    pub snapshot: Snapshot,
+    /// The save that wrote the snapshot's file: the V in `ID-V-POS.snap`.
+    pub version: u64,
+}
+
+/// A state on the SSD, as the cache sees it.
+#[derive(Clone, Debug)]
+pub struct SavedState {
+    /// The model whose identity the saved state has. It is None when no model
+    /// here has that identity. Such a saved state is never loaded. It is
+    /// deleted first when room is needed.
+    pub model: Option<usize>,
+    /// The tokens whose rows it holds, from position 0.
+    pub tokens: Vec<i32>,
+    /// The saved state's parts, in the order they were written. The last part
+    /// ends at the saved state's end.
+    pub parts: Vec<Part>,
+    /// The saved state's snapshots, at most one at each position.
+    pub snapshots: Vec<SavedSnapshot>,
+    /// How many positions a later part wrote again. Their old rows still take
+    /// room in earlier parts.
+    pub replaced_positions: usize,
+    /// The saved state's last load or save, on the cache's use clock. When room
+    /// is needed, the least recently used saved state is deleted first.
+    pub last_used: u64,
+    /// The saved state's version: 1 after its first save, and one more after
+    /// each append.
+    pub version: u64,
+}
+
+impl SavedState {
+    /// Counts the bytes of the saved state's files.
+    pub fn count_bytes(&self) -> u64 {
+        self.parts.iter().map(|part| part.bytes).sum::<u64>()
+            + self
+                .snapshots
+                .iter()
+                .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
+                .sum::<u64>()
+    }
 }
 
 /// How a prompt resumes.
@@ -300,7 +367,8 @@ pub struct Evicted {
     pub states: Vec<(StateId, Entry)>,
 }
 
-/// The state cache of all models: their states and snapshots.
+/// The state cache of all models: their states and snapshots. It also holds
+/// their saved states.
 #[derive(Debug)]
 pub struct Cache {
     /// The states in memory, by id.
@@ -309,7 +377,18 @@ pub struct Cache {
     pub byte_limit: u64,
     /// The most states that the cache keeps (--max-cached-states).
     pub max_states: usize,
-    /// The use clock. Each use of a state advances it by one.
+    /// The saved states, by id.
+    pub saved_states: BTreeMap<SavedStateId, SavedState>,
+    /// The bytes that saved states may take on the SSD (--state-disk).
+    pub saved_byte_limit: u64,
+    /// The fewest unshared tokens that make a state worth keeping on the SSD
+    /// (--state-disk-tokens).
+    pub min_unshared_tokens: usize,
+    /// The saved state that an admitted request loads next. Until then, no save
+    /// appends to it, replaces it or deletes it.
+    pub pinned: Option<SavedStateId>,
+    /// The use clock. Each use of a state advances it by one. So does each use
+    /// of a saved state.
     clock: u64,
     /// The id that the next new state gets.
     next_id: StateId,
@@ -322,6 +401,10 @@ impl Cache {
             entries: BTreeMap::new(),
             byte_limit,
             max_states,
+            saved_states: BTreeMap::new(),
+            saved_byte_limit: 0,
+            min_unshared_tokens: DEFAULT_MIN_UNSHARED_TOKENS,
+            pinned: None,
             clock: 0,
             // Ids start at 1. They are the state numbers that the log and the
             // status show.
@@ -868,6 +951,93 @@ impl Cache {
             .filter_map(|&id| self.entries.remove(&id).map(|entry| (id, entry)))
             .collect();
         Evicted { snapshots, states }
+    }
+}
+
+// ---- saved states ----
+
+impl Cache {
+    /// Counts the bytes that saved states take on the SSD.
+    pub fn count_saved_bytes(&self) -> u64 {
+        self.saved_states
+            .values()
+            .map(SavedState::count_bytes)
+            .sum()
+    }
+
+    /// Adds saved state `saved_state` with id `id`, and marks it used now. At
+    /// startup, the caller adds the saved states it found, the least recently
+    /// used first. So they keep their use order, before every state of this
+    /// run.
+    pub fn add_saved_state(&mut self, id: SavedStateId, mut saved_state: SavedState) {
+        saved_state.last_used = self.advance_clock();
+        self.saved_states.insert(id, saved_state);
+    }
+
+    /// Marks saved state `id` as used now.
+    pub fn mark_saved_state_used(&mut self, id: SavedStateId) {
+        let now = self.advance_clock();
+        if let Some(saved_state) = self.saved_states.get_mut(&id) {
+            saved_state.last_used = now;
+        }
+    }
+
+    /// Finds the saved states that saved state `id` covers. A saved state of
+    /// the same model is covered when it has fewer than `min_unshared_tokens`
+    /// tokens after the prefix it shares with `id`. The pinned saved state is
+    /// never covered.
+    pub fn find_covered_saved_states(&self, id: SavedStateId) -> Vec<SavedStateId> {
+        let Some(covering) = self.saved_states.get(&id) else {
+            return Vec::new();
+        };
+        self.saved_states
+            .iter()
+            .filter(|&(&other, saved_state)| {
+                other != id
+                    && Some(other) != self.pinned
+                    && saved_state.model.is_some()
+                    && saved_state.model == covering.model
+                    && saved_state.tokens.len()
+                        < count_shared_prefix(&saved_state.tokens, &covering.tokens)
+                            + self.min_unshared_tokens
+            })
+            .map(|(&other, _)| other)
+            .collect()
+    }
+
+    /// Finds the saved states to delete so that `need` more bytes fit within
+    /// `saved_byte_limit`. It never picks `keep` or the pinned saved state. It
+    /// picks saved states of no model here first, then the least recently used.
+    /// With `used_before`, it picks only those used before that time, and those
+    /// of no model here. So a save deletes only saved states older than the
+    /// state it saves. Returns None when deleting cannot make the room.
+    pub fn find_saved_states_to_delete(
+        &self,
+        need: u64,
+        keep: Option<SavedStateId>,
+        used_before: Option<u64>,
+    ) -> Option<Vec<SavedStateId>> {
+        let mut total = self.count_saved_bytes() + need;
+        let mut order: Vec<(&SavedStateId, &SavedState)> = self
+            .saved_states
+            .iter()
+            .filter(|(id, saved_state)| {
+                Some(**id) != keep
+                    && Some(**id) != self.pinned
+                    && (saved_state.model.is_none()
+                        || used_before.is_none_or(|before| saved_state.last_used < before))
+            })
+            .collect();
+        order.sort_by_key(|(_, saved_state)| (saved_state.model.is_some(), saved_state.last_used));
+        let mut to_delete = Vec::new();
+        for (&id, saved_state) in order {
+            if total <= self.saved_byte_limit {
+                break;
+            }
+            total -= saved_state.count_bytes();
+            to_delete.push(id);
+        }
+        (total <= self.saved_byte_limit).then_some(to_delete)
     }
 }
 
@@ -1888,6 +2058,108 @@ mod tests {
         assert_eq!(
             cache.find_eviction(0, false, &[]),
             Some(Eviction::default())
+        );
+    }
+
+    // ---- saved states ----
+
+    /// Adds saved state `id` of model 0 to `cache`. It holds `tokens` in one
+    /// part, with `snapshots`.
+    fn add_saved_state_in_one_part(
+        cache: &mut Cache,
+        id: SavedStateId,
+        tokens: &[i32],
+        snapshots: &[SavedSnapshot],
+    ) {
+        cache.add_saved_state(
+            id,
+            SavedState {
+                model: Some(0),
+                tokens: tokens.to_vec(),
+                parts: vec![Part {
+                    from: 0,
+                    to: tokens.len(),
+                    bytes: 100 * tokens.len() as u64,
+                    file_number: 0,
+                }],
+                snapshots: snapshots.to_vec(),
+                replaced_positions: 0,
+                last_used: 0,
+                version: 1,
+            },
+        );
+    }
+
+    /// Makes a cache that saves states of 100 unshared tokens or more.
+    fn make_saving_cache() -> Cache {
+        let mut cache = Cache::new(1 << 30, 16);
+        cache.saved_byte_limit = 1 << 30;
+        cache.min_unshared_tokens = 100;
+        cache
+    }
+
+    #[test]
+    fn a_new_saved_state_covers_older_ones_and_the_oldest_are_deleted_first_for_room() {
+        let mut cache = make_saving_cache();
+        // 60 tokens after the prefix it shares with 2
+        add_saved_state_in_one_part(&mut cache, 1, &collect_tokens(0..1000), &[]);
+        let mut other = collect_tokens(0..940);
+        other.extend(collect_tokens(5000..5300)); // 300 unshared tokens
+        add_saved_state_in_one_part(&mut cache, 2, &other, &[]);
+        let mut newer = collect_tokens(0..940);
+        newer.extend(collect_tokens(6000..6500));
+        add_saved_state_in_one_part(&mut cache, 3, &newer, &[]);
+        assert_eq!(cache.find_covered_saved_states(3), vec![1]);
+        cache.pinned = Some(1);
+        assert!(
+            cache.find_covered_saved_states(3).is_empty(),
+            "the saved state a request loads next stays"
+        );
+        cache.pinned = None;
+        // room: one of no model here first, then the least recently used
+        add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..10), &[]);
+        cache.saved_states.get_mut(&4).unwrap().model = None;
+        let all = cache.count_saved_bytes();
+        cache.saved_byte_limit = all;
+        assert_eq!(
+            cache.find_saved_states_to_delete(0, None, None),
+            Some(vec![])
+        );
+        assert_eq!(
+            cache.find_saved_states_to_delete(1, None, None),
+            Some(vec![4])
+        );
+        assert_eq!(
+            cache.find_saved_states_to_delete(1001, None, None),
+            Some(vec![4, 1])
+        );
+        assert_eq!(
+            cache.find_saved_states_to_delete(1001, Some(1), None),
+            Some(vec![4, 2])
+        );
+        assert_eq!(
+            cache.find_saved_states_to_delete(all + 1, None, None),
+            None,
+            "more than the limit: no room"
+        );
+        // a state used before every saved one takes no room from them
+        assert_eq!(cache.find_saved_states_to_delete(1001, None, Some(1)), None);
+        assert_eq!(
+            cache.find_saved_states_to_delete(1001, None, Some(3)),
+            Some(vec![4, 1])
+        );
+    }
+
+    #[test]
+    fn a_saved_state_used_again_is_deleted_after_newer_ones() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(&mut cache, 1, &collect_tokens(0..10), &[]);
+        add_saved_state_in_one_part(&mut cache, 2, &collect_tokens(20..30), &[]);
+        cache.mark_saved_state_used(1);
+        cache.saved_byte_limit = cache.count_saved_bytes();
+        assert_eq!(
+            cache.find_saved_states_to_delete(1, None, None),
+            Some(vec![2])
         );
     }
 }
