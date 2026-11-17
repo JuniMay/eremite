@@ -206,6 +206,29 @@ impl Plan {
             _ => None,
         }
     }
+
+    /// Counts the snapshot bytes that a request on this plan adds before it
+    /// decodes. A plan that prefills adds a prompt-end snapshot of
+    /// `prompt_end_bytes`. A plan without a prefill uses the snapshot at the
+    /// prompt's end. A plan with a branch snapshot adds `branch_bytes` more.
+    pub fn count_snapshot_bytes(
+        &self,
+        prompt_len: usize,
+        branch_bytes: u64,
+        prompt_end_bytes: u64,
+    ) -> u64 {
+        let prompt_end = if self.count_reused_tokens() < prompt_len {
+            prompt_end_bytes
+        } else {
+            0
+        };
+        prompt_end
+            + if self.find_branch_snapshot_pos(prompt_len).is_some() {
+                branch_bytes
+            } else {
+                0
+            }
+    }
 }
 
 /// The engine's limits and costs that plans depend on, for one model.
@@ -651,6 +674,64 @@ impl Cache {
         }
     }
 
+    /// Counts the bytes by which the states and snapshots exceed the limit.
+    pub fn count_bytes_over_limit(&self) -> u64 {
+        self.count_bytes().saturating_sub(self.byte_limit)
+    }
+
+    /// Grows the bytes counted for busy state `id` to `bytes`, before the pass
+    /// that grows the state. First it evicts spare snapshots and idle states to
+    /// stay within the limit. When that is not enough, it evicts all the other
+    /// states' spare snapshots and idle states. The cache then exceeds its
+    /// limit. It does nothing when `bytes` is not more than the state takes.
+    /// Returns what it evicted.
+    pub fn grow_state(&mut self, id: StateId, bytes: u64) -> Evicted {
+        let Some(old_bytes) = self.entries.get(&id).map(|entry| entry.bytes) else {
+            return Evicted::default();
+        };
+        if bytes <= old_bytes {
+            return Evicted::default();
+        }
+        let (eviction, _) = self.list_evictions(bytes - old_bytes, false, &[id]);
+        let evicted = self.evict(&eviction);
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.bytes = bytes;
+        }
+        evicted
+    }
+
+    /// Finishes the request in state `id`. The state becomes idle and used now.
+    /// It takes `bytes`. `generation_end` is the snapshot at the generation's
+    /// end, when the state has none there. The cache evicts what makes room for
+    /// it within the limit. Then it adds the snapshot. When that room cannot be
+    /// made, the cache adds no snapshot. It then evicts what brings it back
+    /// within its limit, if it can. Returns whether the worker takes the
+    /// snapshot, and what the cache evicted.
+    pub fn finish_request(
+        &mut self,
+        id: StateId,
+        bytes: u64,
+        generation_end: Option<Snapshot>,
+    ) -> (bool, Evicted) {
+        self.set_idle(id, bytes);
+        if let Some(eviction) = self.find_eviction(
+            generation_end.map_or(0, |snapshot| snapshot.bytes),
+            false,
+            &[id],
+        ) {
+            let evicted = self.evict(&eviction);
+            if let Some(snapshot) = generation_end {
+                self.add_snapshot(id, snapshot);
+            }
+            return (generation_end.is_some(), evicted);
+        }
+        let evicted = self
+            .find_eviction(0, false, &[id])
+            .map(|eviction| self.evict(&eviction))
+            .unwrap_or_default();
+        (false, evicted)
+    }
+
     /// Removes state `id`. Returns its snapshots for the worker to free.
     pub fn remove_state(&mut self, id: StateId) -> Vec<Snapshot> {
         self.entries
@@ -701,6 +782,14 @@ impl Cache {
     /// there.
     fn list_evictions(&self, need: u64, adds_state: bool, keep: &[StateId]) -> (Eviction, bool) {
         self.list_evictions_under(self.byte_limit, need, adds_state, keep)
+    }
+
+    /// Evicts spare snapshots and idle states until the cache takes `bytes`
+    /// fewer bytes, or nothing more can be evicted. Returns what it evicted.
+    pub fn evict_bytes(&mut self, bytes: u64) -> Evicted {
+        let target = self.count_bytes().saturating_sub(bytes);
+        let (eviction, _) = self.list_evictions_under(target, 0, false, &[]);
+        self.evict(&eviction)
     }
 
     /// Lists what to evict for `need` more bytes within `limit`, and one more
@@ -893,6 +982,21 @@ mod tests {
     }
 
     #[test]
+    fn growth_evicts_idle_states_of_other_models() {
+        let mut cache = Cache::new(10, 16);
+        let idle = cache.add_state(0, 3);
+        cache.set_idle(idle, 3);
+        let busy = cache.add_state(1, 6);
+        let evicted = cache.grow_state(busy, 9);
+        assert_eq!(
+            evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![idle]
+        );
+        assert_eq!(cache.count_bytes(), 9);
+        assert!(cache.entries[&busy].busy);
+    }
+
+    #[test]
     fn reserved_snapshots_count_once_toward_the_shared_limit() {
         let mut cache = Cache::new(8, 16);
         let admitted = cache.add_state(0, 5);
@@ -945,6 +1049,21 @@ mod tests {
         cache.clear_reserved_snapshots(admitted);
         assert_eq!(cache.count_bytes(), 5);
         assert!(cache.entries[&admitted].busy);
+    }
+
+    #[test]
+    fn evict_bytes_evicts_idle_states_of_any_model_and_keeps_busy_ones() {
+        let mut cache = Cache::new(100, 16);
+        let idle = cache.add_state(0, 4);
+        cache.set_idle(idle, 4);
+        let busy = cache.add_state(1, 3);
+        let evicted = cache.evict_bytes(2);
+        assert_eq!(
+            evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![idle]
+        );
+        assert_eq!(cache.count_bytes(), 3);
+        assert!(cache.entries[&busy].busy);
     }
 
     #[test]
@@ -1620,6 +1739,138 @@ mod tests {
         assert_eq!(evicted.states.len(), 1);
         assert!(evicted.snapshots.iter().all(|&(id, _)| id == new));
         assert!(!cache.entries.contains_key(&old));
+    }
+
+    #[test]
+    fn the_same_prompt_again_takes_no_new_snapshot_and_fits_a_full_cache() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let source = add_idle_state(&mut cache, &prompt, &[4000]);
+        // the same prompt again resumes at its prompt end, without a prefill
+        let plan = cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS);
+        assert_eq!(plan.count_reused_tokens(), prompt.len());
+        assert_eq!(
+            plan.count_snapshot_bytes(prompt.len(), SNAPSHOT_BYTES, SNAPSHOT_BYTES + 1),
+            0
+        );
+        // so with the cache full it fits, and nothing is evicted
+        cache.byte_limit = cache.count_bytes();
+        assert_eq!(
+            cache.find_eviction(
+                plan.count_snapshot_bytes(prompt.len(), SNAPSHOT_BYTES, SNAPSHOT_BYTES + 1),
+                false,
+                &[source]
+            ),
+            Some(Eviction::default())
+        );
+        // a fork prefills: its prompt end (with logits) and its branch point
+        let next_prompt = [&prompt[..3000], &collect_tokens(9000..9100)[..]].concat();
+        let fork = cache.find_cheapest_plan(0, &next_prompt, PLAN_LIMITS);
+        assert_eq!(fork.find_branch_snapshot_pos(next_prompt.len()), Some(3000));
+        assert_eq!(
+            fork.count_snapshot_bytes(next_prompt.len(), SNAPSHOT_BYTES, SNAPSHOT_BYTES + 1),
+            2 * SNAPSHOT_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn a_decoding_state_s_growth_is_counted_before_it_grows_and_others_are_evicted_first() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let old = add_idle_state(&mut cache, &collect_tokens(0..10), &[10]);
+        cache.add_snapshot(
+            old,
+            Snapshot {
+                pos: 5,
+                kind: SnapshotKind::GenerationEnd,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+        ); // spare
+        let busy = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
+        // decoding
+        cache.start_request(busy, &collect_tokens(20..30), 10, STATE_BYTES, 0);
+        cache.byte_limit = cache.count_bytes();
+        // one snapshot's growth: the spare snapshot is evicted before the
+        // growth
+        let evicted = cache.grow_state(busy, STATE_BYTES + SNAPSHOT_BYTES);
+        assert_eq!(
+            evicted
+                .snapshots
+                .iter()
+                .map(|&(id, snapshot)| (id, snapshot.pos))
+                .collect::<Vec<_>>(),
+            vec![(old, 5)]
+        );
+        assert!(evicted.states.is_empty());
+        assert_eq!(cache.entries[&busy].bytes, STATE_BYTES + SNAPSHOT_BYTES);
+        assert_eq!(cache.count_bytes_over_limit(), 0);
+        // more: the idle state is evicted whole
+        let evicted = cache.grow_state(busy, (3 << 20) + SNAPSHOT_BYTES);
+        assert_eq!(
+            evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![old]
+        );
+        assert_eq!(cache.entries[&busy].bytes, (3 << 20) + SNAPSHOT_BYTES);
+        assert_eq!(cache.count_bytes_over_limit(), 0);
+        // no growth: nothing happens
+        let evicted = cache.grow_state(busy, STATE_BYTES);
+        assert!(evicted.snapshots.is_empty() && evicted.states.is_empty());
+        assert_eq!(cache.entries[&busy].bytes, (3 << 20) + SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn growth_that_cannot_fit_evicts_every_idle_state_and_then_exceeds_the_limit() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let idle = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
+        let busy = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
+        let other_busy = add_idle_state(&mut cache, &collect_tokens(40..50), &[]);
+        cache.start_request(busy, &collect_tokens(20..30), 10, STATE_BYTES, 0);
+        cache.start_request(other_busy, &collect_tokens(40..50), 10, STATE_BYTES, 0);
+        cache.byte_limit = cache.count_bytes(); // 3 MiB
+        // 3 MiB more: only the idle state (1 MiB) can be evicted. The busy ones
+        // stay.
+        let evicted = cache.grow_state(busy, 4 << 20);
+        assert_eq!(
+            evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![idle]
+        );
+        assert_eq!(cache.entries[&busy].bytes, 4 << 20);
+        assert_eq!(cache.count_bytes_over_limit(), 2 << 20);
+        assert!(cache.entries.contains_key(&other_busy));
+    }
+
+    #[test]
+    fn a_generation_end_snapshot_is_kept_only_within_the_limit() {
+        let generation_end = Snapshot {
+            pos: 10,
+            kind: SnapshotKind::GenerationEnd,
+            bytes: SNAPSHOT_BYTES,
+            stale_rows: 0,
+        };
+        // the cache full, nothing else to evict: the snapshot is not taken
+        let mut cache = Cache::new(u64::MAX, 256);
+        let state = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
+        cache.start_request(state, &collect_tokens(0..10), 10, STATE_BYTES, 0);
+        cache.byte_limit = cache.count_bytes();
+        let (take, _) = cache.finish_request(state, STATE_BYTES, Some(generation_end));
+        assert!(!take);
+        assert!(cache.find_snapshot(state, 10).is_none());
+        assert_eq!(cache.count_bytes_over_limit(), 0);
+        // an idle state to spare: it is evicted first, and the snapshot is kept
+        let mut other_cache = Cache::new(u64::MAX, 256);
+        let old = add_idle_state(&mut other_cache, &collect_tokens(100..110), &[]);
+        let other_state = add_idle_state(&mut other_cache, &collect_tokens(0..10), &[]);
+        other_cache.start_request(other_state, &collect_tokens(0..10), 10, STATE_BYTES, 0);
+        other_cache.byte_limit = other_cache.count_bytes() + SNAPSHOT_BYTES - STATE_BYTES;
+        let (take, evicted) =
+            other_cache.finish_request(other_state, STATE_BYTES, Some(generation_end));
+        assert!(take);
+        assert_eq!(
+            evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            vec![old]
+        );
+        assert!(other_cache.find_snapshot(other_state, 10).is_some());
+        assert_eq!(other_cache.count_bytes_over_limit(), 0);
     }
 
     #[test]
