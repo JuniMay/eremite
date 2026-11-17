@@ -101,7 +101,9 @@ impl ModelConfig {
             | "reserve"
             | "gpu_timeout"
             | "progress_log"
+            | "state_cache"
             | "max_waiting_requests"
+            | "max_cached_states"
             | "port"
             | "host"
             | "api_key_file"
@@ -247,9 +249,14 @@ pub struct Budgets {
     /// The seconds between a decoding request's progress lines in the log; 0:
     /// none.
     pub progress_log_s: f64,
+    /// The GiB of states and snapshots that the state cache keeps, for all
+    /// models together.
+    pub state_cache_gb: f64,
     /// The most requests that wait for one model. Another request then gets
     /// HTTP 429, too many requests.
     pub max_waiting_requests: usize,
+    /// The most states that the state cache keeps, for all models together.
+    pub max_cached_states: usize,
 }
 
 impl Default for Budgets {
@@ -259,7 +266,9 @@ impl Default for Budgets {
             reserve_gb: 10.0,
             gpu_timeout_s: 60.0,
             progress_log_s: 10.0,
+            state_cache_gb: 8.0,
             max_waiting_requests: 16,
+            max_cached_states: 256,
         }
     }
 }
@@ -296,6 +305,14 @@ impl Budgets {
                     "progress_log takes 0 (none) to {MAX_SECONDS} seconds"
                 ));
             }
+            "state_cache" if number > 0.0 && number <= MAX_MEMORY_GIB => {
+                self.state_cache_gb = number
+            }
+            "state_cache" => {
+                return Err(format!(
+                    "state_cache takes a positive budget up to {MAX_MEMORY_GIB} GiB"
+                ));
+            }
             "max_waiting_requests" if is_count(MAX_COUNT) => {
                 self.max_waiting_requests = number as usize
             }
@@ -303,6 +320,10 @@ impl Budgets {
                 return Err(format!(
                     "max_waiting_requests takes 1 to {MAX_COUNT} requests"
                 ));
+            }
+            "max_cached_states" if is_count(MAX_COUNT) => self.max_cached_states = number as usize,
+            "max_cached_states" => {
+                return Err(format!("max_cached_states takes 1 to {MAX_COUNT} states"));
             }
             _ => return Err(format!("no server budget {name}")),
         }
@@ -363,7 +384,9 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "reserve",
             "gpu_timeout",
             "progress_log",
+            "state_cache",
             "max_waiting_requests",
+            "max_cached_states",
             "port",
             "host",
             "api_key_file",
@@ -380,7 +403,9 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "reserve",
         "gpu_timeout",
         "progress_log",
+        "state_cache",
         "max_waiting_requests",
+        "max_cached_states",
     ] {
         if let Some(value) = object.get(name) {
             budgets.set(name, value)?;
@@ -462,12 +487,42 @@ mod tests {
     }
 
     #[test]
+    fn model_memory_is_global_and_separate_from_states() {
+        let root = json!({"memory": 64, "reserve": 10, "state_cache": 12, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/second"}
+        ]});
+        assert!(
+            parse(&root).is_ok(),
+            "one model-memory budget must serve every architecture"
+        );
+        for key in ["cache", "memory"] {
+            let nested = json!({"models": [{"model": "/models/any-model", key: 32}]});
+            assert!(
+                parse(&nested).is_err(),
+                "{key} must not create a per-model memory budget"
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_and_state_cache_are_server_wide() {
+        let root = json!({"memory": 56, "reserve": 10, "state_cache": 12, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/second"}
+        ]});
+        assert!(
+            parse(&root).is_ok(),
+            "one reserve and one state budget must cover every model"
+        );
+    }
+
+    #[test]
     fn model_entries_cannot_create_separate_memory_budgets() {
         for setting in [
             "memory",
             "reserve",
             "gpu_timeout",
             "progress_log",
+            "state_cache",
             "http_timeout",
             "keepalive",
         ] {
@@ -524,7 +579,7 @@ mod tests {
 
     #[test]
     fn a_file_gives_each_model_its_own_options() {
-        let config = parse(&json!({"memory": 72, "models": [
+        let config = parse(&json!({"memory": 72, "state_cache": 16, "models": [
             {"model": "/m/deepseek"},
             {"model": "/m/small", "id": "small", "ctx": 32768, "top_k": 20, "think": 0}
         ]}))
@@ -533,8 +588,12 @@ mod tests {
         assert_eq!(models.len(), 2);
         let (deepseek, small) = (&models[0], &models[1]);
         assert_eq!(
-            (deepseek.engine.model.as_str(), config.budgets.memory_gb),
-            ("/m/deepseek", 72.0)
+            (
+                deepseek.engine.model.as_str(),
+                config.budgets.memory_gb,
+                config.budgets.state_cache_gb
+            ),
+            ("/m/deepseek", 72.0, 16.0)
         );
         assert_eq!(deepseek.id.as_deref(), None);
         assert_eq!(
@@ -562,6 +621,33 @@ mod tests {
         );
         assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": 0}]})).is_err());
         assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": "all"}]})).is_err());
+    }
+
+    #[test]
+    fn the_queue_and_state_limits_are_server_settings() {
+        let defaults = Budgets::default();
+        assert_eq!(
+            (defaults.max_waiting_requests, defaults.max_cached_states),
+            (16, 256)
+        );
+        let budgets = parse(
+            &json!({"models": [{"model": "/m"}], "max_waiting_requests": 8,
+                              "max_cached_states": 64}),
+        )
+        .unwrap()
+        .budgets;
+        assert_eq!(
+            (budgets.max_waiting_requests, budgets.max_cached_states),
+            (8, 64)
+        );
+        for (name, value) in [
+            ("max_waiting_requests", json!(0)),
+            ("max_cached_states", json!(1.5)),
+        ] {
+            let mut root = json!({"models": [{"model": "/m"}]});
+            root[name] = value;
+            assert!(parse(&root).is_err(), "{name}");
+        }
     }
 
     #[test]

@@ -48,6 +48,9 @@ extern "C" fn keep_line(line: *const c_char) {
 struct Reply {
     /// The prompt tokens that DecodingStarted counted, if it came.
     prompt_tokens: Option<usize>,
+    /// The prompt tokens that DecodingStarted took from the state cache, if it
+    /// came.
+    reused_tokens: Option<usize>,
     /// The tokens of the Tokens events.
     tokens: Vec<u32>,
     /// The last event. It is None when the reading stopped at the first token.
@@ -59,6 +62,7 @@ struct Reply {
 fn read_events(events: &mut UnboundedReceiver<worker::Event>, until_first_token: bool) -> Reply {
     let mut reply = Reply {
         prompt_tokens: None,
+        reused_tokens: None,
         tokens: Vec::new(),
         last: None,
     };
@@ -71,8 +75,8 @@ fn read_events(events: &mut UnboundedReceiver<worker::Event>, until_first_token:
                 prompt_tokens,
                 reused_tokens,
             } => {
-                assert_eq!(reused_tokens, 0, "the worker keeps no state");
                 reply.prompt_tokens = Some(prompt_tokens);
+                reply.reused_tokens = Some(reused_tokens);
             }
             worker::Event::Tokens(tokens) => {
                 reply.tokens.extend(tokens);
@@ -146,6 +150,7 @@ fn requests_run_to_their_end_and_report_their_events() {
     // A greedy reply ends at its token limit, or before it at a stop token.
     let first = run(&prompt, &[], GREEDY, MAX_TOKENS);
     assert_eq!(first.prompt_tokens, Some(prompt.len()));
+    assert_eq!(first.reused_tokens, Some(0), "nothing to reuse yet");
     match first.last {
         Some(worker::Event::Done {
             reason: worker::FinishReason::Length,
@@ -155,8 +160,15 @@ fn requests_run_to_their_end_and_report_their_events() {
         }) => assert!(first.tokens.len() < MAX_TOKENS as usize),
         other => panic!("the reply ended with {other:?}"),
     }
-    // The same greedy request gives the same tokens.
-    assert_eq!(run(&prompt, &[], GREEDY, MAX_TOKENS).tokens, first.tokens);
+    // The same greedy request gives the same tokens. Its prompt comes from the
+    // state that the first request left in the state cache.
+    let repeat = run(&prompt, &[], GREEDY, MAX_TOKENS);
+    assert_eq!(repeat.tokens, first.tokens);
+    assert_eq!(
+        repeat.reused_tokens,
+        Some(prompt.len()),
+        "the whole prompt is reused"
+    );
 
     // A prompt as long as the context leaves no room for a reply.
     let long_prompt = vec![prompt[0]; CTX];

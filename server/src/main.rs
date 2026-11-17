@@ -4,6 +4,8 @@
 //! - The engine (src/eremite.h, and engine.rs here) runs the models. It owns
 //!   the stop on SIGINT or SIGTERM.
 //! - The worker (worker.rs) runs every model's requests on the engine thread.
+//! - The state cache (state_cache.rs) keeps every model's states between
+//!   requests.
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
 
@@ -55,8 +57,11 @@ const USAGE: &str =
   --gpu-timeout S seconds a wait for the GPU may last before the server ends (default 60)
   --progress-log S   seconds between a decoding request's progress lines in the log, 0 none
                   (default 10)
+  --state-cache GB   total states and snapshots across all models, GiB (default 8)
   --max-waiting-requests N  requests that may wait for one model; another gets HTTP 429
                   (default 16)
+  --max-cached-states N  states that the state cache keeps, for all models together
+                  (default 256)
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
@@ -144,7 +149,9 @@ fn parse_arguments(args: &[String]) -> Arguments {
                     | "--reserve"
                     | "--gpu-timeout"
                     | "--progress-log"
-                    | "--max-waiting-requests" => {
+                    | "--state-cache"
+                    | "--max-waiting-requests"
+                    | "--max-cached-states" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -242,18 +249,59 @@ fn one_model_takes_its_options_from_the_command_line() {
     let model = &parsed.models[0];
     assert!(model.engine.deepseek().unwrap().prefill_prune);
     assert!(model.engine.deepseek().unwrap().packed_state_rows);
-    assert_eq!((model.temperature, model.top_p), (None, None));
+    assert_eq!(
+        (
+            model.temperature,
+            model.top_p,
+            parsed.budgets.state_cache_gb
+        ),
+        (None, None, 8.0)
+    );
     assert_eq!(parsed.server.port, Some(8008));
     let parsed = parse_arguments(
         &[
-            "-m", "/m/small", "-t", "0.6", "--top-k", "20", "--id", "small",
+            "-m",
+            "/m/small",
+            "-t",
+            "0.6",
+            "--top-k",
+            "20",
+            "--id",
+            "small",
+            "--state-cache",
+            "4",
         ]
         .map(String::from),
     );
     let model = &parsed.models[0];
     assert_eq!(
-        (model.temperature, model.top_k, model.id.as_deref()),
-        (Some(0.6), Some(20), Some("small"))
+        (
+            model.temperature,
+            model.top_k,
+            model.id.as_deref(),
+            parsed.budgets.state_cache_gb
+        ),
+        (Some(0.6), Some(20), Some("small"), 4.0)
+    );
+}
+
+#[test]
+fn the_queue_and_state_limits_come_from_the_command_line() {
+    let parsed = parse_arguments(
+        &[
+            "-m",
+            "/m/d",
+            "--max-waiting-requests",
+            "4",
+            "--max-cached-states",
+            "32",
+        ]
+        .map(String::from),
+    );
+    let budgets = &parsed.budgets;
+    assert_eq!(
+        (budgets.max_waiting_requests, budgets.max_cached_states),
+        (4, 32)
     );
 }
 
@@ -272,7 +320,7 @@ impl Drop for TestFile {
 fn command_line_server_settings_override_the_file_in_either_order() {
     let path = std::env::temp_dir().join(format!("eremite-server-{}.json", std::process::id()));
     let config = json!({"port": 8008, "host": "127.0.0.1", "api_key_file": "/dev/null",
-                        "reserve": 10, "models": [{"model": "unused-model"}]});
+                        "reserve": 10, "state_cache": 8, "models": [{"model": "unused-model"}]});
     std::fs::write(&path, config.to_string()).unwrap();
     let written = TestFile(path);
     let file = written.0.to_string_lossy().into_owned();
@@ -289,6 +337,8 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             "override-key",
             "--reserve",
             "12",
+            "--state-cache",
+            "16",
         ]
         .map(String::from)
         .into();
@@ -306,7 +356,10 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             ),
             (Some(9008), "127.0.0.2", Some("override-key"))
         );
-        assert_eq!(parsed.budgets.reserve_gb, 12.0);
+        assert_eq!(
+            (parsed.budgets.reserve_gb, parsed.budgets.state_cache_gb),
+            (12.0, 16.0)
+        );
     }
 }
 
@@ -488,7 +541,7 @@ async fn list_served_models(State(shared): App) -> Response {
 
 /// Answers GET /v1/models/{id} with the model's object and its live status
 /// under "status". The status shows what the model is doing, its requests, its
-/// counters, its expert cache and the process's memory.
+/// state cache, its counters, its expert cache and the process's memory.
 async fn report_model_status(State(shared): App, Path(id): Path<String>) -> Response {
     let Some(index) = shared
         .models

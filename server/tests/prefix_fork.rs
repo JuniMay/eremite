@@ -4,6 +4,15 @@
 //! model's status follows a running prefill, and quitting stops a long prefill.
 //! A request is answered while four others decode.
 //!
+//! Forks of a conversation reuse its history up to where they part from it,
+//! also while the conversation is still decoding. The cache resumes each fork
+//! the cheaper way: a replay at the shared prefix, or a snapshot before it that
+//! leaves fewer rows to compute. So a fork reuses at least its shared prefix
+//! less what a replay there computes again, and never more than the prefix.
+//! Each fork must give the tokens that the same prompt gives a server that
+//! starts without a cache. The other cache tests check the cache's budget
+//! (--state-cache).
+//!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
 //! tests run one model process at a time (they share a lock):
@@ -12,7 +21,9 @@
 //!       --manifest-path server/Cargo.toml --test prefix_fork -- --nocapture
 //!
 //! EREMITE_SERVER picks the server binary (default build/eremite-server) and
-//! EREMITE_CLI the tokenizer's (default build/eremite).
+//! EREMITE_CLI the tokenizer's (default build/eremite). The fork tests print
+//! every fork's shared and reported reuse and fail if any lies outside those
+//! bounds.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,6 +43,18 @@ const DECODING_REQUESTS: usize = 4;
 /// with IQ2 experts and 100 s with MXFP4 experts. The arriving request's answer
 /// takes less than 20 s.
 const DECODING_TOKENS: u32 = 500;
+
+/// Returns at least the rows that an exact replay at `k` computes again, on
+/// average per layer (the cache's cost of a replay, eremite_replay_rows). Layer
+/// 39 starts a ring before `k`: 136 positions, the window and the rewind margin
+/// of 8. Each layer below starts at most 128 positions earlier: 127, plus a
+/// ratio-2 compressor's pair.
+fn replay_rows(k: usize) -> usize {
+    (0..40)
+        .map(|layer| k.min(137 + 128 * layer))
+        .sum::<usize>()
+        .div_ceil(40)
+}
 
 /// What the tests run: the checkpoint, its experts, and the server's and the
 /// CLI's programs.
@@ -117,10 +140,17 @@ fn start_server(setup: &Setup, extra: &[&str]) -> Server {
         std::process::id(),
         nanos ^ (port as u128) << 64
     );
-    let mut args: Vec<String> = ["-m", &setup.checkpoint, "--memory", "56"]
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
+    let mut args: Vec<String> = [
+        "-m",
+        &setup.checkpoint,
+        "--memory",
+        "56",
+        "--state-cache",
+        "8",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
     if let Some(experts) = &setup.experts {
         args.extend(["--experts".to_string(), experts.clone()]);
     }
@@ -201,6 +231,15 @@ fn rendered_tokens(setup: &Setup, messages: &Value, thinking: bool) -> Vec<i64> 
         .collect()
 }
 
+/// Counts the tokens at the start of `first` and `second` that are the same.
+fn count_shared(first: &[i64], second: &[i64]) -> usize {
+    first
+        .iter()
+        .zip(second)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 /// Builds a greedy chat request of `messages` with thinking off, for at most
 /// `max_tokens`.
 fn request(messages: &Value, max_tokens: u32) -> Value {
@@ -212,6 +251,21 @@ fn request(messages: &Value, max_tokens: u32) -> Value {
 fn body(messages: &Value, max_tokens: u32, thinking: bool) -> Value {
     json!({"model": "deepseek-v4.1-flash", "messages": messages, "max_tokens": max_tokens,
            "temperature": 0, "thinking": thinking, "stream": false})
+}
+
+/// Returns the prompt tokens that `answer` took from the cache, or -1.
+fn hit(answer: &Value) -> i64 {
+    answer["usage"]["prompt_cache_hit_tokens"]
+        .as_i64()
+        .unwrap_or(-1)
+}
+
+/// Returns `answer`'s content.
+fn content(answer: &Value) -> String {
+    answer["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Returns the conversation's text, from the repository's own documents: a long
@@ -228,6 +282,143 @@ fn texts() -> (String, String) {
         ),
         cut(&usage, 4000),
     )
+}
+
+/// Returns character offsets in a text of `len` characters: fixed ones near the
+/// ends, and `random` ones from `seed`.
+fn offsets(len: usize, random: usize, seed: u64) -> Vec<usize> {
+    let mut offsets = vec![1, len / 3, len / 2, len.saturating_sub(2)];
+    let mut state = seed;
+    for _ in 0..random {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        offsets.push(1 + (state as usize) % len.saturating_sub(2).max(1));
+    }
+    offsets.sort();
+    offsets.dedup();
+    offsets
+}
+
+/// Returns the conversation, a long system prompt and a long user turn, and its
+/// forks. Each fork cuts the user turn or the system prompt at an offset and
+/// continues differently.
+fn conversation_and_forks() -> (Value, Vec<(String, Value)>) {
+    let (system, user) = texts();
+    let tail =
+        " Leave the rest aside and answer in one short sentence: what does this part describe?";
+    let conversation =
+        json!([{"role": "system", "content": system}, {"role": "user", "content": user}]);
+    let mut forks: Vec<(String, Value)> = Vec::new();
+    for offset in offsets(user.chars().count(), 8, 0x9E37_79B9) {
+        let cut: String = user.chars().take(offset).collect();
+        forks.push((
+            format!("user turn at character {offset}"),
+            json!([{"role": "system", "content": system}, {"role": "user", "content": cut + tail}]),
+        ));
+    }
+    for offset in offsets(system.chars().count(), 4, 0x85EB_CA6B) {
+        let cut: String = system.chars().take(offset).collect();
+        forks.push((
+            format!("system prompt at character {offset}"),
+            json!([{"role": "system", "content": cut + tail}, {"role": "user", "content": user}]),
+        ));
+    }
+    (conversation, forks)
+}
+
+/// A fork's outcome on the cached server.
+struct Forked {
+    /// Where the fork parts from the conversation.
+    what: String,
+    /// The fork's messages.
+    messages: Value,
+    /// The tokens that the fork shares with the conversation.
+    shared: usize,
+    /// The tokens that the server reused.
+    reused: i64,
+    /// The fork's reply.
+    text: String,
+}
+
+/// Runs the forks, one after another on one server, while the conversation
+/// decodes there. A fork whose reuse lies outside
+/// [shared - replay_rows(shared), shared] is added to `wrong`.
+fn run_forks(setup: &Setup, wrong: &mut Vec<String>) -> Vec<Forked> {
+    let (conversation, forks) = conversation_and_forks();
+    let source = tokens(setup, &conversation);
+    let mut results = Vec::new();
+    let server = start_server(setup, &[]);
+    let port = server.port;
+    let key = server.key.clone();
+    let mut long = request(&conversation, 6000);
+    long["stream"] = json!(true);
+    let (first_token, first_tokens) = mpsc::channel();
+    let busy = std::thread::spawn(move || stream_chat(port, &key, &long, first_token));
+    // Past the conversation's prefill: it decodes.
+    first_tokens.recv().expect("the conversation's first token");
+    for (what, messages) in forks {
+        let shared = count_shared(&tokens(setup, &messages), &source);
+        let answer = chat(&server, &request(&messages, 16));
+        let (reused, least) = (hit(&answer), shared - replay_rows(shared));
+        println!("{what}: shares {shared} tokens, reused {reused} (at least {least})");
+        if reused < least as i64 || reused > shared as i64 {
+            wrong.push(format!(
+                "{what}: shares {shared} tokens, reused {reused}; at least {least} expected"
+            ));
+        }
+        results.push(Forked {
+            what,
+            messages,
+            shared,
+            reused,
+            text: content(&answer),
+        });
+    }
+    // Dropping the server ends the decoding request too.
+    drop(server);
+    let _ = busy.join();
+    results
+}
+
+#[test]
+fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let mut wrong = Vec::new();
+    let results = run_forks(&setup, &mut wrong);
+    // The same prompts on servers that start without a cache.
+    for fork in &results {
+        let cold = start_server(&setup, &[]);
+        let reference = content(&chat(&cold, &request(&fork.messages, 16)));
+        drop(cold);
+        let same = reference == fork.text;
+        println!(
+            "{} (shares {}, reused {}): tokens {}",
+            fork.what,
+            fork.shared,
+            fork.reused,
+            if same {
+                "equal to the cold server's"
+            } else {
+                "DIFFERENT from the cold server's"
+            }
+        );
+        if !same {
+            wrong.push(format!(
+                "{}: {:?} against the cold server's {reference:?}",
+                fork.what, fork.text
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "forks that reused too little or changed the output:\n{}",
+        wrong.join("\n")
+    );
 }
 
 // ---- an image in the prompt ----
@@ -313,6 +504,50 @@ fn image_url() -> String {
     format!("data:image/png;base64,{}", base64(&png))
 }
 
+/// A fork after an image reuses the rows through the image. It gives the tokens
+/// that a server starting without a cache gives: the image's rows are the same,
+/// also those that an exact replay at the fork computes again.
+#[test]
+fn image_forks_give_the_cold_tokens() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let (system, _) = texts();
+    let image = image_url();
+    let turn = |question: &str| {
+        json!([{"role": "system", "content": system},
+               {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}},
+                                            {"type": "text", "text": question}]}])
+    };
+    let first = turn("Describe the colors of this picture in one sentence.");
+    let fork = turn("Which color is in the top left quarter? Answer in one word.");
+    let (reused, text) = {
+        let server = start_server(&setup, &[]);
+        chat(&server, &request(&first, 8));
+        let answer = chat(&server, &request(&fork, 16));
+        (hit(&answer), content(&answer))
+    };
+    let reference = {
+        let cold = start_server(&setup, &[]);
+        content(&chat(&cold, &request(&fork, 16)))
+    };
+    println!(
+        "image fork: reused {reused}; tokens {}",
+        if text == reference {
+            "equal to the cold server's"
+        } else {
+            "DIFFERENT"
+        }
+    );
+    assert!(reused > 0, "the fork after the image reused nothing");
+    assert_eq!(
+        text, reference,
+        "the fork after the image gives other tokens than a cold server"
+    );
+}
+
 /// A prompt too long for the context is refused with its token count. With an
 /// image, the count includes the image's span. So it is more than that of the
 /// same text alone.
@@ -358,10 +593,138 @@ fn a_prompt_with_an_image_that_does_not_fit_is_refused_with_its_token_count() {
     );
 }
 
+// ---- the cache's budget (--state-cache) ----
+
+/// What the model's status tells of the cache.
+struct Status {
+    /// The GiB that the cache counts.
+    states: f64,
+    /// The GiB that the cache allows.
+    limit: f64,
+    /// The positions of each state.
+    sessions: Vec<i64>,
+}
+
+/// Reads what the model's status `status` tells of the cache.
+fn read_status(status: &Value) -> Status {
+    Status {
+        states: status["state_cache_gib"].as_f64().unwrap_or(f64::NAN),
+        limit: status["state_cache_limit_gib"].as_f64().unwrap_or(f64::NAN),
+        sessions: status["sessions"]
+            .as_array()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter_map(|session| session["tokens"].as_i64())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Reads the cache's status once `requests` requests have ended and the server
+/// is idle.
+fn settled(server: &Server, requests: i64) -> Status {
+    read_status(&server.settled(requests))
+}
+
 /// Returns a short conversation with a one-word answer.
 fn short_prompt() -> Value {
     json!([{"role": "system", "content": "You answer in one word."},
            {"role": "user", "content": "Name a color."}])
+}
+
+/// A retry of a saved prompt resumes at its prompt end from the snapshot there.
+/// It takes no snapshot of its own. So it fits a cache that the first try
+/// filled to within less than a snapshot (5.3 MiB) of --state-cache.
+#[test]
+fn a_saved_prompt_again_fits_a_full_state_cache() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let prompt = short_prompt();
+    let count = tokens(&setup, &prompt).len() as i64;
+    // What the first try takes: its state and its prompt-end snapshot.
+    let first = {
+        let server = start_server(&setup, &[]);
+        chat(&server, &request(&prompt, 1));
+        settled(&server, 1).states
+    };
+    let limit = format!("{:.4}", first + 2.0 / 1024.0);
+    let server = start_server(&setup, &["--state-cache", &limit]);
+    chat(&server, &request(&prompt, 1));
+    let again = chat(&server, &request(&prompt, 1));
+    let cache = settled(&server, 2);
+    println!(
+        "saved prompt again: the first try took {first:.3} GiB, --state-cache {limit}; the retry reused {} of {count}; the cache takes {:.3} GiB",
+        hit(&again),
+        cache.states
+    );
+    assert_eq!(
+        hit(&again),
+        count,
+        "the retry did not resume at its prompt end"
+    );
+    assert!(
+        cache.states <= cache.limit,
+        "the cache takes {:.3} GiB of {:.3}",
+        cache.states,
+        cache.limit
+    );
+}
+
+/// A prompt that shares only its first tokens with the one idle state, in a
+/// cache with room for one state, runs in that state's place. Reusing those
+/// tokens would keep the state, and the two do not fit together.
+#[test]
+fn a_prompt_runs_in_place_of_the_state_whose_reuse_does_not_fit() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let cut = |doc: &str, question: &str| {
+        let text = std::fs::read_to_string(root().join(doc)).expect("a document");
+        let reference: String = text.chars().take(6000).collect();
+        json!([{"role": "system", "content": format!("Answer from this reference.\n\n{reference}")},
+               {"role": "user", "content": question}])
+    };
+    let first = cut("src/eremite.h", "Which calls run on the engine thread?");
+    let second = cut("src/model/model.h", "What does a model family fill in?");
+    // What the first conversation takes alone: its state and its prompt-end
+    // snapshot.
+    let one = {
+        let server = start_server(&setup, &[]);
+        chat(&server, &request(&first, 8));
+        settled(&server, 1).states
+    };
+    // Room for one such state, not two.
+    let limit = format!("{:.4}", one * 1.5);
+    let server = start_server(&setup, &["--state-cache", &limit]);
+    chat(&server, &request(&first, 8));
+    let answer = chat(&server, &request(&second, 8));
+    let cache = settled(&server, 2);
+    println!(
+        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, --state-cache {limit}; \
+         the second reused {} tokens; the cache holds states of {:?} positions in {:.3} GiB",
+        hit(&answer),
+        cache.sessions,
+        cache.states
+    );
+    assert_eq!(
+        cache.sessions.len(),
+        1,
+        "the first state stayed beside the second: {:?}",
+        cache.sessions
+    );
+    assert!(
+        cache.states <= cache.limit,
+        "the cache takes {:.3} GiB of {:.3}",
+        cache.states,
+        cache.limit
+    );
 }
 
 /// Returns a conversation of `low` to `high` prompt tokens, and its token

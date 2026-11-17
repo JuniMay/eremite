@@ -9,18 +9,19 @@
 //! Each turn of the worker's loop gives every model one step. A step admits
 //! every waiting request. It starts a prefill call for each prefilling request
 //! with no call running. Prefills run beside each other and beside decoding.
-//! The call prefills the whole prompt. The step then starts decoding calls for
-//! the decoding requests with no call running. A request starts decoding as
-//! soon as its prefill ends. Several decoding requests run together, at most
-//! the model's rows per call.
+//! The call prefills the rest of the prompt. The step then starts decoding
+//! calls for the decoding requests with no call running. A request starts
+//! decoding as soon as its prefill ends. Several decoding requests run
+//! together, at most the model's rows per call.
 //!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
-//! that call. The worker also builds each model's status.
+//! that call. A prompt resumes from a state in the state cache. The worker also
+//! builds each model's status.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -31,8 +32,10 @@ use tokio::sync::mpsc;
 use crate::calls::CallChooser;
 use crate::control::GIB;
 use crate::engine::{
-    self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, StateHandle, Stream,
+    self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
+    StateHandle, Stream,
 };
+use crate::state_cache::{self, Cache, Evicted, Plan, PlanLimits, Snapshot, SnapshotKind};
 
 /// The engine needs a stack of at least 16 MiB on its thread.
 const ENGINE_STACK_BYTES: usize = 16 << 20;
@@ -75,9 +78,9 @@ pub enum FinishReason {
 /// What the worker reports about a request.
 #[derive(Debug)]
 pub enum Event {
-    /// The request starts decoding. Its prefill ended. `prompt_tokens` counts
-    /// the prompt with its media expanded. `reused_tokens` counts the prompt
-    /// tokens taken from the state cache.
+    /// The request starts decoding. Its prefill ended, or it needed none.
+    /// `prompt_tokens` counts the prompt with its media expanded.
+    /// `reused_tokens` counts the prompt tokens taken from the state cache.
     DecodingStarted {
         prompt_tokens: usize,
         reused_tokens: usize,
@@ -248,6 +251,9 @@ struct ModelStatus {
     shown_request_id: u64,
     /// The number of prompt tokens of the shown request.
     shown_prompt_tokens: usize,
+    /// The number of the shown request's prompt tokens that came from the state
+    /// cache.
+    shown_reused_tokens: usize,
     /// The number of tokens that the shown request generated.
     shown_generated_tokens: usize,
     /// The number of requests that ended.
@@ -260,6 +266,14 @@ struct ModelStatus {
     last_prefill: PrefillInfo,
     /// Whether the decoding requests split evenly over at least two calls.
     split_calls: bool,
+    /// The model's states: each one's number, token count and last use.
+    sessions: Vec<(u64, usize, Instant)>,
+    /// The state bytes committed for the model: what the state cache counts for
+    /// its states and their snapshots, the reserved ones included.
+    state_committed_bytes: u64,
+    /// The bytes that the engine allocated for the model's states and their
+    /// snapshots.
+    state_allocated_bytes: u64,
 }
 
 /// A model as the HTTP handlers and the worker share it. The tokenizer works on
@@ -284,8 +298,11 @@ struct Shared {
     models: Vec<SharedModel>,
     /// The server-wide budgets and limits.
     budgets: crate::config::Budgets,
-    /// Whether a status reader asked for fresh counters. The worker publishes
-    /// them at its next turn, also between the steps of a running call.
+    /// The state bytes committed for all models together.
+    state_committed_bytes: AtomicU64,
+    /// Whether a status reader asked for fresh counters and states. The worker
+    /// publishes them at its next turn, also between the steps of a running
+    /// call.
     status_wanted: AtomicBool,
     /// Wakes the status readers once the worker has published, when a long
     /// operation starts, and at the stop.
@@ -329,9 +346,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Asks the worker for fresh counters, and returns once it has published them.
-/// While the server stops, and while the worker runs a long operation, it
-/// returns at once: the status is then the last one published.
+/// Asks the worker for fresh counters and states, and returns once it has
+/// published them. While the server stops, and while the worker runs a long
+/// operation, it returns at once: the status is then the last one published.
 pub async fn refresh_status() {
     let shared = clone_shared();
     // A notified future gets the wake from the time it is made, before it is
@@ -413,6 +430,7 @@ pub fn start(
                 worker_wakeup: Condvar::new(),
                 models,
                 budgets,
+                state_committed_bytes: AtomicU64::new(0),
                 status_wanted: AtomicBool::new(false),
                 status_published: tokio::sync::Notify::new(),
                 long_operations: AtomicUsize::new(0),
@@ -565,8 +583,8 @@ fn round(value: f64, digits: i32) -> f64 {
     (value * scale).round() / scale
 }
 
-/// Builds each model's memory as JSON: its weights, experts and workspace
-/// bytes.
+/// Builds each model's memory as JSON: its weights, experts, workspace and
+/// state bytes.
 fn build_model_memory_json(shared: &Shared) -> Vec<Value> {
     shared
         .models
@@ -574,12 +592,18 @@ fn build_model_memory_json(shared: &Shared) -> Vec<Value> {
         .map(|shared_model| {
             let status = lock(&shared_model.status);
             let stats = status.stats;
-            let tracked = stats.dense_bytes + stats.cache_bytes + stats.model_workspace;
+            let tracked = stats.dense_bytes
+                + stats.cache_bytes
+                + stats.model_workspace
+                + status.state_allocated_bytes;
             json!({
                 "model": shared_model.settings.id,
                 "weights": stats.dense_bytes,
                 "experts": stats.cache_bytes,
                 "workspace": stats.model_workspace,
+                "states": status.state_allocated_bytes,
+                "states_committed": status.state_committed_bytes,
+                "sessions": status.sessions.len(),
                 "tracked": tracked,
             })
         })
@@ -587,20 +611,33 @@ fn build_model_memory_json(shared: &Shared) -> Vec<Value> {
 }
 
 /// Builds the status of the model at `model_index` as JSON. It shows what the
-/// model is doing, its requests, its counters, its expert cache and the
-/// process's memory. Returns null for an unknown index.
+/// model is doing, its requests, its state cache, its counters, its expert
+/// cache and the process's memory. Returns null for an unknown index.
 pub fn build_model_status_json(model_index: usize) -> Value {
     let shared = clone_shared();
     let Some(shared_model) = shared.models.get(model_index) else {
         return Value::Null;
     };
     let waiting = lock(&shared.queue).waiting[model_index].len();
+    let state_limit = (shared.budgets.state_cache_gb * GIB) as u64;
     let stats = lock(&shared_model.status).stats;
     let allocations = build_model_memory_json(&shared);
     let status = lock(&shared_model.status);
     let now = Instant::now();
-    // The status rounds seconds and memory GiB to tenths. Why these digits were
-    // chosen is unknown.
+    // The status rounds idle times to whole seconds. It rounds other seconds
+    // and memory GiB to tenths, and state GiB to thousandths. Why these digits
+    // were chosen is unknown.
+    let sessions: Vec<Value> = status
+        .sessions
+        .iter()
+        .map(|&(number, tokens, last_used_at)| {
+            json!({
+                "session": number,
+                "tokens": tokens,
+                "idle_seconds": round((now - last_used_at).as_secs_f64(), 0),
+            })
+        })
+        .collect();
     let phase = if status.phase.is_empty() {
         "idle"
     } else {
@@ -609,6 +646,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let phase_seconds = status
         .phase_since
         .map_or(0.0, |since| (now - since).as_secs_f64());
+    let total_state_bytes = shared.state_committed_bytes.load(Ordering::Relaxed);
     let last_prefill = &status.last_prefill;
     let options = &shared_model.settings.options;
     json!({
@@ -619,8 +657,14 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "decoding": status.decoding_count,
         "request": status.shown_request_id,
         "prompt_tokens": status.shown_prompt_tokens,
+        "reused_tokens": status.shown_reused_tokens,
         "generated_tokens": status.shown_generated_tokens,
         "waiting": waiting,
+        "sessions": sessions,
+        "state_cache_gib": round(status.state_committed_bytes as f64 / GIB, 3),
+        "state_cache_limit_gib": round(state_limit as f64 / GIB, 3),
+        "state_cache_scope": "server",
+        "state_cache_total_gib": round(total_state_bytes as f64 / GIB, 3),
         "reserve_gib": shared.budgets.reserve_gb,
         "memory_gib": shared.budgets.memory_gb,
         "model_memory": allocations,
@@ -698,10 +742,19 @@ fn build_engine_times_json(stats: &engine::Stats) -> Value {
 
 // ---- the worker ----
 
-/// A prefill in progress: its prompt.
+/// A prefill in progress: its prompt and how far it has run.
 struct Prefill {
     /// The prompt's tokens, with the media expanded.
     prompt: Vec<i32>,
+    /// The position where the next prefill call starts.
+    next_position: usize,
+    /// Where the prefill takes a branch snapshot, if anywhere.
+    capture_position: Option<usize>,
+    /// The position of the rows that the prefill continues, and their stale
+    /// rows.
+    origin: state_cache::Origin,
+    /// Whether the prefill's first call replays.
+    replays: bool,
     /// The prompt's media. They are kept until the prefill ends.
     media: Option<Media>,
     /// When the prefill started.
@@ -716,10 +769,13 @@ struct Generation {
     job: Job,
     /// The request's sampler.
     sampler: Sampler,
-    /// The request's engine state.
-    state: StateHandle,
+    /// The key of the request's state in the state cache.
+    state_id: state_cache::StateId,
     /// The number of prompt tokens, with the media expanded.
     prompt_tokens: usize,
+    /// The number of prompt tokens taken from the state cache. The prefill
+    /// starts after them.
+    reused_tokens: usize,
     /// Some while the prompt prefills.
     prefill: Option<Prefill>,
     /// The position of the next token.
@@ -765,8 +821,13 @@ impl Generation {
 
 /// An engine call that runs on a stream, and what to do when it ends.
 enum Call {
-    /// One prefill call of the request. It prefills the whole prompt.
-    Prefill { request_id: u64 },
+    /// One prefill call of the request. It prefills the rest of the prompt.
+    /// `call_capture` is the position where the engine takes a snapshot during
+    /// the call, if any.
+    Prefill {
+        request_id: u64,
+        call_capture: Option<usize>,
+    },
     /// One token for each of these requests, one row each.
     DecodeRows {
         request_ids: Vec<u64>,
@@ -783,7 +844,8 @@ struct RunningCall {
 }
 
 /// One model as the worker runs it: its engine handle, settings, requests and
-/// streams.
+/// streams. Its states are in the state cache that all models share. A prompt
+/// resumes only from this model's states.
 struct WorkerModel {
     /// The model's index in the configured order.
     model_index: usize,
@@ -858,12 +920,170 @@ struct Round {
     gap_seconds: f64,
 }
 
+/// A state's engine handles: the engine state and its snapshots. Dropping them
+/// frees them through the model that owns them.
+struct StateHandles {
+    /// The model that owns the state and its snapshots.
+    owner: Rc<Model>,
+    /// The engine's state.
+    engine_state: StateHandle,
+    /// The state's snapshots, by position.
+    snapshots: HashMap<usize, SnapshotHandle>,
+    /// When a request last used the state.
+    last_used_at: Instant,
+}
+
+impl Drop for StateHandles {
+    fn drop(&mut self) {
+        for (_, snapshot) in self.snapshots.drain() {
+            self.owner.snapshot_free(snapshot);
+        }
+        self.owner.state_free(self.engine_state);
+    }
+}
+
+/// The states of all models: the state cache's records and each state's engine
+/// handles.
+struct States {
+    /// The state cache's records of the states.
+    cache: Cache,
+    /// Each state's engine handles, by the state's key.
+    handles: HashMap<state_cache::StateId, StateHandles>,
+}
+
+impl States {
+    /// Creates the states of all models: an empty state cache of at most
+    /// `limit` bytes and `max_states` states.
+    fn new(limit: u64, max_states: usize) -> Self {
+        Self {
+            cache: Cache::new(limit, max_states),
+            handles: HashMap::new(),
+        }
+    }
+
+    /// Frees what the state cache evicted: the snapshots, then the states.
+    fn free_evicted(&mut self, Evicted { snapshots, states }: Evicted) {
+        for (state_id, snapshot) in snapshots {
+            self.free_snapshot(state_id, snapshot.pos);
+        }
+        for (state_id, _) in states {
+            self.handles.remove(&state_id);
+        }
+    }
+
+    /// Adds a new, empty state of the model at `model_index`. Returns its key,
+    /// or None when the state's memory does not fit.
+    fn add_state(&mut self, model_index: usize, model: Rc<Model>) -> Option<state_cache::StateId> {
+        let engine_state = model.state_new()?;
+        let state_id = self.cache.add_state(model_index, 0);
+        self.handles.insert(
+            state_id,
+            StateHandles {
+                owner: model,
+                engine_state,
+                snapshots: HashMap::new(),
+                last_used_at: Instant::now(),
+            },
+        );
+        Some(state_id)
+    }
+
+    /// Gets state `state_id`'s snapshot at `pos`. Panics when there is none.
+    fn get_snapshot(&self, state_id: state_cache::StateId, pos: usize) -> SnapshotHandle {
+        self.handles[&state_id].snapshots[&pos]
+    }
+
+    /// Inserts `snapshot` as state `state_id`'s snapshot at `pos`. It frees the
+    /// snapshot it replaces.
+    fn insert_snapshot(
+        &mut self,
+        state_id: state_cache::StateId,
+        pos: usize,
+        snapshot: SnapshotHandle,
+    ) {
+        let state_handles = self
+            .handles
+            .get_mut(&state_id)
+            .expect("a state owns its snapshots");
+        if let Some(previous) = state_handles.snapshots.insert(pos, snapshot) {
+            state_handles.owner.snapshot_free(previous);
+        }
+    }
+
+    /// Frees state `state_id`'s snapshot at `pos`, if there is one.
+    fn free_snapshot(&mut self, state_id: state_cache::StateId, pos: usize) {
+        let state_handles = self
+            .handles
+            .get_mut(&state_id)
+            .expect("a state owns its snapshots");
+        if let Some(snapshot) = state_handles.snapshots.remove(&pos) {
+            state_handles.owner.snapshot_free(snapshot);
+        }
+    }
+
+    /// Frees the snapshots in `snapshots` and the states in `states`.
+    fn free_snapshots_and_states(
+        &mut self,
+        snapshots: Vec<(state_cache::StateId, Snapshot)>,
+        states: Vec<(state_cache::StateId, Vec<Snapshot>)>,
+    ) {
+        for (state_id, snapshot) in snapshots {
+            self.free_snapshot(state_id, snapshot.pos);
+        }
+        for (state_id, _) in states {
+            self.handles.remove(&state_id);
+        }
+    }
+
+    /// Publishes the states to the status: each model's states and state bytes.
+    fn publish_states(&mut self, shared: &Shared) {
+        shared
+            .state_committed_bytes
+            .store(self.cache.count_bytes(), Ordering::Relaxed);
+        for (model_index, shared_model) in shared.models.iter().enumerate() {
+            let entries: Vec<_> = self
+                .cache
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.model == model_index)
+                .collect();
+            let mut status = lock(&shared_model.status);
+            status.sessions = entries
+                .iter()
+                .map(|(state_id, entry)| {
+                    (
+                        entry.number,
+                        entry.tokens.len(),
+                        self.handles[state_id].last_used_at,
+                    )
+                })
+                .collect();
+            status.state_committed_bytes = self.cache.count_model_bytes(model_index);
+            status.state_allocated_bytes = entries
+                .iter()
+                .map(|(state_id, entry)| {
+                    self.handles[state_id]
+                        .owner
+                        .state_bytes(Some(self.handles[state_id].engine_state), 0)
+                        + entry
+                            .snapshots
+                            .iter()
+                            .map(|snapshot| snapshot.bytes)
+                            .sum::<u64>()
+                })
+                .sum();
+        }
+    }
+}
+
 /// The worker on the engine thread.
 struct Worker {
     /// What the threads share.
     shared: Arc<Shared>,
     /// The models that the worker serves, in their configured order.
     models: Vec<WorkerModel>,
+    /// The states of all models.
+    states: States,
 }
 
 impl Worker {
@@ -895,7 +1115,17 @@ impl Worker {
                 }
             })
             .collect();
-        Worker { shared, models }
+        let states = States::new(
+            (shared.budgets.state_cache_gb * GIB) as u64,
+            shared.budgets.max_cached_states,
+        );
+        let mut worker = Worker {
+            shared,
+            models,
+            states,
+        };
+        worker.states.publish_states(&worker.shared);
+        worker
     }
 
     /// Publishes each model's engine counters to its status.
@@ -907,11 +1137,12 @@ impl Worker {
         }
     }
 
-    /// Publishes the counters when a status reader asked for them, and wakes
-    /// the readers.
+    /// Publishes the counters and the states when a status reader asked for
+    /// them, and wakes the readers.
     fn publish_status_if_wanted(&mut self) {
         if self.shared.status_wanted.swap(false, Ordering::AcqRel) {
             engine::refresh_stats();
+            self.states.publish_states(&self.shared);
             self.publish_counters();
             self.shared.status_published.notify_waiters();
         }
@@ -986,7 +1217,7 @@ impl Worker {
             let shared = self.shared.clone();
             let worker_model = &mut self.models[model_index];
             let ended_call = worker_model.running_calls.remove(call_index);
-            worker_model.finish_call(ended_call, &shared);
+            worker_model.finish_call(ended_call, &shared, &mut self.states);
         }
     }
 
@@ -1048,7 +1279,7 @@ impl Worker {
             }
             drop(queue);
             for (worker_model, admitted) in self.models.iter_mut().zip(admitted_by_model) {
-                worker_model.run_step(&shared, admitted);
+                worker_model.run_step(&shared, admitted, &mut self.states);
                 worker_model
                     .model
                     .set_request_running(!worker_model.generations.is_empty());
@@ -1060,7 +1291,7 @@ impl Worker {
         self.finish_running_calls();
         for worker_model in &mut self.models {
             for generation in std::mem::take(&mut worker_model.generations) {
-                worker_model.end_generation(&shared, generation, true);
+                worker_model.end_generation(&shared, generation, true, &mut self.states);
             }
         }
         let mut waiting: Vec<Job> = {
@@ -1116,13 +1347,48 @@ fn end_before_prefill(job: Job, reason: FinishReason) {
 }
 
 impl WorkerModel {
+    /// Lists the ways `prompt` can resume from this model's states, the
+    /// cheapest first. The last way is a cold start.
+    fn list_resume_plans(&self, prompt: &[i32], states: &States) -> Vec<Plan> {
+        let model = self.model.clone();
+        let cost = move |position: usize| model.replay_rows(position).unwrap_or(0);
+        let limits = PlanLimits {
+            rewind_margin: self.model.rewind_margin(),
+            // Any position tells whether the model rebuilds its rolling rows
+            // from the rows it keeps.
+            can_replay: self.model.replay_rows(1).is_some(),
+            replay_cost: &cost,
+        };
+        states.cache.list_plans(self.model_index, prompt, limits)
+    }
+
+    /// Counts the bytes that a prompt of `prompt_tokens` tokens adds to the
+    /// state cache on `plan`. It counts the state's growth to the prompt and
+    /// its first token. It also counts the snapshots that the plan takes.
+    fn count_plan_bytes(&self, plan: &Plan, prompt_tokens: usize, states: &States) -> u64 {
+        let growth = match *plan {
+            Plan::InPlace { state, .. } => self
+                .model
+                .state_bytes(Some(states.handles[&state].engine_state), prompt_tokens + 1)
+                .saturating_sub(states.cache.entries[&state].bytes),
+            _ => self.model.state_bytes(None, prompt_tokens + 1),
+        };
+        growth
+            + plan.count_snapshot_bytes(
+                prompt_tokens,
+                self.model.snapshot_bytes(false),
+                self.model.snapshot_bytes(true),
+            )
+    }
+
     /// Runs one step of the model. Admitted requests start, one at a time after
     /// the prefills before them. One prefill call starts. The generations that
     /// are done end. The others start decoding calls.
-    fn run_step(&mut self, shared: &Shared, admitted: Vec<Job>) {
+    fn run_step(&mut self, shared: &Shared, admitted: Vec<Job>, states: &mut States) {
         self.admitted.extend(admitted);
         // A request plans its prefill only after the prefills before it have
-        // ended. So one request at a time starts its prefill.
+        // ended. It can then resume from their states. So one request at a time
+        // starts its prefill.
         while !self
             .generations
             .iter()
@@ -1159,15 +1425,18 @@ impl WorkerModel {
                 lock(&shared.models[self.model_index].status).load_error = None;
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
                 if !was_loaded && self.model.is_loaded() {
-                    engine::log(&format!("{}: loaded", self.settings.id));
+                    engine::log(&format!(
+                        "{}: loaded; shares the {:.1} GiB state cache limit",
+                        self.settings.id, shared.budgets.state_cache_gb
+                    ));
                 }
-                self.start_request(job);
+                self.start_request(shared, job, states);
             }
         }
         if engine::is_stopping() {
             return;
         }
-        self.start_prefill_calls();
+        self.start_prefill_calls(states);
         let ctx = self.ctx;
         let mut i = 0;
         while i < self.generations.len() {
@@ -1176,7 +1445,7 @@ impl WorkerModel {
                 && Self::check_ended(&self.model, &mut self.generations[i], ctx)
             {
                 let generation = self.generations.swap_remove(i);
-                self.end_generation(shared, generation, false);
+                self.end_generation(shared, generation, false, states);
             } else if !self.generations[i].in_call
                 && !self.generations[i].is_decoding()
                 && self.generations[i]
@@ -1187,7 +1456,8 @@ impl WorkerModel {
             {
                 let mut generation = self.generations.swap_remove(i);
                 generation.cancelled = true;
-                self.end_generation(shared, generation, false);
+                self.end_prefill_early(&mut generation, states);
+                self.end_generation(shared, generation, false, states);
             } else {
                 i += 1;
             }
@@ -1210,7 +1480,7 @@ impl WorkerModel {
             return;
         }
         if decoding_count > 0 {
-            self.start_decode_calls();
+            self.start_decode_calls(states);
         }
         let progress_log_s = shared.budgets.progress_log_s;
         for generation in &mut self.generations {
@@ -1268,20 +1538,24 @@ impl WorkerModel {
         (
             status.shown_request_id,
             status.shown_prompt_tokens,
+            status.shown_reused_tokens,
             status.shown_generated_tokens,
-        ) = first.map_or((0, 0, 0), |generation| {
+        ) = first.map_or((0, 0, 0, 0), |generation| {
             (
                 generation.job.id,
                 generation.prompt_tokens,
+                generation.reused_tokens,
                 generation.generated,
             )
         });
     }
 
     /// Starts an admitted request. It checks the request's media and prompt. It
-    /// makes the request's state, and the prefill follows. It refuses a request
-    /// that does not fit.
-    fn start_request(&mut self, job: Job) {
+    /// carries out the cheapest plan that fits in the state cache, and the
+    /// prefill follows. For the same prompt again, the first token comes from
+    /// the prompt-end snapshot instead. It runs after the prefills before the
+    /// request have ended. It refuses a request that does not fit.
+    fn start_request(&mut self, shared: &Shared, job: Job, states: &mut States) {
         // A reply has at least one token, so a prompt has at most ctx - 1.
         let most_prompt_tokens = self.ctx - 1;
         let mut prompt = job.request.prompt.clone();
@@ -1322,14 +1596,126 @@ impl WorkerModel {
         };
         // A reply has at least one token.
         let max_new_tokens = (job.request.max_tokens.max(1) as usize).min(self.ctx - prompt_tokens);
-        // A request whose new state does not fit is refused.
-        let Some(state) = self.model.state_new() else {
-            return refuse(job, STATE_MEMORY_SHORT);
+        // Take the cheapest plan that fits. Each plan keeps the state it
+        // reuses. The last plan is a cold start, and it keeps nothing. With it,
+        // the cache can evict a state that does not fit beside the new one.
+        let mut need = 0;
+        let mut chosen = None;
+        for plan in self.list_resume_plans(&prompt, states) {
+            need = self.count_plan_bytes(&plan, prompt_tokens, states);
+            let keep: Vec<state_cache::StateId> = plan.find_source_state().into_iter().collect();
+            if let Some(eviction) =
+                states
+                    .cache
+                    .find_eviction(need, !matches!(plan, Plan::InPlace { .. }), &keep)
+            {
+                chosen = Some((plan, eviction));
+                break;
+            }
+        }
+        let Some((plan, eviction)) = chosen else {
+            let busy: u64 = states
+                .cache
+                .entries
+                .values()
+                .filter(|entry| entry.busy)
+                .map(|entry| entry.bytes)
+                .sum();
+            // The state's bytes count the prompt and its first token.
+            let message = format!(
+                "the conversation's attention state needs {:.1} GiB ({:.1} GiB with its snapshots); the state cache allows {:.1} GiB, and the requests running take {:.1} GiB of it",
+                self.model.state_bytes(None, prompt_tokens + 1) as f64 / GIB,
+                need as f64 / GIB,
+                states.cache.byte_limit as f64 / GIB,
+                busy as f64 / GIB
+            );
+            return refuse(job, &message);
         };
+        let origin = states.cache.find_origin(&plan, prompt_tokens);
+        let capture_position = plan.find_branch_snapshot_pos(prompt_tokens);
         let wait = job.queued_at.elapsed().as_secs_f64();
+        let evicted = states.cache.evict(&eviction);
+        states.free_evicted(evicted);
+        let reused_tokens = plan.count_reused_tokens();
+        // The plan's state: the one that it continues in place, or a new one. A
+        // request whose new state does not fit is refused.
+        let planned_state = match plan {
+            Plan::InPlace { state, .. } => state,
+            _ => match states.add_state(self.model_index, self.model.clone()) {
+                Some(state_id) => state_id,
+                None => return refuse(job, STATE_MEMORY_SHORT),
+            },
+        };
+        let state_id = match plan {
+            Plan::Cold => planned_state,
+            Plan::InPlace { state, .. } => {
+                states.cache.record_reuse(state);
+                state
+            }
+            Plan::Snapshot {
+                source, from: at, ..
+            }
+            | Plan::Replay { source, from: at } => {
+                let state_id = planned_state;
+                let engine_state = states.handles[&state_id].engine_state;
+                self.model
+                    .state_copy(engine_state, states.handles[&source].engine_state, at);
+                states.cache.record_reuse(source);
+                states.handles.get_mut(&source).expect("state").last_used_at = Instant::now();
+                if let Plan::Snapshot { snapshot_pos, .. } = plan {
+                    self.model
+                        .snapshot_restore(engine_state, states.get_snapshot(source, snapshot_pos));
+                }
+                state_id
+            }
+            Plan::Load { .. } => {
+                unreachable!("a saved state's plan needs the store of saved states")
+            }
+        };
+        // The state's bytes count the prompt and its first token.
+        let bytes = self.model.state_bytes(
+            Some(states.handles[&state_id].engine_state),
+            prompt_tokens + 1,
+        );
+        let dropped = states.cache.start_request(
+            state_id,
+            &prompt,
+            reused_tokens,
+            bytes,
+            state_cache::count_stale_rows_at(origin, reused_tokens),
+        );
+        let mut reserved = Vec::new();
+        if reused_tokens < prompt_tokens {
+            reserved.push(Snapshot {
+                pos: prompt_tokens,
+                kind: SnapshotKind::PromptEnd,
+                bytes: self.model.snapshot_bytes(true),
+                stale_rows: state_cache::count_stale_rows_at(origin, prompt_tokens),
+            });
+        }
+        if let Some(pos) = capture_position {
+            reserved.push(Snapshot {
+                pos,
+                kind: SnapshotKind::Branch,
+                bytes: self.model.snapshot_bytes(false),
+                stale_rows: state_cache::count_stale_rows_at(origin, pos),
+            });
+        }
+        states.cache.set_reserved_snapshots(state_id, reserved);
+        for snapshot in dropped {
+            states.free_snapshot(state_id, snapshot.pos);
+        }
+        states
+            .handles
+            .get_mut(&state_id)
+            .expect("state")
+            .last_used_at = Instant::now();
+        states.publish_states(shared);
+        let number = states.cache.entries[&state_id].number;
+        let plan_kind = plan.describe_for_log(prompt_tokens);
         let thinking = self.think_start_token == Some(prompt[prompt_tokens - 1]);
         engine::log(&format!(
-            "req {}: {} {prompt_tokens} prompt tokens; thinking {}; at most {max_new_tokens} new tokens, {}; waited {wait:.1} s",
+            "req {}: {} {prompt_tokens} prompt tokens, session {number} ({plan_kind}), {reused_tokens} reused; thinking {}; at most {max_new_tokens} new tokens, {}; waited {wait:.1} s",
             job.id,
             self.settings.id,
             if thinking { "on" } else { "off" },
@@ -1339,14 +1725,23 @@ impl WorkerModel {
                 "greedy"
             }
         ));
+        let replays = plan.starts_with_replay();
         if let Some(opened) = media.as_mut() {
-            // Encode the media that the prefill reaches. The prefill starts at
-            // the prompt's start. So it reaches all of them.
+            // Encode the media that the prefill reaches. A replay computes
+            // again from its first position. That position lies before the
+            // branch point.
+            let first = if replays {
+                self.model.replay_start(reused_tokens)
+            } else {
+                reused_tokens
+            };
             let encode_started_at = Instant::now();
-            let encoded = match opened.encode(0) {
+            let encoded = match opened.encode(first) {
                 Ok(count) => count,
                 Err(error) => {
-                    self.model.state_free(state);
+                    let snapshots = states.cache.remove_state(state_id);
+                    states.free_snapshots_and_states(Vec::new(), vec![(state_id, snapshots)]);
+                    states.publish_states(shared);
                     job.send_last_event(Event::Failed(error));
                     return;
                 }
@@ -1361,13 +1756,18 @@ impl WorkerModel {
             }
         }
         let now = Instant::now();
-        self.generations.push(Generation {
+        let mut generation = Generation {
             job,
             sampler,
-            state,
+            state_id,
             prompt_tokens,
+            reused_tokens,
             prefill: Some(Prefill {
                 prompt,
+                next_position: reused_tokens,
+                capture_position,
+                origin,
+                replays,
                 media,
                 started_at: now,
                 expert_counts_at_start: self.model.read_stats().cache,
@@ -1387,7 +1787,38 @@ impl WorkerModel {
             in_call: false,
             turn: 0,
             measured_token_at: None,
-        });
+        };
+        if reused_tokens == prompt_tokens {
+            // The same prompt again: its prompt-end snapshot holds its logits.
+            let source = plan.find_source_state().unwrap_or(state_id);
+            let snapshot = states.get_snapshot(source, prompt_tokens);
+            if source == state_id {
+                self.model
+                    .snapshot_restore(states.handles[&state_id].engine_state, snapshot);
+            }
+            let prompt = generation
+                .prefill
+                .as_ref()
+                .map(|prefill| prefill.prompt.clone())
+                .unwrap_or_default();
+            self.model.set_history(
+                states.handles[&state_id].engine_state,
+                &prompt,
+                prompt_tokens,
+            );
+            let logits = self
+                .model
+                .snapshot_logits(snapshot)
+                .expect("a prompt-end snapshot holds its logits");
+            self.start_decoding(
+                shared,
+                &mut generation,
+                logits,
+                PrefillInfo::default(),
+                states,
+            );
+        }
+        self.generations.push(generation);
     }
 
     /// Finds the index in `generations` of the request with `request_id`.
@@ -1401,47 +1832,70 @@ impl WorkerModel {
 
     /// Starts a prefill call for each request still prefilling with no call
     /// running.
-    fn start_prefill_calls(&mut self) {
+    fn start_prefill_calls(&mut self, states: &mut States) {
         for i in 0..self.generations.len() {
-            self.start_prefill_call(i);
+            self.start_prefill_call(i, states);
         }
     }
 
     /// Starts a prefill call for request `i` if it is still prefilling with no
-    /// call running. The call prefills the whole prompt.
-    fn start_prefill_call(&mut self, i: usize) {
+    /// call running. The call prefills the rest of the prompt. The engine takes
+    /// the prefill's branch snapshot during the call.
+    fn start_prefill_call(&mut self, i: usize, states: &mut States) {
         let generation = &self.generations[i];
-        let Some(prefill) = generation.prefill.as_ref() else {
-            return;
-        };
-        if generation.in_call {
+        if generation.prefill.is_none() || generation.in_call {
             return;
         }
-        if generation.job.flags.cancelled.load(Ordering::SeqCst) {
+        let state_id = self.generations[i].state_id;
+        let engine_state = states.handles[&state_id].engine_state;
+        let prefill = self.generations[i].prefill.as_ref().expect("a prefill");
+        let (next_position, capture_position) = (prefill.next_position, prefill.capture_position);
+        if self.generations[i]
+            .job
+            .flags
+            .cancelled
+            .load(Ordering::SeqCst)
+        {
             // The next step ends the cancelled request.
             return;
         }
         let stream = Stream::new(&self.model);
         stream.prefill(
-            generation.state,
+            engine_state,
             &prefill.prompt,
-            0,
-            false,
-            None,
+            next_position,
+            prefill.replays,
+            capture_position,
             prefill.media.as_ref(),
         );
-        let request_id = generation.job.id;
+        let request_id = self.generations[i].job.id;
         self.generations[i].in_call = true;
         self.running_calls.push(RunningCall {
             stream,
-            call: Call::Prefill { request_id },
+            call: Call::Prefill {
+                request_id,
+                call_capture: capture_position,
+            },
         });
     }
 
-    /// Finishes a prefill call that ended. The request starts decoding.
-    fn finish_prefill_call(&mut self, stream: Stream, request_id: u64, shared: &Shared) {
+    /// Finishes a prefill call that ended. It keeps the request's new
+    /// snapshots. The request starts decoding.
+    fn finish_prefill_call(
+        &mut self,
+        stream: Stream,
+        request_id: u64,
+        call_capture: Option<usize>,
+        shared: &Shared,
+        states: &mut States,
+    ) {
         let i = self.find_generation_index(request_id);
         self.generations[i].in_call = false;
+        let (state_id, prompt_tokens) = (
+            self.generations[i].state_id,
+            self.generations[i].prompt_tokens,
+        );
+        let engine_state = states.handles[&state_id].engine_state;
         let Some(logits) = stream.logits() else {
             if engine::is_stopping() {
                 // The stop cut the prefill short. The stop also ends the
@@ -1449,15 +1903,53 @@ impl WorkerModel {
                 return;
             }
             let generation = self.generations.remove(i);
-            self.model.state_free(generation.state);
+            let snapshots = states.cache.remove_state(generation.state_id);
+            states.free_snapshots_and_states(Vec::new(), vec![(generation.state_id, snapshots)]);
+            states.publish_states(shared);
             generation.job.send_last_event(Event::Failed(
                 "the prefill's working memory does not fit: memory is short".into(),
             ));
             return;
         };
-        let info = stream.prefill_info();
+        let (captured, info) = (stream.captured_snapshot(), stream.prefill_info());
+        let prefill = self.generations[i].prefill.as_ref().expect("a prefill");
+        let origin = prefill.origin;
+        states.cache.add_prefilled_tokens(
+            state_id,
+            &prefill.prompt,
+            state_cache::count_stale_rows_at(origin, prompt_tokens),
+        );
+        if let Some(at) = call_capture
+            && let Some(captured) = captured
+        {
+            states.insert_snapshot(state_id, at, captured);
+            let stale = state_cache::count_stale_rows_at(origin, at);
+            states.cache.add_snapshot(
+                state_id,
+                Snapshot {
+                    pos: at,
+                    kind: SnapshotKind::Branch,
+                    bytes: self.model.snapshot_bytes(false),
+                    stale_rows: stale,
+                },
+            );
+        }
+        let snapshot = self
+            .model
+            .snapshot_take(engine_state, prompt_tokens, Some(logits));
+        states.insert_snapshot(state_id, prompt_tokens, snapshot);
+        let stale = state_cache::count_stale_rows_at(origin, prompt_tokens);
+        states.cache.add_snapshot(
+            state_id,
+            Snapshot {
+                pos: prompt_tokens,
+                kind: SnapshotKind::PromptEnd,
+                bytes: self.model.snapshot_bytes(true),
+                stale_rows: stale,
+            },
+        );
         let mut generation = self.generations.remove(i);
-        self.start_decoding(shared, &mut generation, logits, info);
+        self.start_decoding(shared, &mut generation, logits, info, states);
         self.generations.insert(i, generation);
         // The stream owns the logits until here. Dropping it frees the prompt's
         // large buffers.
@@ -1465,14 +1957,28 @@ impl WorkerModel {
     }
 
     /// Finishes a call that ended. Its requests then go on.
-    fn finish_call(&mut self, running_call: RunningCall, shared: &Shared) {
+    fn finish_call(&mut self, running_call: RunningCall, shared: &Shared, states: &mut States) {
         let RunningCall { stream, call } = running_call;
         match call {
-            Call::Prefill { request_id } => self.finish_prefill_call(stream, request_id, shared),
+            Call::Prefill {
+                request_id,
+                call_capture,
+            } => self.finish_prefill_call(stream, request_id, call_capture, shared, states),
             Call::DecodeRows {
                 request_ids,
                 tokens,
-            } => self.finish_decode_rows_call(stream, request_ids, tokens),
+            } => self.finish_decode_rows_call(stream, request_ids, tokens, states),
+        }
+    }
+
+    /// Ends the request's prefill before the prompt's end. It cuts the state's
+    /// tokens to the positions that the prefill ran.
+    fn end_prefill_early(&mut self, generation: &mut Generation, states: &mut States) {
+        if let Some(prefill) = generation.prefill.take()
+            && let Some(entry) = states.cache.entries.get_mut(&generation.state_id)
+        {
+            entry.tokens.truncate(prefill.next_position);
+            generation.pos = prefill.next_position;
         }
     }
 
@@ -1485,34 +1991,47 @@ impl WorkerModel {
         generation: &mut Generation,
         logits: Logits,
         info: PrefillInfo,
+        states: &mut States,
     ) {
+        states.cache.clear_reserved_snapshots(generation.state_id);
         let prefill = generation.prefill.take().expect("a prefill");
         let prompt_tokens = generation.prompt_tokens;
+        let reused_tokens = generation.reused_tokens;
         let now = Instant::now();
         let prefill_seconds = (now - prefill.started_at).as_secs_f64();
         let stats = self.model.read_stats();
         let read = (stats.cache.bytes - prefill.expert_counts_at_start.bytes) as f64 / GB;
-        // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
-        // unknown.
-        engine::log(&format!(
-            "req {}: prefill of {} tokens in {prefill_seconds:.2} s ({:.0} tokens/s), {read:.2} GB of experts read",
-            generation.job.id,
-            prompt_tokens,
-            prompt_tokens as f64 / prefill_seconds.max(1e-9)
-        ));
-        engine::log(&format!(
-            "req {}: prefill plan: {} chunks, {} encoder tokens, {} decoder tokens, ced_applied={}, prune_applied={}, prefix={} (full)",
-            generation.job.id,
-            info.chunks,
-            info.tokens,
-            info.decoder_tokens,
-            info.ced_applied,
-            info.prune_applied,
-            info.prefix_tokens
-        ));
+        if reused_tokens < prompt_tokens {
+            let replayed = if prefill.replays {
+                format!(
+                    "; an exact replay at {reused_tokens}: up to {} earlier rows computed again",
+                    (info.tokens as usize).saturating_sub(prompt_tokens - reused_tokens)
+                )
+            } else {
+                String::new()
+            };
+            // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly
+            // is unknown.
+            engine::log(&format!(
+                "req {}: prefill of {} tokens in {prefill_seconds:.2} s ({:.0} tokens/s), {read:.2} GB of experts read{replayed}",
+                generation.job.id,
+                prompt_tokens - reused_tokens,
+                (prompt_tokens - reused_tokens) as f64 / prefill_seconds.max(1e-9)
+            ));
+            engine::log(&format!(
+                "req {}: prefill plan: {} chunks, {} encoder tokens, {} decoder tokens, ced_applied={}, prune_applied={}, prefix={} (full)",
+                generation.job.id,
+                info.chunks,
+                info.tokens,
+                info.decoder_tokens,
+                info.ced_applied,
+                info.prune_applied,
+                info.prefix_tokens
+            ));
+        }
         let _ = generation.job.events.send(Event::DecodingStarted {
             prompt_tokens,
-            reused_tokens: 0,
+            reused_tokens,
         });
         {
             let mut status = lock(&shared.models[self.model_index].status);
@@ -1524,16 +2043,24 @@ impl WorkerModel {
         generation.progress_logged_at = now;
         generation.turn = self.turns.take(1).start;
         generation.expert_counts_at_decode_start = stats.cache;
+        states.publish_states(shared);
     }
 
     /// Keeps `token`. The token ran at the generation's position. It adds the
-    /// token to the tokens to send. A stop token ends the reply and is not
-    /// sent.
-    fn keep_token(model: &Model, generation: &mut Generation, token: i32, think_end: Option<i32>) {
+    /// token to the state's tokens and to the tokens to send. A stop token ends
+    /// the reply and is not sent.
+    fn keep_token(
+        model: &Model,
+        cache: &mut Cache,
+        generation: &mut Generation,
+        token: i32,
+        think_end: Option<i32>,
+    ) {
         if generation.thinking {
             generation.reasoning_tokens += 1;
             generation.thinking = Some(token) != think_end;
         }
+        cache.add_decoded_token(generation.state_id, token);
         generation.pos += 1;
         generation.generated += 1;
         // A kept stop token ends the reply.
@@ -1574,9 +2101,15 @@ impl WorkerModel {
     }
 
     /// Ends the generation. It sends its last tokens and its Done event. It
-    /// frees the request's state. It logs the request's counts and adds them to
-    /// the model's totals.
-    fn end_generation(&mut self, shared: &Shared, mut generation: Generation, at_stop: bool) {
+    /// keeps a snapshot at the generation's end when the state cache has room.
+    /// It logs the request's counts and adds them to the model's totals.
+    fn end_generation(
+        &mut self,
+        shared: &Shared,
+        mut generation: Generation,
+        at_stop: bool,
+        states: &mut States,
+    ) {
         if !generation.unsent_tokens.is_empty() {
             let _ = generation
                 .job
@@ -1599,7 +2132,42 @@ impl WorkerModel {
             FinishReason::ServerStop => "stopped by the server's stop",
         };
         generation.job.send_last_event(Event::Done { reason });
-        self.model.state_free(generation.state);
+        self.end_prefill_early(&mut generation, states);
+        // Take a snapshot at the generation's end when the cache keeps it. A
+        // later fork there resumes from it.
+        let stale = states.cache.entries[&generation.state_id].stale_rows;
+        let end_snapshot = states
+            .cache
+            .find_snapshot(generation.state_id, generation.pos)
+            .is_none()
+            .then(|| Snapshot {
+                pos: generation.pos,
+                kind: SnapshotKind::GenerationEnd,
+                bytes: self.model.snapshot_bytes(false),
+                stale_rows: stale,
+            });
+        let (take, evicted) = states.cache.finish_request(
+            generation.state_id,
+            self.model.state_bytes(
+                Some(states.handles[&generation.state_id].engine_state),
+                generation.pos,
+            ),
+            end_snapshot,
+        );
+        if take {
+            let snapshot = self.model.snapshot_take(
+                states.handles[&generation.state_id].engine_state,
+                generation.pos,
+                None,
+            );
+            states.insert_snapshot(generation.state_id, generation.pos, snapshot);
+        }
+        states.free_evicted(evicted);
+        states
+            .handles
+            .get_mut(&generation.state_id)
+            .expect("state")
+            .last_used_at = Instant::now();
         let stats = self.model.read_stats();
         {
             let mut status = lock(&shared.models[self.model_index].status);
@@ -1627,11 +2195,13 @@ impl WorkerModel {
         // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
         // unknown.
         engine::log(&format!(
-            "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}",
+            "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}; states {} sessions, {:.2} GiB",
             generation.job.id,
             generation.generated,
             generation.reasoning_tokens,
             generation.generated as f64 / decode_seconds.max(1e-9),
+            states.cache.entries.len(),
+            states.cache.count_bytes() as f64 / GIB,
         ));
         let sampling = generation.job.request.sampling;
         engine::log(&format!(
@@ -1642,6 +2212,8 @@ impl WorkerModel {
         status.total_requests += 1;
         status.total_prompt_tokens += generation.prompt_tokens as u64;
         status.total_generated_tokens += generation.generated as u64;
+        drop(status);
+        states.publish_states(shared);
     }
 
     /// Ends the requests of a decoding pass that could not load its experts.
@@ -1649,7 +2221,7 @@ impl WorkerModel {
     /// memory was freed. During the stop, the requests end as every request
     /// does at the stop. Otherwise the requests end with an error. The pass may
     /// have changed their states in part. So the states are freed.
-    fn end_failed_pass(&mut self, generation_indices: &[usize]) {
+    fn end_failed_pass(&mut self, generation_indices: &[usize], states: &mut States) {
         if engine::is_stopping() {
             return;
         }
@@ -1657,7 +2229,8 @@ impl WorkerModel {
         indices.sort_unstable_by(|left, right| right.cmp(left));
         for i in indices {
             let generation = self.generations.remove(i);
-            self.model.state_free(generation.state);
+            let snapshots = states.cache.remove_state(generation.state_id);
+            states.free_snapshots_and_states(Vec::new(), vec![(generation.state_id, snapshots)]);
             engine::log(&format!(
                 "req {}: a pass could not load its experts: memory is short",
                 generation.job.id
@@ -1678,7 +2251,7 @@ impl WorkerModel {
     /// Starts decoding calls for the decoding requests with no call running.
     /// Several requests run together, at most the model's rows per call. Each
     /// row then gives what it would give alone.
-    fn start_decode_calls(&mut self) {
+    fn start_decode_calls(&mut self, states: &mut States) {
         // The call chooser sets how many calls run at once and the rows of
         // each. A call starts as soon as its requests are free and the chooser
         // allows one more call. Groups of requests run independently. The GPU
@@ -1739,12 +2312,14 @@ impl WorkerModel {
         decoding_indices.sort_by_key(|&i| self.generations[i].turn);
         if decoding_count == 1 {
             let index = decoding_indices[0];
+            let state_id = self.generations[index].state_id;
+            let engine_state = states.handles[&state_id].engine_state;
             let stream = self.take_decode_stream();
             let generation = &mut self.generations[index];
             generation.in_call = true;
             let request_id = generation.job.id;
             stream.decode_rows(
-                &[generation.state],
+                &[engine_state],
                 &[generation.next_token],
                 &[generation.pos as i32],
             );
@@ -1760,8 +2335,10 @@ impl WorkerModel {
             .chunks(rows_per_call)
             .take(allowed - running)
         {
-            let engine_states: Vec<StateHandle> =
-                group.iter().map(|&i| self.generations[i].state).collect();
+            let engine_states: Vec<StateHandle> = group
+                .iter()
+                .map(|&i| states.handles[&self.generations[i].state_id].engine_state)
+                .collect();
             let tokens: Vec<i32> = group
                 .iter()
                 .map(|&i| self.generations[i].next_token)
@@ -1788,7 +2365,13 @@ impl WorkerModel {
 
     /// Finishes a decoding call of one token per request. Each request keeps
     /// its token and samples the next one.
-    fn finish_decode_rows_call(&mut self, stream: Stream, request_ids: Vec<u64>, tokens: Vec<i32>) {
+    fn finish_decode_rows_call(
+        &mut self,
+        stream: Stream,
+        request_ids: Vec<u64>,
+        tokens: Vec<i32>,
+        states: &mut States,
+    ) {
         let indices: Vec<usize> = request_ids
             .iter()
             .map(|&request_id| self.find_generation_index(request_id))
@@ -1801,7 +2384,7 @@ impl WorkerModel {
         }
         let Some(logits) = stream.logits() else {
             self.idle_decode_streams.push(stream);
-            self.end_failed_pass(&indices);
+            self.end_failed_pass(&indices, states);
             return;
         };
         let vocab = self.model.vocab_size();
@@ -1809,7 +2392,13 @@ impl WorkerModel {
         let think_end = self.think_end_token;
         for (row, &i) in indices.iter().enumerate() {
             let generation = &mut self.generations[i];
-            Self::keep_token(&model, generation, tokens[row], think_end);
+            Self::keep_token(
+                &model,
+                &mut states.cache,
+                generation,
+                tokens[row],
+                think_end,
+            );
             // Safety: the call returns one row of logits for each state. Each
             // row holds vocab_size floats.
             generation.next_token =
