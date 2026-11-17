@@ -767,7 +767,8 @@ impl Searxng {
         let granian = state.dir.join("venv/bin/granian");
         if !granian.exists() {
             return Err(format!(
-                "SearXNG is not installed in {}",
+                "SearXNG is not set up in {}: eremite's scripts/setup-searxng.sh \
+                 sets it up",
                 state.dir.display()
             ));
         }

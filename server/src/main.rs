@@ -1137,12 +1137,9 @@ fn main() {
                 .searxng_dir
                 .as_deref()
                 .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .filter(|home| !home.is_empty())
-                        .map(|home| PathBuf::from(home).join(".local/share/searxng"))
-                });
-            let dir = dir.unwrap_or_else(|| PathBuf::from(".local/share/searxng"));
+                .or_else(config::default_searxng_dir);
+            // Without HOME, the folder is relative to the current one.
+            let dir = dir.unwrap_or_else(|| PathBuf::from(".local/share/eremite/searxng"));
             let socket = arguments
                 .server
                 .searxng_socket

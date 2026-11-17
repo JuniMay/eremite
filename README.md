@@ -34,3 +34,34 @@ against the reference tokenizer's ids.
 Flash, whose checkpoint is the directory CHECKPOINT. `--experts GGUF` reads
 the routed experts from a GGUF file set instead, and `--memory GB` limits the
 model memory, state memory included. `build/eremite` alone lists the options.
+
+## Serve
+
+`make server` builds `build/eremite-server`. It serves the OpenAI Chat
+Completions and Responses APIs at `http://HOST:PORT/v1`, and Codex's model
+catalog at `/v1/codex/models`. `--tui` shows its status in the terminal.
+
+Its settings are in a JSON file: `--config FILE`, or else
+`~/.config/eremite/server.json`. For example:
+
+```json
+{
+  "port": 8000,
+  "api_key_file": "/path/to/api-key",
+  "models": [
+    {
+      "model": "/path/to/DeepSeek-V4.1-Flash-1017",
+      "experts": "/path/to/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf"
+    }
+  ]
+}
+```
+
+The API key file holds the key that clients send, 16 to 256 characters. Each
+option that `build/eremite-server --help` lists is a key of the same name, with
+`_` for `-`. A model's own options go in its entry under `models`.
+
+Codex's web tool searches through eremite's own SearXNG.
+`scripts/setup-searxng.sh` sets it up in `~/.local/share/eremite/searxng`, the
+server's default `searxng_dir`. It needs git and Python 3.10 or later, and
+downloads about 100 MB.

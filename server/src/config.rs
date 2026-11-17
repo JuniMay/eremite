@@ -207,8 +207,8 @@ pub struct Server {
     /// The folder of the states saved on the SSD (disk.rs); None:
     /// [`default_state_dir`].
     pub state_dir: Option<String>,
-    /// SearXNG's installation for Codex's web tool (codex/search.rs); None:
-    /// $HOME/.local/share/searxng.
+    /// The SearXNG for Codex's web tool (codex/search.rs), as
+    /// scripts/setup-searxng.sh sets it up; None: [`default_searxng_dir`].
     pub searxng_dir: Option<String>,
     /// The Unix socket that the server starts SearXNG on; None: eremite.sock in
     /// the SearXNG folder.
@@ -278,6 +278,15 @@ pub fn default_state_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".cache/eremite/states"))
+}
+
+/// Returns $HOME/.local/share/eremite/searxng: the folder of eremite's own
+/// SearXNG unless searxng_dir sets another one. scripts/setup-searxng.sh sets
+/// it up there by default. Returns None when HOME is unset.
+pub fn default_searxng_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/share/eremite/searxng"))
 }
 
 impl Server {
@@ -671,6 +680,19 @@ pub fn parse(root: &Value) -> Result<Config, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_default_folders_are_eremite_s_own_under_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        assert_eq!(
+            default_state_dir(),
+            Some(home.join(".cache/eremite/states"))
+        );
+        assert_eq!(
+            default_searxng_dir(),
+            Some(home.join(".local/share/eremite/searxng"))
+        );
+    }
 
     #[test]
     fn a_budget_takes_values_in_its_range_only() {
