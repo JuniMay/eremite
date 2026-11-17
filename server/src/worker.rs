@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -1099,6 +1099,8 @@ struct Worker {
     models: Vec<WorkerModel>,
     /// The states of all models.
     states: States,
+    /// When the worker last kept the memory reserve free.
+    reserve_kept_free_at: Instant,
 }
 
 impl Worker {
@@ -1140,9 +1142,38 @@ impl Worker {
             shared,
             models,
             states,
+            reserve_kept_free_at: Instant::now(),
         };
         worker.states.publish_states(&worker.shared);
         worker
+    }
+
+    /// Keeps the memory reserve free, between engine calls. When memory is
+    /// short, the engine frees idle memory. After that, the state cache evicts
+    /// idle states. Last, it publishes the counters.
+    fn keep_reserve_free(&mut self) {
+        engine::refresh_stats();
+        if let Some(worker_model) = self.models.first() {
+            let available = worker_model.model.read_stats().available;
+            let reserve = (self.shared.budgets.reserve_gb * GIB) as u64;
+            let shortfall = reserve.saturating_sub(available);
+            let shortfall = shortfall.saturating_sub(engine::reclaim(shortfall));
+            if shortfall > 0 {
+                let evicted = self.states.cache.evict_bytes(shortfall);
+                self.states.free_evicted(evicted);
+                self.states.publish_states(&self.shared);
+            }
+        }
+        self.publish_counters();
+        self.reserve_kept_free_at = Instant::now();
+    }
+
+    /// Returns how long the worker may wait before it keeps the memory reserve
+    /// free again: the engine's idle work expects a call once per
+    /// available-memory reading interval.
+    fn wait_before_keeping_reserve(&self) -> Duration {
+        Duration::from_secs_f64(engine::idle_work_interval_seconds())
+            .saturating_sub(self.reserve_kept_free_at.elapsed())
     }
 
     /// Publishes each model's engine counters to its status.
@@ -1253,10 +1284,15 @@ impl Worker {
 
     /// Runs the worker's loop until the stop. Each turn gives every model one
     /// step. A step admits requests, starts a prefill call and starts decoding
-    /// calls. At the stop, every request ends with FinishReason::ServerStop.
+    /// calls. Once per available-memory reading interval, the loop keeps the
+    /// memory reserve free between calls. At the stop, every request ends with
+    /// FinishReason::ServerStop.
     fn run_until_stop(&mut self) {
         let shared = self.shared.clone();
         while !engine::is_stopping() {
+            if self.wait_before_keeping_reserve().is_zero() {
+                self.keep_reserve_free();
+            }
             self.publish_status_if_wanted();
             let mut queue = lock(&shared.queue);
             let idle = |queue: &Queue, models: &[WorkerModel]| {
@@ -1272,10 +1308,20 @@ impl Worker {
                     queue = lock(&shared.queue);
                     continue;
                 }
-                queue = shared
+                // A wake before the interval's end, such as a status read, does
+                // not delay the reserve's keeping.
+                let wait = self.wait_before_keeping_reserve();
+                if wait.is_zero() {
+                    drop(queue);
+                    self.keep_reserve_free();
+                    queue = lock(&shared.queue);
+                    continue;
+                }
+                let (guard, _) = shared
                     .worker_wakeup
-                    .wait(queue)
+                    .wait_timeout(queue, wait)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                queue = guard;
             }
             let mut admitted_by_model: Vec<Vec<Job>> = Vec::new();
             for worker_model in &self.models {
@@ -2374,13 +2420,15 @@ impl WorkerModel {
         // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
         // unknown.
         engine::log(&format!(
-            "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}; states {} sessions, {:.2} GiB",
+            "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}; states {} sessions, {:.2} GiB; available {:.1} GiB, footprint {:.1} GiB",
             generation.job.id,
             generation.generated,
             generation.reasoning_tokens,
             generation.generated as f64 / decode_seconds.max(1e-9),
             states.cache.entries.len(),
             states.cache.count_bytes() as f64 / GIB,
+            stats.available as f64 / GIB,
+            stats.footprint as f64 / GIB
         ));
         let sampling = generation.job.request.sampling;
         engine::log(&format!(
