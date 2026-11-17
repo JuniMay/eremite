@@ -10,6 +10,7 @@ pub mod log;
 pub mod memory;
 pub mod overview;
 pub mod samples;
+pub mod screen;
 pub mod status;
 #[cfg(test)]
 mod testing;
