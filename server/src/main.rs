@@ -85,6 +85,9 @@ const USAGE: &str =
   --think N       thinking effort 1-100 of requests that set none; 0 turns thinking off
   --ctx N         context capacity in tokens, at most 1048576 and the model's own (default: the
                   most)
+  --draft N       at most N DSpark proposals per pass, 0-5; each pass runs the count that has
+                  given the most tokens per second
+  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft supplies fallback
   DeepSeek only:
   --ced off|N     approximate prefill: replay N decoder tokens, 128-1048576 (default off), plus
                   the rewind margin (8)
@@ -257,6 +260,10 @@ fn one_model_takes_its_options_from_the_command_line() {
             "/m/d",
             "--prefill-prune",
             "--packed-state-rows",
+            "--lookup",
+            "15",
+            "--draft",
+            "2",
             "--ced",
             "off",
             "--serve",
@@ -267,7 +274,14 @@ fn one_model_takes_its_options_from_the_command_line() {
     let model = &parsed.models[0];
     assert!(model.engine.deepseek().unwrap().prefill_prune);
     assert!(model.engine.deepseek().unwrap().packed_state_rows);
-    assert_eq!(model.engine.deepseek().unwrap().ced, 0);
+    assert_eq!(
+        (
+            model.engine.lookup,
+            model.engine.draft,
+            model.engine.deepseek().unwrap().ced
+        ),
+        (15, 2, 0)
+    );
     assert_eq!(
         (
             model.temperature,
@@ -913,13 +927,18 @@ fn main() {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
         };
         engine::log(&format!(
-            "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{})",
+            "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",
             if settings
                 .options
                 .deepseek()
                 .is_some_and(|deepseek| deepseek.experts.is_some())
             {
                 ", GGUF experts"
+            } else {
+                ""
+            },
+            if settings.options.draft > 0 {
+                ", drafts"
             } else {
                 ""
             }

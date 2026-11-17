@@ -13,7 +13,8 @@
 //! Otherwise the call takes at most the model's prefill rows. The step then
 //! starts decoding calls for the decoding requests with no call running. A
 //! request starts decoding as soon as its prefill ends. Several decoding
-//! requests run together, at most the model's rows per call.
+//! requests run together, at most the model's rows per call. A request that
+//! decodes alone may also run its drafts or its lookup proposals.
 //!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
@@ -36,8 +37,8 @@ use crate::calls::CallChooser;
 use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
-    self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
-    StateHandle, Stream,
+    self, CacheCounts, DraftChoice, ExpandError, Logits, Lookup, Media, Model, PrefillInfo,
+    Sampler, SnapshotHandle, StateHandle, Stream,
 };
 use crate::state_cache::{self, Cache, Entry, Evicted, Plan, PlanLimits, Snapshot, SnapshotKind};
 
@@ -249,6 +250,8 @@ struct ModelStatus {
     stats: engine::Stats,
     /// Whether the model's weights are in memory.
     loaded: bool,
+    /// The drafts per pass that the model makes itself.
+    drafts_per_pass: usize,
     /// What the model does now: idle, loading, prefill or decode.
     phase: &'static str,
     /// When the model started its phase.
@@ -500,6 +503,7 @@ pub fn start(
                     tokenizer: model.tokenizer(),
                     status: Mutex::new(ModelStatus {
                         stats: model.read_stats(),
+                        drafts_per_pass: model.drafts_per_pass(),
                         ..ModelStatus::default()
                     }),
                 });
@@ -781,9 +785,11 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "generated_tokens": status.total_generated_tokens,
         },
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
+        "lookup_depth": options.lookup,
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
         "rows_per_call": shared_model.settings.rows_per_call,
         "split_decoding_calls": status.split_calls,
+        "drafts": status.drafts_per_pass,
         "model_decode": {
             "computed_rows": stats.decode_rows,
             "seconds": stats.decode_seconds,
@@ -918,6 +924,27 @@ struct Generation {
     next_token: i32,
     /// The kept tokens not sent to the client yet.
     unsent_tokens: Vec<u32>,
+    /// The number of verify passes that ran drafts or proposals.
+    draft_passes: usize,
+    /// The number of drafts and proposals that the verify passes accepted.
+    drafts_accepted: usize,
+    /// The lookup that proposes tokens from the context, when the model uses
+    /// one.
+    lookup: Option<Lookup>,
+    /// The number of tokens that the lookup holds.
+    lookup_tokens: usize,
+    /// The number of passes that ran the lookup's proposals.
+    lookup_passes: usize,
+    /// The number of proposals that the lookup offered.
+    lookup_offered: usize,
+    /// The number of proposals that the passes accepted.
+    lookup_accepted: usize,
+    /// Chooses how many drafts each pass runs, when the model drafts.
+    draft_choice: Option<DraftChoice>,
+    /// The start time and the draft count of the running pass. It is set only
+    /// while no other call of the model runs beside the pass. The draft choice
+    /// learns from such passes only.
+    timed_pass: Option<(Instant, usize)>,
     /// The most tokens that the reply may generate.
     max_new_tokens: usize,
     /// When the request started decoding.
@@ -957,6 +984,14 @@ enum Call {
     DecodeRows {
         request_ids: Vec<u64>,
         tokens: Vec<i32>,
+    },
+    /// One verify pass of the request: its token and its drafts in `rows`.
+    /// `proposed_count` counts the lookup's proposals among them. With 0, the
+    /// model made the drafts.
+    Verify {
+        request_id: u64,
+        rows: Vec<i32>,
+        proposed_count: usize,
     },
 }
 
@@ -1548,6 +1583,7 @@ impl Worker {
             let mut status = lock(&self.shared.models[worker_model.model_index].status);
             status.stats = worker_model.model.read_stats();
             status.loaded = worker_model.model.is_loaded();
+            status.drafts_per_pass = worker_model.model.drafts_per_pass();
         }
         let memory_in_use = engine::read_memory();
         lock(&self.shared.queue).control.retained = control::MemoryBytes {
@@ -2116,6 +2152,14 @@ impl WorkerModel {
         self.update_status(shared, phase);
     }
 
+    /// Stops timing the running passes. A call that starts beside them changes
+    /// their times. The draft choice then learns nothing from them.
+    fn stop_timing_passes(&mut self) {
+        for generation in &mut self.generations {
+            generation.timed_pass = None;
+        }
+    }
+
     /// Makes room in the state cache for state `state_id` to hold `positions`
     /// positions, before a pass grows it. The cache counts the state's new size
     /// now. The worker frees what the cache evicts for it. With only decoding
@@ -2535,6 +2579,15 @@ impl WorkerModel {
             cancelled: false,
             next_token: 0,
             unsent_tokens: Vec::new(),
+            draft_passes: 0,
+            drafts_accepted: 0,
+            lookup: None,
+            lookup_tokens: prompt_tokens,
+            lookup_passes: 0,
+            lookup_offered: 0,
+            lookup_accepted: 0,
+            draft_choice: None,
+            timed_pass: None,
             max_new_tokens,
             decode_started_at: now,
             progress_logged_at: now,
@@ -2680,6 +2733,7 @@ impl WorkerModel {
         );
         let request_id = self.generations[i].job.id;
         self.generations[i].in_call = true;
+        self.stop_timing_passes();
         self.running_calls.push(RunningCall {
             stream,
             call: Call::Prefill {
@@ -2841,6 +2895,11 @@ impl WorkerModel {
                 request_ids,
                 tokens,
             } => self.finish_decode_rows_call(stream, request_ids, tokens, states),
+            Call::Verify {
+                request_id,
+                rows,
+                proposed_count,
+            } => self.finish_verify_call(stream, request_id, rows, proposed_count, states),
         }
     }
 
@@ -2857,7 +2916,7 @@ impl WorkerModel {
 
     /// Starts decoding after the prefill ended with `logits`. It logs the
     /// prefill and sends DecodingStarted. It samples the first token from
-    /// `logits`.
+    /// `logits`. It also sets up the lookup and the draft choice.
     fn start_decoding(
         &mut self,
         shared: &Shared,
@@ -2922,6 +2981,17 @@ impl WorkerModel {
         }
         drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
+        if self.settings.options.lookup > 0 {
+            let mut lookup =
+                Lookup::new(self.ctx).unwrap_or_else(|| panic!("cannot initialize context lookup"));
+            if !lookup.append(&prefill.prompt) {
+                panic!("cannot initialize context lookup");
+            }
+            generation.lookup = Some(lookup);
+        }
+        if self.model.drafts_per_pass() > 0 {
+            generation.draft_choice = Some(DraftChoice::new());
+        }
         generation.decode_started_at = now;
         generation.progress_logged_at = now;
         generation.turn = self.turns.take(1).start;
@@ -2939,6 +3009,14 @@ impl WorkerModel {
         token: i32,
         think_end: Option<i32>,
     ) {
+        if let Some(lookup) = generation.lookup.as_mut()
+            && generation.lookup_tokens == generation.pos
+        {
+            if !lookup.append(&[token]) {
+                panic!("context lookup exceeds the configured context");
+            }
+            generation.lookup_tokens += 1;
+        }
         if generation.thinking {
             generation.reasoning_tokens += 1;
             generation.thinking = Some(token) != think_end;
@@ -3064,6 +3142,7 @@ impl WorkerModel {
             let mut status = lock(&shared.models[self.model_index].status);
             status.stats = stats;
             status.loaded = self.model.is_loaded();
+            status.drafts_per_pass = self.model.drafts_per_pass();
         }
         let (expert_counts, decode_seconds) = (
             stats.cache,
@@ -3098,9 +3177,23 @@ impl WorkerModel {
         ));
         let sampling = generation.job.request.sampling;
         engine::log(&format!(
-            "req {}: sampling temperature {}, top_p {}, top_k {}",
-            generation.job.id, sampling.temperature, sampling.top_p, sampling.top_k,
+            "req {}: sampling temperature {}, top_p {}, top_k {}; {} draft passes, {} drafts accepted",
+            generation.job.id,
+            sampling.temperature,
+            sampling.top_p,
+            sampling.top_k,
+            generation.draft_passes,
+            generation.drafts_accepted
         ));
+        if generation.lookup.is_some() {
+            engine::log(&format!(
+                "req {}: context lookup {} passes, {} offered, {} accepted",
+                generation.job.id,
+                generation.lookup_passes,
+                generation.lookup_offered,
+                generation.lookup_accepted
+            ));
+        }
         let mut status = lock(&shared.models[self.model_index].status);
         status.total_requests += 1;
         status.total_prompt_tokens += generation.prompt_tokens as u64;
@@ -3146,7 +3239,8 @@ impl WorkerModel {
             .unwrap_or_else(|| Stream::new(&self.model))
     }
 
-    /// Starts decoding calls for the decoding requests with no call running.
+    /// Starts decoding calls for the decoding requests with no call running. A
+    /// request that decodes alone may run its drafts or proposals in its call.
     /// Several requests run together, at most the model's rows per call. Each
     /// row then gives what it would give alone.
     fn start_decode_calls(&mut self, shared: &Shared, states: &mut States) {
@@ -3201,6 +3295,7 @@ impl WorkerModel {
         if running >= allowed {
             return;
         }
+        let ctx = self.ctx;
         let mut decoding_indices: Vec<usize> = (0..self.generations.len())
             .filter(|&i| self.generations[i].is_decoding() && !self.generations[i].in_call)
             .collect();
@@ -3212,21 +3307,86 @@ impl WorkerModel {
             let index = decoding_indices[0];
             let state_id = self.generations[index].state_id;
             let engine_state = states.handles[&state_id].engine_state;
-            let pos = self.generations[index].pos;
-            // The row that the call writes: the token's.
-            self.make_room_to_grow(shared, state_id, pos + 1, states);
+            let lookup_depth = self.settings.options.lookup as usize;
+            // A verify pass's rows hold the token too.
+            let verify_room = self.model.max_verify().saturating_sub(1);
+            let (mut rows, proposed_count, draft_count, pos) = {
+                let generation = &mut self.generations[index];
+                let mut rows = vec![generation.next_token];
+                // The drafts or proposals that the pass may run. Suppose the
+                // pass keeps the token and all of them. The token sampled after
+                // them must still fit the token limit. It must also fit a
+                // position before the context's end. That token may go out
+                // without a pass. The 2 counts the token and the token sampled
+                // after them.
+                let room = (generation.max_new_tokens as isize - generation.generated as isize - 2)
+                    .min(ctx as isize - generation.pos as isize - 2)
+                    .min(verify_room as isize);
+                let mut proposed_count = 0;
+                if let Some(lookup) = generation.lookup.as_mut() {
+                    if generation.lookup_tokens != generation.pos
+                        || !lookup.append(&[generation.next_token])
+                    {
+                        panic!("context lookup history is not aligned with the generation");
+                    }
+                    generation.lookup_tokens += 1;
+                    if room > 0 {
+                        let mut proposals = vec![0i32; self.model.max_verify()];
+                        proposed_count =
+                            lookup.propose(lookup_depth.min(room as usize), &mut proposals);
+                        rows.extend_from_slice(&proposals[..proposed_count]);
+                    }
+                }
+                let draft_count = if proposed_count > 0 {
+                    generation.lookup_passes += 1;
+                    generation.lookup_offered += proposed_count;
+                    proposed_count
+                } else {
+                    let max_drafts = self.model.drafts_per_pass().min(room.max(0) as usize);
+                    match generation.draft_choice.as_mut() {
+                        Some(draft_choice) if max_drafts > 0 => draft_choice.next_count(max_drafts),
+                        _ => max_drafts,
+                    }
+                };
+                (rows, proposed_count, draft_count, generation.pos)
+            };
+            // The rows the pass writes: the token and its drafts or proposals.
+            self.make_room_to_grow(shared, state_id, pos + 1 + draft_count, states);
             let stream = self.take_decode_stream();
+            self.stop_timing_passes();
+            let alone = self.running_calls.is_empty();
             let generation = &mut self.generations[index];
             generation.in_call = true;
+            if alone && proposed_count == 0 && generation.draft_choice.is_some() {
+                generation.timed_pass = Some((Instant::now(), draft_count));
+            }
             let request_id = generation.job.id;
-            stream.decode_rows(
-                &[engine_state],
-                &[generation.next_token],
-                &[generation.pos as i32],
-            );
-            let call = Call::DecodeRows {
-                request_ids: vec![request_id],
-                tokens: vec![generation.next_token],
+            let call = if draft_count > 0 {
+                if proposed_count == 0 {
+                    rows.resize(draft_count + 1, 0);
+                }
+                stream.verify(
+                    engine_state,
+                    &mut rows,
+                    proposed_count > 0,
+                    generation.pos,
+                    &mut generation.sampler,
+                );
+                Call::Verify {
+                    request_id,
+                    rows,
+                    proposed_count,
+                }
+            } else {
+                stream.decode_rows(
+                    &[engine_state],
+                    &[generation.next_token],
+                    &[generation.pos as i32],
+                );
+                Call::DecodeRows {
+                    request_ids: vec![request_id],
+                    tokens: vec![generation.next_token],
+                }
             };
             self.running_calls.push(RunningCall { stream, call });
             return;
@@ -3259,6 +3419,7 @@ impl WorkerModel {
             for &i in group {
                 self.generations[i].in_call = true;
             }
+            self.stop_timing_passes();
             self.running_calls.push(RunningCall {
                 stream,
                 call: Call::DecodeRows {
@@ -3283,16 +3444,30 @@ impl WorkerModel {
             .map(|&request_id| self.find_generation_index(request_id))
             .collect();
         let ended_at = Instant::now();
+        // The timed passes in this call. Their draft choice chose 0 drafts.
+        let mut timed_passes = Vec::new();
         let turns = self.turns.take(indices.len());
         for (&i, turn) in indices.iter().zip(turns) {
             self.generations[i].in_call = false;
             self.generations[i].turn = turn;
+            if let Some(timed_pass) = self.generations[i].timed_pass.take() {
+                timed_passes.push((i, timed_pass));
+            }
         }
         let Some(logits) = stream.logits() else {
             self.idle_decode_streams.push(stream);
             self.end_failed_pass(&indices, states);
             return;
         };
+        for (i, (started_at, draft_count)) in timed_passes {
+            if let Some(draft_choice) = self.generations[i].draft_choice.as_mut() {
+                draft_choice.record_pass(
+                    draft_count,
+                    0,
+                    ended_at.duration_since(started_at).as_secs_f64(),
+                );
+            }
+        }
         let vocab = self.model.vocab_size();
         let model = self.model.clone();
         let think_end = self.think_end_token;
@@ -3355,6 +3530,60 @@ impl WorkerModel {
         for generation in &mut self.generations {
             generation.measured_token_at = None;
         }
+    }
+
+    /// Finishes a verify call of one request. The request keeps its token and
+    /// the accepted drafts. They go out with the next Tokens event.
+    fn finish_verify_call(
+        &mut self,
+        stream: Stream,
+        request_id: u64,
+        rows: Vec<i32>,
+        proposed_count: usize,
+        states: &mut States,
+    ) {
+        let index = self.find_generation_index(request_id);
+        self.generations[index].in_call = false;
+        self.generations[index].turn = self.turns.take(1).start;
+        let timed_pass = self.generations[index].timed_pass.take();
+        if stream.logits().is_none() {
+            self.idle_decode_streams.push(stream);
+            self.end_failed_pass(&[index], states);
+            return;
+        }
+        let (next, accepted) = stream.next_token();
+        self.idle_decode_streams.push(stream);
+        let model = self.model.clone();
+        let think_end = self.think_end_token;
+        let generation = &mut self.generations[index];
+        generation.draft_passes += 1;
+        generation.drafts_accepted += accepted;
+        if let (Some((started_at, draft_count)), Some(draft_choice)) =
+            (timed_pass, generation.draft_choice.as_mut())
+        {
+            draft_choice.record_pass(draft_count, accepted, started_at.elapsed().as_secs_f64());
+        }
+        if proposed_count > 0
+            && let Some(lookup) = generation.lookup.as_mut()
+        {
+            // The drafts offered: every row but the token's.
+            lookup.record_verification(rows.len() - 1, accepted);
+            generation.lookup_accepted += accepted;
+        }
+        let mut kept = 0;
+        for &token in &rows[..=accepted] {
+            if generation.reached_stop_token {
+                break;
+            }
+            Self::keep_token(&model, &mut states.cache, generation, token, think_end);
+            kept += 1;
+        }
+        // The pass's rows after the kept tokens took places in the state's
+        // rings. The cache counts them as stale.
+        states
+            .cache
+            .record_rejected_rows(generation.state_id, rows.len() - kept);
+        generation.next_token = next;
     }
 }
 

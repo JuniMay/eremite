@@ -51,8 +51,8 @@ const DECODING_TOKENS: u32 = 500;
 /// Returns at least the rows that an exact replay at `k` computes again, on
 /// average per layer (the cache's cost of a replay, eremite_replay_rows). Layer
 /// 39 starts a ring before `k`: 136 positions, the window and the rewind margin
-/// of 8. Each layer below starts at most 128 positions earlier: 127, plus a
-/// ratio-2 compressor's pair.
+/// of 8, with the default --lookup. Each layer below starts at most 128
+/// positions earlier: 127, plus a ratio-2 compressor's pair.
 fn replay_rows(k: usize) -> usize {
     (0..40)
         .map(|layer| k.min(137 + 128 * layer))

@@ -114,6 +114,13 @@ impl ModelConfig {
                         "ced takes off or {MIN_CED_TOKENS} to {MAX_CONTEXT_TOKENS} replay tokens"
                     ))?,
             },
+            "draft" => options.draft = integer()?,
+            "lookup" => {
+                options.lookup = match value {
+                    Value::String(text) if text == "off" => 0,
+                    _ => integer()?,
+                }
+            }
             "prefill_prune" => options.deepseek_mut()?.prefill_prune = switch()?,
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
             "memory"
@@ -709,7 +716,7 @@ mod tests {
     fn a_file_gives_each_model_its_own_options() {
         let config = parse(&json!({"memory": 72, "state_cache": 16, "models": [
             {"model": "/m/deepseek", "ced": 128},
-            {"model": "/m/small", "id": "small", "ctx": 32768, "top_k": 20, "think": 0}
+            {"model": "/m/small", "id": "small", "draft": 1, "ctx": 32768, "top_k": 20, "think": 0}
         ]}))
         .unwrap();
         let models = config.models;
@@ -724,15 +731,16 @@ mod tests {
             ),
             ("/m/deepseek", 72.0, 128, 16.0)
         );
-        assert_eq!(deepseek.id.as_deref(), None);
+        assert_eq!((deepseek.engine.draft, deepseek.id.as_deref()), (0, None));
         assert_eq!(
             (
                 small.id.as_deref(),
+                small.engine.draft,
                 small.engine.ctx,
                 small.top_k,
                 small.think
             ),
-            (Some("small"), 32768, Some(20), Some(0))
+            (Some("small"), 1, 32768, Some(20), Some(0))
         );
         assert!(small.engine.deepseek().is_none());
     }
@@ -870,7 +878,7 @@ mod tests {
             120.0
         );
         assert_eq!(
-            parse(&json!({"models": [{"model": "/m", "ced": "off"}]}))
+            parse(&json!({"models": [{"model": "/m", "ced": "off", "lookup": "off"}]}))
                 .unwrap()
                 .models[0]
                 .engine
