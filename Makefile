@@ -4,6 +4,7 @@
 #   make                build/liberemite.a, build/eremite and every test program
 #   make test           run the tests that need neither a GPU nor model files
 #   make gpu-test       run the tests that need a GPU but no model files
+#   make server         build/eremite-server, the HTTP server in server/
 #   make server-test    run the tests of the server in server/
 #   make format         format the sources in place with clang-format and
 #                       rustfmt
@@ -87,7 +88,7 @@ TEST_CFLAGS =
 
 FORMAT_SRC = $(shell find src tests -name '*.c' -o -name '*.m' -o -name '*.h' 2>/dev/null)
 
-.PHONY: all test gpu-test server-test format format-check clean
+.PHONY: all test gpu-test server server-test format format-check clean
 all: $(LIB) $(CLI) $(TESTS) $(TIME_LIMIT) compile_commands.json
 
 # Each compiled file writes its entry of the compilation database beside its
@@ -133,9 +134,17 @@ gpu-test: $(TIME_LIMIT) $(call group_tests,gpu)
 
 # The server, in Rust. cargo builds it in build/cargo, which
 # server/.cargo/config.toml also sets for cargo commands inside server/, and
-# links build/liberemite.a.
+# links build/liberemite.a. A new program replaces the old one by a rename, so
+# that a running server keeps its own file.
 CARGO ?= cargo
 SERVER := $(wildcard server/Cargo.toml)
+SERVER_INPUTS := $(if $(SERVER),server/Cargo.toml server/Cargo.lock server/build.rs $(shell find server/src -name '*.rs'))
+
+$(BUILD)/eremite-server: $(LIB) $(SERVER_INPUTS)
+	$(CARGO) build --release --locked --manifest-path server/Cargo.toml --target-dir $(BUILD)/cargo
+	cp $(BUILD)/cargo/release/eremite-server $@.new && mv -f $@.new $@
+
+server: $(BUILD)/eremite-server
 
 server-test: $(LIB) $(TIME_LIMIT)
 	$(TIME_LIMIT) $(TEST_SECONDS) $(CARGO) test --release --locked --manifest-path server/Cargo.toml --target-dir $(BUILD)/cargo

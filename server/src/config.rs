@@ -6,6 +6,7 @@
 //! `-`. The file's root holds the server-wide settings.
 
 use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
 
 use crate::engine;
 
@@ -303,6 +304,25 @@ pub struct Config {
     pub budgets: Budgets,
     /// The models, in the file's order.
     pub models: Vec<ModelConfig>,
+}
+
+/// Returns $HOME/.config/eremite/server.json: the configuration file that the
+/// server reads when its arguments give neither --config nor -m. Returns an
+/// error when HOME is unset.
+pub fn default_path() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".config/eremite/server.json"))
+        .ok_or("HOME is unset; specify --config FILE or -m DIR".into())
+}
+
+/// Reads the server settings and the models they serve from the JSON file at
+/// `path`.
+pub fn read(path: &Path) -> Result<Config, String> {
+    let name = path.display();
+    let text = std::fs::read(path).map_err(|error| format!("cannot read {name}: {error}"))?;
+    let root: Value = serde_json::from_slice(&text).map_err(|error| format!("{name}: {error}"))?;
+    parse(&root).map_err(|error| format!("{name}: {error}"))
 }
 
 /// Parses the server settings and the models they serve from the JSON object
