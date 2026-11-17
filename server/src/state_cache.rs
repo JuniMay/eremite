@@ -17,6 +17,10 @@
 
 use std::collections::BTreeMap;
 
+/// How many tokens one slice comparison takes. Slices compare faster than
+/// single tokens.
+const SHARED_PREFIX_BLOCK: usize = 1024;
+
 /// The id of a state in memory. The worker maps it to the engine's state.
 pub type StateId = u64;
 
@@ -73,6 +77,22 @@ pub struct Entry {
     pub reserved_snapshots: Vec<Snapshot>,
     /// Its number in the log and the status.
     pub number: u64,
+}
+
+/// Counts the positions that two token sequences share from the start.
+pub fn count_shared_prefix(tokens: &[i32], other: &[i32]) -> usize {
+    let len = tokens.len().min(other.len());
+    let mut shared = 0;
+    while shared + SHARED_PREFIX_BLOCK <= len
+        && tokens[shared..shared + SHARED_PREFIX_BLOCK]
+            == other[shared..shared + SHARED_PREFIX_BLOCK]
+    {
+        shared += SHARED_PREFIX_BLOCK;
+    }
+    while shared < len && tokens[shared] == other[shared] {
+        shared += 1;
+    }
+    shared
 }
 
 /// The state cache of all models: their states and snapshots.
@@ -150,6 +170,51 @@ impl Cache {
         id
     }
 
+    /// Starts a request in state `id` at position `from`. The state is new, or
+    /// it continues in place. Its tokens become those of `prompt` before
+    /// `from`, with `stale_rows` stale rows there. The request writes the
+    /// state's rows from `from` on. So the cache removes the state's snapshots
+    /// after `from`. It returns them for the worker to free. The state becomes
+    /// busy and used now. It takes `bytes`.
+    pub fn start_request(
+        &mut self,
+        id: StateId,
+        prompt: &[i32],
+        from: usize,
+        bytes: u64,
+        stale_rows: usize,
+    ) -> Vec<Snapshot> {
+        let now = self.advance_clock();
+        let entry = self.entries.get_mut(&id).expect("a live state");
+        entry.busy = true;
+        entry.last_used = now;
+        entry.bytes = bytes;
+        entry.stale_rows = stale_rows;
+        entry.reserved_snapshots.clear();
+        entry.tokens.clear();
+        entry.tokens.extend_from_slice(&prompt[..from]);
+        let (kept, dropped): (Vec<Snapshot>, Vec<Snapshot>) = entry
+            .snapshots
+            .drain(..)
+            .partition(|snapshot| snapshot.pos <= from);
+        entry.snapshots = kept;
+        dropped
+    }
+
+    /// Adds the tokens that a prefill call computed to state `id`. `prompt` is
+    /// the prompt up to where the call ended. Later requests may reuse these
+    /// tokens before this request ends. `stale_rows` is the state's stale rows
+    /// at the end of `prompt`.
+    pub fn add_prefilled_tokens(&mut self, id: StateId, prompt: &[i32], stale_rows: usize) {
+        let entry = self.entries.get_mut(&id).expect("a live prefilling state");
+        assert!(entry.tokens.len() <= prompt.len());
+        debug_assert_eq!(entry.tokens, prompt[..entry.tokens.len()]);
+        entry
+            .tokens
+            .extend_from_slice(&prompt[entry.tokens.len()..]);
+        entry.stale_rows = stale_rows;
+    }
+
     /// Adds `snapshot` to state `id`. It replaces any snapshot at the same
     /// position. It removes the reserved snapshot of the same position and
     /// kind.
@@ -191,11 +256,50 @@ impl Cache {
             entry.reserved_snapshots.clear();
         }
     }
+
+    /// Removes state `id`. Returns its snapshots for the worker to free.
+    pub fn remove_state(&mut self, id: StateId) -> Vec<Snapshot> {
+        self.entries
+            .remove(&id)
+            .map(|entry| entry.snapshots)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test state's bytes, 1 MiB.
+    const STATE_BYTES: u64 = 1 << 20;
+    /// A test snapshot's bytes, 6 MiB.
+    const SNAPSHOT_BYTES: u64 = 6 << 20;
+
+    /// Collects the tokens of `range`.
+    fn collect_tokens(range: std::ops::Range<i32>) -> Vec<i32> {
+        range.collect()
+    }
+
+    /// Adds an idle state of model 0 that holds `tokens`. It has prompt-end
+    /// snapshots at `prompt_ends`. Returns its id.
+    fn add_idle_state(cache: &mut Cache, tokens: &[i32], prompt_ends: &[usize]) -> StateId {
+        let id = cache.add_state(0, STATE_BYTES);
+        cache.start_request(id, tokens, 0, STATE_BYTES, 0);
+        cache.add_prefilled_tokens(id, tokens, 0);
+        for &pos in prompt_ends {
+            cache.add_snapshot(
+                id,
+                Snapshot {
+                    pos,
+                    kind: SnapshotKind::PromptEnd,
+                    bytes: SNAPSHOT_BYTES,
+                    stale_rows: 0,
+                },
+            );
+        }
+        cache.set_idle(id, STATE_BYTES);
+        id
+    }
 
     #[test]
     fn reserved_snapshots_count_once_toward_the_shared_limit() {
@@ -249,5 +353,55 @@ mod tests {
         cache.clear_reserved_snapshots(admitted);
         assert_eq!(cache.count_bytes(), 5);
         assert!(cache.entries[&admitted].busy);
+    }
+
+    #[test]
+    fn continuing_in_place_truncates_the_state_and_its_later_snapshots() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let state = add_idle_state(&mut cache, &collect_tokens(0..1000), &[400, 998, 1000]);
+        let mut prompt = collect_tokens(0..998);
+        prompt.extend(7000..7050);
+        let dropped = cache.start_request(state, &prompt, 998, STATE_BYTES, 0);
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|snapshot| snapshot.pos)
+                .collect::<Vec<_>>(),
+            vec![1000]
+        );
+        assert_eq!(cache.entries[&state].tokens, prompt[..998]);
+        cache.add_prefilled_tokens(state, &prompt, 0);
+        let entry = &cache.entries[&state];
+        assert_eq!(entry.tokens, prompt);
+        assert_eq!(
+            entry
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.pos)
+                .collect::<Vec<_>>(),
+            vec![400, 998]
+        );
+        assert!(entry.busy);
+        // a later prompt on the old tail shares only 998 positions with it
+        assert_eq!(
+            count_shared_prefix(&collect_tokens(0..1000), &entry.tokens),
+            998
+        );
+    }
+
+    #[test]
+    fn a_removed_state_returns_its_snapshots_and_takes_no_bytes() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let state = add_idle_state(&mut cache, &collect_tokens(0..100), &[50, 100]);
+        let snapshots = cache.remove_state(state);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.pos)
+                .collect::<Vec<_>>(),
+            vec![50, 100]
+        );
+        assert!(!cache.entries.contains_key(&state));
+        assert_eq!(cache.count_bytes(), 0);
     }
 }
