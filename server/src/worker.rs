@@ -22,13 +22,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::engine::{self, Logits, Model, Sampler, StateHandle, Stream};
+use crate::engine::{self, CacheCounts, Logits, Model, PrefillInfo, Sampler, StateHandle, Stream};
 
 /// The engine needs a stack of at least 16 MiB on its thread.
 const ENGINE_STACK_BYTES: usize = 16 << 20;
+/// The bytes in one GB, for expert reads.
+const GB: f64 = 1e9;
 
 /// What the threads share. The engine thread sets it when it starts.
 static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
@@ -101,6 +104,8 @@ pub struct Request {
     pub sampling: Sampling,
     /// The most tokens the reply may have.
     pub max_tokens: i64,
+    /// The log shows "req ID NOTE" with this note when the request is queued.
+    pub note: String,
 }
 
 /// Why the worker did not queue a request.
@@ -151,6 +156,7 @@ impl Drop for CancelGuard {
         if !self.flags.last_event_sent.load(Ordering::SeqCst)
             && !self.flags.cancelled.swap(true, Ordering::SeqCst)
         {
+            engine::log(&format!("req {}: cancellation requested", self.id));
             wake_worker();
         }
     }
@@ -166,6 +172,8 @@ struct Job {
     events: mpsc::UnboundedSender<Event>,
     /// The flags it shares with its cancel guard.
     flags: Arc<RequestFlags>,
+    /// When the request was queued.
+    queued_at: Instant,
 }
 
 impl Job {
@@ -396,13 +404,27 @@ pub fn submit(
     }
     queue.last_request_id += 1;
     let request_id = queue.last_request_id;
-    let model_index = request.model_index;
+    if !request.note.is_empty() {
+        // The log shows the note before the worker can take the request.
+        engine::log(&format!("req {request_id} {}", request.note));
+    }
+    let (prompt_tokens, max_tokens, model_index) = (
+        request.prompt.len(),
+        request.max_tokens,
+        request.model_index,
+    );
     queue.waiting[model_index].push_back(Job {
         id: request_id,
         request,
         events,
         flags: flags.clone(),
+        queued_at: Instant::now(),
     });
+    engine::log(&format!(
+        "req {request_id}: queued for {}, waiting={}, prompt_tokens={prompt_tokens}, max_new={max_tokens}",
+        shared.models[model_index].settings.id,
+        queue.waiting[model_index].len()
+    ));
     notify_worker(&shared);
     Ok((
         CancelGuard {
@@ -419,6 +441,10 @@ pub fn submit(
 struct Prefill {
     /// The prompt's tokens.
     prompt: Vec<i32>,
+    /// When the prefill started.
+    started_at: Instant,
+    /// The expert cache's counters when the prefill started.
+    expert_counts_at_start: CacheCounts,
 }
 
 /// A request from its prefill to its end.
@@ -437,6 +463,10 @@ struct Generation {
     pos: usize,
     /// The number of tokens that the reply generated, a stop token included.
     generated: usize,
+    /// The number of the reply's tokens inside its think block.
+    reasoning_tokens: usize,
+    /// Whether the reply is inside its think block.
+    thinking: bool,
     /// Whether the reply reached a stop token.
     reached_stop_token: bool,
     /// Whether the client cancelled the request.
@@ -447,6 +477,10 @@ struct Generation {
     unsent_tokens: Vec<u32>,
     /// The most tokens that the reply may generate.
     max_new_tokens: usize,
+    /// When the request started decoding.
+    decode_started_at: Instant,
+    /// The expert cache's counters when the request started decoding.
+    expert_counts_at_decode_start: CacheCounts,
     /// Whether a call of this request runs on a stream.
     in_call: bool,
 }
@@ -484,12 +518,21 @@ struct WorkerModel {
     model_index: usize,
     /// The model's engine handle.
     model: Rc<Model>,
+    /// The model's settings.
+    settings: ModelSettings,
     /// The model's context length, in tokens.
     ctx: usize,
     /// The requests from their prefill to their end.
     generations: Vec<Generation>,
     /// Admitted requests that wait for their turn to plan their prefill.
     admitted: VecDeque<Job>,
+    /// The token that starts a think block, if the model has one.
+    think_start_token: Option<i32>,
+    /// The token that ends a think block, if the model has one.
+    think_end_token: Option<i32>,
+    /// The experts that a decoded row chooses in all layers together. It is 0
+    /// for a model without routed experts.
+    experts_per_row: usize,
     /// The calls that run now.
     running_calls: Vec<RunningCall>,
     /// The streams that ended a decoding call and wait for the next one.
@@ -512,14 +555,21 @@ impl Worker {
             .iter()
             .zip(model_handles)
             .enumerate()
-            .map(|(model_index, (shared_model, model))| WorkerModel {
-                model_index,
-                ctx: shared_model.settings.options.ctx as usize,
-                generations: Vec::new(),
-                admitted: VecDeque::new(),
-                running_calls: Vec::new(),
-                idle_decode_streams: Vec::new(),
-                model,
+            .map(|(model_index, (shared_model, model))| {
+                let settings = shared_model.settings.clone();
+                WorkerModel {
+                    model_index,
+                    ctx: settings.options.ctx as usize,
+                    generations: Vec::new(),
+                    admitted: VecDeque::new(),
+                    think_start_token: model.tokenizer().find_added_token("<think>"),
+                    think_end_token: model.tokenizer().find_added_token("</think>"),
+                    experts_per_row: model.read_stats().experts_per_row.max(0) as usize,
+                    running_calls: Vec::new(),
+                    idle_decode_streams: Vec::new(),
+                    model,
+                    settings,
+                }
             })
             .collect();
         Worker { shared, models }
@@ -586,6 +636,14 @@ impl Worker {
                 } else {
                     queue.waiting[worker_model.model_index].drain(..).collect()
                 };
+                if !admitted.is_empty() {
+                    engine::log(&format!(
+                        "{}: admitted={}, running={}",
+                        worker_model.settings.id,
+                        admitted.len(),
+                        worker_model.generations.len()
+                    ));
+                }
                 admitted_by_model.push(admitted);
             }
             drop(queue);
@@ -621,8 +679,10 @@ impl Worker {
     }
 }
 
-/// Refuses `job` with `message`. It sends the refusal as the last event.
+/// Refuses `job` with `message`. It logs the refusal and sends it as the last
+/// event.
 fn refuse(job: Job, message: &str) {
+    engine::log(&format!("req {}: refused: {message}", job.id));
     job.send_last_event(Event::Refused(message.into()));
 }
 
@@ -634,9 +694,19 @@ fn format_prompt_too_long(tokens: usize, ctx: usize) -> String {
     format!("the prompt has {tokens} tokens; the context holds {ctx}")
 }
 
-/// Ends `job` before its prefill with `reason`. It sends Done as the last
-/// event.
+/// Ends `job` before its prefill with `reason`. It logs the end and sends Done
+/// as the last event.
 fn end_before_prefill(job: Job, reason: FinishReason) {
+    engine::log(&format!(
+        "req {}: ended before prefill ({}), waited {:.3} s",
+        job.id,
+        if reason == FinishReason::Cancelled {
+            "cancelled"
+        } else {
+            "shutdown"
+        },
+        job.queued_at.elapsed().as_secs_f64()
+    ));
     job.send_last_event(Event::Done { reason });
 }
 
@@ -654,16 +724,23 @@ impl WorkerModel {
             if engine::is_stopping() {
                 end_before_prefill(job, FinishReason::ServerStop);
             } else if job.flags.cancelled.load(Ordering::SeqCst) {
+                engine::log(&format!("req {}: client gone while waiting", job.id));
                 end_before_prefill(job, FinishReason::Cancelled);
             } else {
+                let was_loaded = self.model.is_loaded();
                 if let Err(error) = self.model.load() {
                     if engine::is_stopping() {
                         // The stop cut the load short.
                         end_before_prefill(job, FinishReason::ServerStop);
                         continue;
                     }
+                    engine::log(&format!("{}: {error}", self.settings.id));
                     job.send_last_event(Event::Failed(error));
                     continue;
+                }
+                self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
+                if !was_loaded && self.model.is_loaded() {
+                    engine::log(&format!("{}: loaded", self.settings.id));
                 }
                 self.start_request(job);
             }
@@ -744,19 +821,41 @@ impl WorkerModel {
         let Some(state) = self.model.state_new() else {
             return refuse(job, STATE_MEMORY_SHORT);
         };
+        let wait = job.queued_at.elapsed().as_secs_f64();
+        let thinking = self.think_start_token == Some(prompt[prompt_tokens - 1]);
+        engine::log(&format!(
+            "req {}: {} {prompt_tokens} prompt tokens; thinking {}; at most {max_new_tokens} new tokens, {}; waited {wait:.1} s",
+            job.id,
+            self.settings.id,
+            if thinking { "on" } else { "off" },
+            if sampling.temperature > 0.0 {
+                "sampled"
+            } else {
+                "greedy"
+            }
+        ));
+        let now = Instant::now();
         self.generations.push(Generation {
             job,
             sampler,
             state,
             prompt_tokens,
-            prefill: Some(Prefill { prompt }),
+            prefill: Some(Prefill {
+                prompt,
+                started_at: now,
+                expert_counts_at_start: self.model.read_stats().cache,
+            }),
             pos: prompt_tokens,
             generated: 0,
+            reasoning_tokens: 0,
+            thinking,
             reached_stop_token: false,
             cancelled: false,
             next_token: 0,
             unsent_tokens: Vec::new(),
             max_new_tokens,
+            decode_started_at: now,
+            expert_counts_at_decode_start: CacheCounts::default(),
             in_call: false,
         });
     }
@@ -819,8 +918,9 @@ impl WorkerModel {
             ));
             return;
         };
+        let info = stream.prefill_info();
         let mut generation = self.generations.remove(i);
-        self.start_decoding(&mut generation, logits);
+        self.start_decoding(&mut generation, logits, info);
         self.generations.insert(i, generation);
         // The stream owns the logits until here. Dropping it frees the prompt's
         // large buffers.
@@ -839,22 +939,51 @@ impl WorkerModel {
         }
     }
 
-    /// Starts decoding after the prefill ended with `logits`. It sends
-    /// DecodingStarted. It samples the first token from `logits`.
-    fn start_decoding(&mut self, generation: &mut Generation, logits: Logits) {
-        generation.prefill.take().expect("a prefill");
+    /// Starts decoding after the prefill ended with `logits`. It logs the
+    /// prefill and sends DecodingStarted. It samples the first token from
+    /// `logits`.
+    fn start_decoding(&mut self, generation: &mut Generation, logits: Logits, info: PrefillInfo) {
+        let prefill = generation.prefill.take().expect("a prefill");
         let prompt_tokens = generation.prompt_tokens;
+        let now = Instant::now();
+        let prefill_seconds = (now - prefill.started_at).as_secs_f64();
+        let stats = self.model.read_stats();
+        let read = (stats.cache.bytes - prefill.expert_counts_at_start.bytes) as f64 / GB;
+        // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
+        // unknown.
+        engine::log(&format!(
+            "req {}: prefill of {} tokens in {prefill_seconds:.2} s ({:.0} tokens/s), {read:.2} GB of experts read",
+            generation.job.id,
+            prompt_tokens,
+            prompt_tokens as f64 / prefill_seconds.max(1e-9)
+        ));
+        engine::log(&format!(
+            "req {}: prefill plan: {} chunks, {} encoder tokens, {} decoder tokens, ced_applied={}, prune_applied={}, prefix={} (full)",
+            generation.job.id,
+            info.chunks,
+            info.tokens,
+            info.decoder_tokens,
+            info.ced_applied,
+            info.prune_applied,
+            info.prefix_tokens
+        ));
         let _ = generation.job.events.send(Event::DecodingStarted {
             prompt_tokens,
             reused_tokens: 0,
         });
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
+        generation.decode_started_at = now;
+        generation.expert_counts_at_decode_start = stats.cache;
     }
 
     /// Keeps `token`. The token ran at the generation's position. It adds the
     /// token to the tokens to send. A stop token ends the reply and is not
     /// sent.
-    fn keep_token(model: &Model, generation: &mut Generation, token: i32) {
+    fn keep_token(model: &Model, generation: &mut Generation, token: i32, think_end: Option<i32>) {
+        if generation.thinking {
+            generation.reasoning_tokens += 1;
+            generation.thinking = Some(token) != think_end;
+        }
         generation.pos += 1;
         generation.generated += 1;
         // A kept stop token ends the reply.
@@ -884,6 +1013,9 @@ impl WorkerModel {
             // pass. The state then ends at the last token that ran. A model
             // that cannot rewind needs that for the next turn to continue the
             // state.
+            if generation.thinking {
+                generation.reasoning_tokens += 1;
+            }
             generation.unsent_tokens.push(generation.next_token as u32);
             generation.generated += 1;
             return true;
@@ -892,7 +1024,7 @@ impl WorkerModel {
     }
 
     /// Ends the generation. It sends its last tokens and its Done event. It
-    /// frees the request's state.
+    /// frees the request's state. It logs the request's counts.
     fn end_generation(&mut self, mut generation: Generation, at_stop: bool) {
         if !generation.unsent_tokens.is_empty() {
             let _ = generation
@@ -909,8 +1041,47 @@ impl WorkerModel {
         } else {
             FinishReason::Length
         };
+        let reason_text = match reason {
+            FinishReason::StopToken => "stop",
+            FinishReason::Length => "length",
+            FinishReason::Cancelled => "client gone",
+            FinishReason::ServerStop => "stopped by the server's stop",
+        };
         generation.job.send_last_event(Event::Done { reason });
         self.model.state_free(generation.state);
+        let stats = self.model.read_stats();
+        let (expert_counts, decode_seconds) = (
+            stats.cache,
+            generation.decode_started_at.elapsed().as_secs_f64(),
+        );
+        let hits = expert_counts.hits - generation.expert_counts_at_decode_start.hits
+            + expert_counts.prefetch_hits
+            - generation.expert_counts_at_decode_start.prefetch_hits;
+        let misses = expert_counts.misses - generation.expert_counts_at_decode_start.misses;
+        let experts = if self.experts_per_row > 0 {
+            // 100 turns the share of hits into a percent.
+            format!(
+                "; experts {:.1}% hit, {:.2} GB read",
+                100.0 * hits as f64 / ((hits + misses).max(1)) as f64,
+                (expert_counts.bytes - generation.expert_counts_at_decode_start.bytes) as f64 / GB
+            )
+        } else {
+            String::new()
+        };
+        // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
+        // unknown.
+        engine::log(&format!(
+            "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}",
+            generation.job.id,
+            generation.generated,
+            generation.reasoning_tokens,
+            generation.generated as f64 / decode_seconds.max(1e-9),
+        ));
+        let sampling = generation.job.request.sampling;
+        engine::log(&format!(
+            "req {}: sampling temperature {}, top_p {}, top_k {}",
+            generation.job.id, sampling.temperature, sampling.top_p, sampling.top_k,
+        ));
     }
 
     /// Ends the requests of a decoding pass that could not load its experts.
@@ -927,6 +1098,10 @@ impl WorkerModel {
         for i in indices {
             let generation = self.generations.remove(i);
             self.model.state_free(generation.state);
+            engine::log(&format!(
+                "req {}: a pass could not load its experts: memory is short",
+                generation.job.id
+            ));
             generation.job.send_last_event(Event::Failed(
                 "a pass could not load the model's experts: memory is short".into(),
             ));
@@ -982,9 +1157,10 @@ impl WorkerModel {
         };
         let vocab = self.model.vocab_size();
         let model = self.model.clone();
+        let think_end = self.think_end_token;
         for (row, &i) in indices.iter().enumerate() {
             let generation = &mut self.generations[i];
-            Self::keep_token(&model, generation, tokens[row]);
+            Self::keep_token(&model, generation, tokens[row], think_end);
             // Safety: the call returns one row of logits for each state. Each
             // row holds vocab_size floats.
             generation.next_token =

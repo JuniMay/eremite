@@ -2,9 +2,14 @@
 //! events. A request decodes until its token limit or a stop token. The worker
 //! refuses a prompt that does not fit the context, and invalid sampling
 //! settings. A dropped guard cancels its request. The stop ends a decoding
-//! request, and the worker queues no request after it. Set EREMITE_CHECKPOINT
-//! to a DeepSeek V4.1 checkpoint's directory, and EREMITE_EXPERTS to GGUF
-//! experts if wanted. Without EREMITE_CHECKPOINT, the test is skipped.
+//! request, and the worker queues no request after it. The log shows each
+//! request's note when it is queued, and its counts at its end. Set
+//! EREMITE_CHECKPOINT to a DeepSeek V4.1 checkpoint's directory, and
+//! EREMITE_EXPERTS to GGUF experts if wanted. Without EREMITE_CHECKPOINT, the
+//! test is skipped.
+use std::ffi::{CStr, c_char};
+use std::sync::Mutex;
+
 use eremite_server::{config, engine, worker};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -21,6 +26,18 @@ const GREEDY: worker::Sampling = worker::Sampling {
     top_k: 0,
     seed: None,
 };
+/// The note of every request that the test submits.
+const NOTE: &str = "from the worker test";
+
+/// The lines that the log hook received.
+static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+extern "C" fn keep_line(line: *const c_char) {
+    let line = unsafe { CStr::from_ptr(line) }
+        .to_string_lossy()
+        .into_owned();
+    LINES.lock().unwrap().push(line);
+}
 
 /// What the worker reported about one request.
 struct Reply {
@@ -78,6 +95,7 @@ fn submit(
         prompt: prompt.to_vec(),
         sampling,
         max_tokens,
+        note: NOTE.into(),
     };
     match worker::submit(request) {
         Ok(submitted) => submitted,
@@ -111,7 +129,7 @@ fn requests_run_to_their_end_and_report_their_events() {
     assert!(worker::start(
         vec![settings],
         config::Budgets::default(),
-        None,
+        Some(keep_line),
         None
     ));
     let tokenizer = worker::list_models()[0].1;
@@ -184,10 +202,26 @@ fn requests_run_to_their_end_and_report_their_events() {
         prompt,
         sampling: GREEDY,
         max_tokens: MAX_TOKENS,
+        note: NOTE.into(),
     };
     let refused = worker::submit(request).err();
     assert!(
         matches!(&refused, Some(worker::SubmitError::Busy(message)) if message == "the server is stopping"),
         "the worker queued a request after the stop"
+    );
+
+    // The first request is number 1. The log shows its note and its end.
+    let lines = LINES.lock().unwrap();
+    for wanted in [format!("req 1 {NOTE}"), "req 1: queued for deepseek".into()] {
+        assert!(
+            lines.iter().any(|line| line.contains(&wanted)),
+            "no log line with {wanted:?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("req 1: length: ") || line.contains("req 1: stop: ")),
+        "no end line of request 1"
     );
 }
