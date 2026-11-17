@@ -9,15 +9,17 @@
 //!   requests.
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
+//! - With --tui, the terminal UI (ui/) shows the server's status, its requests,
+//!   its memory and its log on stderr's terminal instead of the log.
 
-use eremite_server::{chat, codex, config, control, engine, http, worker};
+use eremite_server::{chat, codex, config, control, engine, http, ui, worker};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -78,6 +80,19 @@ const USAGE: &str =
                   (default 256)
   --snapshot-interval N  positions between the snapshots of a long prompt, for a model that
                   resumes only from snapshots (default 2048)
+  --tui           the terminal UI on stderr's terminal instead of the log: the server's status,
+                  its requests, its memory and its log; q stops the server, and the log's lines
+                  print on exit
+  --no-tui        the log on stderr even when the configuration file turns the terminal UI on
+  --tui-theme T   the terminal UI's colors: auto (by the terminal's background; light without an
+                  answer), light or dark (default auto)
+  --tui-background-answer-wait S  seconds that the terminal UI waits for the terminal to tell
+                  its background color, with --tui-theme auto (default 1)
+  --tui-now-window S  seconds that the terminal UI's \"now\" figures average (default 5)
+  --tui-recent-window S  seconds that its \"recent\" figures average (default 60)
+  --tui-history-window S  seconds that its history charts span, a sample a column (default 60)
+  --tui-expert-map-tokens N  the latest tokens of a decoding request whose experts its expert
+                  map shows (default 12)
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
@@ -153,6 +168,7 @@ fn parse_arguments(args: &[String]) -> Arguments {
             "--prefill-prune" | "--packed-state-rows" => {
                 options.push(switch(&flag[2..].replace('-', "_")))
             }
+            "--tui" | "--no-tui" => server.push(("tui".into(), Value::Bool(flag == "--tui"))),
             _ => {
                 let Some(text) = args.get(i + 1) else {
                     exit_with_usage()
@@ -187,14 +203,19 @@ fn parse_arguments(args: &[String]) -> Arguments {
                             .unwrap_or_else(|_| die(&format!("--serve: not a port: {text}")));
                         server.push(("port".into(), Value::from(port)));
                     }
-                    "--host" | "--api-key-file" | "--state-dir" => {
+                    "--host" | "--api-key-file" | "--state-dir" | "--tui-theme" => {
                         server.push((flag[2..].replace('-', "_"), Value::String(text.clone())))
                     }
                     "--http-timeout"
                     | "--keepalive"
                     | "--search-timeout"
                     | "--searxng-idle"
-                    | "--search-session-idle" => {
+                    | "--search-session-idle"
+                    | "--tui-background-answer-wait"
+                    | "--tui-now-window"
+                    | "--tui-recent-window"
+                    | "--tui-history-window"
+                    | "--tui-expert-map-tokens" => {
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         server.push((flag[2..].replace('-', "_"), value));
                     }
@@ -416,6 +437,37 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             (12.0, 16.0, 30.0)
         );
     }
+}
+
+#[test]
+fn the_terminal_uis_settings_come_from_the_command_line() {
+    let flags: Vec<String> = [
+        "-m",
+        "/m/d",
+        "--serve",
+        "8008",
+        "--tui",
+        "--tui-theme",
+        "dark",
+        "--tui-history-window",
+        "120",
+        "--tui-expert-map-tokens",
+        "20",
+    ]
+    .map(String::from)
+    .into();
+    let parsed = parse_arguments(&flags);
+    assert_eq!(
+        (
+            parsed.server.tui,
+            parsed.server.tui_theme,
+            parsed.server.tui_history_window_s,
+            parsed.server.tui_expert_map_tokens
+        ),
+        (true, ui::terminal::ThemeChoice::Dark, 120.0, 20)
+    );
+    let parsed = parse_arguments(&[flags, vec!["--no-tui".into()]].concat());
+    assert!(!parsed.server.tui);
 }
 
 /// A served model: its names, its context, its tokenizer and its family's chat
@@ -882,6 +934,7 @@ async fn refuse_other_than_post() -> Response {
 /// Starts the server: it reads the settings, listens, starts the worker with
 /// the models, and serves the routes until the stop.
 fn main() {
+    let started = Instant::now();
     let arguments = parse_arguments(&std::env::args().skip(1).collect::<Vec<_>>());
     if let Some(file) = &arguments.render {
         exit(deepseek::render_test_case_file(file));
@@ -957,14 +1010,38 @@ fn main() {
                 .or_else(config::default_state_dir)
         })
         .flatten();
+    // The terminal UI takes the terminal before the engine starts to log.
+    let settings = &arguments.server;
+    let opened = if settings.tui {
+        let wait = Duration::from_secs_f64(settings.tui_background_answer_wait_s);
+        let opened = ui::terminal::enter(settings.tui_theme, wait);
+        if opened.is_none() {
+            engine::log("--tui: stderr is not a terminal that can show the terminal UI");
+        }
+        opened
+    } else {
+        None
+    };
+    let (on_log, on_die, view_options) = match opened {
+        Some(_) => (
+            Some(ui::log::ENGINE_LOG_HOOK),
+            Some(ui::terminal::leave_before_fatal_error as extern "C" fn()),
+            worker::ViewOptions {
+                kept_route_tokens: settings.tui_expert_map_tokens,
+                on_model_log: Some(ui::log::keep_model_line),
+            },
+        ),
+        None => (None, None, worker::ViewOptions::default()),
+    };
     if !worker::start(
         served.clone(),
         arguments.budgets.clone(),
         state_dir,
-        None,
-        None,
-        worker::ViewOptions::default(),
+        on_log,
+        on_die,
+        view_options,
     ) {
+        // The exit gives the terminal back first, as enter() arranged.
         exit(2);
     }
     let loaded = worker::list_models();
@@ -1018,6 +1095,30 @@ fn main() {
             format,
         });
     }
+    let view = opened.map(|opened| {
+        let models = served_models
+            .iter()
+            .zip(&families)
+            .map(|(model, family)| ui::view::ViewModel {
+                info: ui::frame::ModelInfo {
+                    name: model.id.clone(),
+                    kind: match family {
+                        Family::DeepSeek => ui::frame::Kind::Llm,
+                    },
+                },
+                tokenizer: model.tokenizer,
+                find_role: match family {
+                    Family::DeepSeek => deepseek::find_role_of_token,
+                },
+            })
+            .collect();
+        let windows = ui::samples::Windows {
+            now: settings.tui_now_window_s,
+            recent: settings.tui_recent_window_s,
+            history: settings.tui_history_window_s,
+        };
+        ui::view::start_view(opened, models, format!("{host}:{port}"), started, windows)
+    });
     if !host.is_loopback() {
         engine::log(&format!(
             "warning: plain HTTP on {host}: keys and conversations cross the network unencrypted"
@@ -1149,4 +1250,7 @@ fn main() {
     });
     stopper.search.stop_searxng();
     worker::stop();
+    if let Some(view) = view {
+        view.finish();
+    }
 }
