@@ -96,6 +96,7 @@ impl ModelConfig {
             "memory"
             | "reserve"
             | "gpu_timeout"
+            | "progress_log"
             | "max_waiting_requests"
             | "port"
             | "host"
@@ -230,6 +231,9 @@ pub struct Budgets {
     /// A wait for the GPU that lasts this many seconds ends the server. Only a
     /// failed command buffer or a stopped GPU takes that long.
     pub gpu_timeout_s: f64,
+    /// The seconds between a decoding request's progress lines in the log; 0:
+    /// none.
+    pub progress_log_s: f64,
     /// The most requests that wait for one model. Another request then gets
     /// HTTP 429, too many requests.
     pub max_waiting_requests: usize,
@@ -241,6 +245,7 @@ impl Default for Budgets {
             memory_gb: 0.0,
             reserve_gb: 10.0,
             gpu_timeout_s: 60.0,
+            progress_log_s: 10.0,
             max_waiting_requests: 16,
         }
     }
@@ -272,6 +277,12 @@ impl Budgets {
             }
             "gpu_timeout" if number > 0.0 => self.gpu_timeout_s = number,
             "gpu_timeout" => return Err("gpu_timeout takes a positive number of seconds".into()),
+            "progress_log" if (0.0..=MAX_SECONDS).contains(&number) => self.progress_log_s = number,
+            "progress_log" => {
+                return Err(format!(
+                    "progress_log takes 0 (none) to {MAX_SECONDS} seconds"
+                ));
+            }
             "max_waiting_requests" if is_count(MAX_COUNT) => {
                 self.max_waiting_requests = number as usize
             }
@@ -338,6 +349,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "memory",
             "reserve",
             "gpu_timeout",
+            "progress_log",
             "max_waiting_requests",
             "port",
             "host",
@@ -350,7 +362,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         return Err(format!("no server setting {key}"));
     }
     let mut budgets = Budgets::default();
-    for name in ["memory", "reserve", "gpu_timeout", "max_waiting_requests"] {
+    for name in [
+        "memory",
+        "reserve",
+        "gpu_timeout",
+        "progress_log",
+        "max_waiting_requests",
+    ] {
         if let Some(value) = object.get(name) {
             budgets.set(name, value)?;
         }
@@ -436,6 +454,7 @@ mod tests {
             "memory",
             "reserve",
             "gpu_timeout",
+            "progress_log",
             "http_timeout",
             "keepalive",
         ] {
@@ -554,6 +573,20 @@ mod tests {
                 "gpu_timeout {timeout} is refused"
             );
         }
+        for period in [json!(-1), json!(2e6)] {
+            assert!(
+                parse(&json!({"progress_log": period, "models": [{"model": "/m"}]})).is_err(),
+                "progress_log {period} is refused"
+            );
+        }
+        assert_eq!(
+            parse(&json!({"progress_log": 0, "models": [{"model": "/m"}]}))
+                .unwrap()
+                .budgets
+                .progress_log_s,
+            0.0,
+            "progress_log 0 logs no progress lines"
+        );
         let timeout = |root: Value| parse(&root).unwrap().budgets.gpu_timeout_s;
         assert_eq!(timeout(json!({"models": [{"model": "/m"}]})), 60.0);
         assert_eq!(

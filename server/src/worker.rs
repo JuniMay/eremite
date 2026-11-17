@@ -726,6 +726,8 @@ struct Generation {
     max_new_tokens: usize,
     /// When the request started decoding.
     decode_started_at: Instant,
+    /// When the worker last logged the request's progress.
+    progress_logged_at: Instant,
     /// The expert cache's counters when the request started decoding.
     expert_counts_at_decode_start: CacheCounts,
     /// Whether a call of this request runs on a stream.
@@ -1070,12 +1072,27 @@ impl WorkerModel {
         if decoding_count > 0 {
             self.start_decode_calls();
         }
+        let progress_log_s = shared.budgets.progress_log_s;
         for generation in &mut self.generations {
             if !generation.unsent_tokens.is_empty() {
                 let _ = generation
                     .job
                     .events
                     .send(Event::Tokens(std::mem::take(&mut generation.unsent_tokens)));
+            }
+            if generation.is_decoding()
+                && progress_log_s > 0.0
+                && generation.progress_logged_at.elapsed().as_secs_f64() >= progress_log_s
+            {
+                generation.progress_logged_at = Instant::now();
+                engine::log(&format!(
+                    "req {}: {} tokens, {:.1} tokens/s",
+                    generation.job.id,
+                    generation.generated,
+                    generation.generated as f64
+                        / (generation.progress_logged_at - generation.decode_started_at)
+                            .as_secs_f64()
+                ));
             }
         }
         let phase = if self
@@ -1225,6 +1242,7 @@ impl WorkerModel {
             unsent_tokens: Vec::new(),
             max_new_tokens,
             decode_started_at: now,
+            progress_logged_at: now,
             expert_counts_at_decode_start: CacheCounts::default(),
             in_call: false,
         });
@@ -1361,6 +1379,7 @@ impl WorkerModel {
         drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
         generation.decode_started_at = now;
+        generation.progress_logged_at = now;
         generation.expert_counts_at_decode_start = stats.cache;
     }
 

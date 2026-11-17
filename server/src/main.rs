@@ -53,6 +53,8 @@ const USAGE: &str =
                   (default: none; the memory that other programs leave, less --reserve, decides)
   --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
   --gpu-timeout S seconds a wait for the GPU may last before the server ends (default 60)
+  --progress-log S   seconds between a decoding request's progress lines in the log, 0 none
+                  (default 10)
   --max-waiting-requests N  requests that may wait for one model; another gets HTTP 429
                   (default 16)
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
@@ -135,7 +137,11 @@ fn parse_arguments(args: &[String]) -> Arguments {
                         model = Some(ModelConfig::new(text));
                     }
                     "--config" => file = Some(text.into()),
-                    "--memory" | "--reserve" | "--gpu-timeout" | "--max-waiting-requests" => {
+                    "--memory"
+                    | "--reserve"
+                    | "--gpu-timeout"
+                    | "--progress-log"
+                    | "--max-waiting-requests" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         budgets.push((name, value));
