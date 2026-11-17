@@ -1,8 +1,9 @@
 //! A model's counters and the process's memory: decoding counts its rows,
-//! the memory limit can be set, idle memory can be given back, and a wake
-//! makes run_streams return before its call finishes. Set EREMITE_CHECKPOINT
-//! to a DeepSeek V4.1 checkpoint's directory, and EREMITE_EXPERTS to GGUF
-//! experts if wanted; without EREMITE_CHECKPOINT, the test is skipped.
+//! a decoded row's experts can be read, the memory limit can be set, idle
+//! memory can be given back, and a wake makes run_streams return before its
+//! call finishes. Set EREMITE_CHECKPOINT to a DeepSeek V4.1 checkpoint's
+//! directory, and EREMITE_EXPERTS to GGUF experts if wanted; without
+//! EREMITE_CHECKPOINT, the test is skipped.
 use eremite_server::engine::{self, Model, Sampler, Stream};
 
 /// The tokens decoded after the prompt.
@@ -68,6 +69,17 @@ fn counters_and_memory_follow_the_model() {
             }
             engine::refresh_stats();
             let after = model.read_stats();
+            // The last decoding call ran one row: its experts, one for each
+            // choice in each layer with routed experts, and where each was.
+            let (experts, sources) = model.read_routes(0).expect("row 0's routes");
+            assert_eq!(experts.len(), after.experts_per_row as usize);
+            assert!(
+                experts
+                    .iter()
+                    .all(|&e| (e as i32) < after.experts_per_layer)
+            );
+            assert!(sources.iter().all(|&s| s <= 4), "{sources:?}");
+            assert_eq!(model.read_routes(1), None, "no second row ran");
             assert_eq!(
                 after.decode_rows - before.decode_rows,
                 DECODED_TOKENS as u64

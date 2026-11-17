@@ -963,6 +963,7 @@ fn main() {
         state_dir,
         None,
         None,
+        worker::ViewOptions::default(),
     ) {
         exit(2);
     }

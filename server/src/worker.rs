@@ -228,6 +228,14 @@ pub struct ModelSettings {
     pub idle_unload: f64,
 }
 
+/// What the terminal UI asks of the worker. The default asks for nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ViewOptions {
+    /// The number of tokens whose experts the status keeps for each decoding
+    /// request. 0 keeps none.
+    pub kept_route_tokens: usize,
+}
+
 /// What the HTTP handlers and the worker share under one lock.
 #[derive(Default)]
 struct Queue {
@@ -318,6 +326,18 @@ struct RequestStatus {
     reused_tokens: usize,
     /// The number of tokens that the reply generated.
     generated_tokens: usize,
+    /// The experts of the request's latest tokens, the oldest first.
+    routes: Vec<Route>,
+}
+
+/// The experts that one token of a request chose, and where each one was.
+#[derive(Clone, Debug, PartialEq)]
+struct Route {
+    /// The experts of each layer with routed experts, layer by layer.
+    experts: Vec<u16>,
+    /// Where each expert was: 0 in memory, 1 read ahead, 2 late, 3
+    /// substituted, 4 from the SSD.
+    sources: Vec<u8>,
 }
 
 impl RequestStatus {
@@ -330,6 +350,7 @@ impl RequestStatus {
             prompt_tokens: job.request.prompt.len(),
             reused_tokens: 0,
             generated_tokens: 0,
+            routes: Vec::new(),
         }
     }
 }
@@ -390,6 +411,8 @@ struct Shared {
     status_published: tokio::sync::Notify,
     /// The worker's long operations running now (LongOperation).
     long_operations: AtomicUsize,
+    /// What the terminal UI asks of the worker.
+    view: ViewOptions,
     /// The session whose tokens a reader asked for: its model's index and its
     /// number. The worker takes it at its next publish of the states.
     session_tokens_wanted: Mutex<Option<(usize, u64)>>,
@@ -558,15 +581,17 @@ pub fn list_models() -> Vec<(String, engine::Tokenizer, ModelSettings)> {
 }
 
 /// Starts the engine thread. The thread registers each model without loading
-/// its weights. This call returns true once the worker takes requests. It
-/// returns false when the engine cannot start or a model's settings are
-/// invalid. The log says why a model's settings are invalid.
+/// its weights. `view` holds what the terminal UI asks of the worker. This call
+/// returns true once the worker takes requests. It returns false when the
+/// engine cannot start or a model's settings are invalid. The log says why a
+/// model's settings are invalid.
 pub fn start(
     model_settings: Vec<ModelSettings>,
     budgets: crate::config::Budgets,
     state_dir: Option<PathBuf>,
     on_log: Option<extern "C" fn(*const std::ffi::c_char)>,
     on_die: Option<extern "C" fn()>,
+    view: ViewOptions,
 ) -> bool {
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let handle = thread::Builder::new()
@@ -619,6 +644,7 @@ pub fn start(
                 status_wanted: AtomicBool::new(false),
                 status_published: tokio::sync::Notify::new(),
                 long_operations: AtomicUsize::new(0),
+                view,
                 session_tokens_wanted: Mutex::new(None),
                 session_tokens: Mutex::new(None),
             });
@@ -933,7 +959,8 @@ pub fn build_model_status_json(model_index: usize) -> Value {
 }
 
 /// Builds `requests` as JSON: each request's id, what it does, its session,
-/// its prompt tokens, its reused tokens and its generated tokens.
+/// its prompt tokens, its reused tokens, its generated tokens, and the experts
+/// of its latest tokens.
 fn build_requests_json(requests: &[RequestStatus]) -> Value {
     requests
         .iter()
@@ -945,6 +972,11 @@ fn build_requests_json(requests: &[RequestStatus]) -> Value {
                 "prompt_tokens": request.prompt_tokens,
                 "reused_tokens": request.reused_tokens,
                 "generated_tokens": request.generated_tokens,
+                "routes": request
+                    .routes
+                    .iter()
+                    .map(|route| json!({"experts": route.experts, "sources": route.sources}))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -1134,6 +1166,9 @@ struct Generation {
     /// since then stayed steady and kept their arrangement. The call chooser
     /// measures the gap from it to the next token.
     measured_token_at: Option<Instant>,
+    /// The experts of the request's latest tokens, the oldest first, as many
+    /// as the status keeps.
+    routes: VecDeque<Route>,
 }
 
 impl Generation {
@@ -1201,6 +1236,8 @@ struct WorkerModel {
     /// The experts that a decoded row chooses in all layers together. It is 0
     /// for a model without routed experts.
     experts_per_row: usize,
+    /// What the terminal UI asks of the worker.
+    view: ViewOptions,
     /// When the model last had a request. The idle unload counts from then.
     last_used_at: Instant,
     /// The calls that run now.
@@ -1582,6 +1619,7 @@ impl Worker {
                     think_end_token: model.tokenizer().find_added_token("</think>"),
                     logged_decoding_count: 0,
                     experts_per_row: model.read_stats().experts_per_row.max(0) as usize,
+                    view: shared.view,
                     last_used_at: Instant::now(),
                     running_calls: Vec::new(),
                     idle_prefill_streams: Vec::new(),
@@ -2461,6 +2499,7 @@ impl WorkerModel {
                 prompt_tokens: generation.prompt_tokens,
                 reused_tokens: generation.reused_tokens,
                 generated_tokens: generation.generated,
+                routes: generation.routes.iter().cloned().collect(),
             })
             .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
             .collect();
@@ -2839,6 +2878,7 @@ impl WorkerModel {
             in_call: false,
             turn: 0,
             measured_token_at: None,
+            routes: VecDeque::new(),
         };
         if reused_tokens == prompt_tokens {
             // The same prompt again: its prompt-end snapshot holds its logits.
@@ -3734,6 +3774,9 @@ impl WorkerModel {
             generation.next_token =
                 model.sample(unsafe { logits.row(row, vocab) }, &mut generation.sampler);
         }
+        for (row, &i) in indices.iter().enumerate() {
+            self.keep_routes(i, row);
+        }
         self.idle_decode_streams.push(stream);
         self.count_round_tokens(&indices, ended_at);
     }
@@ -3833,6 +3876,30 @@ impl WorkerModel {
             .cache
             .record_rejected_rows(generation.state_id, rows.len() - kept);
         generation.next_token = next;
+        // Row 0 is the request's own token.
+        self.keep_routes(index, 0);
+    }
+
+    /// Keeps the experts of row `row` of the latest decoding pass as those of
+    /// the latest token of the request at `index`, when the status keeps
+    /// experts. It keeps nothing while another decoding call of the model
+    /// runs, because the latest pass may then be that call's.
+    fn keep_routes(&mut self, index: usize, row: usize) {
+        let other_decoding_call = self
+            .running_calls
+            .iter()
+            .any(|running_call| !matches!(running_call.call, Call::Prefill { .. }));
+        if self.view.kept_route_tokens == 0 || self.experts_per_row == 0 || other_decoding_call {
+            return;
+        }
+        let Some((experts, sources)) = self.model.read_routes(row) else {
+            return;
+        };
+        let routes = &mut self.generations[index].routes;
+        if routes.len() == self.view.kept_route_tokens {
+            routes.pop_front();
+        }
+        routes.push_back(Route { experts, sources });
     }
 }
 
@@ -3866,7 +3933,7 @@ mod tests {
     }
 
     /// A request that waits shows no session yet. The running ones show what
-    /// they do and their tokens.
+    /// they do, their tokens, and the experts of their latest tokens.
     #[test]
     fn the_status_lists_each_request_with_what_it_does() {
         let (events, _receiver) = mpsc::unbounded_channel();
@@ -3896,15 +3963,21 @@ mod tests {
             prompt_tokens: 23,
             reused_tokens: 2,
             generated_tokens: 516,
+            routes: vec![Route {
+                experts: vec![17, 300],
+                sources: vec![0, 4],
+            }],
         };
         let requests = [decoding, RequestStatus::for_waiting_job(&job)];
         assert_eq!(
             build_requests_json(&requests),
             json!([
                 {"request": 5, "status": "decoding", "session": 5,
-                 "prompt_tokens": 23, "reused_tokens": 2, "generated_tokens": 516},
+                 "prompt_tokens": 23, "reused_tokens": 2, "generated_tokens": 516,
+                 "routes": [{"experts": [17, 300], "sources": [0, 4]}]},
                 {"request": 7, "status": "waiting", "session": null,
-                 "prompt_tokens": 3, "reused_tokens": 0, "generated_tokens": 0},
+                 "prompt_tokens": 3, "reused_tokens": 0, "generated_tokens": 0,
+                 "routes": []},
             ])
         );
     }

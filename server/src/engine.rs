@@ -316,6 +316,12 @@ unsafe extern "C" {
     fn eremite_set_memory_limit(bytes: u64);
     fn eremite_refresh_stats();
     fn eremite_read_stats(m: *const RawModel, s: *mut Stats);
+    fn eremite_read_routes(
+        m: *const RawModel,
+        row: c_int,
+        experts: *mut u16,
+        sources: *mut u8,
+    ) -> c_int;
     fn eremite_wake();
     fn eremite_max_rows(m: *const RawModel) -> c_int;
     fn eremite_drafts_per_pass(m: *const RawModel) -> c_int;
@@ -895,6 +901,28 @@ impl Model {
         let mut stats = Stats::default();
         unsafe { eremite_read_stats(self.raw, &mut stats) };
         stats
+    }
+
+    /// Returns the experts that row `row` of the model's latest decoding pass
+    /// chose in each layer with routed experts, layer by layer. With them, it
+    /// returns where each one was: 0 in memory, 1 read ahead, 2 late, 3
+    /// substituted, 4 from the SSD. Returns None for a model without routed
+    /// experts, and for a row that did not run every layer.
+    pub fn read_routes(&self, row: usize) -> Option<(Vec<u16>, Vec<u8>)> {
+        let count = self.read_stats().experts_per_row.max(0) as usize;
+        let mut experts = vec![0u16; count];
+        let mut sources = vec![0u8; count];
+        // Safety: the engine writes experts_per_row values to each buffer, and
+        // each buffer holds that many.
+        let read = unsafe {
+            eremite_read_routes(
+                self.raw,
+                row as c_int,
+                experts.as_mut_ptr(),
+                sources.as_mut_ptr(),
+            )
+        };
+        (read != 0 && count > 0).then_some((experts, sources))
     }
 
     /// Returns how many drafts the model makes itself for one pass: the

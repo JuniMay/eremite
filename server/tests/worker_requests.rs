@@ -144,7 +144,8 @@ fn requests_run_to_their_end_and_report_their_events() {
         config::Budgets::default(),
         None,
         Some(keep_line),
-        None
+        None,
+        worker::ViewOptions::default()
     ));
     let tokenizer = worker::list_models()[0].1;
     let prompt = tokenizer.tokenize("The first ten prime numbers are");

@@ -26,7 +26,14 @@ fn the_worker_registers_its_models_and_stops() {
         .into_iter()
         .collect();
     assert!(
-        worker::start(models.clone(), config::Budgets::default(), None, None, None),
+        worker::start(
+            models.clone(),
+            config::Budgets::default(),
+            None,
+            None,
+            None,
+            worker::ViewOptions::default()
+        ),
         "the worker starts"
     );
     let listed = worker::list_models();

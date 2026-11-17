@@ -55,7 +55,14 @@ fn wait_while(runtime: &tokio::runtime::Runtime, state: &str) -> Value {
 #[test]
 fn a_yield_takes_effect_and_a_resume_restores_the_limits() {
     assert!(
-        worker::start(Vec::new(), config::Budgets::default(), None, None, None),
+        worker::start(
+            Vec::new(),
+            config::Budgets::default(),
+            None,
+            None,
+            None,
+            worker::ViewOptions::default()
+        ),
         "the worker starts"
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
