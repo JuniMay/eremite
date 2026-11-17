@@ -3,6 +3,8 @@
 //! For each call, Codex sends the model's commands with its session id.
 //! The server answers with text for the model.
 //!
+//! - `search_query` runs on SearXNG.
+//!   SearXNG listens on a Unix socket, so it occupies no TCP port.
 //! - `open` shows a page from a reference or a URL, and `click` follows one
 //!   of its links.
 //! - `find` shows the lines of a page that contain a text.
@@ -11,6 +13,7 @@
 //!   refused, at every redirect.
 //! - HTML pages become numbered lines, and their links are numbered too.
 //! - Each session keeps its results under reference ids.
+//!   A search result gets `turnNsearchM`.
 //!   An opened page gets `turnNviewM`.
 //!   N is the call's turn: its number in the session, from 0.
 //!   Later calls name these ids in their commands.
@@ -22,6 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +52,8 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_SESSION_REFERENCES: usize = 400;
 /// Lines longer than this are wrapped at a space.
 const MAX_LINE_CHARS: usize = 200;
+/// The characters of a search result's text at most; longer text is cut.
+const MAX_SNIPPET_CHARS: usize = 400;
 /// The User-Agent header that curl sends: Safari's on macOS.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
@@ -73,6 +79,9 @@ pub struct SearchRequest {
 /// The model's commands in one call. Each kind holds a list of commands.
 #[derive(Deserialize, Default)]
 pub struct Commands {
+    /// Web searches.
+    #[serde(default)]
+    search_query: Option<Vec<SearchQuery>>,
     /// Searches for papers: not available.
     #[serde(default)]
     literature_search_query: Option<Vec<Value>>,
@@ -106,6 +115,21 @@ pub struct Commands {
     /// How much the call returns: "short", "medium" or "long".
     #[serde(default)]
     response_length: Option<String>,
+}
+
+/// One web search.
+#[derive(Deserialize, Clone)]
+struct SearchQuery {
+    /// The query: Codex's `q`.
+    #[serde(rename = "q")]
+    text: String,
+    /// The results' age at most, in days, rounded up to a day, a week, a
+    /// month or a year.
+    #[serde(default)]
+    recency: Option<u64>,
+    /// The domains that the results must be in.
+    #[serde(default)]
+    domains: Option<Vec<String>>,
 }
 
 /// Opens a page.
@@ -185,6 +209,15 @@ impl ResponseLength {
         }
     }
 
+    /// Returns the search results that each query shows at most.
+    fn max_results_per_query(self) -> usize {
+        match self {
+            ResponseLength::Short => 5,
+            ResponseLength::Medium => 8,
+            ResponseLength::Long => 12,
+        }
+    }
+
     /// Returns the lines that each view of a page shows at most.
     fn max_lines_per_view(self) -> usize {
         match self {
@@ -224,6 +257,11 @@ pub struct Page {
 /// What a reference id names.
 #[derive(Clone)]
 enum Reference {
+    /// A search result, not fetched yet.
+    SearchResult {
+        /// The result's URL.
+        url: String,
+    },
     /// An opened page.
     Page(Arc<Page>),
 }
@@ -259,6 +297,7 @@ impl Session {
 #[derive(Clone, Copy, Debug)]
 pub struct Times {
     /// What each fetch may take.
+    /// Each search may take as long.
     pub timeout: Duration,
     /// A session without calls for this long is forgotten.
     pub session_idle: Duration,
@@ -268,6 +307,8 @@ pub struct Times {
 pub struct Service {
     /// The sessions by id.
     sessions: Mutex<HashMap<String, Session>>,
+    /// The SearXNG that runs the searches.
+    searxng: Searxng,
     /// Which addresses pages may be fetched from.
     address_policy: AddressPolicy,
     /// The time limit and lifetimes.
@@ -302,9 +343,11 @@ impl Call {
 
 impl Service {
     /// Creates the service with no sessions.
-    pub fn new(address_policy: AddressPolicy, times: Times) -> Self {
+    /// SearXNG listens on `searxng_socket`.
+    pub fn new(searxng_socket: PathBuf, address_policy: AddressPolicy, times: Times) -> Self {
         Service {
             sessions: Mutex::new(HashMap::new()),
+            searxng: Searxng::new(searxng_socket, times),
             address_policy,
             times,
         }
@@ -367,6 +410,13 @@ impl Service {
             known_references: known,
         };
 
+        let queries: Vec<SearchQuery> = commands
+            .search_query
+            .iter()
+            .flatten()
+            .filter(|q| !q.text.trim().is_empty())
+            .cloned()
+            .collect();
         let pages = commands.open.as_ref().map_or(0, Vec::len)
             + commands.click.as_ref().map_or(0, Vec::len)
             + commands.find.as_ref().map_or(0, Vec::len);
@@ -376,9 +426,23 @@ impl Service {
         let budget = (request.max_output_tokens.unwrap_or(2500) as usize)
             .saturating_mul(3)
             .clamp(2000, 60_000);
-        let section_budget = budget / pages.max(1);
+        let section_budget = budget / (usize::from(!queries.is_empty()) + pages).max(1);
 
         let mut sections: Vec<String> = Vec::new();
+        if !queries.is_empty() {
+            sections.push(if may_fetch {
+                self.run_searches(
+                    &mut call,
+                    &queries,
+                    &allowed_domains,
+                    length,
+                    section_budget,
+                )
+                .await
+            } else {
+                format_offline_note("search_query")
+            });
+        }
         for (name, given) in [
             (
                 "literature_search_query",
@@ -451,16 +515,78 @@ impl Service {
         self.add_references(&request.session_id, call.new_references);
         let output = format!("{UNTRUSTED_CONTENT_NOTICE}\n\n{}", sections.join("\n\n"));
         engine::log(&format!(
-            "alpha/search turn {turn}: {pages} page commands, {new_reference_count} new references, {} bytes in {:.1} s",
+            "alpha/search turn {turn}: {} queries, {pages} page commands, {new_reference_count} new references, {} bytes in {:.1} s",
+            queries.len(),
             output.len(),
             started.elapsed().as_secs_f64()
         ));
         output
     }
 
+    /// Runs the queries on SearXNG at the same time and lists their results.
+    /// Each result gets a search reference, `turnNsearchM`.
+    async fn run_searches(
+        &self,
+        call: &mut Call,
+        queries: &[SearchQuery],
+        allowed_domains: &[String],
+        length: ResponseLength,
+        budget: usize,
+    ) -> String {
+        let mut tasks = Vec::new();
+        for query in queries {
+            let (searxng, query, allowed_domains) = (
+                self.searxng.clone_handle(),
+                query.clone(),
+                allowed_domains.to_vec(),
+            );
+            tasks.push(tokio::spawn(async move {
+                searxng.search(&query, &allowed_domains, length).await
+            }));
+        }
+        let mut out = String::new();
+        let mut index = 0;
+        for (query, task) in queries.iter().zip(tasks) {
+            out.push_str(&format!("Search results for \"{}\":\n", query.text));
+            match task.await.unwrap_or_else(|e| Err(e.to_string())) {
+                Ok(results) if results.is_empty() => out.push_str("No results.\n"),
+                Ok(results) => {
+                    for result in results {
+                        let id = format!("turn{}search{index}", call.turn);
+                        index += 1;
+                        let mut entry = format!("[{id}] {}\n{}\n", result.title, result.url);
+                        if !result.snippet.is_empty() {
+                            entry.push_str(&result.snippet);
+                            if let Some(date) = &result.date {
+                                entry.push_str(&format!(" ({date})"));
+                            }
+                            entry.push('\n');
+                        }
+                        if out.len() + entry.len() > budget {
+                            break;
+                        }
+                        out.push_str(&entry);
+                        call.known_references.insert(
+                            id.clone(),
+                            Reference::SearchResult {
+                                url: result.url.clone(),
+                            },
+                        );
+                        call.new_references
+                            .push((id, Reference::SearchResult { url: result.url }));
+                    }
+                }
+                Err(e) => out.push_str(&format!("The search failed: {e}\n")),
+            }
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    }
+
     /// Returns the page that a reference or URL names, with its reference id.
     /// A page opened before comes back as it is.
     /// A URL is fetched now, and its page gets a view reference.
+    /// A search result's URL is fetched in the same way.
     async fn open_page(
         &self,
         call: &mut Call,
@@ -470,6 +596,7 @@ impl Service {
     ) -> Result<(String, Arc<Page>), String> {
         let url = match call.known_references.get(ref_id) {
             Some(Reference::Page(p)) => return Ok((ref_id.to_string(), p.clone())),
+            Some(Reference::SearchResult { url }) => url.clone(),
             None if ref_id.starts_with("http://") || ref_id.starts_with("https://") => {
                 ref_id.to_string()
             }
@@ -515,6 +642,142 @@ impl Service {
         let url = url.clone();
         self.open_page(call, &url, may_fetch, allowed_domains).await
     }
+}
+
+/// Says that the command does not run while live web access is off.
+fn format_offline_note(command: &str) -> String {
+    format!("{command}: live web access is off (Codex's web_search = \"cached\").")
+}
+
+// ---- SearXNG on a Unix socket ----
+
+/// A search result before it gets its reference.
+struct SearxngResult {
+    /// The result's URL.
+    url: String,
+    /// The result's title, or its URL when it has none.
+    title: String,
+    /// SearXNG's text about the result.
+    snippet: String,
+    /// When the page was published, as YYYY-MM-DD, if SearXNG knows.
+    date: Option<String>,
+}
+
+/// What the handles to SearXNG share.
+struct SearxngState {
+    /// The Unix socket that SearXNG listens on.
+    socket: PathBuf,
+    /// The web tool's time limit and lifetimes.
+    times: Times,
+}
+
+/// A handle to the SearXNG that runs the searches.
+struct Searxng(Arc<SearxngState>);
+
+impl Searxng {
+    /// Creates a handle to the SearXNG on `socket`.
+    fn new(socket: PathBuf, times: Times) -> Self {
+        Searxng(Arc::new(SearxngState { socket, times }))
+    }
+
+    /// Returns another handle to the same SearXNG.
+    fn clone_handle(&self) -> Searxng {
+        Searxng(self.0.clone())
+    }
+
+    /// Runs one query on SearXNG and returns its results.
+    async fn search(
+        &self,
+        query: &SearchQuery,
+        allowed_domains: &[String],
+        length: ResponseLength,
+    ) -> Result<Vec<SearxngResult>, String> {
+        let domains: Vec<String> = query
+            .domains
+            .iter()
+            .flatten()
+            .chain(allowed_domains)
+            .map(|domain| domain.trim().trim_start_matches("*.").to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        let mut text = query.text.trim().to_string();
+        if let [only] = domains.as_slice() {
+            text.push_str(&format!(" site:{only}"));
+        }
+        let mut command = Command::new(CURL_PATH);
+        command
+            .args(["-q", "-sS", "--max-time"])
+            .arg(self.0.times.timeout.as_secs_f64().to_string())
+            .arg("--unix-socket")
+            .arg(&self.0.socket)
+            .args(["--get", "--data-urlencode"])
+            .arg(format!("q={text}"))
+            .args(["--data-urlencode", "format=json"]);
+        if let Some(days) = query.recency {
+            let range = match days {
+                0..=1 => "day",
+                2..=7 => "week",
+                8..=31 => "month",
+                _ => "year",
+            };
+            command
+                .args(["--data-urlencode"])
+                .arg(format!("time_range={range}"));
+        }
+        let output = command
+            .arg("http://localhost/search")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        parse_searxng_results(&output.stdout, &domains, length.max_results_per_query())
+    }
+}
+
+/// SearXNG's JSON: its results, those within `domains` when any are given.
+fn parse_searxng_results(
+    body: &[u8],
+    domains: &[String],
+    max_results: usize,
+) -> Result<Vec<SearxngResult>, String> {
+    let answer_json: Value =
+        serde_json::from_slice(body).map_err(|e| format!("SearXNG answered no JSON: {e}"))?;
+    let mut results = Vec::new();
+    for searxng_result in answer_json["results"].as_array().into_iter().flatten() {
+        let Some(url) = searxng_result["url"].as_str() else {
+            continue;
+        };
+        if !domains.is_empty() {
+            let host = Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+            if !host.is_some_and(|host| {
+                domains
+                    .iter()
+                    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+            }) {
+                continue;
+            }
+        }
+        let snippet = collapse_whitespace(searxng_result["content"].as_str().unwrap_or(""));
+        results.push(SearxngResult {
+            url: url.to_string(),
+            title: collapse_whitespace(searxng_result["title"].as_str().unwrap_or(url)),
+            snippet: cut_to_chars(&snippet, MAX_SNIPPET_CHARS),
+            // The date without its time: YYYY-MM-DD.
+            date: searxng_result["publishedDate"]
+                .as_str()
+                .filter(|date| !date.is_empty())
+                .map(|date| date.chars().take(10).collect()),
+        });
+        if results.len() == max_results {
+            break;
+        }
+    }
+    Ok(results)
 }
 
 // ---- fetching ----
@@ -1177,6 +1440,16 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Cuts the text to `max_chars` characters, and ends a cut text with "…".
+fn cut_to_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut t: String = text.chars().take(max_chars).collect();
+    t.push('…');
+    t
+}
+
 /// Lines no longer than [`MAX_LINE_CHARS`], longer ones wrapped at spaces.
 fn wrap_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut out = Vec::new();
@@ -1465,7 +1738,11 @@ mod tests {
 
     #[test]
     fn references_stay_in_their_session_between_calls() {
-        let s = Service::new(AddressPolicy::Public, TEST_TIMES);
+        let s = Service::new(
+            "/nonexistent.sock".into(),
+            AddressPolicy::Public,
+            TEST_TIMES,
+        );
         let (turn, _) = s.begin_call("session");
         assert_eq!(turn, 0);
         let p = Arc::new(build_test_page(
@@ -1481,7 +1758,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_answers_each_of_its_commands() {
-        let s = Service::new(AddressPolicy::Public, TEST_TIMES);
+        let s = Service::new(
+            "/nonexistent.sock".into(),
+            AddressPolicy::Public,
+            TEST_TIMES,
+        );
         let p = Arc::new(build_test_page(
             &["first line", "the Pattern here", "last"],
             &[],
@@ -1495,6 +1776,7 @@ mod tests {
                 "open": [{"ref_id": "turn0view0", "lineno": 1}, {"ref_id": "turn9search9"}],
                 "image_query": [{"q": "cats"}],
                 "time": [{"utc_offset": "+00:00"}],
+                "search_query": [{"q": ""}],
             },
             "settings": {"external_web_access": true},
             "max_output_tokens": 2500,
@@ -1514,22 +1796,35 @@ mod tests {
         );
         assert!(out.contains("image_query: not available"), "{out}");
         assert!(out.contains("Time at UTC+00:00: "), "{out}");
+        assert!(
+            !out.contains("Search results"),
+            "an empty query searches nothing: {out}"
+        );
     }
 
     /// With Codex's web_search = "cached", the commands that need the web say
     /// that live web access is off.
     #[tokio::test]
     async fn cached_web_access_fetches_nothing() {
-        let s = Service::new(AddressPolicy::Public, TEST_TIMES);
+        let s = Service::new(
+            "/nonexistent.sock".into(),
+            AddressPolicy::Public,
+            TEST_TIMES,
+        );
         let request: SearchRequest = serde_json::from_value(serde_json::json!({
             "id": "s",
             "commands": {
+                "search_query": [{"q": "cats"}],
                 "open": [{"ref_id": "https://example.com/"}],
             },
             "settings": {"external_web_access": "cached"},
         }))
         .unwrap();
         let out = s.answer_call(request).await;
+        assert!(
+            out.contains("search_query: live web access is off"),
+            "{out}"
+        );
         assert!(
             out.contains("open https://example.com/: live web access is off"),
             "{out}"
@@ -1564,6 +1859,69 @@ mod tests {
             "Time at UTC-08:00: 2026-11-12 13:00:00"
         );
         assert!(format_time_at_offset("noon", now).contains("is not a UTC offset"));
+    }
+
+    #[test]
+    fn searxng_results_are_kept_within_the_domains() {
+        let body = serde_json::json!({"results": [
+            {"url": "https://docs.rs/url/", "title": "url - Rust", "content": "URL  library", "publishedDate": "2025-01-02T00:00:00"},
+            {"url": "https://example.com/x", "title": "Other", "content": ""},
+        ]})
+        .to_string();
+        let all = parse_searxng_results(body.as_bytes(), &[], 5).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            (all[0].snippet.as_str(), all[0].date.as_deref()),
+            ("URL library", Some("2025-01-02"))
+        );
+        let docs = parse_searxng_results(body.as_bytes(), &["docs.rs".into()], 5).unwrap();
+        assert_eq!(docs.len(), 1);
+    }
+
+    /// A search on a stand-in for SearXNG: a Unix socket that answers each
+    /// request with the same two results.
+    #[tokio::test]
+    async fn search_results_get_references() {
+        let socket =
+            std::env::temp_dir().join(format!("eremite-search-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                // Each test request fits in one read of 4 KB.
+                let mut buf = vec![0u8; 4 * KIB];
+                let _ = stream.read(&mut buf).await;
+                let body = serde_json::json!({"results": [
+                    {"url": "https://docs.rs/url/", "title": "url - Rust", "content": "URL library"},
+                    {"url": "https://example.com/x", "title": "Other", "content": ""},
+                ]})
+                .to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        let s = Service::new(socket.clone(), AddressPolicy::Public, TEST_TIMES);
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "id": "s",
+            "commands": {"search_query": [{"q": "url crate", "domains": ["docs.rs"]}]},
+        }))
+        .unwrap();
+        let out = s.answer_call(request).await;
+        let _ = std::fs::remove_file(&socket);
+        assert!(
+            out.contains("Search results for \"url crate\":\n[turn0search0] url - Rust\nhttps://docs.rs/url/\nURL library"),
+            "{out}"
+        );
+        assert!(!out.contains("example.com"), "only docs.rs is kept: {out}");
+        let (_, known) = s.begin_call("s");
+        assert!(
+            matches!(known.get("turn0search0"), Some(Reference::SearchResult { url }) if url == "https://docs.rs/url/"),
+            "the result is a reference"
+        );
     }
 
     #[test]
@@ -1615,7 +1973,7 @@ mod tests {
     #[tokio::test]
     async fn pages_are_fetched_followed_and_clicked() {
         let port = serve_test_pages().await;
-        let s = Service::new(AddressPolicy::Any, TEST_TIMES);
+        let s = Service::new("/nonexistent.sock".into(), AddressPolicy::Any, TEST_TIMES);
         let request = |commands: serde_json::Value| -> SearchRequest {
             serde_json::from_value(
                 serde_json::json!({"id": "t", "commands": commands, "max_output_tokens": 2500}),
