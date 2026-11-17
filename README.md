@@ -28,6 +28,16 @@ hand. Each one's usage is at the top of its source. For example,
 `build/tests/model-tokenizer CHECKPOINT` checks DeepSeek V4.1 Flash's tokenizer
 against the reference tokenizer's ids.
 
+## Models
+
+`scripts/download-models.sh FOLDER` downloads DeepSeek V4.1 Flash from Hugging
+Face: its checkpoint (510 GB) into `FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
+and the routed experts of the UD-IQ2_XXS GGUF quantization (165 GB) into
+`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`. Other
+quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists the
+files without downloading them. It needs Python 3.10 or later, and runs again
+from where an interrupted download stopped.
+
 ## Run
 
 `build/eremite -m CHECKPOINT -p PROMPT` generates a reply with DeepSeek V4.1
