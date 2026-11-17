@@ -13,6 +13,7 @@ pub mod overview;
 pub mod samples;
 pub mod screen;
 pub mod status;
+pub mod terminal;
 #[cfg(test)]
 mod testing;
 pub mod theme;
