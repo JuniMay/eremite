@@ -9,6 +9,7 @@ use ratatui::text::Line;
 
 use super::draw::{colored, fit_line, format_duration, label, plain, strong};
 use super::log::LogFilter;
+use super::samples::Samples;
 use super::status::{ModelStatus, Phase};
 use super::theme::{Rgb, Theme};
 
@@ -94,6 +95,8 @@ pub struct Screen<'a> {
     pub models: &'a [ModelInfo],
     /// Each model's latest status, in the same order.
     pub statuses: &'a [ModelStatus],
+    /// The samples of the history window.
+    pub samples: &'a Samples,
 }
 
 /// The keys that the keys row names: each key, and what it does.
@@ -513,7 +516,7 @@ pub fn list_model_keys(screen: &Screen, choices: &Choices) -> Keys {
 mod tests {
     use super::*;
     use crate::ui::status::{Activity, Request};
-    use crate::ui::testing::{draw_on_terminal, find_in_row, read_row};
+    use crate::ui::testing::{WINDOWS, draw_on_terminal, find_in_row, read_row};
     use crate::ui::theme::DARK;
 
     /// Two models: deepseek-v4.1-flash decodes request 5, and qwen3.8-27b is
@@ -545,6 +548,7 @@ mod tests {
             uptime_seconds: 57.0,
             models: &models,
             statuses: &statuses,
+            samples: &Samples::new(WINDOWS),
         };
         let (mut keys, last) = list_chrome_keys(choices);
         if choices.view == View::Models {
@@ -732,6 +736,7 @@ mod tests {
             uptime_seconds: 57.0,
             models: &models,
             statuses: &statuses,
+            samples: &Samples::new(WINDOWS),
         };
         for chosen in [0, 6, 11] {
             let mut choices = Choices {

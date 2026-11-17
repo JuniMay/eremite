@@ -4,6 +4,7 @@
 pub mod draw;
 pub mod frame;
 pub mod log;
+pub mod overview;
 pub mod samples;
 pub mod status;
 #[cfg(test)]

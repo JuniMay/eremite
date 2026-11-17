@@ -286,7 +286,8 @@ pub fn draw_log(
 mod tests {
     use super::*;
     use crate::ui::frame::Kind;
-    use crate::ui::testing::{draw_on_terminal, find_in_row, read_row};
+    use crate::ui::samples::Samples;
+    use crate::ui::testing::{WINDOWS, draw_on_terminal, find_in_row, read_row};
     use crate::ui::theme::DARK;
     use std::ffi::CString;
 
@@ -321,6 +322,7 @@ mod tests {
             uptime_seconds: 57.0,
             models: &models,
             statuses: &[],
+            samples: &Samples::new(WINDOWS),
         };
         draw_on_terminal(160, height, |buf, area| {
             draw_log(buf, area, &screen, lines, choices);

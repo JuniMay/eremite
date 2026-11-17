@@ -6,6 +6,15 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::samples::Windows;
+
+/// The windows' defaults: 5 s now, and 60 s recent and history.
+pub const WINDOWS: Windows = Windows {
+    now: 5.0,
+    recent: 60.0,
+    history: 60.0,
+};
+
 /// Draws with `draw` on a test terminal of `width` x `height` cells, and
 /// returns its cells.
 pub fn draw_on_terminal(width: u16, height: u16, draw: impl FnOnce(&mut Buffer, Rect)) -> Buffer {

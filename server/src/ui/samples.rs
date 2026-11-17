@@ -267,6 +267,37 @@ pub fn find_hit_share(sources: [u64; 5]) -> Option<f64> {
     (all > 0).then(|| (sources[0] + sources[1] + sources[2]) as f64 / all as f64)
 }
 
+/// Returns the share of all models' decoding time since the start in which
+/// the GPU was busy.
+pub fn find_gpu_busy_since_start(statuses: &[ModelStatus]) -> Option<f64> {
+    let seconds: f64 = statuses
+        .iter()
+        .map(|status| status.model_decode.seconds)
+        .sum();
+    let busy: f64 = statuses
+        .iter()
+        .map(|status| status.model_decode.main_queue_gpu_seconds)
+        .sum();
+    (seconds > 0.0).then(|| (busy / seconds).clamp(0.0, 1.0))
+}
+
+/// Returns the GB per second that all models read from the SSD since the
+/// start, over the seconds in which they decoded or prefilled.
+pub fn find_ssd_read_since_start(statuses: &[ModelStatus]) -> Option<f64> {
+    let seconds: f64 = statuses
+        .iter()
+        .map(|status| status.model_decode.seconds + status.totals.prefill_seconds)
+        .sum();
+    let gb: f64 = statuses
+        .iter()
+        .map(|status| {
+            status.model_decode.requested_expert_gb
+                + status.engine_counters.prefill_read_bytes as f64 / GB
+        })
+        .sum();
+    (seconds > 0.0).then(|| gb / seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +377,23 @@ mod tests {
         assert_eq!(find_hit_share([0; 5]), None);
         let first = &samples.samples[0];
         assert_eq!(first.sum_models(|model| model.decoding), None);
+    }
+
+    #[test]
+    fn the_gpu_and_the_ssd_since_the_start_count_all_models() {
+        let mut first = status(Vec::new(), 0, 20);
+        first.totals.prefill_seconds = 10.0;
+        first.engine_counters.prefill_read_bytes = 5_000_000_000;
+        first.model_decode.requested_expert_gb = 15.0;
+        let mut second = status(Vec::new(), 0, 0);
+        second.model_decode.seconds = 20.0;
+        second.totals.prefill_seconds = 20.0;
+        let both = [first, second];
+        // 8 GPU seconds in 30 s of decoding calls
+        assert_eq!(find_gpu_busy_since_start(&both), Some(8.0 / 30.0));
+        // 15 GB decoded and 5 GB prefilled, in 20 s and then 40 s
+        assert_eq!(find_ssd_read_since_start(&both), Some(20.0 / 60.0));
+        assert_eq!(find_gpu_busy_since_start(&[]), None);
     }
 
     #[test]
