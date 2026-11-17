@@ -5,14 +5,29 @@
 //! itself.
 //! deepseek-recipe then converts the request. It renders the V4.1 prompt.
 //! The model's tokenizer turns the prompt into tokens.
+//! deepseek-recipe's stream processor turns the worker's events into the API's
+//! chunks.
+//! A chunk is a chat completion chunk or a Responses stream event.
 
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use deepseek_recipe::openai::chat_completion::response::{
+    ChatCompletionChunk, ChatCompletionToolCallDelta,
+};
+use deepseek_recipe::openai::responses::response::{ResponsesOutputItem, ResponsesStreamEvent};
 use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
 use deepseek_recipe::request::{
     ConversationRequest, ConversionError, ConversionOptions, ProtocolRequest,
+};
+use deepseek_recipe::response::{Accumulate, ProtocolResponse};
+use deepseek_recipe::stream::{
+    ChunkGenerator, InferenceChunk, InferenceFinishReason, PromptUsage, StreamProcessor,
 };
 use deepseek_recipe_core::multimodal::ImageSource;
 use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens, SpecialTokensMap};
@@ -20,10 +35,12 @@ use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_stream::{Stream, StreamExt};
 
-use super::{Api, DEFAULT_MAX_TOKENS, Error};
+use super::{Api, DEFAULT_MAX_TOKENS, Error, build_error_response, generate_random_id};
 use crate::engine;
-use crate::worker::{self, Sampling};
+use crate::worker::{self, Event, FinishReason, Sampling};
 
 /// The model id of a DeepSeek model whose configuration gives none.
 /// Responses and GET /v1/models show this id.
@@ -97,6 +114,8 @@ struct RequestSettings {
     sampling: Sampling,
     /// The most tokens that the response may have.
     max_tokens: i64,
+    /// The model id that the response names.
+    model_id: String,
     /// The reasoning effort from 1 to 100, or None when thinking is off.
     effort: Option<u32>,
 }
@@ -175,6 +194,11 @@ fn rewrite_chat_request(
     super::read_stop_sequences(root)?;
     root.remove("max_completion_tokens");
     root.remove("max_tokens");
+    let model_id = root
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.model_id)
+        .to_string();
     root.insert("model".into(), RECIPE_MODEL_NAME.into());
 
     // A `thinking` value decides whether thinking is on.
@@ -274,6 +298,7 @@ fn rewrite_chat_request(
     Ok(RequestSettings {
         sampling,
         max_tokens,
+        model_id,
         effort: is_thinking_on.then_some(effort),
     })
 }
@@ -305,6 +330,11 @@ fn rewrite_responses_request(
             Error::new_bad_request("max_output_tokens must be a positive integer")
         })?,
     };
+    let model_id = root
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.model_id)
+        .to_string();
     root.insert("model".into(), RECIPE_MODEL_NAME.into());
 
     // The effort "none" turns thinking off.
@@ -339,6 +369,7 @@ fn rewrite_responses_request(
     Ok(RequestSettings {
         sampling,
         max_tokens,
+        model_id,
         effort: is_thinking_on.then_some(effort),
     })
 }
@@ -476,6 +507,8 @@ fn render_as<ApiRequest: ProtocolRequest + DeserializeOwned>(
 pub struct PreparedRequest {
     /// The model's tokenizer.
     tokenizer: engine::Tokenizer,
+    /// The request as deepseek-recipe converted it.
+    converted_request: ConversationRequest,
     /// The rendered prompt's bytes, with the byte 0xFF at each image's place.
     prompt: Vec<u8>,
     /// The file bytes of each image, in prompt order.
@@ -621,6 +654,7 @@ pub fn prepare_request(
     Ok(PreparedRequest {
         tokenizer,
         is_streamed: rendered.converted_request.stream,
+        converted_request: rendered.converted_request,
         prompt,
         images,
         settings: rendered.settings,
@@ -631,9 +665,265 @@ pub fn prepare_request(
     })
 }
 
+// ---- responses ----
+
+/// Converts the worker's events into deepseek-recipe's inference chunks.
+/// The first event is `first_event`. The others come from `events`.
+/// The worker's token events leave out the end token.
+/// When a response ends at the end token, one token without text stands for it
+/// in the usage.
+/// A shutdown sets `ended_by_shutdown`.
+/// It ends the chunks without a finish chunk.
+fn convert_events_to_inference_chunks(
+    first_event: Event,
+    mut events: UnboundedReceiver<Event>,
+    ended_by_shutdown: Arc<AtomicBool>,
+) -> impl Stream<Item = InferenceChunk> + Send {
+    async_stream::stream! {
+        let mut next = Some(first_event);
+        loop {
+            let event = match next.take() {
+                Some(event) => event,
+                None => match events.recv().await {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            match event {
+                Event::DecodingStarted { prompt_tokens, reused_tokens } => {
+                    let prompt_usage = PromptUsage { prompt_tokens, prompt_cache_hit_tokens: reused_tokens };
+                    yield InferenceChunk::Ready { system_fingerprint: None, prompt_usage };
+                }
+                Event::Tokens(token_ids) => yield InferenceChunk::Tokens { token_ids, logprobs: None },
+                Event::Done { reason: FinishReason::StopToken, .. } => {
+                    // The end token counts as one token.
+                    yield InferenceChunk::Text { content: String::new(), token_count: 1 };
+                    yield InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop };
+                    break;
+                }
+                Event::Done { reason: FinishReason::Length, .. } => {
+                    yield InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length };
+                    break;
+                }
+                Event::Done { reason: FinishReason::ServerStop, .. } => {
+                    ended_by_shutdown.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Event::Done { .. } | Event::Refused(_) | Event::Failed(_) => break,
+            }
+        }
+    }
+}
+
+/// The chunk type of an API's response: a chat completion chunk or a Responses
+/// stream event.
+type Chunk<ApiRequest> =
+    <<<ApiRequest as ProtocolRequest>::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk;
+
+/// The parts of a response that differ between the two APIs.
+trait ApiOutput: ProtocolRequest {
+    /// Generates a new response id with the API's prefix.
+    fn generate_response_id() -> String;
+    /// Counts the tool calls that `chunk` starts.
+    fn count_started_tool_calls(chunk: &Chunk<Self>) -> usize;
+}
+
+impl ApiOutput for ChatCompletionRequest {
+    fn generate_response_id() -> String {
+        generate_random_id("chatcmpl-")
+    }
+
+    fn count_started_tool_calls(chunk: &ChatCompletionChunk) -> usize {
+        chunk
+            .choices
+            .iter()
+            .filter_map(|choice| choice.delta.tool_calls.as_ref())
+            .flatten()
+            .filter(|delta| matches!(delta, ChatCompletionToolCallDelta::Start { .. }))
+            .count()
+    }
+}
+
+impl ApiOutput for ResponsesRequest {
+    fn generate_response_id() -> String {
+        generate_random_id("resp_")
+    }
+
+    fn count_started_tool_calls(chunk: &ResponsesStreamEvent) -> usize {
+        match chunk {
+            ResponsesStreamEvent::OutputItemAdded { item, .. } => matches!(
+                item,
+                ResponsesOutputItem::FunctionCall { .. }
+                    | ResponsesOutputItem::CustomToolCall { .. }
+                    | ResponsesOutputItem::ToolSearchCall { .. }
+            ) as usize,
+            _ => 0,
+        }
+    }
+}
+
+/// Reads the Unix time: the current time in seconds since 1970-01-01 UTC.
+fn read_unix_time() -> u64 {
+    // A clock set before 1970 reads as 0.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Converts the worker's events into the API's chunks with deepseek-recipe's
+/// stream processor.
+/// Also returns `ended_by_shutdown`.
+/// It is set when the server's shutdown ended the chunks.
+fn convert_events_to_api_chunks<ApiRequest: ApiOutput>(
+    mut converted_request: ConversationRequest,
+    response_id: String,
+    model_id: String,
+    tokenizer: engine::Tokenizer,
+    first_event: Event,
+    events: UnboundedReceiver<Event>,
+) -> (
+    impl Stream<Item = Result<Chunk<ApiRequest>, String>> + Send,
+    Arc<AtomicBool>,
+)
+where
+    Chunk<ApiRequest>: Send,
+{
+    let ended_by_shutdown = Arc::new(AtomicBool::new(false));
+    let generator = ApiRequest::chunk_generator(&converted_request, response_id, model_id);
+    let options = std::mem::take(&mut converted_request.parsing_options);
+    let processor = StreamProcessor::new(generator, options).with_tokenizer(tokenizer);
+    let chunks = processor
+        .into_protocol_stream(convert_events_to_inference_chunks(
+            first_event,
+            events,
+            ended_by_shutdown.clone(),
+        ))
+        .map(|c| c.map_err(|e| e.to_string()));
+    (chunks, ended_by_shutdown)
+}
+
+/// Logs the number of tool calls in a response when it has any.
+fn log_tool_calls(request_id: u64, tool_call_count: usize) {
+    if tool_call_count > 0 {
+        engine::log(&format!(
+            "req {request_id}: {tool_call_count} tool call{}",
+            if tool_call_count == 1 { "" } else { "s" }
+        ));
+    }
+}
+
+/// Collects the whole response before it answers.
+/// deepseek-recipe adds each chunk to one chat.completion or Responses response
+/// object.
+pub async fn collect_response(
+    request: PreparedRequest,
+    cancel: worker::CancelGuard,
+    events: UnboundedReceiver<Event>,
+) -> Response {
+    match request.api {
+        Api::ChatCompletions => {
+            collect_response_as::<ChatCompletionRequest>(request, cancel, events).await
+        }
+        Api::Responses => collect_response_as::<ResponsesRequest>(request, cancel, events).await,
+    }
+}
+
+/// Collects the whole response of an `ApiRequest` request.
+async fn collect_response_as<ApiRequest: ApiOutput>(
+    request: PreparedRequest,
+    cancel: worker::CancelGuard,
+    mut events: UnboundedReceiver<Event>,
+) -> Response
+where
+    Chunk<ApiRequest>: Send,
+{
+    let request_id = cancel.id();
+    let first = match events.recv().await {
+        Some(Event::Failed(message)) => {
+            return build_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", &message);
+        }
+        Some(Event::Refused(message)) => {
+            return build_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &message,
+            );
+        }
+        Some(event) => event,
+        None => {
+            return build_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "the request ended without an answer",
+            );
+        }
+    };
+    let (response_id, model_id) = (
+        ApiRequest::generate_response_id(),
+        request.settings.model_id.clone(),
+    );
+    // The chunks carry the token usage. The prompt counts start at 0.
+    let mut response = <ApiRequest::Response as ProtocolResponse>::new(
+        response_id.clone(),
+        model_id,
+        read_unix_time(),
+        0,
+        0,
+    );
+    let (chunks, ended_by_shutdown) = convert_events_to_api_chunks::<ApiRequest>(
+        request.converted_request,
+        response_id,
+        request.settings.model_id,
+        request.tokenizer,
+        first,
+        events,
+    );
+    let mut chunks = pin!(chunks);
+    let mut tool_call_count = 0;
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(chunk) => {
+                tool_call_count += ApiRequest::count_started_tool_calls(&chunk);
+                response.accumulate(chunk);
+            }
+            Err(message) => {
+                return build_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    &message,
+                );
+            }
+        }
+    }
+    if ended_by_shutdown.load(Ordering::Relaxed) {
+        return build_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the server is stopping",
+        );
+    }
+    log_tool_calls(request_id, tool_call_count);
+    match serde_json::to_string(&response) {
+        Ok(json) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response(),
+        Err(e) => build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &e.to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The id of `</think>` in the DeepSeek V4.1 tokenizer.
+    const THINK_END_TOKEN: u32 = 128_822;
 
     /// Builds the defaults that the tests use: thinking on at effort 75.
     fn build_test_defaults() -> Defaults {
@@ -694,6 +984,7 @@ mod tests {
             (0.0, 0.0, Some(7), Some(62))
         );
         assert_eq!(s.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(s.model_id, DEFAULT_MODEL_ID);
         assert_eq!(root["model"], RECIPE_MODEL_NAME);
         assert_eq!(root["thinking"], json!({"type": "enabled"}));
         assert_eq!(root["reasoning_effort"], "high");
@@ -839,6 +1130,7 @@ mod tests {
         }))
         .expect("settings");
         assert_eq!(root["model"], RECIPE_MODEL_NAME);
+        assert_eq!(s.model_id, "deepseek-v4.1-flash");
         assert_eq!(
             (s.effort, &root["reasoning"]["effort"]),
             (Some(75), &json!("high"))
@@ -1044,5 +1336,200 @@ mod tests {
         );
         assert_eq!(counts, (1, 1, 1));
         assert_eq!(prepared.describe_thinking(), "thinking off");
+    }
+
+    /// Builds the worker's events of a short answer.
+    /// The model reasons "Hmm." and answers "Hi there!".
+    /// The answer ends at the end token.
+    fn build_test_answer(tokenizer: engine::Tokenizer) -> Vec<Event> {
+        let tokens =
+            |s: &str| -> Vec<u32> { tokenizer.tokenize(s).iter().map(|&t| t as u32).collect() };
+        let mut ids = tokens("Hmm.");
+        ids.push(THINK_END_TOKEN);
+        ids.extend(tokens("Hi there!"));
+        let started = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let done = Event::Done {
+            reason: FinishReason::StopToken,
+        };
+        vec![started, Event::Tokens(ids), done]
+    }
+
+    /// Returns the receiver of a closed channel that holds `events`.
+    fn queue_test_events(events: Vec<Event>) -> UnboundedReceiver<Event> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        for event in events {
+            sender.send(event).expect("an open channel");
+        }
+        receiver
+    }
+
+    /// Reads the status and the whole body of `response`.
+    async fn read_response(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (status, String::from_utf8(body.to_vec()).expect("UTF-8"))
+    }
+
+    /// Collects whole responses of the worker's events.
+    /// A response holds the answer, or the worker's error.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn a_collected_response_holds_the_answer_or_the_error() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let collect = async |api, request: &Value, events| {
+            let prepared = prepare_test_request(request, api, tokenizer).expect("prepared");
+            let cancel = worker::CancelGuard::new_unsubmitted(1);
+            let response = collect_response(prepared, cancel, queue_test_events(events)).await;
+            let (status, body) = read_response(response).await;
+            (status, serde_json::from_str::<Value>(&body).expect("JSON"))
+        };
+        let chat = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let (status, response) =
+            collect(Api::ChatCompletions, &chat, build_test_answer(tokenizer)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            response["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("chatcmpl-"))
+        );
+        let message = &response["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "Hmm.");
+        assert_eq!(message["content"], "Hi there!");
+        assert_eq!(response["usage"]["prompt_tokens"], 10);
+        let responses = json!({"input": "hi"});
+        let (status, response) =
+            collect(Api::Responses, &responses, build_test_answer(tokenizer)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            response["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("resp_"))
+        );
+        assert_eq!(response["output"][0]["content"][0]["text"], "Hmm.");
+        assert_eq!(response["output"][1]["content"][0]["text"], "Hi there!");
+        assert_eq!(response["usage"]["input_tokens"], 10);
+        let started = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let stopped = Event::Done {
+            reason: FinishReason::ServerStop,
+        };
+        for (events, status, message) in [
+            (
+                vec![Event::Failed("no memory".into())],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no memory",
+            ),
+            (
+                vec![Event::Refused("too long".into())],
+                StatusCode::BAD_REQUEST,
+                "too long",
+            ),
+            (
+                vec![],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the request ended without an answer",
+            ),
+            (
+                vec![started, stopped],
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the server is stopping",
+            ),
+        ] {
+            let (got, error) = collect(Api::ChatCompletions, &chat, events).await;
+            assert_eq!((got, &error["error"]["message"]), (status, &json!(message)));
+        }
+    }
+
+    /// Counts the tool calls that `ApiRequest`'s chunks start for the output
+    /// token `ids`.
+    async fn count_test_tool_calls<ApiRequest: ApiOutput>(
+        request: Value,
+        api: Api,
+        ids: Vec<u32>,
+        tokenizer: engine::Tokenizer,
+    ) -> usize
+    where
+        Chunk<ApiRequest>: Send,
+    {
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let rendered = render_request(root, &build_test_defaults(), api).expect("rendered");
+        let done = Event::Done {
+            reason: FinishReason::StopToken,
+        };
+        let started = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let (chunks, _) = convert_events_to_api_chunks::<ApiRequest>(
+            rendered.converted_request,
+            ApiRequest::generate_response_id(),
+            DEFAULT_MODEL_ID.into(),
+            tokenizer,
+            started,
+            queue_test_events(vec![Event::Tokens(ids), done]),
+        );
+        chunks
+            .map(|chunk| ApiRequest::count_started_tool_calls(&chunk.expect("a chunk")))
+            .fold(0, |calls, chunk_calls| calls + chunk_calls)
+            .await
+    }
+
+    /// Runs a tool call in the model's output through each API's chunks.
+    /// The chunks of each API start one tool call.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn the_chunks_of_a_tool_call_start_one_call() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let tokens =
+            |s: &str| -> Vec<u32> { tokenizer.tokenize(s).iter().map(|&t| t as u32).collect() };
+        // After its reasoning, the model calls the tool f with a = 1.
+        let call = concat!(
+            "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        );
+        let mut ids = tokens("Call f.");
+        ids.push(THINK_END_TOKEN);
+        ids.extend(tokens(call));
+        let parameters = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let chat = json!({
+            "messages": [{"role": "user", "content": "Call f."}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}],
+        });
+        let calls = count_test_tool_calls::<ChatCompletionRequest>(
+            chat,
+            Api::ChatCompletions,
+            ids.clone(),
+            tokenizer,
+        )
+        .await;
+        assert_eq!(calls, 1);
+        let responses = json!({
+            "input": "Call f.",
+            "tools": [{"type": "function", "name": "f", "parameters": parameters}],
+        });
+        let calls =
+            count_test_tool_calls::<ResponsesRequest>(responses, Api::Responses, ids, tokenizer)
+                .await;
+        assert_eq!(calls, 1);
     }
 }
