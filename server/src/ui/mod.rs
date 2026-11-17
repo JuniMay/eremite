@@ -2,5 +2,6 @@
 //! its log, drawn in the terminal with ratatui.
 
 pub mod draw;
+pub mod samples;
 pub mod status;
 pub mod theme;
