@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use super::draw::{colored, fit_line, format_duration, label, plain, strong};
+use super::log::LogFilter;
 use super::status::{ModelStatus, Phase};
 use super::theme::{Rgb, Theme};
 
@@ -134,6 +135,12 @@ pub struct Choices {
     /// Whether the view takes the mouse. Without it, the terminal selects
     /// text.
     pub mouse: bool,
+    /// Which lines the log shows.
+    pub log_filter: LogFilter,
+    /// The log's lines scrolled back from the newest.
+    pub log_back: usize,
+    /// The rows of the log, in the frame drawn last.
+    pub log_page: usize,
     /// The places that a click acts on, in the frame drawn last.
     pub targets: Vec<ClickTarget>,
 }
@@ -145,6 +152,9 @@ impl Default for Choices {
             model: 0,
             sub_view: SubView::States,
             mouse: true,
+            log_filter: LogFilter::All,
+            log_back: 0,
+            log_page: 0,
             targets: Vec::new(),
         }
     }
