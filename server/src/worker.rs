@@ -221,6 +221,9 @@ pub struct ModelSettings {
     pub options: engine::Options,
     /// The most rows a decoding call takes. None takes the model's own limit.
     pub rows_per_call: Option<usize>,
+    /// The seconds without requests before the model's weights and experts
+    /// unload. 0 keeps them loaded.
+    pub idle_unload: f64,
 }
 
 /// What the HTTP handlers and the worker share under one lock.
@@ -922,6 +925,8 @@ struct WorkerModel {
     /// The experts that a decoded row chooses in all layers together. It is 0
     /// for a model without routed experts.
     experts_per_row: usize,
+    /// When the model last had a request. The idle unload counts from then.
+    last_used_at: Instant,
     /// The calls that run now.
     running_calls: Vec<RunningCall>,
     /// The streams that ended a prefill call of a prompt that is still
@@ -1252,6 +1257,7 @@ impl Worker {
                     think_end_token: model.tokenizer().find_added_token("</think>"),
                     logged_decoding_count: 0,
                     experts_per_row: model.read_stats().experts_per_row.max(0) as usize,
+                    last_used_at: Instant::now(),
                     running_calls: Vec::new(),
                     idle_prefill_streams: Vec::new(),
                     idle_decode_streams: Vec::new(),
@@ -1377,15 +1383,74 @@ impl Worker {
         }
     }
 
-    /// Keeps the memory reserve free, between engine calls. When memory is
-    /// short, the engine frees idle memory. After that, the state cache evicts
-    /// idle states. Last, it publishes the counters.
+    /// Unloads each model that had no request for its idle_unload seconds and
+    /// has none waiting. It frees the model's expert cache and weights. The
+    /// model's states stay. Its next request loads it again.
+    fn unload_idle_models(&mut self) {
+        let waiting: Vec<bool> = lock(&self.shared.queue)
+            .waiting
+            .iter()
+            .map(|jobs| !jobs.is_empty())
+            .collect();
+        let mut drained = false;
+        for worker_model in &self.models {
+            let after = worker_model.settings.idle_unload;
+            if after <= 0.0
+                || !worker_model.generations.is_empty()
+                || !worker_model.admitted.is_empty()
+                || waiting
+                    .get(worker_model.model_index)
+                    .copied()
+                    .unwrap_or(false)
+                || worker_model.last_used_at.elapsed().as_secs_f64() < after
+                || !worker_model.model.is_loaded()
+            {
+                continue;
+            }
+            let _long = LongOperation::start(&self.shared);
+            if !drained {
+                // Wait for the GPU work and the reads. No running work then
+                // reads the memory that the unload frees.
+                engine::drain();
+                drained = true;
+            }
+            let freed = worker_model.model.unload();
+            if freed > 0 {
+                engine::log(&format!(
+                    "{}: unloaded after {after:.0} s without requests; {:.1} GiB back",
+                    worker_model.settings.id,
+                    freed as f64 / GIB
+                ));
+            }
+        }
+    }
+
+    /// Keeps the memory reserve free, between engine calls. It first unloads
+    /// idle models. A model with routed experts then runs its idle work.
+    /// Another model runs its idle work only while it has no request. The idle
+    /// work frees memory that other programs need. When memory is still short,
+    /// the engine frees idle memory. After that, the state cache evicts idle
+    /// states. Last, it publishes the counters.
     fn keep_reserve_free(&mut self) {
+        self.unload_idle_models();
         engine::refresh_stats();
+        let mut freed = 0;
+        for worker_model in &self.models {
+            if worker_model.experts_per_row > 0 {
+                let before = worker_model.model.read_stats().cache_bytes;
+                worker_model.model.run_idle_work();
+                freed += before.saturating_sub(worker_model.model.read_stats().cache_bytes);
+            } else if worker_model.generations.is_empty() {
+                worker_model.model.run_idle_work();
+            }
+        }
         if let Some(worker_model) = self.models.first() {
             let available = worker_model.model.read_stats().available;
             let reserve = (self.shared.budgets.reserve_gb * GIB) as u64;
-            let shortfall = reserve.saturating_sub(available);
+            // Freed expert pages can take a moment to show in the system's
+            // memory counters. Count them here. This turn then does not free
+            // the same shortfall twice.
+            let shortfall = reserve.saturating_sub(available).saturating_sub(freed);
             let shortfall = shortfall.saturating_sub(engine::reclaim(shortfall));
             if shortfall > 0 {
                 let evicted = self.states.cache.evict_bytes(shortfall);
@@ -1572,6 +1637,9 @@ impl Worker {
             drop(queue);
             for (worker_model, admitted) in self.models.iter_mut().zip(admitted_by_model) {
                 worker_model.run_step(&shared, admitted, &mut self.states);
+                if !worker_model.generations.is_empty() {
+                    worker_model.last_used_at = Instant::now();
+                }
                 worker_model
                     .model
                     .set_request_running(!worker_model.generations.is_empty());
@@ -1725,6 +1793,7 @@ impl WorkerModel {
                     continue;
                 }
                 lock(&shared.models[self.model_index].status).load_error = None;
+                self.last_used_at = Instant::now();
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
                 if !was_loaded && self.model.is_loaded() {
                     engine::log(&format!(

@@ -14,7 +14,8 @@
 //! design: the replay is bounded to a ring, and their tokens are printed. The
 //! other cache tests check the cache's budget (--state-cache).
 //!
-//! A growing generation frees room in the cache before it grows.
+//! A growing generation frees room in the cache before it grows. A session
+//! stays while its idle model unloads (--idle-unload).
 //!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
@@ -1134,4 +1135,85 @@ fn quitting_stops_a_long_prefill() {
         "the server exited {took:.1} s after SIGTERM, during a {count}-token prefill"
     );
     assert_eq!(code, 503, "the stopped request's answer");
+}
+
+/// A model that goes its idle_unload time without requests gives back its
+/// weights and experts. Its status reads unloaded. The memory it held is back
+/// in the engine's count and in the process's footprint, and its session stays.
+/// It stays unloaded while the server keeps calling its idle hook (35 s: past
+/// DeepSeek's 32 calm calls, after which its cache raises its cap). The same
+/// request then loads it again and continues that session with the same greedy
+/// reply.
+#[test]
+fn an_idle_model_unloads_and_its_next_request_loads_it_again() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let server = start_server(&setup, &["--idle-unload", "3"]);
+    let footprint = |status: &Value| {
+        status["memory"]["footprint_gib"]
+            .as_f64()
+            .unwrap_or(f64::MAX)
+    };
+    let ask = request(&short_prompt(), 16);
+    let first = content(&chat(&server, &ask));
+    let replied = Instant::now();
+    let before = server.status();
+    assert_eq!(before["loaded"], json!(true), "{before}");
+    let bytes = |status: &Value| {
+        status["model_memory_budget"]["allocated"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    let held = bytes(&before);
+    // Each status read waits for the worker to publish; the model unloads a
+    // little after the 3 s.
+    let mut after = before.clone();
+    while after["loaded"] != json!(false) {
+        after = server.status();
+    }
+    let took = replied.elapsed().as_secs_f64();
+    let back = held.saturating_sub(bytes(&after));
+    // Then it stays unloaded, and freed pages reach the counters.
+    let unloaded = Instant::now();
+    let mut stayed = after["loaded"] == json!(false);
+    while stayed && unloaded.elapsed().as_secs() < 35 {
+        after = server.status();
+        stayed = after["loaded"] == json!(false);
+    }
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    println!(
+        "unloaded {took:.1} s after the reply: {:.2} of {:.2} GiB of model memory back; \
+         the process's footprint {:.1} GiB loaded, {:.1} after 35 s unloaded; sessions {}",
+        gib(back),
+        gib(held),
+        footprint(&before),
+        footprint(&after),
+        after["sessions"]
+    );
+    assert!(
+        took >= 2.5,
+        "unloaded {took:.1} s after the reply, before 3 s"
+    );
+    assert!(stayed, "it did not stay unloaded: {after}");
+    assert!(back * 10 >= held * 9, "{back} of {held} bytes back");
+    // The pages go back to the system too, not only the engine's count. The
+    // session, the workspace and the compiled kernels stay.
+    assert!(
+        footprint(&after) <= footprint(&before) / 10.0,
+        "the footprint fell from {:.1} to only {:.1} GiB",
+        footprint(&before),
+        footprint(&after)
+    );
+    assert!(
+        after["sessions"]
+            .as_array()
+            .is_some_and(|sessions| !sessions.is_empty()),
+        "the session stays: {after}"
+    );
+    let again = chat(&server, &ask);
+    assert_eq!(content(&again), first, "the reply after the reload");
+    assert_eq!(server.status()["loaded"], json!(true));
 }

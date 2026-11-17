@@ -63,6 +63,9 @@ const USAGE: &str =
   --state-dir DIR    the saved states' folder (default ~/.cache/eremite/states)
   --state-disk-tokens N  save a state only when it holds at least N tokens no other kept state
                   holds (default 8192)
+  --idle-unload S seconds a model may go without requests before its weights and experts
+                  unload (its states stay; the next request loads it again), 0 never
+                  (default 600; a model's own setting wins)
   --max-waiting-requests N  requests that may wait for one model; another gets HTTP 429
                   (default 16)
   --max-cached-states N  states that the state cache keeps, for all models together
@@ -163,7 +166,8 @@ fn parse_arguments(args: &[String]) -> Arguments {
                     | "--state-disk-tokens"
                     | "--max-waiting-requests"
                     | "--max-cached-states"
-                    | "--snapshot-interval" => {
+                    | "--snapshot-interval"
+                    | "--idle-unload" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -360,6 +364,8 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             "12",
             "--state-cache",
             "16",
+            "--idle-unload",
+            "30",
         ]
         .map(String::from)
         .into();
@@ -378,8 +384,12 @@ fn command_line_server_settings_override_the_file_in_either_order() {
             (Some(9008), "127.0.0.2", Some("override-key"))
         );
         assert_eq!(
-            (parsed.budgets.reserve_gb, parsed.budgets.state_cache_gb),
-            (12.0, 16.0)
+            (
+                parsed.budgets.reserve_gb,
+                parsed.budgets.state_cache_gb,
+                parsed.budgets.idle_unload_s
+            ),
+            (12.0, 16.0, 30.0)
         );
     }
 }
@@ -798,6 +808,7 @@ fn main() {
             id,
             options,
             rows_per_call: model.rows_per_call,
+            idle_unload: model.idle_unload.unwrap_or(arguments.budgets.idle_unload_s),
         });
         families.push(family);
     }

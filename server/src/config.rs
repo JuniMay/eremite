@@ -53,6 +53,9 @@ pub struct ModelConfig {
     /// The thinking effort of requests that set none, from 1 to 100, or 0 for
     /// thinking off; None: the format's default.
     pub think: Option<u32>,
+    /// The seconds without requests before the model's weights and experts
+    /// unload, 0 for never; None: the server-wide setting.
+    pub idle_unload: Option<f64>,
 }
 
 impl ModelConfig {
@@ -72,6 +75,7 @@ impl ModelConfig {
             top_k: None,
             seed: None,
             think: None,
+            idle_unload: None,
         }
     }
 
@@ -172,6 +176,7 @@ impl ModelConfig {
                         .ok_or("think takes 0 (off) or 1 to 100")? as u32,
                 )
             }
+            "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
             _ => return Err(format!("no option {name}")),
         }
         Ok(())
@@ -266,6 +271,17 @@ impl Server {
     }
 }
 
+/// Reads the seconds without requests before a model unloads: 0 for never, up
+/// to MAX_SECONDS.
+fn read_idle_seconds(value: &Value) -> Result<f64, String> {
+    value
+        .as_f64()
+        .filter(|seconds| (0.0..=MAX_SECONDS).contains(seconds))
+        .ok_or(format!(
+            "idle_unload takes 0 (never) to {MAX_SECONDS} seconds"
+        ))
+}
+
 /// The server-wide budgets and limits. The engine's memory policy keeps its
 /// defaults. Settings that can slow the server stay out of the configuration.
 #[derive(Clone, Debug, PartialEq)]
@@ -284,6 +300,9 @@ pub struct Budgets {
     /// The GiB of states and snapshots that the state cache keeps, for all
     /// models together.
     pub state_cache_gb: f64,
+    /// The seconds without requests before a model unloads; 0: never. A model's
+    /// own idle_unload setting overrides it.
+    pub idle_unload_s: f64,
     /// The GiB that saved states may take on the SSD; 0: none are saved or
     /// read.
     pub state_disk_gb: f64,
@@ -308,6 +327,7 @@ impl Default for Budgets {
             gpu_timeout_s: 60.0,
             progress_log_s: 10.0,
             state_cache_gb: 8.0,
+            idle_unload_s: 600.0,
             state_disk_gb: 32.0,
             state_disk_tokens: 8192,
             max_waiting_requests: 16,
@@ -321,6 +341,10 @@ impl Budgets {
     /// Sets the budget `name` to `value`. Returns the budget's message when
     /// either is invalid.
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        if name == "idle_unload" {
+            self.idle_unload_s = read_idle_seconds(value)?;
+            return Ok(());
+        }
         let number = value
             .as_f64()
             .filter(|number| number.is_finite())
@@ -459,6 +483,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "max_cached_states",
             "snapshot_interval",
             "state_dir",
+            "idle_unload",
             "port",
             "host",
             "api_key_file",
@@ -481,6 +506,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "max_waiting_requests",
         "max_cached_states",
         "snapshot_interval",
+        "idle_unload",
     ] {
         if let Some(value) = object.get(name) {
             budgets.set(name, value)?;
@@ -565,6 +591,26 @@ mod tests {
             ("cache", json!(8)),
         ] {
             assert!(budgets.set(name, &value).is_err(), "{name} {value}");
+        }
+    }
+
+    #[test]
+    fn idle_unload_is_server_wide_and_a_model_can_set_its_own() {
+        let config = parse(&json!({"idle_unload": 120, "models": [
+            {"model": "/models/deepseek"}, {"model": "/models/second", "idle_unload": 0}
+        ]}))
+        .unwrap();
+        assert_eq!(config.budgets.idle_unload_s, 120.0);
+        assert_eq!(
+            (config.models[0].idle_unload, config.models[1].idle_unload),
+            (None, Some(0.0))
+        );
+        // Ten minutes when nothing sets it.
+        let config = parse(&json!({"models": [{"model": "/models/deepseek"}]})).unwrap();
+        assert_eq!(config.budgets.idle_unload_s, 600.0);
+        for bad in [json!(-1), json!(2e6), json!("soon")] {
+            assert!(parse(&json!({"idle_unload": bad, "models": [{"model": "/m"}]})).is_err());
+            assert!(parse(&json!({"models": [{"model": "/m", "idle_unload": bad}]})).is_err());
         }
     }
 
