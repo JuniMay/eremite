@@ -291,8 +291,8 @@ struct ModelStatus {
     last_prefill: PrefillInfo,
     /// Whether the decoding requests split evenly over at least two calls.
     split_calls: bool,
-    /// The model's states: each one's number, token count and last use.
-    sessions: Vec<(u64, usize, Instant)>,
+    /// The model's sessions, in the order of their tokens.
+    sessions: Vec<SessionStatus>,
     /// The state bytes committed for the model: what the state cache counts for
     /// its states and their snapshots, the reserved ones included.
     state_committed_bytes: u64,
@@ -334,6 +334,27 @@ impl RequestStatus {
     }
 }
 
+/// A session of a model, for the model's status. A session is a state that
+/// the state cache keeps.
+#[derive(Clone, Debug, PartialEq)]
+struct SessionStatus {
+    /// The session's number in the log.
+    number: u64,
+    /// The number of tokens whose rows the state holds.
+    tokens: usize,
+    /// When a request last used the state.
+    last_used_at: Instant,
+    /// Whether a request runs in the state.
+    busy: bool,
+    /// The bytes that the state cache counts for the state and its snapshots.
+    bytes: u64,
+    /// The position of the state's latest prompt-end snapshot, if it has one.
+    prompt_end: Option<usize>,
+    /// The number of tokens that the session shares from position 0 with the
+    /// next session in the order of their tokens. It is 0 for the last one.
+    shared_with_next: usize,
+}
+
 /// A model as the HTTP handlers and the worker share it. The tokenizer works on
 /// any thread.
 pub struct SharedModel {
@@ -369,6 +390,12 @@ struct Shared {
     status_published: tokio::sync::Notify,
     /// The worker's long operations running now (LongOperation).
     long_operations: AtomicUsize,
+    /// The session whose tokens a reader asked for: its model's index and its
+    /// number. The worker takes it at its next publish of the states.
+    session_tokens_wanted: Mutex<Option<(usize, u64)>>,
+    /// The tokens of the session asked for last, with its model's index and
+    /// its number, once the worker has published them.
+    session_tokens: Mutex<Option<(usize, u64, Vec<i32>)>>,
 }
 
 /// Marks a worker operation that may take seconds and publishes nothing, as
@@ -494,6 +521,25 @@ pub fn start_resume(request: control::ResumeRequest) -> Result<(u16, Value), con
     Ok((http_status.as_u16(), status_json))
 }
 
+/// Asks for the tokens of session `session` of the model at `model_index`. The
+/// worker publishes them at its next publish of the states, such as the one
+/// that refresh_status asks for.
+pub fn ask_session_tokens(model_index: usize, session: u64) {
+    *lock(&clone_shared().session_tokens_wanted) = Some((model_index, session));
+}
+
+/// Returns the tokens of session `session` of the model at `model_index`, once
+/// the worker has published them after ask_session_tokens. Returns None
+/// before that, and for a session that the state cache no longer keeps.
+pub fn read_session_tokens(model_index: usize, session: u64) -> Option<Vec<i32>> {
+    match &*lock(&clone_shared().session_tokens) {
+        Some((model, number, tokens)) if (*model, *number) == (model_index, session) => {
+            Some(tokens.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Lists the models the worker serves, in their configured order: each one's
 /// id, tokenizer and settings. A request's model_index is an index into this
 /// list.
@@ -573,6 +619,8 @@ pub fn start(
                 status_wanted: AtomicBool::new(false),
                 status_published: tokio::sync::Notify::new(),
                 long_operations: AtomicUsize::new(0),
+                session_tokens_wanted: Mutex::new(None),
+                session_tokens: Mutex::new(None),
             });
             *SHARED.lock().unwrap() = Some(shared.clone());
             // A panic here ends the process, as the engine's fatal errors do.
@@ -783,11 +831,15 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let sessions: Vec<Value> = status
         .sessions
         .iter()
-        .map(|&(number, tokens, last_used_at)| {
+        .map(|session| {
             json!({
-                "session": number,
-                "tokens": tokens,
-                "idle_seconds": round((now - last_used_at).as_secs_f64(), 0),
+                "session": session.number,
+                "tokens": session.tokens,
+                "idle_seconds": round((now - session.last_used_at).as_secs_f64(), 0),
+                "busy": session.busy,
+                "bytes": session.bytes,
+                "prompt_end": session.prompt_end,
+                "shared_with_next": session.shared_with_next,
             })
         })
         .collect();
@@ -1404,15 +1456,32 @@ impl States {
                 .iter()
                 .filter(|(_, entry)| entry.model == model_index)
                 .collect();
+            let token_lists: Vec<&[i32]> =
+                entries.iter().map(|(_, entry)| &entry.tokens[..]).collect();
             let mut status = lock(&shared_model.status);
-            status.sessions = entries
-                .iter()
-                .map(|(state_id, entry)| {
-                    (
-                        entry.number,
-                        entry.tokens.len(),
-                        self.handles[state_id].last_used_at,
-                    )
+            status.sessions = order_by_tokens(&token_lists)
+                .into_iter()
+                .map(|(i, shared_with_next)| {
+                    let (state_id, entry) = entries[i];
+                    SessionStatus {
+                        number: entry.number,
+                        tokens: entry.tokens.len(),
+                        last_used_at: self.handles[state_id].last_used_at,
+                        busy: entry.busy,
+                        bytes: entry.bytes
+                            + entry
+                                .snapshots
+                                .iter()
+                                .map(|snapshot| snapshot.bytes)
+                                .sum::<u64>(),
+                        prompt_end: entry
+                            .snapshots
+                            .iter()
+                            .filter(|snapshot| snapshot.kind == SnapshotKind::PromptEnd)
+                            .map(|snapshot| snapshot.pos)
+                            .max(),
+                        shared_with_next,
+                    }
                 })
                 .collect();
             status.state_committed_bytes = self.cache.count_model_bytes(model_index);
@@ -1430,6 +1499,10 @@ impl States {
                 })
                 .sum();
         }
+        if let Some((model_index, number)) = lock(&shared.session_tokens_wanted).take() {
+            *lock(&shared.session_tokens) = find_session_tokens(&self.cache, model_index, number)
+                .map(|tokens| (model_index, number, tokens));
+        }
         *lock(&shared.disk_status) = match &self.store {
             Some(store) => DiskStatus {
                 dir: Some(store.get_folder().display().to_string()),
@@ -1443,6 +1516,34 @@ impl States {
             None => DiskStatus::default(),
         };
     }
+}
+
+/// Orders `token_lists` by their tokens, as words are ordered by their letters.
+/// Returns each list's index in that order, with the number of tokens that the
+/// list shares from position 0 with the next one. The last one shares 0.
+fn order_by_tokens(token_lists: &[&[i32]]) -> Vec<(usize, usize)> {
+    let mut order: Vec<usize> = (0..token_lists.len()).collect();
+    order.sort_by(|&a, &b| token_lists[a].cmp(token_lists[b]));
+    order
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| {
+            let shared = order.get(k + 1).map_or(0, |&next| {
+                state_cache::count_shared_prefix(token_lists[i], token_lists[next])
+            });
+            (i, shared)
+        })
+        .collect()
+}
+
+/// Returns a copy of the tokens of session `number` of the model at
+/// `model_index`, or None when `cache` keeps no such session.
+fn find_session_tokens(cache: &Cache, model_index: usize, number: u64) -> Option<Vec<i32>> {
+    cache
+        .entries
+        .values()
+        .find(|entry| entry.model == model_index && entry.number == number)
+        .map(|entry| entry.tokens.clone())
 }
 
 /// The worker on the engine thread.
@@ -3841,6 +3942,31 @@ mod tests {
         stats.gpu_limit = 107 << 30;
         let counters = build_engine_counters_json(&stats);
         assert_eq!(counters["memory"]["gpu_limit"], 107i64 << 30);
+    }
+
+    /// Sessions in the order of their tokens tell the tree of their shared
+    /// prefixes: each one shares with the next its prefix in that tree.
+    #[test]
+    fn sessions_come_in_the_order_of_their_tokens_with_their_shared_prefixes() {
+        let lists: [&[i32]; 4] = [&[1, 2, 3, 9], &[1, 2, 3], &[1, 2, 7], &[5]];
+        assert_eq!(
+            order_by_tokens(&lists),
+            [(1, 3), (0, 2), (2, 0), (3, 0)],
+            "[1, 2, 3] comes before [1, 2, 3, 9], then [1, 2, 7], then [5]"
+        );
+        assert!(order_by_tokens(&[]).is_empty());
+        let mut cache = Cache::new(1 << 30, 8);
+        let first = cache.add_state(0, 0);
+        let other_model = cache.add_state(1, 0);
+        cache.entries.get_mut(&first).unwrap().tokens = vec![4, 5, 6];
+        let number = cache.entries[&first].number;
+        assert_eq!(find_session_tokens(&cache, 0, number), Some(vec![4, 5, 6]));
+        let number = cache.entries[&other_model].number;
+        assert_eq!(
+            find_session_tokens(&cache, 0, number),
+            None,
+            "a session of another model"
+        );
     }
 
     /// DeepSeek V4.1 Flash's most rows per call.
