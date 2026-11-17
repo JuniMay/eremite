@@ -1,6 +1,7 @@
 //! Requests through HTTP to a DeepSeek checkpoint.
 //!
-//! A prompt too long for the context is refused with its token count.
+//! A prompt too long for the context is refused with its token count. The
+//! model's status follows a running prefill, and quitting stops a long prefill.
 //!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
@@ -9,17 +10,23 @@
 //!     EREMITE_CHECKPOINT=DIR EREMITE_EXPERTS=GGUF cargo test --release \
 //!       --manifest-path server/Cargo.toml --test prefix_fork -- --nocapture
 //!
-//! EREMITE_SERVER picks the server binary (default build/eremite-server).
+//! EREMITE_SERVER picks the server binary (default build/eremite-server) and
+//! EREMITE_CLI the tokenizer's (default build/eremite).
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::mpsc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
 mod common;
 use common::{Server, http, one_model, root};
 
-/// What the tests run: the checkpoint, its experts and the server's program.
+/// What the tests run: the checkpoint, its experts, and the server's and the
+/// CLI's programs.
 struct Setup {
     /// The checkpoint's directory.
     checkpoint: String,
@@ -27,6 +34,8 @@ struct Setup {
     experts: Option<String>,
     /// The server's program.
     server: PathBuf,
+    /// The CLI's program, for its tokenizer.
+    cli: PathBuf,
 }
 
 /// Reads the tests' setup from the environment. Returns None without
@@ -43,7 +52,47 @@ fn setup() -> Option<Setup> {
         checkpoint,
         experts,
         server: pick("EREMITE_SERVER", "build/eremite-server"),
+        cli: pick("EREMITE_CLI", "build/eremite"),
     })
+}
+
+// ---- HTTP/1.1: a streamed chat request ----
+
+/// Sends a streamed chat request and reads its answer to the end. When the
+/// answer's first token arrives, it sends on `first_token`.
+fn stream_chat(port: u16, key: &str, body: &Value, first_token: mpsc::Sender<()>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let sent_body = body.to_string();
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        sent_body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(sent_body.as_bytes()))
+        .expect("send");
+    // A token's chunk holds "content":" and then a character other than the
+    // closing quote.
+    let token = b"\"content\":\"";
+    let (mut received, mut buffer, mut sent) = (Vec::new(), [0u8; 4096], false);
+    loop {
+        let count = stream.read(&mut buffer).expect("read");
+        if count == 0 {
+            return;
+        }
+        received.extend_from_slice(&buffer[..count]);
+        if !sent
+            && received
+                .windows(token.len() + 1)
+                .any(|window| window.starts_with(token) && window[token.len()] != b'"')
+        {
+            first_token
+                .send(())
+                .expect("the test waits for the first token");
+            sent = true;
+        }
+    }
 }
 
 /// Starts a server with the tests' settings, and `extra`.
@@ -70,6 +119,78 @@ fn start_server(setup: &Setup, extra: &[&str]) -> Server {
     args.extend(["--ctx", "32768", "--serve", &port.to_string()].map(String::from));
     args.extend(extra.iter().map(|arg| arg.to_string()));
     Server::start(&setup.server, &args, &key, port)
+}
+
+/// Sends a chat completion and returns its answer, which must be a success.
+fn chat(server: &Server, body: &Value) -> Value {
+    let (status, answer) = http(
+        server.port,
+        &server.key,
+        "POST",
+        "/v1/chat/completions",
+        Some(body),
+    );
+    let parsed: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+    assert_eq!(
+        status,
+        200,
+        "chat completion: {}",
+        String::from_utf8_lossy(&answer)
+    );
+    parsed
+}
+
+// ---- prompt tokens from the server's renderer and the CLI's tokenizer ----
+
+/// Returns the tokens of `messages`' prompt, with thinking off.
+fn tokens(setup: &Setup, messages: &Value) -> Vec<i64> {
+    rendered_tokens(setup, messages, false)
+}
+
+/// Returns the tokens of `messages`' prompt, with thinking on or off.
+fn rendered_tokens(setup: &Setup, messages: &Value, thinking: bool) -> Vec<i64> {
+    let case = std::env::temp_dir().join(format!("eremite-fork-{}.json", std::process::id()));
+    let mode = if thinking { "thinking" } else { "chat" };
+    std::fs::write(
+        &case,
+        json!({"messages": messages, "thinking_mode": mode}).to_string(),
+    )
+    .expect("a render case");
+    let rendered = Command::new(&setup.server)
+        .arg("--render")
+        .arg(&case)
+        .output()
+        .expect("render");
+    let _ = std::fs::remove_file(&case);
+    assert!(
+        rendered.status.success(),
+        "render: {}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let prompt = String::from_utf8(rendered.stdout).expect("UTF-8");
+    let ids = Command::new(&setup.cli)
+        .args([
+            "-m",
+            &setup.checkpoint,
+            "--rendered",
+            "--ctx",
+            "32768",
+            "--tokenize",
+            "-p",
+        ])
+        .arg(prompt.trim_end_matches('\n'))
+        .output()
+        .expect("tokenize");
+    assert!(
+        ids.status.success(),
+        "tokenize: {}",
+        String::from_utf8_lossy(&ids.stderr)
+    );
+    String::from_utf8_lossy(&ids.stdout)
+        .trim()
+        .split(',')
+        .filter_map(|token| token.parse().ok())
+        .collect()
 }
 
 /// Builds a greedy chat request of `messages` with thinking off, for at most
@@ -227,4 +348,129 @@ fn a_prompt_with_an_image_that_does_not_fit_is_refused_with_its_token_count() {
         "the prompt with an image is refused with {with_image} tokens, no more than the \
          {text_alone} of its text alone"
     );
+}
+
+/// Returns a short conversation with a one-word answer.
+fn short_prompt() -> Value {
+    json!([{"role": "system", "content": "You answer in one word."},
+           {"role": "user", "content": "Name a color."}])
+}
+
+/// Returns a conversation of `low` to `high` prompt tokens, and its token
+/// count. Its system prompt is a cut of src/eremite.h, repeated as often as
+/// that size needs. Its question has a long answer.
+fn sized_prompt(setup: &Setup, low: usize, high: usize) -> (Value, usize) {
+    let text = std::fs::read_to_string(root().join("src/eremite.h")).expect("src/eremite.h");
+    let conversation = |reference: &str| {
+        json!([{"role": "system", "content": format!("You review this project's design. Reference:\n\n{reference}")},
+               {"role": "user", "content": "List every heading of the reference, one per line, each with a one-sentence summary."}])
+    };
+    let once = tokens(setup, &conversation(&text)).len();
+    let design: Vec<char> = text.repeat(high / once + 1).chars().collect();
+    let make = |chars: usize| conversation(&design[..chars].iter().collect::<String>());
+    let (mut shortest, mut longest) = (0, design.len());
+    while shortest < longest {
+        let middle = (shortest + longest) / 2;
+        let messages = make(middle);
+        let count = tokens(setup, &messages).len();
+        if count < low {
+            shortest = middle + 1;
+        } else if count >= high {
+            longest = middle;
+        } else {
+            return (messages, count);
+        }
+    }
+    panic!("no cut of src/eremite.h gives {low} to {high} prompt tokens");
+}
+
+/// The model's status follows a running prefill: before the answer's first
+/// token comes, the engine thread's seconds in calls grow in it. A status that
+/// is published only when a call ends shows the same seconds until the
+/// prefill's end.
+#[test]
+fn the_status_follows_a_running_prefill() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let server = start_server(&setup, &[]);
+    // The first request loads the model.
+    chat(&server, &request(&short_prompt(), 1));
+    let (long, _) = sized_prompt(&setup, 4000, 4096);
+    let mut body = request(&long, 1);
+    body["stream"] = json!(true);
+    let (first_token, first_tokens) = mpsc::channel();
+    let (port, key) = (server.port, server.key.clone());
+    let job = std::thread::spawn(move || stream_chat(port, &key, &body, first_token));
+    let seconds_in_calls = |status: &Value| -> f64 {
+        ["pass", "wait_gpu", "wait_read", "wait_other"]
+            .iter()
+            .map(|state| {
+                status["engine_times"]["thread_seconds"][state]
+                    .as_f64()
+                    .unwrap_or(0.0)
+            })
+            .sum()
+    };
+    let (mut first, mut grew) = (None, false);
+    // The loop also ends when the request's thread ends without a first token.
+    while !grew && first_tokens.try_recv() == Err(mpsc::TryRecvError::Empty) {
+        let status = server.status();
+        if status["phase"] != "prefill" {
+            continue;
+        }
+        let seconds = seconds_in_calls(&status);
+        grew = first.is_some_and(|first| seconds > first);
+        first.get_or_insert(seconds);
+    }
+    job.join().expect("the long request");
+    assert!(
+        grew,
+        "the status showed the same seconds in calls until the prefill ended"
+    );
+}
+
+/// Quitting stops a long prompt's prefill. SIGTERM 5 s into the prefill of
+/// about 15,000 tokens ends the server within 5 s, not when the prefill ends.
+/// The request's answer is the server's stop (503). A short request loads the
+/// model first, so the long prompt's prefill starts as soon as it arrives.
+#[test]
+fn quitting_stops_a_long_prefill() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let (long, count) = sized_prompt(&setup, 15_000, 16_000);
+    let mut server = start_server(&setup, &[]);
+    chat(&server, &request(&short_prompt(), 1));
+    let body = request(&long, 8);
+    let (port, key) = (server.port, server.key.clone());
+    let job =
+        std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&body)));
+    // Each status read waits for the worker to publish: the loop ends once the
+    // prefill runs.
+    while server.status()["phase"] != "prefill" {}
+    let stop = Instant::now();
+    let _ = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status();
+    let exit = server.child.wait().ok();
+    let took = stop.elapsed().as_secs_f64();
+    let (code, answer) = job.join().expect("the long request");
+    println!(
+        "quitting a {count}-token prefill: the server exited {took:.1} s after SIGTERM ({exit:?}); the request: {code} {}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert!(
+        exit.is_some_and(|status| status.success()),
+        "the server did not exit cleanly"
+    );
+    assert!(
+        took < 5.0,
+        "the server exited {took:.1} s after SIGTERM, during a {count}-token prefill"
+    );
+    assert_eq!(code, 503, "the stopped request's answer");
 }

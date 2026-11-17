@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -477,6 +477,27 @@ async fn list_served_models(State(shared): App) -> Response {
     build_json_response(json!({"object": "list", "data": data}).to_string())
 }
 
+/// Answers GET /v1/models/{id} with the model's object and its live status
+/// under "status". The status shows what the model is doing, its requests, its
+/// counters, its expert cache and the process's memory.
+async fn report_model_status(State(shared): App, Path(id): Path<String>) -> Response {
+    let Some(index) = shared
+        .models
+        .iter()
+        .position(|model| id.eq_ignore_ascii_case(&model.id))
+    else {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("no model {id:?} here"),
+        );
+    };
+    let mut object = build_model_object(&shared, &shared.models[index]);
+    worker::refresh_status().await;
+    object["status"] = worker::build_model_status_json(index);
+    build_json_response(object.to_string())
+}
+
 /// Logs `error` from `peer`, which ends a request before its response starts,
 /// and builds the error's response.
 fn refuse_request(peer: &str, error: chat::Error) -> Response {
@@ -768,6 +789,14 @@ fn main() {
         .route(
             "/models",
             get(list_served_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/models/{id}",
+            get(report_model_status).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/models/{id}",
+            get(report_model_status).fallback(refuse_other_than_get),
         )
         .route(
             "/v1/chat/completions",

@@ -171,6 +171,35 @@ impl Server {
         }
     }
 
+    /// Sends GET `path` and returns the status and the body.
+    pub fn get(&self, path: &str) -> (u16, Vec<u8>) {
+        http(self.port, &self.key, "GET", path, None)
+    }
+
+    /// Reads the served model's status: GET /v1/models/{id}'s "status".
+    pub fn status(&self) -> Value {
+        let models: Value =
+            serde_json::from_slice(&self.get("/v1/models").1).unwrap_or(Value::Null);
+        let id = models["data"][0]["id"].as_str().unwrap_or("").to_string();
+        serde_json::from_slice::<Value>(&self.get(&format!("/v1/models/{id}")).1)
+            .map(|object| object["status"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// Reads the status once `requests` requests have ended and the server is
+    /// idle. Each status read waits for the worker to publish, so the reads
+    /// follow the worker's turns.
+    pub fn settled(&self, requests: i64) -> Value {
+        loop {
+            let status = self.status();
+            if status["phase"] == "idle"
+                && status["totals"]["requests"].as_i64().unwrap_or(0) >= requests
+            {
+                return status;
+            }
+        }
+    }
+
     /// Sends SIGTERM to the server, unless it exited, and waits for it to exit.
     fn terminate(&mut self) {
         if let Ok(Some(_)) = self.child.try_wait() {

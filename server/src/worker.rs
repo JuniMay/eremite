@@ -15,17 +15,19 @@
 //!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
-//! that call.
+//! that call. The worker also builds each model's status.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::control::GIB;
 use crate::engine::{
     self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, StateHandle, Stream,
 };
@@ -34,6 +36,9 @@ use crate::engine::{
 const ENGINE_STACK_BYTES: usize = 16 << 20;
 /// The bytes in one GB, for expert reads.
 const GB: f64 = 1e9;
+/// The engine thread's states, in the order of eremite_stats's thread_s and
+/// gpu_idle_s.
+const THREAD_STATES: [&str; 5] = ["outside", "pass", "wait_gpu", "wait_read", "wait_other"];
 
 /// What the threads share. The engine thread sets it when it starts.
 static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
@@ -211,6 +216,38 @@ struct Queue {
     last_request_id: u64,
 }
 
+/// What a model is doing and has done, for its status.
+#[derive(Default)]
+struct ModelStatus {
+    /// Why the model's last load failed. None after a load that worked.
+    load_error: Option<String>,
+    /// The model's engine counters.
+    stats: engine::Stats,
+    /// Whether the model's weights are in memory.
+    loaded: bool,
+    /// What the model does now: idle, loading, prefill or decode.
+    phase: &'static str,
+    /// When the model started its phase.
+    phase_since: Option<Instant>,
+    /// The number of the model's requests that decode.
+    decoding_count: usize,
+    /// The id of the request shown in the status. It is the first request that
+    /// prefills, or else the first request.
+    shown_request_id: u64,
+    /// The number of prompt tokens of the shown request.
+    shown_prompt_tokens: usize,
+    /// The number of tokens that the shown request generated.
+    shown_generated_tokens: usize,
+    /// The number of requests that ended.
+    total_requests: u64,
+    /// The number of prompt tokens of the ended requests.
+    total_prompt_tokens: u64,
+    /// The number of tokens that the ended requests generated.
+    total_generated_tokens: u64,
+    /// The plan of the latest prefill.
+    last_prefill: PrefillInfo,
+}
+
 /// A model as the HTTP handlers and the worker share it. The tokenizer works on
 /// any thread.
 pub struct SharedModel {
@@ -218,19 +255,50 @@ pub struct SharedModel {
     pub settings: ModelSettings,
     /// The model's tokenizer.
     pub tokenizer: engine::Tokenizer,
+    /// The model's status. The worker updates it.
+    status: Mutex<ModelStatus>,
 }
 
 /// What the HTTP handlers and the worker share.
 struct Shared {
     /// The waiting requests.
     queue: Mutex<Queue>,
-    /// Wakes the worker when it has work: a new request, a cancellation, or the
-    /// stop.
+    /// Wakes the worker when it has work: a new request, a cancellation, a
+    /// status reader's request, or the stop.
     worker_wakeup: Condvar,
     /// The served models, in their configured order.
     models: Vec<SharedModel>,
     /// The server-wide budgets and limits.
     budgets: crate::config::Budgets,
+    /// Whether a status reader asked for fresh counters. The worker publishes
+    /// them at its next turn, also between the steps of a running call.
+    status_wanted: AtomicBool,
+    /// Wakes the status readers once the worker has published, when a long
+    /// operation starts, and at the stop.
+    status_published: tokio::sync::Notify,
+    /// The worker's long operations running now (LongOperation).
+    long_operations: AtomicUsize,
+}
+
+/// Marks a worker operation that may take seconds and publishes nothing, as
+/// long as it lives. Status readers then take the last published status at
+/// once.
+struct LongOperation<'a>(&'a Shared);
+
+impl<'a> LongOperation<'a> {
+    /// Starts a long operation in `shared`. It wakes the status readers that
+    /// wait for a publish.
+    fn start(shared: &'a Shared) -> LongOperation<'a> {
+        shared.long_operations.fetch_add(1, Ordering::AcqRel);
+        shared.status_published.notify_waiters();
+        LongOperation(shared)
+    }
+}
+
+impl Drop for LongOperation<'_> {
+    fn drop(&mut self) {
+        self.0.long_operations.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Clones the handle to what the threads share. Panics before the worker
@@ -245,6 +313,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Asks the worker for fresh counters, and returns once it has published them.
+/// While the server stops, and while the worker runs a long operation, it
+/// returns at once: the status is then the last one published.
+pub async fn refresh_status() {
+    let shared = clone_shared();
+    // A notified future gets the wake from the time it is made, before it is
+    // polled.
+    let published = shared.status_published.notified();
+    if engine::is_stopping() || shared.long_operations.load(Ordering::Acquire) > 0 {
+        return;
+    }
+    shared.status_wanted.store(true, Ordering::Release);
+    wake_worker();
+    published.await;
 }
 
 /// Lists the models the worker serves, in their configured order: each one's
@@ -288,6 +372,7 @@ pub fn start(
                 let _ = started_sender.send(false);
                 return;
             }
+            engine::refresh_stats();
             let mut models = Vec::new();
             let mut model_handles = Vec::new();
             for settings in &model_settings {
@@ -298,6 +383,10 @@ pub fn start(
                 models.push(SharedModel {
                     settings: settings.clone(),
                     tokenizer: model.tokenizer(),
+                    status: Mutex::new(ModelStatus {
+                        stats: model.read_stats(),
+                        ..ModelStatus::default()
+                    }),
                 });
                 model_handles.push(Rc::new(model));
             }
@@ -310,6 +399,9 @@ pub fn start(
                 worker_wakeup: Condvar::new(),
                 models,
                 budgets,
+                status_wanted: AtomicBool::new(false),
+                status_published: tokio::sync::Notify::new(),
+                long_operations: AtomicUsize::new(0),
             });
             *SHARED.lock().unwrap() = Some(shared.clone());
             // A panic here ends the process, as the engine's fatal errors do.
@@ -343,6 +435,10 @@ pub fn request_stop() {
 /// it after each stop request, on a thread of its own.
 extern "C" fn wake_after_stop() {
     wake_worker();
+    if let Some(shared) = SHARED.lock().unwrap().clone() {
+        // The status readers then take the last published status.
+        shared.status_published.notify_waiters();
+    }
     STOPPED.notify_waiters();
 }
 
@@ -438,6 +534,150 @@ pub fn submit(
         },
         receiver,
     ))
+}
+
+// ---- a model's status ----
+
+/// Loads `model`'s weights. Status readers take the last published status
+/// meanwhile.
+fn load_model(shared: &Shared, model: &Model) -> Result<(), String> {
+    let _long = LongOperation::start(shared);
+    model.load()
+}
+
+/// Rounds `value` to `digits` decimal places.
+fn round(value: f64, digits: i32) -> f64 {
+    let scale = 10f64.powi(digits);
+    (value * scale).round() / scale
+}
+
+/// Builds each model's memory as JSON: its weights, experts and workspace
+/// bytes.
+fn build_model_memory_json(shared: &Shared) -> Vec<Value> {
+    shared
+        .models
+        .iter()
+        .map(|shared_model| {
+            let status = lock(&shared_model.status);
+            let stats = status.stats;
+            let tracked = stats.dense_bytes + stats.cache_bytes + stats.model_workspace;
+            json!({
+                "model": shared_model.settings.id,
+                "weights": stats.dense_bytes,
+                "experts": stats.cache_bytes,
+                "workspace": stats.model_workspace,
+                "tracked": tracked,
+            })
+        })
+        .collect()
+}
+
+/// Builds the status of the model at `model_index` as JSON. It shows what the
+/// model is doing, its requests, its counters, its expert cache and the
+/// process's memory. Returns null for an unknown index.
+pub fn build_model_status_json(model_index: usize) -> Value {
+    let shared = clone_shared();
+    let Some(shared_model) = shared.models.get(model_index) else {
+        return Value::Null;
+    };
+    let waiting = lock(&shared.queue).waiting[model_index].len();
+    let stats = lock(&shared_model.status).stats;
+    let allocations = build_model_memory_json(&shared);
+    let status = lock(&shared_model.status);
+    let now = Instant::now();
+    // The status rounds seconds and memory GiB to tenths. Why these digits were
+    // chosen is unknown.
+    let phase = if status.phase.is_empty() {
+        "idle"
+    } else {
+        status.phase
+    };
+    let phase_seconds = status
+        .phase_since
+        .map_or(0.0, |since| (now - since).as_secs_f64());
+    let last_prefill = &status.last_prefill;
+    let options = &shared_model.settings.options;
+    json!({
+        "loaded": status.loaded,
+        "load_error": status.load_error,
+        "phase": phase,
+        "phase_seconds": round(phase_seconds, 1),
+        "decoding": status.decoding_count,
+        "request": status.shown_request_id,
+        "prompt_tokens": status.shown_prompt_tokens,
+        "generated_tokens": status.shown_generated_tokens,
+        "waiting": waiting,
+        "reserve_gib": shared.budgets.reserve_gb,
+        "memory_gib": shared.budgets.memory_gb,
+        "model_memory": allocations,
+        "model_memory_budget": {
+            "limit": stats.model_memory_limit,
+            "allocated": stats.model_memory_used,
+            "committed": stats.model_memory_committed,
+            "peak": stats.model_memory_peak,
+        },
+        "totals": {
+            "requests": status.total_requests,
+            "prompt_tokens": status.total_prompt_tokens,
+            "generated_tokens": status.total_generated_tokens,
+        },
+        "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
+        "model_decode": {
+            "computed_rows": stats.decode_rows,
+            "seconds": stats.decode_seconds,
+            "main_queue_gpu_seconds": stats.decode_gpu_seconds,
+            "requested_expert_gb": stats.decode.bytes as f64 / GB,
+            "read_wait_seconds": stats.decode.read_s,
+        },
+        "last_prefill": {
+            "chunks": last_prefill.chunks,
+            "tokens": last_prefill.tokens,
+            "decoder_tokens": last_prefill.decoder_tokens,
+            "ced_applied": last_prefill.ced_applied != 0,
+            "prune_applied": last_prefill.prune_applied != 0,
+            "prefix_tokens": last_prefill.prefix_tokens,
+            "prefix_encoder_only": false,
+        },
+        "expert_cache": {
+            "slots": stats.slots,
+            "gib": round(stats.cache_bytes as f64 / GIB, 1),
+            "hits": stats.cache.hits + stats.cache.prefetch_hits,
+            "misses": stats.cache.misses,
+            "read_gb": round(stats.cache.bytes as f64 / GB, 1),
+            "slots_released": stats.cache.given_back,
+        },
+        "memory": {
+            "available_gib": round(stats.available as f64 / GIB, 1),
+            "footprint_gib": round(stats.footprint as f64 / GIB, 1),
+        },
+        "engine_times": build_engine_times_json(&stats),
+    })
+}
+
+/// Builds where the process's time went since the start, as JSON. It is the
+/// same for every model. It holds the engine thread's seconds in each of its
+/// states. It holds the GPU main queue's busy seconds. It holds the queue's
+/// idle seconds between command buffers, by the engine thread's state at the
+/// time. It holds the SSD's seconds while an expert read runs. It also holds
+/// the summed seconds of demand reads and of background reads.
+fn build_engine_times_json(stats: &engine::Stats) -> Value {
+    let by_state = |seconds: &[f64; THREAD_STATES.len()]| {
+        Value::Object(
+            THREAD_STATES
+                .iter()
+                .zip(seconds)
+                .map(|(state, &value)| (state.to_string(), json!(value)))
+                .collect(),
+        )
+    };
+    json!({
+        "thread_seconds": by_state(&stats.thread_s),
+        "gpu_busy_seconds": stats.gpu_busy_s,
+        "gpu_idle_seconds": by_state(&stats.gpu_idle_s),
+        "ssd_busy_seconds": stats.ssd_busy_s,
+        "demand_read_seconds": stats.demand_read_s,
+        "background_read_seconds": stats.background_read_s,
+    })
 }
 
 // ---- the worker ----
@@ -582,6 +822,25 @@ impl Worker {
         Worker { shared, models }
     }
 
+    /// Publishes each model's engine counters to its status.
+    fn publish_counters(&self) {
+        for worker_model in &self.models {
+            let mut status = lock(&self.shared.models[worker_model.model_index].status);
+            status.stats = worker_model.model.read_stats();
+            status.loaded = worker_model.model.is_loaded();
+        }
+    }
+
+    /// Publishes the counters when a status reader asked for them, and wakes
+    /// the readers.
+    fn publish_status_if_wanted(&mut self) {
+        if self.shared.status_wanted.swap(false, Ordering::AcqRel) {
+            engine::refresh_stats();
+            self.publish_counters();
+            self.shared.status_published.notify_waiters();
+        }
+    }
+
     /// Advances the running calls of every model until one ends, and finishes
     /// the call that ended. A new request, a cancellation or the stop wakes the
     /// engine, so that the worker serves it without waiting for a call to end.
@@ -599,9 +858,10 @@ impl Worker {
         }
         if let Some(i) = engine::run_streams(&streams) {
             let (model_index, call_index) = owners[i];
+            let shared = self.shared.clone();
             let worker_model = &mut self.models[model_index];
             let ended_call = worker_model.running_calls.remove(call_index);
-            worker_model.finish_call(ended_call);
+            worker_model.finish_call(ended_call, &shared);
         }
     }
 
@@ -614,6 +874,7 @@ impl Worker {
             .any(|worker_model| !worker_model.running_calls.is_empty())
         {
             self.advance_running_calls();
+            self.publish_status_if_wanted();
         }
     }
 
@@ -623,6 +884,7 @@ impl Worker {
     fn run_until_stop(&mut self) {
         let shared = self.shared.clone();
         while !engine::is_stopping() {
+            self.publish_status_if_wanted();
             let mut queue = lock(&shared.queue);
             let idle = |queue: &Queue, models: &[WorkerModel]| {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
@@ -631,6 +893,12 @@ impl Worker {
                     })
             };
             while idle(&queue, &self.models) && !engine::is_stopping() {
+                if shared.status_wanted.load(Ordering::Acquire) {
+                    drop(queue);
+                    self.publish_status_if_wanted();
+                    queue = lock(&shared.queue);
+                    continue;
+                }
                 queue = shared
                     .worker_wakeup
                     .wait(queue)
@@ -655,17 +923,18 @@ impl Worker {
             }
             drop(queue);
             for (worker_model, admitted) in self.models.iter_mut().zip(admitted_by_model) {
-                worker_model.run_step(admitted);
+                worker_model.run_step(&shared, admitted);
                 worker_model
                     .model
                     .set_request_running(!worker_model.generations.is_empty());
             }
             self.advance_running_calls();
+            self.publish_status_if_wanted();
         }
         self.finish_running_calls();
         for worker_model in &mut self.models {
             for generation in std::mem::take(&mut worker_model.generations) {
-                worker_model.end_generation(generation, true);
+                worker_model.end_generation(&shared, generation, true);
             }
         }
         let mut waiting: Vec<Job> = {
@@ -682,6 +951,9 @@ impl Worker {
         }
         for job in waiting {
             end_before_prefill(job, FinishReason::ServerStop);
+        }
+        for worker_model in &mut self.models {
+            worker_model.update_status(&shared, "idle");
         }
     }
 }
@@ -721,7 +993,7 @@ impl WorkerModel {
     /// Runs one step of the model. Admitted requests start one at a time, when
     /// the model runs no other request. A prefill call starts. The generations
     /// that are done end. The others start decoding calls.
-    fn run_step(&mut self, admitted: Vec<Job>) {
+    fn run_step(&mut self, shared: &Shared, admitted: Vec<Job>) {
         self.admitted.extend(admitted);
         // The model runs one request at a time.
         while self.generations.is_empty() {
@@ -735,16 +1007,21 @@ impl WorkerModel {
                 end_before_prefill(job, FinishReason::Cancelled);
             } else {
                 let was_loaded = self.model.is_loaded();
-                if let Err(error) = self.model.load() {
+                if !was_loaded {
+                    self.update_status(shared, "loading");
+                }
+                if let Err(error) = load_model(shared, &self.model) {
                     if engine::is_stopping() {
                         // The stop cut the load short.
                         end_before_prefill(job, FinishReason::ServerStop);
                         continue;
                     }
+                    lock(&shared.models[self.model_index].status).load_error = Some(error.clone());
                     engine::log(&format!("{}: {error}", self.settings.id));
                     job.send_last_event(Event::Failed(error));
                     continue;
                 }
+                lock(&shared.models[self.model_index].status).load_error = None;
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
                 if !was_loaded && self.model.is_loaded() {
                     engine::log(&format!("{}: loaded", self.settings.id));
@@ -764,7 +1041,7 @@ impl WorkerModel {
                 && Self::check_ended(&self.model, &mut self.generations[i], ctx)
             {
                 let generation = self.generations.swap_remove(i);
-                self.end_generation(generation, false);
+                self.end_generation(shared, generation, false);
             } else if !self.generations[i].in_call
                 && !self.generations[i].is_decoding()
                 && self.generations[i]
@@ -775,7 +1052,7 @@ impl WorkerModel {
             {
                 let mut generation = self.generations.swap_remove(i);
                 generation.cancelled = true;
-                self.end_generation(generation, false);
+                self.end_generation(shared, generation, false);
             } else {
                 i += 1;
             }
@@ -787,6 +1064,7 @@ impl WorkerModel {
             .count();
         if self.generations.is_empty() {
             self.idle_decode_streams.clear();
+            self.update_status(shared, "idle");
             return;
         }
         if decoding_count > 0 {
@@ -800,6 +1078,47 @@ impl WorkerModel {
                     .send(Event::Tokens(std::mem::take(&mut generation.unsent_tokens)));
             }
         }
+        let phase = if self
+            .generations
+            .iter()
+            .any(|generation| !generation.is_decoding())
+        {
+            "prefill"
+        } else {
+            "decode"
+        };
+        self.update_status(shared, phase);
+    }
+
+    /// Updates the model's status: its phase, its counts and the request it
+    /// shows.
+    fn update_status(&mut self, shared: &Shared, phase: &'static str) {
+        let mut status = lock(&shared.models[self.model_index].status);
+        if status.phase != phase || status.phase_since.is_none() {
+            status.phase_since = Some(Instant::now());
+        }
+        status.phase = phase;
+        status.decoding_count = self
+            .generations
+            .iter()
+            .filter(|generation| generation.is_decoding())
+            .count();
+        let first = self
+            .generations
+            .iter()
+            .find(|generation| !generation.is_decoding())
+            .or(self.generations.first());
+        (
+            status.shown_request_id,
+            status.shown_prompt_tokens,
+            status.shown_generated_tokens,
+        ) = first.map_or((0, 0, 0), |generation| {
+            (
+                generation.job.id,
+                generation.prompt_tokens,
+                generation.generated,
+            )
+        });
     }
 
     /// Starts an admitted request. It checks the request's media and prompt. It
@@ -960,7 +1279,7 @@ impl WorkerModel {
     }
 
     /// Finishes a prefill call that ended. The request starts decoding.
-    fn finish_prefill_call(&mut self, stream: Stream, request_id: u64) {
+    fn finish_prefill_call(&mut self, stream: Stream, request_id: u64, shared: &Shared) {
         let i = self.find_generation_index(request_id);
         self.generations[i].in_call = false;
         let Some(logits) = stream.logits() else {
@@ -978,7 +1297,7 @@ impl WorkerModel {
         };
         let info = stream.prefill_info();
         let mut generation = self.generations.remove(i);
-        self.start_decoding(&mut generation, logits, info);
+        self.start_decoding(shared, &mut generation, logits, info);
         self.generations.insert(i, generation);
         // The stream owns the logits until here. Dropping it frees the prompt's
         // large buffers.
@@ -986,10 +1305,10 @@ impl WorkerModel {
     }
 
     /// Finishes a call that ended. Its requests then go on.
-    fn finish_call(&mut self, running_call: RunningCall) {
+    fn finish_call(&mut self, running_call: RunningCall, shared: &Shared) {
         let RunningCall { stream, call } = running_call;
         match call {
-            Call::Prefill { request_id } => self.finish_prefill_call(stream, request_id),
+            Call::Prefill { request_id } => self.finish_prefill_call(stream, request_id, shared),
             Call::DecodeRows {
                 request_ids,
                 tokens,
@@ -1000,7 +1319,13 @@ impl WorkerModel {
     /// Starts decoding after the prefill ended with `logits`. It logs the
     /// prefill and sends DecodingStarted. It samples the first token from
     /// `logits`.
-    fn start_decoding(&mut self, generation: &mut Generation, logits: Logits, info: PrefillInfo) {
+    fn start_decoding(
+        &mut self,
+        shared: &Shared,
+        generation: &mut Generation,
+        logits: Logits,
+        info: PrefillInfo,
+    ) {
         let prefill = generation.prefill.take().expect("a prefill");
         let prompt_tokens = generation.prompt_tokens;
         let now = Instant::now();
@@ -1029,6 +1354,10 @@ impl WorkerModel {
             prompt_tokens,
             reused_tokens: 0,
         });
+        {
+            let mut status = lock(&shared.models[self.model_index].status);
+            status.last_prefill = info;
+        }
         drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
         generation.decode_started_at = now;
@@ -1083,8 +1412,9 @@ impl WorkerModel {
     }
 
     /// Ends the generation. It sends its last tokens and its Done event. It
-    /// frees the request's state. It logs the request's counts.
-    fn end_generation(&mut self, mut generation: Generation, at_stop: bool) {
+    /// frees the request's state. It logs the request's counts and adds them to
+    /// the model's totals.
+    fn end_generation(&mut self, shared: &Shared, mut generation: Generation, at_stop: bool) {
         if !generation.unsent_tokens.is_empty() {
             let _ = generation
                 .job
@@ -1109,6 +1439,11 @@ impl WorkerModel {
         generation.job.send_last_event(Event::Done { reason });
         self.model.state_free(generation.state);
         let stats = self.model.read_stats();
+        {
+            let mut status = lock(&shared.models[self.model_index].status);
+            status.stats = stats;
+            status.loaded = self.model.is_loaded();
+        }
         let (expert_counts, decode_seconds) = (
             stats.cache,
             generation.decode_started_at.elapsed().as_secs_f64(),
@@ -1141,6 +1476,10 @@ impl WorkerModel {
             "req {}: sampling temperature {}, top_p {}, top_k {}",
             generation.job.id, sampling.temperature, sampling.top_p, sampling.top_k,
         ));
+        let mut status = lock(&shared.models[self.model_index].status);
+        status.total_requests += 1;
+        status.total_prompt_tokens += generation.prompt_tokens as u64;
+        status.total_generated_tokens += generation.generated as u64;
     }
 
     /// Ends the requests of a decoding pass that could not load its experts.
