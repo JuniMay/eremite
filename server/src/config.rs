@@ -32,6 +32,9 @@ pub struct ModelConfig {
     pub id: Option<String>,
     /// The engine's options for the model.
     pub engine: engine::Options,
+    /// The most rows that a decoding call takes, at most the model's own; None:
+    /// the model's own. DeepSeek's own is 6.
+    pub rows_per_call: Option<usize>,
     /// The temperature of requests that set none; None: 1.
     pub temperature: Option<f64>,
     /// The top_p of requests that set none; None: 1.
@@ -57,6 +60,7 @@ impl ModelConfig {
                 ctx: MAX_CONTEXT_TOKENS,
                 ..Default::default()
             },
+            rows_per_call: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -104,6 +108,15 @@ impl ModelConfig {
             | "http_timeout"
             | "keepalive" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
+            }
+            "rows_per_call" => {
+                self.rows_per_call = Some(
+                    integer()
+                        .ok()
+                        .filter(|rows| *rows >= 1)
+                        .ok_or("rows_per_call takes a positive integer")?
+                        as usize,
+                )
             }
             "temperature" => {
                 self.temperature = Some(
@@ -534,6 +547,21 @@ mod tests {
             (Some("small"), 32768, Some(20), Some(0))
         );
         assert!(small.engine.deepseek().is_none());
+    }
+
+    #[test]
+    fn rows_per_call_is_per_model_and_positive() {
+        let models = parse(&json!({"models": [
+            {"model": "/m/deepseek", "rows_per_call": 2}, {"model": "/m/small"}
+        ]}))
+        .unwrap()
+        .models;
+        assert_eq!(
+            (models[0].rows_per_call, models[1].rows_per_call),
+            (Some(2), None)
+        );
+        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": 0}]})).is_err());
+        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": "all"}]})).is_err());
     }
 
     #[test]

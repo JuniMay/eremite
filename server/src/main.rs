@@ -60,6 +60,9 @@ const USAGE: &str =
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
+  --rows-per-call N  rows of one decoding call at most, at most the model's own; fewer rows per
+                  call run more calls beside each other (default: the model's own, 6 for
+                  DeepSeek)
   -t T, --temperature T  the temperature of requests that set none (default 1)
   --top-p P       the top_p of requests that set none, 0 to 1 (default 1)
   --top-k K       the top_k of requests that set none, 0 for all (default 0)
@@ -717,7 +720,11 @@ fn main() {
         {
             die(&format!("two models named {id}: give one an id"));
         }
-        served.push(worker::ModelSettings { id, options });
+        served.push(worker::ModelSettings {
+            id,
+            options,
+            rows_per_call: model.rows_per_call,
+        });
         families.push(family);
     }
     if !worker::start(served.clone(), arguments.budgets.clone(), None, None) {

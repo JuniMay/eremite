@@ -8,10 +8,11 @@
 //!
 //! Each turn of the worker's loop gives every model one step. A step admits
 //! every waiting request. It starts a prefill call for each prefilling request
-//! with no call running. The call prefills the whole prompt. The step then
-//! starts decoding calls for the decoding requests with no call running. A
-//! request starts decoding as soon as its prefill ends. A model runs one
-//! request at a time.
+//! with no call running. Prefills run beside each other and beside decoding.
+//! The call prefills the whole prompt. The step then starts decoding calls for
+//! the decoding requests with no call running. A request starts decoding as
+//! soon as its prefill ends. Several decoding requests run together, at most
+//! the model's rows per call.
 //!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
@@ -27,6 +28,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::calls::CallChooser;
 use crate::control::GIB;
 use crate::engine::{
     self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, StateHandle, Stream,
@@ -39,6 +41,14 @@ const GB: f64 = 1e9;
 /// The engine thread's states, in the order of eremite_stats's thread_s and
 /// gpu_idle_s.
 const THREAD_STATES: [&str; 5] = ["outside", "pass", "wait_gpu", "wait_read", "wait_other"];
+
+/// Limits the rows_per_call `setting` to 1 through `model_max_rows`. Without a
+/// setting, it returns `model_max_rows`, at least 1. The result is the most
+/// rows a decoding call takes.
+fn limit_rows_per_call(model_max_rows: usize, setting: Option<usize>) -> usize {
+    let max_rows = model_max_rows.max(1);
+    setting.map_or(max_rows, |rows| rows.clamp(1, max_rows))
+}
 
 /// What the threads share. The engine thread sets it when it starts.
 static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
@@ -203,6 +213,8 @@ pub struct ModelSettings {
     pub id: String,
     /// The engine's options for the model.
     pub options: engine::Options,
+    /// The most rows a decoding call takes. None takes the model's own limit.
+    pub rows_per_call: Option<usize>,
 }
 
 /// What the HTTP handlers and the worker share under one lock.
@@ -622,6 +634,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "generated_tokens": status.total_generated_tokens,
         },
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
+        "rows_per_call": shared_model.settings.rows_per_call,
         "model_decode": {
             "computed_rows": stats.decode_rows,
             "seconds": stats.decode_seconds,
@@ -732,6 +745,8 @@ struct Generation {
     expert_counts_at_decode_start: CacheCounts,
     /// Whether a call of this request runs on a stream.
     in_call: bool,
+    /// The request's turn number since it last became ready to decode (Turns).
+    turn: u64,
 }
 
 impl Generation {
@@ -779,6 +794,8 @@ struct WorkerModel {
     think_start_token: Option<i32>,
     /// The token that ends a think block, if the model has one.
     think_end_token: Option<i32>,
+    /// The number of decoding requests in the last log line about them.
+    logged_decoding_count: usize,
     /// The experts that a decoded row chooses in all layers together. It is 0
     /// for a model without routed experts.
     experts_per_row: usize,
@@ -786,6 +803,32 @@ struct WorkerModel {
     running_calls: Vec<RunningCall>,
     /// The streams that ended a decoding call and wait for the next one.
     idle_decode_streams: Vec<Stream>,
+    /// Chooses how the decoding requests split into calls.
+    call_chooser: CallChooser,
+    /// The order of the decoding requests' turns.
+    turns: Turns,
+}
+
+/// The order in which decoding requests take turns in calls. Each request that
+/// becomes ready takes the next turn number, and the lowest number goes first.
+/// Requests that become ready together, the rows of one call, take numbers in
+/// the order they had in that call. So a request that a call left out goes
+/// before every row of that call, and no request waits behind the same others
+/// again and again.
+#[derive(Default)]
+struct Turns {
+    /// The number of the next request that becomes ready.
+    next: u64,
+}
+
+impl Turns {
+    /// Returns the turn numbers of `count` requests that become ready together,
+    /// in their order.
+    fn take(&mut self, count: usize) -> std::ops::Range<u64> {
+        let start = self.next;
+        self.next += count as u64;
+        start..self.next
+    }
 }
 
 /// The worker on the engine thread.
@@ -813,9 +856,12 @@ impl Worker {
                     admitted: VecDeque::new(),
                     think_start_token: model.tokenizer().find_added_token("<think>"),
                     think_end_token: model.tokenizer().find_added_token("</think>"),
+                    logged_decoding_count: 0,
                     experts_per_row: model.read_stats().experts_per_row.max(0) as usize,
                     running_calls: Vec::new(),
                     idle_decode_streams: Vec::new(),
+                    call_chooser: CallChooser::new(),
+                    turns: Turns::default(),
                     model,
                     settings,
                 }
@@ -992,13 +1038,18 @@ fn end_before_prefill(job: Job, reason: FinishReason) {
 }
 
 impl WorkerModel {
-    /// Runs one step of the model. Admitted requests start one at a time, when
-    /// the model runs no other request. A prefill call starts. The generations
-    /// that are done end. The others start decoding calls.
+    /// Runs one step of the model. Admitted requests start, one at a time after
+    /// the prefills before them. One prefill call starts. The generations that
+    /// are done end. The others start decoding calls.
     fn run_step(&mut self, shared: &Shared, admitted: Vec<Job>) {
         self.admitted.extend(admitted);
-        // The model runs one request at a time.
-        while self.generations.is_empty() {
+        // A request plans its prefill only after the prefills before it have
+        // ended. So one request at a time starts its prefill.
+        while !self
+            .generations
+            .iter()
+            .any(|generation| !generation.is_decoding())
+        {
             let Some(job) = self.admitted.pop_front() else {
                 break;
             };
@@ -1012,7 +1063,11 @@ impl WorkerModel {
                 if !was_loaded {
                     self.update_status(shared, "loading");
                 }
-                if let Err(error) = load_model(shared, &self.model) {
+                // A running call uses the model's buffers. A load may resize
+                // them. So the load runs only while no call runs.
+                if self.running_calls.is_empty()
+                    && let Err(error) = load_model(shared, &self.model)
+                {
                     if engine::is_stopping() {
                         // The stop cut the load short.
                         end_before_prefill(job, FinishReason::ServerStop);
@@ -1064,6 +1119,13 @@ impl WorkerModel {
             .iter()
             .filter(|generation| generation.is_decoding())
             .count();
+        if decoding_count > 1 && decoding_count != self.logged_decoding_count {
+            engine::log(&format!(
+                "{}: {decoding_count} requests decoding together",
+                self.settings.id
+            ));
+        }
+        self.logged_decoding_count = decoding_count;
         if self.generations.is_empty() {
             self.idle_decode_streams.clear();
             self.update_status(shared, "idle");
@@ -1245,6 +1307,7 @@ impl WorkerModel {
             progress_logged_at: now,
             expert_counts_at_decode_start: CacheCounts::default(),
             in_call: false,
+            turn: 0,
         });
     }
 
@@ -1380,6 +1443,7 @@ impl WorkerModel {
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
         generation.decode_started_at = now;
         generation.progress_logged_at = now;
+        generation.turn = self.turns.take(1).start;
         generation.expert_counts_at_decode_start = stats.cache;
     }
 
@@ -1532,29 +1596,86 @@ impl WorkerModel {
             .unwrap_or_else(|| Stream::new(&self.model))
     }
 
-    /// Starts a decoding call for the decoding request with no call running.
+    /// Starts decoding calls for the decoding requests with no call running.
+    /// Several requests run together, at most the model's rows per call. Each
+    /// row then gives what it would give alone.
     fn start_decode_calls(&mut self) {
-        let decoding_indices: Vec<usize> = (0..self.generations.len())
+        // The call chooser sets how many calls run at once and the rows of
+        // each. A call starts as soon as its requests are free and the chooser
+        // allows one more call. Groups of requests run independently. The GPU
+        // work of one call fills the waits of the others.
+        let max_rows_per_call =
+            limit_rows_per_call(self.model.max_rows(), self.settings.rows_per_call);
+        let decoding_count = self
+            .generations
+            .iter()
+            .filter(|generation| generation.is_decoding())
+            .count();
+        let (allowed, rows_per_call) = self
+            .call_chooser
+            .choose_calls(decoding_count, max_rows_per_call);
+        let running = self
+            .running_calls
+            .iter()
+            .filter(|running_call| !matches!(running_call.call, Call::Prefill { .. }))
+            .count();
+        if running >= allowed {
+            return;
+        }
+        let mut decoding_indices: Vec<usize> = (0..self.generations.len())
             .filter(|&i| self.generations[i].is_decoding() && !self.generations[i].in_call)
             .collect();
         if decoding_indices.is_empty() {
             return;
         }
-        let index = decoding_indices[0];
-        let stream = self.take_decode_stream();
-        let generation = &mut self.generations[index];
-        generation.in_call = true;
-        let request_id = generation.job.id;
-        stream.decode_rows(
-            &[generation.state],
-            &[generation.next_token],
-            &[generation.pos as i32],
-        );
-        let call = Call::DecodeRows {
-            request_ids: vec![request_id],
-            tokens: vec![generation.next_token],
-        };
-        self.running_calls.push(RunningCall { stream, call });
+        decoding_indices.sort_by_key(|&i| self.generations[i].turn);
+        if decoding_count == 1 {
+            let index = decoding_indices[0];
+            let stream = self.take_decode_stream();
+            let generation = &mut self.generations[index];
+            generation.in_call = true;
+            let request_id = generation.job.id;
+            stream.decode_rows(
+                &[generation.state],
+                &[generation.next_token],
+                &[generation.pos as i32],
+            );
+            let call = Call::DecodeRows {
+                request_ids: vec![request_id],
+                tokens: vec![generation.next_token],
+            };
+            self.running_calls.push(RunningCall { stream, call });
+            return;
+        }
+        // Each group gets one call, while the chooser allows one more call.
+        for group in decoding_indices
+            .chunks(rows_per_call)
+            .take(allowed - running)
+        {
+            let engine_states: Vec<StateHandle> =
+                group.iter().map(|&i| self.generations[i].state).collect();
+            let tokens: Vec<i32> = group
+                .iter()
+                .map(|&i| self.generations[i].next_token)
+                .collect();
+            let pos: Vec<i32> = group
+                .iter()
+                .map(|&i| self.generations[i].pos as i32)
+                .collect();
+            let request_ids: Vec<u64> = group.iter().map(|&i| self.generations[i].job.id).collect();
+            let stream = self.take_decode_stream();
+            stream.decode_rows(&engine_states, &tokens, &pos);
+            for &i in group {
+                self.generations[i].in_call = true;
+            }
+            self.running_calls.push(RunningCall {
+                stream,
+                call: Call::DecodeRows {
+                    request_ids,
+                    tokens,
+                },
+            });
+        }
     }
 
     /// Finishes a decoding call of one token per request. Each request keeps
@@ -1564,8 +1685,10 @@ impl WorkerModel {
             .iter()
             .map(|&request_id| self.find_generation_index(request_id))
             .collect();
-        for &i in &indices {
+        let turns = self.turns.take(indices.len());
+        for (&i, turn) in indices.iter().zip(turns) {
             self.generations[i].in_call = false;
+            self.generations[i].turn = turn;
         }
         let Some(logits) = stream.logits() else {
             self.idle_decode_streams.push(stream);
@@ -1584,5 +1707,67 @@ impl WorkerModel {
                 model.sample(unsafe { logits.row(row, vocab) }, &mut generation.sampler);
         }
         self.idle_decode_streams.push(stream);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Six requests take turns in one call of four rows at a time. Each call's
+    /// rows become ready together. With turn numbers, every request runs in two
+    /// calls out of three. Ordered by when they became ready, with ties by
+    /// index, requests 0 and 1 would run in every call and the others in every
+    /// second one.
+    #[test]
+    fn requests_that_a_call_leaves_out_go_first() {
+        const REQUESTS: usize = 6;
+        const ROWS: usize = 4;
+        const CALLS: usize = 30;
+        let mut turns = Turns::default();
+        let mut turn: Vec<u64> = turns.take(REQUESTS).collect();
+        let mut calls_run = [0; REQUESTS];
+        for _ in 0..CALLS {
+            let mut order: Vec<usize> = (0..REQUESTS).collect();
+            order.sort_by_key(|&i| turn[i]);
+            let call = &order[..ROWS];
+            for (&i, next) in call.iter().zip(turns.take(ROWS)) {
+                calls_run[i] += 1;
+                turn[i] = next;
+            }
+        }
+        assert_eq!(calls_run, [CALLS * ROWS / REQUESTS; REQUESTS]);
+    }
+
+    /// DeepSeek V4.1 Flash's most rows per call.
+    const MAX_ROWS_PER_CALL: usize = 6;
+
+    #[test]
+    fn the_rows_per_call_setting_stays_between_one_and_the_models_most_rows() {
+        assert_eq!(
+            limit_rows_per_call(MAX_ROWS_PER_CALL, None),
+            MAX_ROWS_PER_CALL
+        );
+        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(1)), 1);
+        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(2)), 2);
+        // Never more than the model takes.
+        assert_eq!(
+            limit_rows_per_call(MAX_ROWS_PER_CALL, Some(9)),
+            MAX_ROWS_PER_CALL
+        );
+        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(0)), 1);
+        let chooser = CallChooser::new();
+        assert_eq!(
+            chooser.choose_calls(4, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(1))),
+            (4, 1)
+        );
+        assert_eq!(
+            chooser.choose_calls(4, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(2))),
+            (2, 2)
+        );
+        assert_eq!(
+            chooser.choose_calls(12, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(4))),
+            (3, 4)
+        );
     }
 }

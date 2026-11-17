@@ -132,6 +132,7 @@ fn requests_run_to_their_end_and_report_their_events() {
     let settings = worker::ModelSettings {
         id: "deepseek".into(),
         options,
+        rows_per_call: None,
     };
     assert!(worker::start(
         vec![settings],

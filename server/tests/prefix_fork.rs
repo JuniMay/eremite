@@ -2,6 +2,7 @@
 //!
 //! A prompt too long for the context is refused with its token count. The
 //! model's status follows a running prefill, and quitting stops a long prefill.
+//! A request is answered while four others decode.
 //!
 //! Set EREMITE_CHECKPOINT to the checkpoint directory. EREMITE_EXPERTS
 //! optionally selects GGUF experts; otherwise the tests use native MXFP4. The
@@ -24,6 +25,13 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{Server, http, one_model, root};
+
+/// The requests that decode while another request arrives.
+const DECODING_REQUESTS: usize = 4;
+/// The tokens that each decoding request asks for. 500 tokens take about 45 s
+/// with IQ2 experts and 100 s with MXFP4 experts. The arriving request's answer
+/// takes less than 20 s.
+const DECODING_TOKENS: u32 = 500;
 
 /// What the tests run: the checkpoint, its experts, and the server's and the
 /// CLI's programs.
@@ -382,6 +390,47 @@ fn sized_prompt(setup: &Setup, low: usize, high: usize) -> (Value, usize) {
         }
     }
     panic!("no cut of src/eremite.h gives {low} to {high} prompt tokens");
+}
+
+/// Four requests decode while another request arrives. The server admits it at
+/// once: its answer comes while the four still decode.
+#[test]
+fn a_request_is_answered_while_four_others_decode() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT and EREMITE_EXPERTS");
+        return;
+    };
+    let _one = one_model();
+    let server = start_server(&setup, &[]);
+    let (first_token, first_tokens) = mpsc::channel();
+    let decoding: Vec<_> = (0..DECODING_REQUESTS)
+        .map(|i| {
+            // A task that does not end within the tokens the request asks for.
+            let messages = json!([{"role": "user", "content": format!(
+                "[{i}] Count from 1 to 100000, one number per line, and write nothing else.")}]);
+            let mut body = request(&messages, DECODING_TOKENS);
+            body["stream"] = json!(true);
+            let (port, key, first_token) = (server.port, server.key.clone(), first_token.clone());
+            std::thread::spawn(move || stream_chat(port, &key, &body, first_token))
+        })
+        .collect();
+    for _ in 0..DECODING_REQUESTS {
+        first_tokens
+            .recv()
+            .expect("a decoding request's first token");
+    }
+    chat(&server, &request(&short_prompt(), 1));
+    let still_decoding = decoding.iter().filter(|job| !job.is_finished()).count();
+    for job in decoding {
+        job.join().expect("a decoding request");
+    }
+    println!(
+        "{still_decoding} of {DECODING_REQUESTS} requests still decoded when the arriving request's answer came"
+    );
+    assert_eq!(
+        still_decoding, DECODING_REQUESTS,
+        "the arriving request waited for a decoding request to end"
+    );
 }
 
 /// The model's status follows a running prefill: before the answer's first
