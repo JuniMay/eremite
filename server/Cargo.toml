@@ -20,6 +20,8 @@ hyper-util = { version = "0.1", features = ["server", "server-graceful", "servic
 # codex/search.rs, chat/deepseek.rs).
 libc = "0.2"
 rand = "0.9"
+# The terminal UI (ui/): ratatui on its crossterm backend.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: JSON in prompts keeps the request's key order, as Python's
 # json does; float_roundtrip: numbers parse as C's strtod parses them.
