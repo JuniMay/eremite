@@ -647,10 +647,7 @@ pub fn start(
             let shared = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     waiting: (0..model_count).map(|_| VecDeque::new()).collect(),
-                    control: Control::new(control::MemoryBytes {
-                        model_bytes: engine::read_memory().limit,
-                        state_cache_bytes: (budgets.state_cache_gb * GIB) as u64,
-                    }),
+                    control: Control::new(engine::read_memory().limit),
                     ..Queue::default()
                 }),
                 worker_wakeup: Condvar::new(),
@@ -860,7 +857,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let Some(shared_model) = shared.models.get(model_index) else {
         return Value::Null;
     };
-    let (waiting, control_phase, state_limit, queued) = {
+    let (waiting, control_phase, queued) = {
         let queue = lock(&shared.queue);
         let queued: Vec<RequestStatus> = queue.waiting[model_index]
             .iter()
@@ -869,7 +866,6 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         (
             queue.waiting[model_index].len(),
             queue.control.phase,
-            queue.control.effective_limits.state_cache_bytes,
             queued,
         )
     };
@@ -923,7 +919,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "requests": build_requests_json(&requests),
         "sessions": sessions,
         "state_cache_gib": round(status.state_committed_bytes as f64 / GIB, 3),
-        "state_cache_limit_gib": round(state_limit as f64 / GIB, 3),
+        "state_cache_limit_gib": round(shared.budgets.state_cache_gb, 3),
         "state_cache_scope": "server",
         "state_cache_total_gib": round(total_state_bytes as f64 / GIB, 3),
         "state_disk": build_disk_status_json(&shared),
@@ -1873,7 +1869,7 @@ impl Worker {
         let memory_in_use = engine::read_memory();
         lock(&self.shared.queue).control.retained = control::MemoryBytes {
             model_bytes: memory_in_use.model_bytes,
-            state_cache_bytes: memory_in_use.state_bytes,
+            state_bytes: memory_in_use.state_bytes,
         };
     }
 
@@ -2009,93 +2005,79 @@ impl Worker {
 
     /// Runs a yield or a resume. It first finishes the running calls, and waits
     /// for the GPU work and the reads. A yield stops every model from running
-    /// requests. It frees model memory and evicts states down to the targets.
-    /// If more memory than a target is still in use, the yield fails and the
-    /// models restart. Otherwise the lower limits take effect. A resume
-    /// restores the configured limits and restarts the models.
+    /// requests. It frees the models' idle memory, then their idle states, down
+    /// to the target. If more memory than the target is still in use, the yield
+    /// fails and the models restart. Otherwise the lower limit takes effect. A
+    /// resume restores the configured limit and restarts the models.
     fn run_control_action(&mut self, action: Action) {
         let shared = self.shared.clone();
         let _long = LongOperation::start(&shared);
         self.finish_running_calls();
-        let configured = lock(&self.shared.queue).control.configured_limits;
+        let configured = lock(&self.shared.queue).control.configured_limit;
         engine::drain();
         match action {
-            Action::Yield(targets) => {
+            Action::Yield(target) => {
                 for worker_model in &self.models {
                     worker_model.model.set_request_running(false);
                 }
+                // The models' idle memory goes first, then their idle states,
+                // the least recently used first.
                 let before = engine::read_memory();
-                engine::reclaim(match targets.model {
+                let excess = match target {
                     // u64::MAX frees all that can be freed.
                     YieldTarget::Minimum => u64::MAX,
                     YieldTarget::Bytes(cap) => before.model_bytes.saturating_sub(cap),
-                });
-                let evicted = self.states.cache.evict_bytes(match targets.state_cache {
-                    // u64::MAX frees all that can be freed.
-                    YieldTarget::Minimum => u64::MAX,
-                    YieldTarget::Bytes(cap) => self.states.cache.count_bytes().saturating_sub(cap),
-                });
+                };
+                let freed = engine::reclaim(excess);
+                let evicted = self.states.cache.evict_bytes(excess.saturating_sub(freed));
                 self.states.free_evicted(&self.shared, evicted);
                 engine::drain();
                 let memory_in_use = engine::read_memory();
                 let retained = control::MemoryBytes {
                     model_bytes: memory_in_use.model_bytes,
-                    state_cache_bytes: memory_in_use.state_bytes,
+                    state_bytes: memory_in_use.state_bytes,
                 };
-                let protected_states = memory_in_use
-                    .state_bytes
-                    .max(self.states.cache.count_bytes());
-                let limits = control::MemoryBytes {
-                    model_bytes: match targets.model {
-                        YieldTarget::Minimum => memory_in_use.model_bytes,
-                        YieldTarget::Bytes(cap) => cap,
-                    },
-                    state_cache_bytes: match targets.state_cache {
-                        YieldTarget::Minimum => protected_states,
-                        YieldTarget::Bytes(cap) => cap,
-                    },
+                let limit = match target {
+                    YieldTarget::Minimum => memory_in_use.model_bytes,
+                    YieldTarget::Bytes(cap) => cap,
                 };
-                if memory_in_use.model_bytes > limits.model_bytes
-                    || protected_states > limits.state_cache_bytes
-                {
+                if memory_in_use.model_bytes > limit {
                     self.restart_models_with_running_requests();
                     let memory_in_use = engine::read_memory();
                     let message = format!(
-                        "limits cannot retain protected buffers: {} model bytes and {} state bytes are required",
-                        retained.model_bytes, protected_states
+                        "the limit cannot retain protected buffers: {} model bytes are required, {} of them for states",
+                        retained.model_bytes, retained.state_bytes
                     );
                     lock(&self.shared.queue).control.fail_yield(
                         message,
                         control::MemoryBytes {
                             model_bytes: memory_in_use.model_bytes,
-                            state_cache_bytes: memory_in_use.state_bytes,
+                            state_bytes: memory_in_use.state_bytes,
                         },
                     );
                 } else {
-                    engine::set_memory_limit(limits.model_bytes);
-                    self.states.cache.byte_limit = limits.state_cache_bytes;
+                    engine::set_memory_limit(limit);
                     lock(&self.shared.queue)
                         .control
-                        .finish_yield(limits, retained);
+                        .finish_yield(limit, retained);
                     engine::log(&format!(
-                        "yielded: {} model bytes and {} state bytes retained",
-                        retained.model_bytes, retained.state_cache_bytes
+                        "yielded: {} model bytes retained, {} of them for states",
+                        retained.model_bytes, retained.state_bytes
                     ));
                 }
             }
             Action::Resume => {
-                engine::set_memory_limit(configured.model_bytes);
-                self.states.cache.byte_limit = configured.state_cache_bytes;
-                lock(&self.shared.queue).control.effective_limits = configured;
+                engine::set_memory_limit(configured);
+                lock(&self.shared.queue).control.effective_limit = configured;
                 self.restart_models_with_running_requests();
                 let memory_in_use = engine::read_memory();
                 lock(&self.shared.queue)
                     .control
                     .finish_resume(control::MemoryBytes {
                         model_bytes: memory_in_use.model_bytes,
-                        state_cache_bytes: memory_in_use.state_bytes,
+                        state_bytes: memory_in_use.state_bytes,
                     });
-                engine::log("resumed: configured model and state limits restored");
+                engine::log("resumed: the configured memory limit holds again");
             }
         }
         engine::refresh_stats();

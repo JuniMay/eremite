@@ -1,6 +1,6 @@
 //! The server's yield and resume control. A client asks the server to yield:
-//! to free memory down to lower limits and keep to them. Later the client asks
-//! it to resume the configured limits. One operation owns a yield at a time.
+//! to free memory down to a lower limit and keep to it. Later the client asks
+//! it to resume the configured limit. One operation owns a yield at a time.
 //! The client names the operation with an operation_id.
 //!
 //! This module records each operation and its outcome. The worker carries out
@@ -25,9 +25,6 @@ pub struct YieldRequest {
     /// The models' memory limit in GiB, their states included. 0 asks for the
     /// least. None keeps the configured limit.
     pub memory_gib: Option<f64>,
-    /// The state cache's limit in GiB. 0 asks for the least. None keeps the
-    /// configured limit.
-    pub state_cache_gib: Option<f64>,
 }
 
 /// A client's request to resume.
@@ -38,14 +35,13 @@ pub struct ResumeRequest {
     pub operation_id: String,
 }
 
-/// Bytes of the models' memory and of the state cache: a pair of limits, or
-/// the bytes in use.
+/// The bytes that the models hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MemoryBytes {
     /// The models' memory, their states included.
     pub model_bytes: u64,
-    /// The state cache's memory.
-    pub state_cache_bytes: u64,
+    /// The models' states, part of model_bytes.
+    pub state_bytes: u64,
 }
 
 /// A yield's target for one kind of memory.
@@ -57,24 +53,15 @@ pub enum YieldTarget {
     Bytes(u64),
 }
 
-/// A yield's targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct YieldTargets {
-    /// The target for the models' memory, their states included.
-    pub model: YieldTarget,
-    /// The target for the state cache.
-    pub state_cache: YieldTarget,
-}
-
 /// Where the server is in a yield.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
-    /// No yield: the configured limits hold.
+    /// No yield: the configured limit holds.
     Running,
     /// The worker carries out a yield, or starts it next.
     Yielding,
-    /// The yield is done. The server keeps to the lower limits.
+    /// The yield is done. The server keeps to the lower limit.
     Yielded,
     /// The worker carries out a resume, or starts it next.
     Resuming,
@@ -150,7 +137,7 @@ fn convert_gib_to_target(
     };
     if !gib.is_finite() || gib < 0.0 || gib > configured_bytes as f64 / GIB {
         return Err(Error::new_invalid_request(
-            "memory limits must be finite, nonnegative and no larger than their configured limits",
+            "memory_gib must be finite, nonnegative and no larger than the configured limit",
         ));
     }
     Ok(if gib == 0.0 {
@@ -172,8 +159,8 @@ enum Outcome {
 
 /// One operation, as the control records it.
 struct Operation {
-    /// The limits that the yield asked for.
-    targets: YieldTargets,
+    /// The limit that the yield asked for.
+    target: YieldTarget,
     /// Where the operation stands.
     outcome: Outcome,
 }
@@ -181,10 +168,10 @@ struct Operation {
 /// What the worker carries out next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// A yield to these targets. The server frees memory down to them and keeps
-    /// to them.
-    Yield(YieldTargets),
-    /// A resume. The configured limits hold again.
+    /// A yield to this target for the models' memory. The server frees memory
+    /// down to it and keeps to it.
+    Yield(YieldTarget),
+    /// A resume. The configured limit holds again.
     Resume,
 }
 
@@ -192,11 +179,11 @@ pub enum Action {
 pub struct Control {
     /// Where the server is in a yield.
     pub phase: Phase,
-    /// The limits from the configuration.
-    pub configured_limits: MemoryBytes,
-    /// The limits in effect. A yield lowers them.
-    pub effective_limits: MemoryBytes,
-    /// The memory the server holds, as the worker last read it.
+    /// The models' memory limit from the configuration, in bytes.
+    pub configured_limit: u64,
+    /// The models' memory limit in effect. A yield lowers it.
+    pub effective_limit: u64,
+    /// The memory the models hold, as the worker last read it.
     pub retained: MemoryBytes,
     /// The operation that owns the yield, if any.
     owner: Option<String>,
@@ -210,19 +197,20 @@ pub struct Control {
 }
 
 impl Default for Control {
-    /// Returns a control whose configured limits are 0 bytes.
+    /// Returns a control whose configured limit is 0 bytes.
     fn default() -> Self {
-        Self::new(MemoryBytes::default())
+        Self::new(0)
     }
 }
 
 impl Control {
-    /// Returns a new control with `configured_limits` and no yield.
-    pub fn new(configured_limits: MemoryBytes) -> Self {
+    /// Returns a new control with the models' memory limit `configured_limit`
+    /// in bytes, and no yield.
+    pub fn new(configured_limit: u64) -> Self {
         Self {
             phase: Phase::Running,
-            configured_limits,
-            effective_limits: configured_limits,
+            configured_limit,
+            effective_limit: configured_limit,
             retained: MemoryBytes::default(),
             owner: None,
             operations: HashMap::new(),
@@ -234,29 +222,24 @@ impl Control {
     /// Builds the control's status as JSON.
     pub fn build_status_json(&self) -> Value {
         json!({"state": self.phase, "operation_id": self.owner,
-            "configured_limits": self.configured_limits, "effective_limits": self.effective_limits,
+            "configured_limit_bytes": self.configured_limit,
+            "effective_limit_bytes": self.effective_limit,
             "retained": self.retained, "error": self.error})
     }
 
     /// Starts a yield for `request`, and returns HTTP 202. A retry with the
-    /// same operation_id and limits gets 202 while the yield goes on. It gets
+    /// same operation_id and limit gets 202 while the yield goes on. It gets
     /// 200 once the yield is done. Returns an error for invalid input, for
-    /// other limits under the same operation_id, for a yield that another
+    /// another limit under the same operation_id, for a yield that another
     /// operation owns, and for an operation that ended.
     pub fn start_yield(&mut self, request: YieldRequest) -> Result<u16, Error> {
         check_operation_id(&request.operation_id)?;
-        let targets = YieldTargets {
-            model: convert_gib_to_target(request.memory_gib, self.configured_limits.model_bytes)?,
-            state_cache: convert_gib_to_target(
-                request.state_cache_gib,
-                self.configured_limits.state_cache_bytes,
-            )?,
-        };
+        let target = convert_gib_to_target(request.memory_gib, self.configured_limit)?;
         if let Some(operation) = self.operations.get(&request.operation_id) {
-            if operation.targets != targets {
+            if operation.target != target {
                 return Err(Error::new_conflict(
                     "operation_conflict",
-                    "this operation_id was used with different limits",
+                    "this operation_id was used with a different limit",
                 ));
             }
             return match &operation.outcome {
@@ -281,7 +264,7 @@ impl Control {
         self.operations.insert(
             request.operation_id.clone(),
             Operation {
-                targets,
+                target,
                 outcome: Outcome::Ongoing,
             },
         );
@@ -322,7 +305,7 @@ impl Control {
             return None;
         }
         let action = match self.phase {
-            Phase::Yielding => Action::Yield(self.operations[self.owner.as_ref().unwrap()].targets),
+            Phase::Yielding => Action::Yield(self.operations[self.owner.as_ref().unwrap()].target),
             Phase::Resuming => Action::Resume,
             Phase::Running | Phase::Yielded => return None,
         };
@@ -330,10 +313,10 @@ impl Control {
         Some(action)
     }
 
-    /// Finishes the yield. `effective_limits` take effect, and `retained` is
-    /// the memory the server holds. A resume that arrived meanwhile runs next.
-    pub fn finish_yield(&mut self, effective_limits: MemoryBytes, retained: MemoryBytes) {
-        self.effective_limits = effective_limits;
+    /// Finishes the yield. `effective_limit` takes effect, and `retained` is
+    /// the memory the models hold. A resume that arrived meanwhile runs next.
+    pub fn finish_yield(&mut self, effective_limit: u64, retained: MemoryBytes) {
+        self.effective_limit = effective_limit;
         self.retained = retained;
         self.is_action_running = false;
         if self.phase != Phase::Resuming {
@@ -341,8 +324,8 @@ impl Control {
         }
     }
 
-    /// Fails the yield with `message`. The configured limits hold again.
-    /// `retained` is the memory the server holds.
+    /// Fails the yield with `message`. The configured limit holds again.
+    /// `retained` is the memory the models hold.
     pub fn fail_yield(&mut self, message: String, retained: MemoryBytes) {
         let operation_id = self.owner.take().unwrap();
         self.operations.get_mut(&operation_id).unwrap().outcome = Outcome::Failed(message.clone());
@@ -350,18 +333,18 @@ impl Control {
             json!({"operation_id":operation_id, "code":"limits_unreachable", "message":message}),
         );
         self.phase = Phase::Running;
-        self.effective_limits = self.configured_limits;
+        self.effective_limit = self.configured_limit;
         self.retained = retained;
         self.is_action_running = false;
     }
 
-    /// Finishes the resume. The configured limits hold again. `retained` is the
-    /// memory the server holds.
+    /// Finishes the resume. The configured limit holds again. `retained` is the
+    /// memory the models hold.
     pub fn finish_resume(&mut self, retained: MemoryBytes) {
         let operation_id = self.owner.take().unwrap();
         self.operations.get_mut(&operation_id).unwrap().outcome = Outcome::Resumed;
         self.phase = Phase::Running;
-        self.effective_limits = self.configured_limits;
+        self.effective_limit = self.configured_limit;
         self.retained = retained;
         self.is_action_running = false;
     }
@@ -374,23 +357,17 @@ mod tests {
     /// The bytes in one GiB.
     const GIB_BYTES: u64 = 1 << 30;
 
-    /// Makes a control with limits of 64 GiB for the models and 8 GiB for the
-    /// state cache.
+    /// Makes a control with a limit of 64 GiB for the models.
     fn make_control() -> Control {
-        Control::new(MemoryBytes {
-            model_bytes: 64 * GIB_BYTES,
-            state_cache_bytes: 8 * GIB_BYTES,
-        })
+        Control::new(64 * GIB_BYTES)
     }
 
-    /// Makes a yield request named `operation_id`, for 4 GiB of model memory
-    /// and 2 GiB of state cache.
+    /// Makes a yield request named `operation_id`, for 4 GiB of model memory:
+    /// below the configured 64 GiB.
     fn make_yield_request(operation_id: &str) -> YieldRequest {
-        // Both are below the configured 64 and 8 GiB.
         YieldRequest {
             operation_id: operation_id.into(),
             memory_gib: Some(4.0),
-            state_cache_gib: Some(2.0),
         }
     }
 
@@ -402,14 +379,15 @@ mod tests {
             StatusCode::ACCEPTED.as_u16()
         );
         assert_eq!(control.phase, Phase::Yielding);
-        assert_eq!(control.effective_limits, control.configured_limits);
+        assert_eq!(control.effective_limit, control.configured_limit);
         assert!(matches!(control.take_next_action(), Some(Action::Yield(_))));
         assert_eq!(control.take_next_action(), None);
-        let limits = MemoryBytes {
-            model_bytes: 4 * GIB_BYTES,
-            state_cache_bytes: 2 * GIB_BYTES,
+        let retained = MemoryBytes {
+            model_bytes: 3 * GIB_BYTES,
+            state_bytes: GIB_BYTES,
         };
-        control.finish_yield(limits, limits);
+        control.finish_yield(4 * GIB_BYTES, retained);
+        assert_eq!(control.effective_limit, 4 * GIB_BYTES);
         assert_eq!(control.phase, Phase::Yielded);
         assert_eq!(
             control.start_yield(make_yield_request("a")).unwrap(),
@@ -439,12 +417,12 @@ mod tests {
         control.take_next_action();
         assert!(!control.start_resume("a").unwrap());
         assert_eq!(control.take_next_action(), None);
-        control.finish_yield(MemoryBytes::default(), MemoryBytes::default());
+        control.finish_yield(0, MemoryBytes::default());
         assert_eq!(control.phase, Phase::Resuming);
         assert_eq!(control.take_next_action(), Some(Action::Resume));
         control.finish_resume(MemoryBytes::default());
         assert_eq!(control.phase, Phase::Running);
-        assert_eq!(control.effective_limits, control.configured_limits);
+        assert_eq!(control.effective_limit, control.configured_limit);
     }
 
     #[test]
@@ -463,21 +441,19 @@ mod tests {
 
     #[test]
     fn an_omitted_limit_keeps_the_configured_limit_and_zero_asks_for_the_minimum() {
-        let mut control = make_control();
-        control
-            .start_yield(YieldRequest {
-                operation_id: "a".into(),
-                memory_gib: None,
-                state_cache_gib: Some(0.0),
-            })
-            .unwrap();
-        assert_eq!(
-            control.take_next_action(),
-            Some(Action::Yield(YieldTargets {
-                model: YieldTarget::Bytes(64 * GIB_BYTES),
-                state_cache: YieldTarget::Minimum
-            }))
-        );
+        for (memory_gib, target) in [
+            (None, YieldTarget::Bytes(64 * GIB_BYTES)),
+            (Some(0.0), YieldTarget::Minimum),
+        ] {
+            let mut control = make_control();
+            control
+                .start_yield(YieldRequest {
+                    operation_id: "a".into(),
+                    memory_gib,
+                })
+                .unwrap();
+            assert_eq!(control.take_next_action(), Some(Action::Yield(target)));
+        }
     }
 
     #[test]
@@ -515,10 +491,10 @@ mod tests {
     }
 
     #[test]
-    fn a_default_control_runs_with_limits_of_zero_bytes() {
+    fn a_default_control_runs_with_a_limit_of_zero_bytes() {
         let control = Control::default();
         assert_eq!(control.phase, Phase::Running);
-        assert_eq!(control.configured_limits, MemoryBytes::default());
+        assert_eq!(control.configured_limit, 0);
     }
 
     #[test]

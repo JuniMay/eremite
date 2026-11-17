@@ -1,5 +1,5 @@
 //! The yield and resume control. A yield to the least memory takes effect
-//! between engine calls, and a resume restores the configured limits. A retry
+//! between engine calls, and a resume restores the configured limit. A retry
 //! of either changes nothing, and another operation cannot yield while one owns
 //! the yield. No yield starts while the server stops. The first test runs the
 //! worker without a model. The second asks a server of the checkpoint over
@@ -24,7 +24,6 @@ fn ask_for_least(operation_id: &str) -> control::YieldRequest {
     control::YieldRequest {
         operation_id: operation_id.into(),
         memory_gib: Some(0.0),
-        state_cache_gib: Some(0.0),
     }
 }
 
@@ -35,9 +34,9 @@ fn ask_to_resume(operation_id: &str) -> control::ResumeRequest {
     }
 }
 
-/// Reads the limit `kind` of the limits `name` in the control's `status`.
-fn read_limit(status: &Value, name: &str, kind: &str) -> u64 {
-    status[name][kind].as_u64().expect("a limit")
+/// Reads the limit `name` in the control's `status`.
+fn read_limit(status: &Value, name: &str) -> u64 {
+    status[name].as_u64().expect("a limit")
 }
 
 /// Asks the worker to publish until the control leaves `state`, and returns
@@ -70,18 +69,19 @@ fn a_yield_takes_effect_and_a_resume_restores_the_limits() {
         .unwrap();
     let before = worker::build_control_status_json();
     assert_eq!(before["state"], "running", "{before}");
-    assert_eq!(before["effective_limits"], before["configured_limits"]);
+    assert_eq!(
+        before["effective_limit_bytes"],
+        before["configured_limit_bytes"]
+    );
     let (code, status) = worker::start_yield(ask_for_least("first")).expect("the yield starts");
     assert_eq!((code, status["state"].as_str()), (202, Some("yielding")));
     let yielded = wait_while(&runtime, "yielding");
     assert_eq!(yielded["state"], "yielded", "{yielded}");
-    for kind in ["model_bytes", "state_cache_bytes"] {
-        assert!(
-            read_limit(&yielded, "effective_limits", kind)
-                <= read_limit(&before, "configured_limits", kind),
-            "{yielded}"
-        );
-    }
+    assert!(
+        read_limit(&yielded, "effective_limit_bytes")
+            <= read_limit(&before, "configured_limit_bytes"),
+        "{yielded}"
+    );
     // A retry of the yield that is done gets 200. Another operation cannot
     // yield now.
     let retry = worker::start_yield(ask_for_least("first")).map(|(code, _)| code);
@@ -95,7 +95,10 @@ fn a_yield_takes_effect_and_a_resume_restores_the_limits() {
     assert_eq!(code, 202);
     let resumed = wait_while(&runtime, "resuming");
     assert_eq!(resumed["state"], "running", "{resumed}");
-    assert_eq!(resumed["effective_limits"], before["configured_limits"]);
+    assert_eq!(
+        resumed["effective_limit_bytes"],
+        before["configured_limit_bytes"]
+    );
     // A retry of the resume changes nothing and names the operation that
     // ended.
     let (code, status) = worker::start_resume(ask_to_resume("first")).expect("a retry");
@@ -164,7 +167,7 @@ fn the_control_routes_answer_over_http() {
         (200, Some("running")),
         "{status}"
     );
-    let least = json!({"operation_id": "http-test", "memory_gib": 0, "state_cache_gib": 0});
+    let least = json!({"operation_id": "http-test", "memory_gib": 0});
     let (code, status) = ask("POST", "/v1/control/yield", Some(&least));
     assert_eq!(code, 202, "{status}");
     let status = wait_while("yielding", status);
