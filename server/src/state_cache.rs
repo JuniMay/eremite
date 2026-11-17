@@ -163,6 +163,31 @@ pub enum Plan {
     Replay { source: StateId, from: usize },
 }
 
+impl Plan {
+    /// Counts the prompt tokens that the plan reuses. The prefill starts after
+    /// them.
+    pub fn count_reused_tokens(&self) -> usize {
+        match *self {
+            Plan::Cold => 0,
+            Plan::InPlace { from, .. } => from,
+            Plan::Snapshot { from, .. } | Plan::Replay { from, .. } => from,
+        }
+    }
+
+    /// Describes the plan for the log in one word. "cold" is a cold start.
+    /// "continued" continues a state in place. "repeated" is the same prompt
+    /// again, from its prompt-end snapshot. "forked" copies another state.
+    pub fn describe_for_log(&self, prompt_len: usize) -> &'static str {
+        match *self {
+            Plan::Cold => "cold",
+            Plan::InPlace { from, .. } if from == prompt_len => "repeated",
+            Plan::InPlace { .. } => "continued",
+            Plan::Snapshot { from, .. } if from == prompt_len => "repeated",
+            Plan::Snapshot { .. } | Plan::Replay { .. } => "forked",
+        }
+    }
+}
+
 /// The engine's limits and costs that plans depend on, for one model.
 #[derive(Clone, Copy)]
 pub struct PlanLimits<'a> {
@@ -432,6 +457,14 @@ impl Cache {
         entry.stale_rows = stale_rows;
     }
 
+    /// Records that a request reuses state `id`. The state is used now.
+    pub fn record_reuse(&mut self, id: StateId) {
+        let now = self.advance_clock();
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.last_used = now;
+        }
+    }
+
     /// Adds `snapshot` to state `id`. It replaces any snapshot at the same
     /// position. It removes the reserved snapshot of the same position and
     /// kind.
@@ -607,6 +640,59 @@ mod tests {
     }
 
     #[test]
+    fn a_prefilling_state_is_reused_only_up_to_its_computed_tokens() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let source = add_idle_state(&mut cache, &collect_tokens(0..13772), &[13772]);
+        cache.entries.get_mut(&source).unwrap().busy = true;
+        let prefilling = cache.add_state(0, STATE_BYTES);
+        cache.start_request(prefilling, &collect_tokens(0..19129), 13772, STATE_BYTES, 0);
+        let plan = cache.find_cheapest_plan(0, &collect_tokens(0..22481), PLAN_LIMITS);
+        assert!(
+            plan.count_reused_tokens() <= 13772,
+            "an admitted prompt has not computed its suffix: {plan:?}"
+        );
+        assert_eq!(cache.entries[&prefilling].tokens.len(), 13772);
+        cache.add_prefilled_tokens(prefilling, &collect_tokens(0..16384), 0);
+        assert!(
+            cache
+                .find_cheapest_plan(0, &collect_tokens(0..22481), PLAN_LIMITS)
+                .count_reused_tokens()
+                <= 16384
+        );
+        cache.add_prefilled_tokens(prefilling, &collect_tokens(0..19129), 0);
+        assert_eq!(
+            cache
+                .find_cheapest_plan(0, &collect_tokens(0..22481), PLAN_LIMITS)
+                .count_reused_tokens(),
+            19129
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_extends_an_idle_state_continues_it_in_place() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let idle = add_idle_state(&mut cache, &collect_tokens(0..1000), &[1000]);
+        let prompt = collect_tokens(0..1200);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::InPlace {
+                state: idle,
+                from: 1000
+            }
+        );
+        // within the rewind margin before its end: still in place
+        let mut next_prompt = collect_tokens(0..997);
+        next_prompt.extend(5000..5100);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &next_prompt, PLAN_LIMITS),
+            Plan::InPlace {
+                state: idle,
+                from: 997
+            }
+        );
+    }
+
+    #[test]
     fn the_longest_shared_prefix_wins_in_a_busy_or_idle_state() {
         let mut cache = Cache::new(u64::MAX, 256);
         let _short = add_idle_state(&mut cache, &collect_tokens(0..3000), &[3000]);
@@ -620,6 +706,84 @@ mod tests {
             Plan::Replay {
                 source: long,
                 from: 15000
+            }
+        );
+    }
+
+    #[test]
+    fn a_nearby_snapshot_beats_a_replay_and_a_far_one_loses_to_it() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let source = add_idle_state(&mut cache, &collect_tokens(0..20000), &[9000, 19000]);
+        let mut near = collect_tokens(0..19500);
+        near.push(-1);
+        // snapshot at 19000: 501 tokens; replay at 19500: 1 + 2610
+        assert_eq!(
+            cache.find_cheapest_plan(0, &near, PLAN_LIMITS),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 19000,
+                from: 19000,
+                branch_point: 19500
+            }
+        );
+        let mut far = collect_tokens(0..15000);
+        far.push(-1);
+        // snapshot at 9000: 6001 tokens; replay at 15000: 1 + 2610
+        assert_eq!(
+            cache.find_cheapest_plan(0, &far, PLAN_LIMITS),
+            Plan::Replay {
+                source,
+                from: 15000
+            }
+        );
+        // for a model that resumes only from snapshots, the snapshot
+        assert_eq!(
+            cache.find_cheapest_plan(
+                0,
+                &far,
+                PlanLimits {
+                    can_replay: false,
+                    ..PLAN_LIMITS
+                }
+            ),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 9000,
+                from: 9000,
+                branch_point: 15000
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_prompt_again_resumes_from_its_prompt_end_without_a_prefill() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let source = add_idle_state(&mut cache, &prompt, &[4000]);
+        // its reply, decoded past the rewind margin
+        for offset in 0..300 {
+            cache.add_decoded_token(source, 100000 + offset);
+        }
+        let plan = cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4000,
+                from: 4000,
+                branch_point: 4000
+            }
+        );
+        assert_eq!(plan.count_reused_tokens(), 4000);
+        assert_eq!(plan.describe_for_log(prompt.len()), "repeated");
+        // without logits there, its last token runs again
+        let mut other_cache = Cache::new(u64::MAX, 256);
+        let idle = add_idle_state(&mut other_cache, &prompt, &[]);
+        assert_eq!(
+            other_cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::InPlace {
+                state: idle,
+                from: 3999
             }
         );
     }
@@ -640,6 +804,12 @@ mod tests {
                 from: 4000
             }
         );
+        assert_eq!(
+            cache
+                .find_cheapest_plan(0, &prompt, PLAN_LIMITS)
+                .describe_for_log(prompt.len()),
+            "repeated"
+        );
         let mut changed = prompt.clone();
         *changed.last_mut().unwrap() = -7;
         assert_eq!(
@@ -648,6 +818,38 @@ mod tests {
                 state: idle,
                 from: 3999
             }
+        );
+    }
+
+    #[test]
+    fn a_prompt_inside_a_longer_state_reuses_it_at_any_length() {
+        assert_eq!(count_replay_rows(20000), 2610);
+        assert_eq!(
+            (count_replay_rows(1999), count_replay_rows(100)),
+            (1633, 100)
+        );
+        let mut cache = Cache::new(u64::MAX, 256);
+        let source = add_idle_state(&mut cache, &collect_tokens(0..20000), &[4000]);
+        // 12,000 of its tokens: the replay at 11,999 (1 + 2,610) beats the
+        // snapshot at 4,000
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..12000), PLAN_LIMITS),
+            Plan::Replay {
+                source,
+                from: 11999
+            }
+        );
+        // 2,000 of them: a replay recomputes 1,633 rows per layer, still less
+        // than a cold start
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..2000), PLAN_LIMITS),
+            Plan::Replay { source, from: 1999 }
+        );
+        // 100: a replay recomputes them all, as a cold start would, and reports
+        // them reused
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..100), PLAN_LIMITS),
+            Plan::Replay { source, from: 99 }
         );
     }
 
@@ -675,6 +877,44 @@ mod tests {
                 snapshot_pos: 4125,
                 from: 4125,
                 branch_point: 4262
+            }
+        );
+    }
+
+    #[test]
+    fn under_ced_a_bounded_replay_beats_a_snapshot_more_than_a_ring_back() {
+        // the bounded replay's cost under --ced with PLAN_LIMITS' margin of 5:
+        // the ring, 133 positions
+        let ced = PlanLimits {
+            replay_cost: &|pos| pos.min(RING_ROWS),
+            ..PLAN_LIMITS
+        };
+        let mut cache = Cache::new(u64::MAX, 256);
+        let source = add_idle_state(&mut cache, &collect_tokens(0..6000), &[]);
+        cache.add_snapshot(
+            source,
+            Snapshot {
+                pos: 4125,
+                kind: SnapshotKind::Branch,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+        );
+        let mut far = collect_tokens(0..4262);
+        far.extend(-20..0);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &far, ced),
+            Plan::Replay { source, from: 4262 }
+        );
+        let mut near = collect_tokens(0..4200);
+        near.extend(-20..0);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &near, ced),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4125,
+                from: 4125,
+                branch_point: 4200
             }
         );
     }
@@ -745,5 +985,53 @@ mod tests {
         );
         assert!(!cache.entries.contains_key(&state));
         assert_eq!(cache.count_bytes(), 0);
+    }
+
+    #[test]
+    fn a_replay_leaves_its_branch_point_as_a_snapshot_of_the_new_state() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let long = add_idle_state(&mut cache, &collect_tokens(0..8000), &[8000]);
+        let mut prompt = collect_tokens(0..5000);
+        prompt.extend(-50..0);
+        let Plan::Replay { source, from } = cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS)
+        else {
+            panic!("a replay")
+        };
+        assert_eq!((source, from), (long, 5000));
+        let new = cache.add_state(0, STATE_BYTES);
+        cache.start_request(new, &prompt, from, STATE_BYTES, 0);
+        cache.add_prefilled_tokens(new, &prompt, 0);
+        cache.add_snapshot(
+            new,
+            Snapshot {
+                pos: from,
+                kind: SnapshotKind::Branch,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+        );
+        cache.record_reuse(source);
+        cache.set_idle(new, STATE_BYTES);
+        // the next fork at the same point resumes from that snapshot
+        let mut next_prompt = collect_tokens(0..5000);
+        next_prompt.extend(-90..-60);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &next_prompt, PLAN_LIMITS),
+            Plan::Snapshot {
+                source: new,
+                snapshot_pos: 5000,
+                from: 5000,
+                branch_point: 5000
+            }
+        );
+    }
+
+    #[test]
+    fn a_reused_state_becomes_the_most_recently_used() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let reused = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
+        let later = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
+        cache.record_reuse(reused);
+        assert!(cache.entries[&reused].last_used > cache.entries[&later].last_used);
     }
 }
