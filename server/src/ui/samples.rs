@@ -3,7 +3,7 @@
 //! the view's memory only. The figures "now" and "recent" are means over the
 //! samples of their windows.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use super::status::{Activity, ModelStatus};
 
@@ -135,6 +135,9 @@ pub struct Samples {
     pub samples: VecDeque<Sample>,
     /// Each model's counters at the latest sample.
     counters: Vec<Counters>,
+    /// Each decoding request's generated tokens at the samples of the now
+    /// window, by the request's number: when, and how many.
+    tracks: HashMap<u64, VecDeque<(f64, u64)>>,
 }
 
 impl Samples {
@@ -144,6 +147,7 @@ impl Samples {
             windows,
             samples: VecDeque::new(),
             counters: Vec::new(),
+            tracks: HashMap::new(),
         }
     }
 
@@ -222,6 +226,7 @@ impl Samples {
                 .sum();
             ssd_read = worked.then(|| read as f64 / GB / seconds);
         }
+        self.track_requests(at, statuses);
         self.counters = counters;
         self.samples.push_back(Sample {
             at,
@@ -235,6 +240,37 @@ impl Samples {
         while self.samples.len() > kept {
             self.samples.pop_front();
         }
+    }
+
+    /// Records each decoding request's generated tokens at `at`, over the now
+    /// window. It forgets the requests that no longer decode.
+    fn track_requests(&mut self, at: f64, statuses: &[ModelStatus]) {
+        let decoding: Vec<(u64, u64)> = statuses
+            .iter()
+            .flat_map(|status| &status.requests)
+            .filter(|request| request.status == Activity::Decoding)
+            .map(|request| (request.id, request.generated_tokens))
+            .collect();
+        self.tracks
+            .retain(|id, _| decoding.iter().any(|&(other, _)| other == *id));
+        let window = self.windows.now;
+        for (id, generated) in decoding {
+            let track = self.tracks.entry(id).or_default();
+            track.push_back((at, generated));
+            // Keep the oldest point inside the window, so that a whole window
+            // lies between the ends.
+            while track.len() > 2 && at - track[1].0 >= window {
+                track.pop_front();
+            }
+        }
+    }
+
+    /// Returns the tokens per second that request `id` decoded over the now
+    /// window, or None before two samples of it.
+    pub fn find_request_speed(&self, id: u64) -> Option<f64> {
+        let track = self.tracks.get(&id)?;
+        let (&(first_at, first), &(last_at, last)) = (track.front()?, track.back()?);
+        (last_at > first_at).then(|| last.saturating_sub(first) as f64 / (last_at - first_at))
     }
 
     /// Returns the mean of `figure` over the samples of the latest `seconds`
@@ -394,6 +430,23 @@ mod tests {
         // 15 GB decoded and 5 GB prefilled, in 20 s and then 40 s
         assert_eq!(find_ssd_read_since_start(&both), Some(20.0 / 60.0));
         assert_eq!(find_gpu_busy_since_start(&[]), None);
+    }
+
+    #[test]
+    fn a_decoding_requests_speed_spans_the_now_window() {
+        let mut samples = Samples::new(WINDOWS);
+        for k in 0..200u64 {
+            let requests = vec![request(5, Activity::Decoding, 10 * k)];
+            samples.add_sample(0.5 * k as f64, &[status(requests, 0, k)]);
+        }
+        // 10 tokens a sample, two samples a second
+        let speed = samples.find_request_speed(5).unwrap();
+        assert!((speed - 20.0).abs() < 1e-9, "{speed}");
+        let track = &samples.tracks[&5];
+        assert!(track.back().unwrap().0 - track.front().unwrap().0 <= 5.5);
+        // a request that no longer decodes is forgotten
+        samples.add_sample(100.0, &[status(Vec::new(), 2000, 200)]);
+        assert_eq!(samples.find_request_speed(5), None);
     }
 
     #[test]

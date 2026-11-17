@@ -1,4 +1,5 @@
-//! The view 1 Overview: the work and the memory of the whole system.
+//! The view 1 Overview: the work and the memory of the whole system, the
+//! requests that run or wait, and the log.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -6,15 +7,27 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::draw::{
-    build_gauge, build_section_rule, build_sparkline, colored, fit_line, format_percent, label,
-    pad_spans, plain, strong,
+    build_gauge, build_section_rule, build_sparkline, colored, fit_line, format_count,
+    format_percent, label, measure_width, pad_spans, plain, strong,
 };
-use super::frame::Screen;
+use super::frame::{Choices, Screen};
+use super::log::{LogLine, draw_log};
 use super::samples::{CHART_COLUMNS, Sample, find_gpu_busy_since_start, find_ssd_read_since_start};
+use super::status::{Activity, ModelStatus, Request};
 use super::theme::{Rgb, Theme};
 
 /// The bytes of one GiB.
 const GIB: f64 = (1u64 << 30) as f64;
+/// The columns of a request's number in the Requests list.
+const REQUEST_COLUMNS: usize = 9;
+/// The columns after the longest model name in the Requests list.
+const REQUEST_GAP: usize = 3;
+/// The columns of a request's session in the Requests list.
+const SESSION_COLUMNS: usize = 9;
+/// The columns of what a request does in the Requests list.
+const STATUS_COLUMNS: usize = 28;
+/// The columns of a request's speed in the Requests list.
+const SPEED_COLUMNS: usize = 14;
 /// The columns of a figure's name in the System table.
 const NAME_COLUMNS: usize = 24;
 /// The columns of each figure in the System table.
@@ -53,12 +66,140 @@ struct Figure {
     from_zero: bool,
 }
 
-/// Draws 1 Overview in `area`.
-pub fn draw_overview(buf: &mut Buffer, area: Rect, screen: &Screen) {
-    let lines = build_system_lines(screen, area.width as usize);
-    for (row, line) in lines.into_iter().take(area.height as usize).enumerate() {
-        let line = fit_line(screen.theme, line, area.width as usize);
+/// Draws 1 Overview in `area`: the System section, the requests that run or
+/// wait, and the log of `log_lines` in the rows left. The log's filter and
+/// scroll are in `choices`.
+pub fn draw_overview(
+    buf: &mut Buffer,
+    area: Rect,
+    screen: &Screen,
+    log_lines: &[LogLine],
+    choices: &mut Choices,
+) {
+    let width = area.width as usize;
+    let mut lines = build_system_lines(screen, width);
+    // The requests take at most half of the rows that the System section
+    // leaves. The log keeps the rest.
+    let left = (area.height as usize).saturating_sub(lines.len());
+    lines.extend(build_request_lines(screen, width, left / 2));
+    let shown = lines.len().min(area.height as usize);
+    for (row, line) in lines.into_iter().take(shown).enumerate() {
+        let line = fit_line(screen.theme, line, width);
         buf.set_line(area.x, area.y + row as u16, &line, area.width);
+    }
+    let log = Rect {
+        y: area.y + shown as u16,
+        height: area.height - shown as u16,
+        ..area
+    };
+    draw_log(buf, log, screen, log_lines, choices);
+}
+
+/// Builds the Requests section in `width` columns and at most `rows` rows:
+/// one row for each request that runs or waits, for all models. Each row
+/// shows the request's number, its model, its session, what it does, its
+/// speed and its tokens. A request that decodes shows its generated tokens.
+/// One that prefills or waits shows its prompt's tokens.
+fn build_request_lines(screen: &Screen, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let theme = screen.theme;
+    let mut lines = vec![build_section_rule(theme, width, "Requests")];
+    let requests: Vec<(usize, &Request)> = screen
+        .statuses
+        .iter()
+        .enumerate()
+        .flat_map(|(i, status)| status.requests.iter().map(move |request| (i, request)))
+        .collect();
+    if requests.is_empty() {
+        lines.push(Line::from(vec![plain(" "), label(theme, "no requests")]));
+        return lines;
+    }
+    let model_columns = screen
+        .models
+        .iter()
+        .map(|model| model.name.chars().count())
+        .chain(["model".len()])
+        .max()
+        .unwrap_or(0)
+        + REQUEST_GAP;
+    let head = format!(
+        " {:<REQUEST_COLUMNS$}{:<model_columns$}{:<SESSION_COLUMNS$}{:<STATUS_COLUMNS$}{:<SPEED_COLUMNS$}amount",
+        "request", "model", "session", "status", "speed"
+    );
+    lines.push(Line::from(label(theme, head)));
+    // The header and the rule take two rows. A last row names the requests
+    // that do not fit.
+    let room = rows.saturating_sub(2);
+    let fit = if requests.len() > room {
+        room.saturating_sub(1)
+    } else {
+        requests.len()
+    };
+    let latest = screen.samples.samples.back();
+    for &(i, request) in &requests[..fit] {
+        let status = &screen.statuses[i];
+        let name = screen.models.get(i).map_or("", |model| model.name.as_str());
+        let session = request
+            .session
+            .map_or(String::new(), |number| number.to_string());
+        let mut spans = vec![
+            plain(" "),
+            strong(format!("{:<REQUEST_COLUMNS$}", format!("#{}", request.id))),
+            plain(format!("{name:<model_columns$}")),
+            label(theme, format!("{session:<SESSION_COLUMNS$}")),
+        ];
+        let activity = describe_activity(theme, status, request);
+        let activity_width = measure_width(&activity);
+        spans.extend(activity);
+        spans.push(plain(
+            " ".repeat(STATUS_COLUMNS.saturating_sub(activity_width)),
+        ));
+        let (speed, tokens) = match request.status {
+            Activity::Decoding => (
+                screen
+                    .samples
+                    .find_request_speed(request.id)
+                    .map(|speed| format!("{speed:.1} tok/s")),
+                request.generated_tokens,
+            ),
+            Activity::Prefill => (
+                latest
+                    .and_then(|sample| sample.models.get(i))
+                    .and_then(|model| model.prefill)
+                    .map(|speed| format!("{} tok/s", format_count(speed))),
+                request.prompt_tokens,
+            ),
+            Activity::Waiting => (None, request.prompt_tokens),
+        };
+        spans.push(plain(format!(
+            "{:<SPEED_COLUMNS$}",
+            speed.unwrap_or_default()
+        )));
+        spans.push(plain(format!("{} tokens", format_count(tokens as f64))));
+        lines.push(Line::from(spans));
+    }
+    if fit < requests.len() {
+        let more = format!(" … {} more", requests.len() - fit);
+        lines.push(Line::from(label(theme, more)));
+    }
+    lines
+}
+
+/// Describes what `request`, a request of the model of `status`, does: it
+/// waits in amber, decodes in the accent, or prefills in the prefill color
+/// with the layer that its prefill has reached.
+fn describe_activity(theme: &Theme, status: &ModelStatus, request: &Request) -> Vec<Span<'static>> {
+    let counters = &status.engine_counters;
+    match request.status {
+        Activity::Waiting => vec![colored(theme, theme.amber, "waiting")],
+        Activity::Decoding => vec![colored(theme, theme.accent, "decoding")],
+        Activity::Prefill if counters.prefill_layer > 0 && counters.layers > 0 => vec![
+            colored(theme, theme.prefill, "prefill"),
+            label(theme, ", layer "),
+            plain(counters.prefill_layer.to_string()),
+            label(theme, " of "),
+            plain(counters.layers.to_string()),
+        ],
+        Activity::Prefill => vec![colored(theme, theme.prefill, "prefill")],
     }
 }
 
@@ -393,7 +534,9 @@ mod tests {
             samples: &samples,
             home: "/home/me",
         };
-        draw_on_terminal(width, height, |buf, area| draw_overview(buf, area, &screen))
+        draw_on_terminal(width, height, |buf, area| {
+            draw_overview(buf, area, &screen, &[], &mut Choices::default());
+        })
     }
 
     #[test]
@@ -458,5 +601,116 @@ mod tests {
         assert!(read_row(&buf, 0).starts_with("─ System ─"));
         // a terminal of one cell takes the view without a panic
         draw(1, 1);
+    }
+
+    /// The statuses of two models at a sample `step` of two: deepseek decodes
+    /// request 5, and qwen prefills request 6, at layer 30 then 31 of 64,
+    /// while request 7 waits.
+    fn two_models(step: u64) -> Vec<ModelStatus> {
+        let deepseek = format!(
+            r#"{{"loaded": true, "phase": "decode",
+            "requests": [{{"request": 5, "status": "decoding", "session": 5,
+                           "prompt_tokens": 23, "generated_tokens": {}}}]}}"#,
+            502 + 14 * step
+        );
+        let qwen = format!(
+            r#"{{"loaded": true, "phase": "prefill",
+            "requests": [
+                {{"request": 6, "status": "prefill", "session": 1, "prompt_tokens": 12000}},
+                {{"request": 7, "status": "waiting", "session": null, "prompt_tokens": 900}}],
+            "engine_counters": {{"layers": 64, "prefill_layer": {}, "prefill_rows_now": 12000}}}}"#,
+            30 + step
+        );
+        [deepseek, qwen]
+            .map(|json| serde_json::from_str(&json).expect("the worker's form"))
+            .to_vec()
+    }
+
+    #[test]
+    fn the_requests_list_every_models_requests_and_the_log_takes_the_rest() {
+        let models = ["deepseek-v4.1-flash", "qwen3.8-27b"].map(|name| ModelInfo {
+            name: name.into(),
+            kind: Kind::Llm,
+        });
+        let mut samples = Samples::new(WINDOWS);
+        samples.add_sample(0.0, &two_models(0));
+        let statuses = two_models(1);
+        samples.add_sample(0.5, &statuses);
+        let screen = Screen {
+            theme: &DARK,
+            address: "127.0.0.1:52878",
+            uptime_seconds: 57.0,
+            models: &models,
+            statuses: &statuses,
+            samples: &samples,
+            home: "",
+        };
+        let log: Vec<LogLine> = (0..50)
+            .map(|i| LogLine {
+                time: "19:19:29.080".into(),
+                model: Some(i % 2),
+                text: format!("line {i}"),
+            })
+            .collect();
+        let mut choices = Choices::default();
+        let buf = draw_on_terminal(160, 45, |buf, area| {
+            draw_overview(buf, area, &screen, &log, &mut choices);
+        });
+        assert!(read_row(&buf, 8).starts_with("─ Requests ───"));
+        assert!(read_row(&buf, 9).starts_with(
+            " request  model                 session  status                      speed         amount"
+        ));
+        let decoding = read_row(&buf, 10);
+        assert!(
+            decoding.starts_with(
+                " #5       deepseek-v4.1-flash   5        decoding                    28.0 tok/s    516 tokens"
+            ),
+            "{decoding}"
+        );
+        // 12,000 rows, 1 of 64 layers further in 0.5 s
+        let prefill = read_row(&buf, 11);
+        assert!(
+            prefill.starts_with(
+                " #6       qwen3.8-27b           1        prefill, layer 31 of 64     375 tok/s     12,000 tokens"
+            ),
+            "{prefill}"
+        );
+        assert!(read_row(&buf, 12).starts_with(" #7       qwen3.8-27b                    waiting"));
+        assert_eq!(buf[(41, 10)].fg, DARK.color(DARK.accent));
+        assert_eq!(buf[(41, 11)].fg, DARK.color(DARK.prefill));
+        assert_eq!(buf[(41, 12)].fg, DARK.color(DARK.amber));
+        // the log in the rows left, its newest line last
+        assert!(read_row(&buf, 13).starts_with("─ Log ─ showing all"));
+        assert!(read_row(&buf, 44).contains("line 49"));
+        assert_eq!(choices.log_page, 31);
+        // without requests, and with more than half the rows can take
+        let idle = [ModelStatus::default()];
+        let screen = Screen {
+            statuses: &idle,
+            ..screen
+        };
+        let buf = draw_on_terminal(160, 45, |buf, area| {
+            draw_overview(buf, area, &screen, &log, &mut choices);
+        });
+        assert_eq!(read_row(&buf, 9).trim_end(), " no requests");
+        let lines = build_request_lines(&screen, 160, 4);
+        assert_eq!(lines.len(), 2, "the rule and the line without requests");
+        let crowded = [statuses[0].clone(), statuses[1].clone()];
+        let screen = Screen {
+            statuses: &crowded,
+            ..screen
+        };
+        let lines = build_request_lines(&screen, 160, 4);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert_eq!(text[3], " … 2 more");
     }
 }
