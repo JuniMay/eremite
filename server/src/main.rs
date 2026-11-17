@@ -58,6 +58,11 @@ const USAGE: &str =
   --progress-log S   seconds between a decoding request's progress lines in the log, 0 none
                   (default 10)
   --state-cache GB   total states and snapshots across all models, GiB (default 8)
+  --state-disk GB    room on the SSD for evicted states, written when evicted and read back for
+                  a prompt that starts like one, GiB; 0 off (default 32)
+  --state-dir DIR    the saved states' folder (default ~/.cache/eremite/states)
+  --state-disk-tokens N  save a state only when it holds at least N tokens no other kept state
+                  holds (default 8192)
   --max-waiting-requests N  requests that may wait for one model; another gets HTTP 429
                   (default 16)
   --max-cached-states N  states that the state cache keeps, for all models together
@@ -154,6 +159,8 @@ fn parse_arguments(args: &[String]) -> Arguments {
                     | "--gpu-timeout"
                     | "--progress-log"
                     | "--state-cache"
+                    | "--state-disk"
+                    | "--state-disk-tokens"
                     | "--max-waiting-requests"
                     | "--max-cached-states"
                     | "--snapshot-interval" => {
@@ -167,7 +174,7 @@ fn parse_arguments(args: &[String]) -> Arguments {
                             .unwrap_or_else(|_| die(&format!("--serve: not a port: {text}")));
                         server.push(("port".into(), Value::from(port)));
                     }
-                    "--host" | "--api-key-file" => {
+                    "--host" | "--api-key-file" | "--state-dir" => {
                         server.push((flag[2..].replace('-', "_"), Value::String(text.clone())))
                     }
                     "--http-timeout" | "--keepalive" => {
@@ -794,7 +801,25 @@ fn main() {
         });
         families.push(family);
     }
-    if !worker::start(served.clone(), arguments.budgets.clone(), None, None) {
+    // The folder of the saved states. There is none without a folder, or with
+    // --state-disk 0.
+    let state_dir = (arguments.budgets.state_disk_gb > 0.0)
+        .then(|| {
+            arguments
+                .server
+                .state_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(config::default_state_dir)
+        })
+        .flatten();
+    if !worker::start(
+        served.clone(),
+        arguments.budgets.clone(),
+        state_dir,
+        None,
+        None,
+    ) {
         exit(2);
     }
     let loaded = worker::list_models();

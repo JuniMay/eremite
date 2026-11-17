@@ -21,6 +21,9 @@ const MIN_CED_TOKENS: i32 = 128;
 const MAX_MEMORY_GIB: f64 = 1024.0;
 /// The fewest GiB that the reserve takes. The reason for this value is unknown.
 const MIN_RESERVE_GIB: f64 = 2.0;
+/// The most GiB that saved states may take on the SSD. The reason for this
+/// value is unknown.
+const MAX_STATE_DISK_GIB: f64 = 65536.0;
 /// The most requests or states that a count setting takes. The reason for this
 /// value is unknown.
 const MAX_COUNT: f64 = 65536.0;
@@ -114,9 +117,12 @@ impl ModelConfig {
             | "gpu_timeout"
             | "progress_log"
             | "state_cache"
+            | "state_disk"
+            | "state_disk_tokens"
             | "max_waiting_requests"
             | "max_cached_states"
             | "snapshot_interval"
+            | "state_dir"
             | "port"
             | "host"
             | "api_key_file"
@@ -182,6 +188,9 @@ pub struct Server {
     pub host: String,
     /// The file that holds the API key; None: the key is in EREMITE_API_KEY.
     pub api_key_file: Option<String>,
+    /// The folder of the states saved on the SSD (disk.rs); None:
+    /// [`default_state_dir`].
+    pub state_dir: Option<String>,
     /// The seconds that a request's head, each part of its body and a stalled
     /// write may take (http.rs).
     pub http_timeout_s: f64,
@@ -196,10 +205,19 @@ impl Default for Server {
             port: None,
             host: "127.0.0.1".into(),
             api_key_file: None,
+            state_dir: None,
             http_timeout_s: 60.0,
             keepalive_s: 15.0,
         }
     }
+}
+
+/// Returns $HOME/.cache/eremite/states: the folder of the saved states unless
+/// state_dir sets another one. Returns None when HOME is unset.
+pub fn default_state_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".cache/eremite/states"))
 }
 
 impl Server {
@@ -229,6 +247,7 @@ impl Server {
                 self.host = host.into();
             }
             "api_key_file" => self.api_key_file = Some(text()?.into()),
+            "state_dir" => self.state_dir = Some(text()?.into()),
             "http_timeout" | "keepalive" => {
                 let seconds = value
                     .as_f64()
@@ -265,6 +284,12 @@ pub struct Budgets {
     /// The GiB of states and snapshots that the state cache keeps, for all
     /// models together.
     pub state_cache_gb: f64,
+    /// The GiB that saved states may take on the SSD; 0: none are saved or
+    /// read.
+    pub state_disk_gb: f64,
+    /// A state is saved when it holds at least this many tokens that no other
+    /// kept state holds.
+    pub state_disk_tokens: usize,
     /// The most requests that wait for one model. Another request then gets
     /// HTTP 429, too many requests.
     pub max_waiting_requests: usize,
@@ -283,6 +308,8 @@ impl Default for Budgets {
             gpu_timeout_s: 60.0,
             progress_log_s: 10.0,
             state_cache_gb: 8.0,
+            state_disk_gb: 32.0,
+            state_disk_tokens: 8192,
             max_waiting_requests: 16,
             max_cached_states: 256,
             snapshot_interval: 2048,
@@ -328,6 +355,22 @@ impl Budgets {
             "state_cache" => {
                 return Err(format!(
                     "state_cache takes a positive budget up to {MAX_MEMORY_GIB} GiB"
+                ));
+            }
+            "state_disk" if (0.0..=MAX_STATE_DISK_GIB).contains(&number) => {
+                self.state_disk_gb = number
+            }
+            "state_disk" => {
+                return Err(format!(
+                    "state_disk takes 0 (off) or a GiB budget up to {MAX_STATE_DISK_GIB}"
+                ));
+            }
+            "state_disk_tokens" if is_count(MAX_CONTEXT_TOKENS as f64) => {
+                self.state_disk_tokens = number as usize
+            }
+            "state_disk_tokens" => {
+                return Err(format!(
+                    "state_disk_tokens takes 1 to {MAX_CONTEXT_TOKENS} tokens"
                 ));
             }
             "max_waiting_requests" if is_count(MAX_COUNT) => {
@@ -410,9 +453,12 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "gpu_timeout",
             "progress_log",
             "state_cache",
+            "state_disk",
+            "state_disk_tokens",
             "max_waiting_requests",
             "max_cached_states",
             "snapshot_interval",
+            "state_dir",
             "port",
             "host",
             "api_key_file",
@@ -430,6 +476,8 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "gpu_timeout",
         "progress_log",
         "state_cache",
+        "state_disk",
+        "state_disk_tokens",
         "max_waiting_requests",
         "max_cached_states",
         "snapshot_interval",
@@ -439,7 +487,14 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         }
     }
     let mut server = Server::default();
-    for name in ["port", "host", "api_key_file", "http_timeout", "keepalive"] {
+    for name in [
+        "port",
+        "host",
+        "api_key_file",
+        "state_dir",
+        "http_timeout",
+        "keepalive",
+    ] {
         if let Some(value) = object.get(name) {
             server.set(name, value)?;
         }

@@ -141,6 +141,7 @@ fn requests_run_to_their_end_and_report_their_events() {
     assert!(worker::start(
         vec![settings],
         config::Budgets::default(),
+        None,
         Some(keep_line),
         None
     ));

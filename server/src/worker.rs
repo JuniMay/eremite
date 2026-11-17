@@ -20,7 +20,8 @@
 //! that call. A prompt resumes from a state in the state cache. The worker also
 //! builds each model's status.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -32,11 +33,12 @@ use tokio::sync::mpsc;
 
 use crate::calls::CallChooser;
 use crate::control::GIB;
+use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
     self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
     StateHandle, Stream,
 };
-use crate::state_cache::{self, Cache, Evicted, Plan, PlanLimits, Snapshot, SnapshotKind};
+use crate::state_cache::{self, Cache, Entry, Evicted, Plan, PlanLimits, Snapshot, SnapshotKind};
 
 /// The engine needs a stack of at least 16 MiB on its thread.
 const ENGINE_STACK_BYTES: usize = 16 << 20;
@@ -301,6 +303,8 @@ struct Shared {
     budgets: crate::config::Budgets,
     /// The state bytes committed for all models together.
     state_committed_bytes: AtomicU64,
+    /// The status of the saved states on the SSD.
+    disk_status: Mutex<DiskStatus>,
     /// Whether a status reader asked for fresh counters and states. The worker
     /// publishes them at its next turn, also between the steps of a running
     /// call.
@@ -331,6 +335,25 @@ impl Drop for LongOperation<'_> {
     fn drop(&mut self) {
         self.0.long_operations.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// The status of the saved states on the SSD.
+#[derive(Clone, Debug, Default)]
+pub struct DiskStatus {
+    /// The store's folder. None without a store.
+    pub dir: Option<String>,
+    /// The number of saved states.
+    pub states: usize,
+    /// The bytes that the saved states take.
+    pub bytes: u64,
+    /// The most bytes that the saved states may take.
+    pub limit: u64,
+    /// The saved states read in this run.
+    pub loads: u64,
+    /// The states saved in this run.
+    pub saves: u64,
+    /// The bytes written in this run.
+    pub written: u64,
 }
 
 /// Clones the handle to what the threads share. Panics before the worker
@@ -387,6 +410,7 @@ pub fn list_models() -> Vec<(String, engine::Tokenizer, ModelSettings)> {
 pub fn start(
     model_settings: Vec<ModelSettings>,
     budgets: crate::config::Budgets,
+    state_dir: Option<PathBuf>,
     on_log: Option<extern "C" fn(*const std::ffi::c_char)>,
     on_die: Option<extern "C" fn()>,
 ) -> bool {
@@ -432,6 +456,7 @@ pub fn start(
                 models,
                 budgets,
                 state_committed_bytes: AtomicU64::new(0),
+                disk_status: Mutex::new(DiskStatus::default()),
                 status_wanted: AtomicBool::new(false),
                 status_published: tokio::sync::Notify::new(),
                 long_operations: AtomicUsize::new(0),
@@ -441,7 +466,7 @@ pub fn start(
             // The waiting requests could not end otherwise. Rust has already
             // printed the panic's message.
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut worker = Worker::new(shared.clone(), model_handles);
+                let mut worker = Worker::new(shared.clone(), model_handles, state_dir);
                 let _ = started_sender.send(true);
                 worker.run_until_stop();
             }));
@@ -626,8 +651,8 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let status = lock(&shared_model.status);
     let now = Instant::now();
     // The status rounds idle times to whole seconds. It rounds other seconds
-    // and memory GiB to tenths, and state GiB to thousandths. Why these digits
-    // were chosen is unknown.
+    // and memory GiB to tenths, and state and disk GiB to thousandths. Why
+    // these digits were chosen is unknown.
     let sessions: Vec<Value> = status
         .sessions
         .iter()
@@ -666,6 +691,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "state_cache_limit_gib": round(state_limit as f64 / GIB, 3),
         "state_cache_scope": "server",
         "state_cache_total_gib": round(total_state_bytes as f64 / GIB, 3),
+        "state_disk": build_disk_status_json(&shared),
         "reserve_gib": shared.budgets.reserve_gb,
         "memory_gib": shared.budgets.memory_gb,
         "model_memory": allocations,
@@ -740,6 +766,25 @@ fn build_engine_times_json(stats: &engine::Stats) -> Value {
         "demand_read_seconds": stats.demand_read_s,
         "background_read_seconds": stats.background_read_s,
     })
+}
+
+/// Builds the status of the saved states as JSON, or null without a store. It
+/// holds their folder, their count, their GiB and the GiB limit. It also holds
+/// this run's loads, saves and GiB written.
+fn build_disk_status_json(shared: &Shared) -> Value {
+    let disk_status = lock(&shared.disk_status).clone();
+    match disk_status.dir {
+        None => Value::Null,
+        Some(dir) => json!({
+            "dir": dir,
+            "states": disk_status.states,
+            "gib": round(disk_status.bytes as f64 / GIB, 3),
+            "limit_gib": round(disk_status.limit as f64 / GIB, 3),
+            "loads": disk_status.loads,
+            "saves": disk_status.saves,
+            "written_gib": round(disk_status.written as f64 / GIB, 3),
+        }),
+    }
 }
 
 // ---- the worker ----
@@ -952,13 +997,18 @@ impl Drop for StateHandles {
     }
 }
 
-/// The states of all models: the state cache's records and each state's engine
-/// handles.
+/// The states of all models: the state cache's records, each state's engine
+/// handles and the store of saved states.
 struct States {
     /// The state cache's records of the states.
     cache: Cache,
     /// Each state's engine handles, by the state's key.
     handles: HashMap<state_cache::StateId, StateHandles>,
+    /// The store of saved states on the SSD. None without one.
+    store: Option<Store>,
+    /// States that the stop cut short in a prefill or a decoding pass. Their
+    /// rows are not saved.
+    cut_short: HashSet<state_cache::StateId>,
     /// For a model that resumes only from snapshots, a prefill takes a snapshot
     /// at every multiple of this many positions.
     snapshot_interval: usize,
@@ -966,23 +1016,82 @@ struct States {
 
 impl States {
     /// Creates the states of all models: an empty state cache of at most
-    /// `limit` bytes and `max_states` states. `snapshot_interval` is the
-    /// prefills' snapshot interval.
+    /// `limit` bytes and `max_states` states, without a store.
+    /// `snapshot_interval` is the prefills' snapshot interval.
     fn new(limit: u64, max_states: usize, snapshot_interval: usize) -> Self {
         Self {
             cache: Cache::new(limit, max_states),
             handles: HashMap::new(),
+            store: None,
+            cut_short: HashSet::new(),
             snapshot_interval,
         }
     }
 
-    /// Frees what the state cache evicted: the snapshots, then the states.
-    fn free_evicted(&mut self, Evicted { snapshots, states }: Evicted) {
+    /// Frees what the state cache evicted. It frees the snapshots. It saves the
+    /// states to the SSD, as the cache decides, then frees them. The most
+    /// recently used state is saved first. A newer saved state may then hold an
+    /// older state's tokens. That older state is then not written.
+    fn free_evicted(
+        &mut self,
+        shared: &Shared,
+        Evicted {
+            snapshots,
+            mut states,
+        }: Evicted,
+    ) {
         for (state_id, snapshot) in snapshots {
             self.free_snapshot(state_id, snapshot.pos);
         }
-        for (state_id, _) in states {
+        states.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.last_used));
+        for (state_id, entry) in states {
+            self.save_state(shared, state_id, &entry, true);
             self.handles.remove(&state_id);
+        }
+    }
+
+    /// Saves state `state_id` to the SSD, as the state cache decides. `entry`
+    /// is its record, already out of the cache. `others_stay_in_memory` says
+    /// whether the states still in the cache stay in memory. A state that the
+    /// stop cut short is not saved.
+    fn save_state(
+        &mut self,
+        shared: &Shared,
+        state_id: state_cache::StateId,
+        entry: &Entry,
+        others_stay_in_memory: bool,
+    ) {
+        let States {
+            store: Some(store),
+            cache,
+            handles,
+            cut_short,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let Some(state_handles) = handles.get(&state_id) else {
+            return;
+        };
+        if cut_short.contains(&state_id) {
+            return;
+        }
+        let snapshot = |pos: usize| state_handles.snapshots.get(&pos).copied();
+        let last_used_at = std::time::SystemTime::now() - state_handles.last_used_at.elapsed();
+        let _long = LongOperation::start(shared);
+        if let Some(line) = store.save_state(
+            cache,
+            &EngineState {
+                model: &state_handles.owner,
+                state: state_handles.engine_state,
+            },
+            &snapshot,
+            entry,
+            last_used_at,
+            others_stay_in_memory,
+        ) {
+            engine::log(&format!("states: {line}"));
         }
     }
 
@@ -1050,7 +1159,8 @@ impl States {
         }
     }
 
-    /// Publishes the states to the status: each model's states and state bytes.
+    /// Publishes the states to the status: each model's states and state bytes,
+    /// and the saved states' figures.
     fn publish_states(&mut self, shared: &Shared) {
         shared
             .state_committed_bytes
@@ -1088,6 +1198,18 @@ impl States {
                 })
                 .sum();
         }
+        *lock(&shared.disk_status) = match &self.store {
+            Some(store) => DiskStatus {
+                dir: Some(store.get_folder().display().to_string()),
+                states: self.cache.saved_states.len(),
+                bytes: self.cache.count_saved_bytes(),
+                limit: self.cache.saved_byte_limit,
+                loads: store.load_count,
+                saves: store.save_count,
+                written: store.bytes_written,
+            },
+            None => DiskStatus::default(),
+        };
     }
 }
 
@@ -1105,7 +1227,12 @@ struct Worker {
 
 impl Worker {
     /// Creates the worker for the models in `shared` and their engine handles.
-    fn new(shared: Arc<Shared>, model_handles: Vec<Rc<Model>>) -> Worker {
+    /// It opens the store of saved states in `state_dir`, if given.
+    fn new(
+        shared: Arc<Shared>,
+        model_handles: Vec<Rc<Model>>,
+        state_dir: Option<PathBuf>,
+    ) -> Worker {
         let models: Vec<WorkerModel> = shared
             .models
             .iter()
@@ -1133,11 +1260,14 @@ impl Worker {
                 }
             })
             .collect();
-        let states = States::new(
+        let mut states = States::new(
             (shared.budgets.state_cache_gb * GIB) as u64,
             shared.budgets.max_cached_states,
             shared.budgets.snapshot_interval,
         );
+        if let Some(dir) = state_dir {
+            Self::open_store(&mut states, &models, &shared.budgets, &dir);
+        }
         let mut worker = Worker {
             shared,
             models,
@@ -1146,6 +1276,60 @@ impl Worker {
         };
         worker.states.publish_states(&worker.shared);
         worker
+    }
+
+    /// Opens the store of saved states in `dir`. A saved state with a model's
+    /// identity can serve that model's prompts. The other saved states stay
+    /// until their room is needed. When the saved states take more than the
+    /// disk limit, some are deleted now.
+    fn open_store(
+        states: &mut States,
+        models: &[WorkerModel],
+        budgets: &crate::config::Budgets,
+        dir: &std::path::Path,
+    ) {
+        let (store, found_states) = match Store::open(dir) {
+            Ok(opened) => opened,
+            Err(message) => {
+                engine::log(&format!("states: no saved states: {message}"));
+                return;
+            }
+        };
+        let identities: Vec<_> = models
+            .iter()
+            .map(|worker_model| worker_model.model.state_identity())
+            .collect();
+        states.cache.saved_byte_limit = (budgets.state_disk_gb * GIB) as u64;
+        states.cache.min_unshared_tokens = budgets.state_disk_tokens;
+        let (mut usable, mut tokens) = (0, 0);
+        for mut found in found_states {
+            found.saved_state.model = identities
+                .iter()
+                .position(|identity| *identity == found.identity);
+            if found.saved_state.model.is_some() {
+                usable += 1;
+                tokens += found.saved_state.tokens.len();
+            }
+            states.cache.add_saved_state(found.id, found.saved_state);
+        }
+        engine::log(&format!(
+            "states: saved states in {}: {} ({:.1} GiB of {:.1} GiB); {usable} of them, {tokens} tokens, for the models here",
+            dir.display(),
+            states.cache.saved_states.len(),
+            states.cache.count_saved_bytes() as f64 / GIB,
+            budgets.state_disk_gb
+        ));
+        states.store = Some(store);
+        // The saved states may take more than the disk limit. Delete them until
+        // they fit: first those of no model here, then the oldest.
+        if let (Some(to_delete), Some(store)) = (
+            states.cache.find_saved_states_to_delete(0, None, None),
+            states.store.as_mut(),
+        ) {
+            for saved_id in to_delete {
+                store.delete_saved_state(&mut states.cache, saved_id);
+            }
+        }
     }
 
     /// Keeps the memory reserve free, between engine calls. When memory is
@@ -1160,7 +1344,7 @@ impl Worker {
             let shortfall = shortfall.saturating_sub(engine::reclaim(shortfall));
             if shortfall > 0 {
                 let evicted = self.states.cache.evict_bytes(shortfall);
-                self.states.free_evicted(evicted);
+                self.states.free_evicted(&self.shared, evicted);
                 self.states.publish_states(&self.shared);
             }
         }
@@ -1427,7 +1611,9 @@ impl WorkerModel {
 
     /// Counts the bytes that a prompt of `prompt_tokens` tokens adds to the
     /// state cache on `plan`. It counts the state's growth to the prompt and
-    /// its first token. It also counts the snapshots that the plan takes.
+    /// its first token. It counts the snapshot that a load reads. It counts
+    /// that snapshot with logits. For the same prompt again, the snapshot holds
+    /// them. It also counts the snapshots that the plan takes.
     fn count_plan_bytes(&self, plan: &Plan, prompt_tokens: usize, states: &States) -> u64 {
         let growth = match *plan {
             Plan::InPlace { state, .. } => self
@@ -1436,7 +1622,15 @@ impl WorkerModel {
                 .saturating_sub(states.cache.entries[&state].bytes),
             _ => self.model.state_bytes(None, prompt_tokens + 1),
         };
+        let loaded_snapshot = match plan {
+            Plan::Load {
+                snapshot_pos: Some(_),
+                ..
+            } => self.model.snapshot_bytes(true),
+            _ => 0,
+        };
         growth
+            + loaded_snapshot
             + plan.count_snapshot_bytes(
                 prompt_tokens,
                 self.model.snapshot_bytes(false),
@@ -1599,7 +1793,7 @@ impl WorkerModel {
             self.model
                 .state_bytes(Some(states.handles[&state_id].engine_state), positions),
         );
-        states.free_evicted(evicted);
+        states.free_evicted(shared, evicted);
         let after = states.cache.entries[&state_id].bytes;
         if after > before && states.cache.count_bytes_over_limit() > 0 {
             engine::log(&format!(
@@ -1731,9 +1925,38 @@ impl WorkerModel {
         };
         let origin = states.cache.find_origin(&plan, prompt_tokens);
         let capture_position = plan.find_branch_snapshot_pos(prompt_tokens);
+        // Pin the saved state that the plan reads, and note its version. The
+        // saves that the eviction below makes then leave it unchanged.
+        let planned = match plan {
+            Plan::Load {
+                saved_id: saved, ..
+            } => {
+                states.cache.pinned = Some(saved);
+                states
+                    .cache
+                    .saved_states
+                    .get(&saved)
+                    .map(|saved_state| saved_state.version)
+            }
+            _ => None,
+        };
         let wait = job.queued_at.elapsed().as_secs_f64();
         let evicted = states.cache.evict(&eviction);
-        states.free_evicted(evicted);
+        states.free_evicted(shared, evicted);
+        if let Plan::Load {
+            saved_id: saved, ..
+        } = plan
+            && states
+                .cache
+                .saved_states
+                .get(&saved)
+                .map(|saved_state| saved_state.version)
+                != planned
+        {
+            states.cache.pinned = None;
+            // It changed during the eviction: plan again.
+            return self.start_request(shared, job, states);
+        }
         let reused_tokens = plan.count_reused_tokens();
         // The plan's state: the one that it continues in place, or a new one. A
         // request whose new state does not fit is refused.
@@ -1741,7 +1964,10 @@ impl WorkerModel {
             Plan::InPlace { state, .. } => state,
             _ => match states.add_state(self.model_index, self.model.clone()) {
                 Some(state_id) => state_id,
-                None => return refuse(job, STATE_MEMORY_SHORT),
+                None => {
+                    states.cache.pinned = None;
+                    return refuse(job, STATE_MEMORY_SHORT);
+                }
             },
         };
         let state_id = match plan {
@@ -1759,6 +1985,7 @@ impl WorkerModel {
                 self.model
                     .state_copy(engine_state, states.handles[&source].engine_state, at);
                 states.cache.record_reuse(source);
+                states.cache.copy_saved_link(state_id, source, at);
                 states.handles.get_mut(&source).expect("state").last_used_at = Instant::now();
                 if let Plan::Snapshot { snapshot_pos, .. } = plan {
                     self.model
@@ -1766,8 +1993,79 @@ impl WorkerModel {
                 }
                 state_id
             }
-            Plan::Load { .. } => {
-                unreachable!("a saved state's plan needs the store of saved states")
+            Plan::Load {
+                saved_id: saved,
+                snapshot_pos,
+                from: at,
+                ..
+            } => {
+                let state_id = planned_state;
+                let engine_state = states.handles[&state_id].engine_state;
+                let load_started_at = Instant::now();
+                let store = states
+                    .store
+                    .as_mut()
+                    .expect("saved states have their store");
+                let long = LongOperation::start(shared);
+                let read = store.load_saved_state(
+                    &mut states.cache,
+                    &EngineState {
+                        model: &self.model,
+                        state: engine_state,
+                    },
+                    saved,
+                    snapshot_pos,
+                    at,
+                );
+                drop(long);
+                states.cache.pinned = None;
+                match read {
+                    Ok(snapshot) => {
+                        states.cache.link_to_saved_state(state_id, saved, at);
+                        if let Some(snapshot) = snapshot {
+                            if at == prompt_tokens {
+                                // The same prompt again. The snapshot is
+                                // restored below.
+                                states.insert_snapshot(state_id, prompt_tokens, snapshot);
+                            } else {
+                                self.model.snapshot_restore(engine_state, snapshot);
+                                self.model.snapshot_free(snapshot);
+                            }
+                        }
+                        engine::log(&format!(
+                            "req {}: {at} positions of saved state {saved} read in {:.2} s",
+                            job.id,
+                            load_started_at.elapsed().as_secs_f64()
+                        ));
+                        state_id
+                    }
+                    Err(error) => {
+                        // Plan again without this saved state. A damaged one is
+                        // deleted. One that cannot be read now is skipped for
+                        // this request.
+                        match error {
+                            LoadError::Damaged(message) => {
+                                engine::log(&format!(
+                                    "req {}: saved state {saved} cannot be read ({message}); it is deleted",
+                                    job.id
+                                ));
+                                store.delete_saved_state(&mut states.cache, saved);
+                            }
+                            LoadError::Unavailable(message) => {
+                                engine::log(&format!(
+                                    "req {}: saved state {saved} cannot be read now ({message}); planned without it",
+                                    job.id
+                                ));
+                                states.cache.skipped = Some(saved);
+                            }
+                        }
+                        let snapshots = states.cache.remove_state(state_id);
+                        states.free_snapshots_and_states(Vec::new(), vec![(state_id, snapshots)]);
+                        self.start_request(shared, job, states);
+                        states.cache.skipped = None;
+                        return;
+                    }
+                }
             }
         };
         // The state's bytes count the prompt and its first token.
@@ -1782,6 +2080,23 @@ impl WorkerModel {
             bytes,
             state_cache::count_stale_rows_at(origin, reused_tokens),
         );
+        if let Plan::Load {
+            from: at,
+            snapshot_pos: Some(_),
+            ..
+        } = plan
+            && at == prompt_tokens
+        {
+            states.cache.add_snapshot(
+                state_id,
+                Snapshot {
+                    pos: prompt_tokens,
+                    kind: SnapshotKind::PromptEnd,
+                    bytes: self.model.snapshot_bytes(true),
+                    stale_rows: state_cache::count_stale_rows_at(origin, prompt_tokens),
+                },
+            );
+        }
         let mut reserved = Vec::new();
         if reused_tokens < prompt_tokens {
             reserved.push(Snapshot {
@@ -1889,6 +2204,8 @@ impl WorkerModel {
         };
         if reused_tokens == prompt_tokens {
             // The same prompt again: its prompt-end snapshot holds its logits.
+            // A loaded saved state's prompt-end snapshot belongs to the new
+            // state.
             let source = plan.find_source_state().unwrap_or(state_id);
             let snapshot = states.get_snapshot(source, prompt_tokens);
             if source == state_id {
@@ -2120,7 +2437,7 @@ impl WorkerModel {
                         .find_eviction(bytes, false, &[state_id])
                         .is_some_and(|eviction| {
                             let evicted = states.cache.evict(&eviction);
-                            states.free_evicted(evicted);
+                            states.free_evicted(shared, evicted);
                             true
                         });
                 if fits {
@@ -2357,7 +2674,15 @@ impl WorkerModel {
             FinishReason::ServerStop => "stopped by the server's stop",
         };
         generation.job.send_last_event(Event::Done { reason });
-        self.end_prefill_early(&mut generation, states);
+        if let Some(prefill) = &generation.prefill {
+            // Do not save the state when the stop cut its prefill short. Do not
+            // save it either when its replay never ran. Its rolling rows were
+            // never rebuilt.
+            if at_stop || (prefill.replays && prefill.next_position == generation.reused_tokens) {
+                states.cut_short.insert(generation.state_id);
+            }
+            self.end_prefill_early(&mut generation, states);
+        }
         // Take a snapshot at the generation's end when the cache keeps it. A
         // later fork there resumes from it.
         let stale = states.cache.entries[&generation.state_id].stale_rows;
@@ -2387,7 +2712,7 @@ impl WorkerModel {
             );
             states.insert_snapshot(generation.state_id, generation.pos, snapshot);
         }
-        states.free_evicted(evicted);
+        states.free_evicted(shared, evicted);
         states
             .handles
             .get_mut(&generation.state_id)
@@ -2446,10 +2771,15 @@ impl WorkerModel {
     /// Ends the requests of a decoding pass that could not load its experts.
     /// The stop may have ended their reads. Or memory stayed short after idle
     /// memory was freed. During the stop, the requests end as every request
-    /// does at the stop. Otherwise the requests end with an error. The pass may
-    /// have changed their states in part. So the states are freed.
+    /// does at the stop. Their states are not saved. Otherwise the requests end
+    /// with an error. The pass may have changed their states in part. So the
+    /// states are freed.
     fn end_failed_pass(&mut self, generation_indices: &[usize], states: &mut States) {
         if engine::is_stopping() {
+            for &i in generation_indices {
+                // The pass may have changed the state in part. Do not save it.
+                states.cut_short.insert(self.generations[i].state_id);
+            }
             return;
         }
         let mut indices = generation_indices.to_vec();

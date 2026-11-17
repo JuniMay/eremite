@@ -149,6 +149,8 @@ fn start_server(setup: &Setup, extra: &[&str]) -> Server {
         std::process::id(),
         nanos ^ (port as u128) << 64
     );
+    // No saved states: a cold server stays cold, and nothing is written to the
+    // SSD.
     let mut args: Vec<String> = [
         "-m",
         &setup.checkpoint,
@@ -156,6 +158,8 @@ fn start_server(setup: &Setup, extra: &[&str]) -> Server {
         "56",
         "--state-cache",
         "8",
+        "--state-disk",
+        "0",
     ]
     .iter()
     .map(|arg| arg.to_string())
