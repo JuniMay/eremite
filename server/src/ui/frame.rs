@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
-use super::draw::{fit_line, format_duration, label, plain, strong};
+use super::draw::{colored, fit_line, format_duration, label, plain, strong};
 use super::status::{ModelStatus, Phase};
 use super::theme::{Rgb, Theme};
 
@@ -103,6 +103,10 @@ pub type Keys = Vec<(&'static str, String)>;
 pub enum Target {
     /// A view of the top tab row.
     View(View),
+    /// A model in the tab row of Models, by its index.
+    Model(usize),
+    /// A sub-view of the chosen model.
+    SubView(SubView),
 }
 
 /// A place that a click acts on: the columns from x0 to before x1 of row y.
@@ -123,6 +127,10 @@ pub struct ClickTarget {
 pub struct Choices {
     /// The view shown.
     pub view: View,
+    /// The model chosen in Models, by its index.
+    pub model: usize,
+    /// The sub-view that Models shows for the chosen model.
+    pub sub_view: SubView,
     /// Whether the view takes the mouse. Without it, the terminal selects
     /// text.
     pub mouse: bool,
@@ -134,6 +142,8 @@ impl Default for Choices {
     fn default() -> Choices {
         Choices {
             view: View::Overview,
+            model: 0,
+            sub_view: SubView::States,
             mouse: true,
             targets: Vec::new(),
         }
@@ -214,7 +224,7 @@ pub fn draw_chrome(
     keys: &[(&'static str, String)],
 ) -> Rect {
     let theme = screen.theme;
-    let above = CHROME_ROWS_ABOVE;
+    let above = CHROME_ROWS_ABOVE + u16::from(choices.view == View::Models);
     let width = area.width as usize;
     let title = Line::from(vec![strong(" eremite  "), label(theme, screen.address)]);
     if area.height < above + 2 || area.width < LEAST_CHROME_COLUMNS {
@@ -252,6 +262,9 @@ pub fn draw_chrome(
         tabs,
         &mut choices.targets,
     );
+    if choices.view == View::Models {
+        draw_model_row(buf, area, screen, choices);
+    }
     buf.set_string(
         area.x,
         area.y + above - 1,
@@ -323,6 +336,136 @@ fn draw_tabs(
     x
 }
 
+/// Draws the tab row of Models in the second row of `area`: one tab per model
+/// with its mark, a rule, the chosen model's sub-views, and at the right what
+/// the chosen model does. When the models do not fit, the row shows the ones
+/// around the chosen model, with a gray "‹" or "›" on the side of the others.
+fn draw_model_row(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &mut Choices) {
+    let theme = screen.theme;
+    let y = area.y + 2;
+    let right_line = screen
+        .statuses
+        .get(choices.model)
+        .map(|status| describe_model_state(theme, status))
+        .unwrap_or_default();
+    let right_width = right_line.width() as u16 + 1;
+    let right = area.right().saturating_sub(right_width + TAB_GAP);
+    let sub_views = screen
+        .models
+        .get(choices.model)
+        .map_or(&[][..], |model| model.kind.list_sub_views());
+    let sub_view_tabs: Vec<(Line<'static>, Target, bool)> = sub_views
+        .iter()
+        .map(|&sub_view| {
+            let line = Line::from(plain(format!(" {} ", sub_view.name())));
+            let chosen = sub_view == choices.sub_view;
+            (line, Target::SubView(sub_view), chosen)
+        })
+        .collect();
+    // The rule and the sub-views' tabs, each with the gap after it.
+    let sub_view_width: u16 = 1
+        + TAB_GAP
+        + sub_view_tabs
+            .iter()
+            .map(|(line, _, _)| line.width() as u16 + TAB_GAP)
+            .sum::<u16>();
+    let model_tabs: Vec<(Line<'static>, Target, bool)> = screen
+        .models
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let (symbol, color) = screen
+                .statuses
+                .get(i)
+                .map_or(Mark::Unloaded, Mark::of)
+                .look(theme);
+            let mark = match color {
+                Some(rgb) => colored(theme, rgb, symbol),
+                None => plain(symbol),
+            };
+            let line = Line::from(vec![plain(" "), mark, plain(format!(" {} ", model.name))]);
+            (line, Target::Model(i), i == choices.model)
+        })
+        .collect();
+    // The arrows take the first column, and the column before the rule.
+    let room = right.saturating_sub(area.x + 1 + sub_view_width + 1);
+    let widths: Vec<u16> = model_tabs
+        .iter()
+        .map(|(line, _, _)| line.width() as u16 + TAB_GAP)
+        .collect();
+    let fits = |from: usize, to: usize| widths[from..to].iter().sum::<u16>() <= room;
+    let mut first = 0;
+    while first < choices.model && !fits(first, choices.model + 1) {
+        first += 1;
+    }
+    let mut end = first;
+    while end < widths.len() && fits(first, end + 1) {
+        end += 1;
+    }
+    let arrow = Style::new().fg(theme.color(theme.label));
+    if first > 0 {
+        buf.set_string(area.x, y, "‹", arrow);
+    }
+    let shown = model_tabs
+        .into_iter()
+        .skip(first)
+        .take(end - first)
+        .collect();
+    let mut x = draw_tabs(
+        buf,
+        theme,
+        (area.x + 1, y),
+        right,
+        shown,
+        &mut choices.targets,
+    );
+    if end < widths.len() {
+        buf.set_string(x.saturating_sub(1), y, "›", arrow);
+        x += 1;
+    }
+    if x < right {
+        buf.set_string(x, y, "│", Style::new().fg(theme.color(theme.rule)));
+        draw_tabs(
+            buf,
+            theme,
+            (x + TAB_GAP, y),
+            right,
+            sub_view_tabs,
+            &mut choices.targets,
+        );
+    }
+    buf.set_line(
+        area.right().saturating_sub(right_width),
+        y,
+        &right_line,
+        right_width,
+    );
+}
+
+/// Describes what the model of `status` does, for the right end of the tab
+/// row of Models: its running and waiting requests, or else its state.
+fn describe_model_state(theme: &Theme, status: &ModelStatus) -> Line<'static> {
+    let (running, waiting) = status.count_requests();
+    let seconds = format_duration(status.phase_seconds);
+    let spans = if running + waiting > 0 {
+        vec![
+            label(theme, "running "),
+            plain(running.to_string()),
+            label(theme, " · waiting "),
+            plain(waiting.to_string()),
+        ]
+    } else {
+        match Mark::of(status) {
+            Mark::Failed => vec![colored(theme, theme.red, "load failed")],
+            Mark::Loading => vec![colored(theme, theme.amber, format!("loading {seconds}"))],
+            Mark::Unloaded if status.phase == Phase::Held => vec![label(theme, "held by a yield")],
+            Mark::Unloaded => vec![label(theme, "not loaded")],
+            Mark::Busy | Mark::Idle => vec![label(theme, format!("idle {seconds}"))],
+        }
+    };
+    Line::from(spans)
+}
+
 /// Returns the keys of the chrome for `choices` at the start and at the end of
 /// the keys row, around those of the view shown.
 pub fn list_chrome_keys(choices: &Choices) -> (Keys, Keys) {
@@ -339,6 +482,23 @@ pub fn list_chrome_keys(choices: &Choices) -> (Keys, Keys) {
     (first, last)
 }
 
+/// Returns the keys of Models for `choices`, after the chrome's first keys:
+/// the keys that choose the model and the sub-view.
+pub fn list_model_keys(screen: &Screen, choices: &Choices) -> Keys {
+    let names: Vec<&str> = screen
+        .models
+        .get(choices.model)
+        .map_or(&[][..], |model| model.kind.list_sub_views())
+        .iter()
+        .map(|sub_view| sub_view.name())
+        .collect();
+    let mut keys = vec![("←→", "model".to_string())];
+    if !names.is_empty() {
+        keys.push(("Tab", names.join(" or ")));
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,16 +506,40 @@ mod tests {
     use crate::ui::testing::{draw_on_terminal, find_in_row, read_row};
     use crate::ui::theme::DARK;
 
+    /// Two models: deepseek-v4.1-flash decodes request 5, and qwen3.8-27b is
+    /// not loaded.
+    fn two_models() -> (Vec<ModelInfo>, Vec<ModelStatus>) {
+        let models = ["deepseek-v4.1-flash", "qwen3.8-27b"].map(|name| ModelInfo {
+            name: name.into(),
+            kind: Kind::Llm,
+        });
+        let decoding = ModelStatus {
+            loaded: true,
+            phase: Phase::Decode,
+            requests: vec![Request {
+                id: 5,
+                status: Activity::Decoding,
+                ..Request::default()
+            }],
+            ..ModelStatus::default()
+        };
+        (models.to_vec(), vec![decoding, ModelStatus::default()])
+    }
+
     /// Draws the chrome at `width` x `height` with `choices`.
     fn draw(width: u16, height: u16, choices: &mut Choices) -> (Buffer, Rect) {
+        let (models, statuses) = two_models();
         let screen = Screen {
             theme: &DARK,
             address: "127.0.0.1:52878",
             uptime_seconds: 57.0,
-            models: &[],
-            statuses: &[],
+            models: &models,
+            statuses: &statuses,
         };
         let (mut keys, last) = list_chrome_keys(choices);
+        if choices.view == View::Models {
+            keys.extend(list_model_keys(&screen, choices));
+        }
         keys.extend(last);
         let mut inner = Rect::default();
         let buf = draw_on_terminal(width, height, |buf, area| {
@@ -388,6 +572,43 @@ mod tests {
         choices.mouse = false;
         let (buf, _) = draw(100, 30, &mut choices);
         assert!(read_row(&buf, 29).contains("m mouse: selects text"));
+    }
+
+    #[test]
+    fn models_has_a_tab_for_each_model_and_its_sub_views() {
+        let mut choices = Choices {
+            view: View::Models,
+            model: 1,
+            sub_view: SubView::Experts,
+            ..Choices::default()
+        };
+        let (buf, inner) = draw(160, 45, &mut choices);
+        let row = read_row(&buf, 2);
+        assert!(
+            row.starts_with("  ● deepseek-v4.1-flash    ○ qwen3.8-27b   │  States    Experts "),
+            "{row}"
+        );
+        assert!(row.ends_with("not loaded "), "{row}");
+        // the busy model's mark in the accent, and the chosen model's tab
+        // white on the accent
+        assert_eq!(buf[(2, 2)].fg, DARK.color(DARK.accent));
+        let qwen = find_in_row(&buf, 2, " ○ qwen3.8-27b ").unwrap();
+        assert_eq!(buf[(qwen + 1, 2)].fg, DARK.color(DARK.on_accent));
+        assert_eq!(buf[(qwen + 1, 2)].bg, DARK.color(DARK.accent));
+        let experts = find_in_row(&buf, 2, " Experts ").unwrap();
+        assert_eq!(buf[(experts, 2)].bg, DARK.color(DARK.accent));
+        assert_eq!(inner.y, 4, "the view starts under the rule");
+        assert!(read_row(&buf, 44).contains("←→ model   Tab States or Experts"));
+        assert_eq!(choices.find_target(3, 2), Some(Target::Model(0)));
+        let states = find_in_row(&buf, 2, " States ").unwrap();
+        assert_eq!(
+            choices.find_target(states + 1, 2),
+            Some(Target::SubView(SubView::States))
+        );
+        // the chosen model's requests at the right
+        choices.model = 0;
+        let (buf, _) = draw(160, 45, &mut choices);
+        assert!(read_row(&buf, 2).ends_with("running 1 · waiting 0 "));
     }
 
     #[test]
@@ -447,6 +668,76 @@ mod tests {
             [SubView::States, SubView::Experts]
         );
         assert_eq!(SubView::Experts.name(), "Experts");
+    }
+
+    #[test]
+    fn a_models_state_shows_at_the_right_of_its_row() {
+        let loading = ModelStatus {
+            phase: Phase::Loading,
+            phase_seconds: 1.0,
+            ..ModelStatus::default()
+        };
+        let failed = ModelStatus {
+            load_error: Some("does not fit".into()),
+            ..ModelStatus::default()
+        };
+        let idle = ModelStatus {
+            loaded: true,
+            phase_seconds: 8.0,
+            ..ModelStatus::default()
+        };
+        let held = ModelStatus {
+            loaded: true,
+            phase: Phase::Held,
+            ..ModelStatus::default()
+        };
+        let text = |status: &ModelStatus| {
+            let line = describe_model_state(&DARK, status);
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(&loading), "loading 1s");
+        assert_eq!(text(&failed), "load failed");
+        assert_eq!(text(&idle), "idle 8s");
+        assert_eq!(text(&held), "held by a yield");
+        assert_eq!(text(&ModelStatus::default()), "not loaded");
+        let amber = describe_model_state(&DARK, &loading);
+        assert_eq!(amber.spans[0].style.fg, Some(DARK.color(DARK.amber)));
+    }
+
+    #[test]
+    fn the_model_row_scrolls_to_the_chosen_model() {
+        let models: Vec<ModelInfo> = (0..12)
+            .map(|i| ModelInfo {
+                name: format!("model-number-{i}"),
+                kind: Kind::Llm,
+            })
+            .collect();
+        let statuses = vec![ModelStatus::default(); 12];
+        let screen = Screen {
+            theme: &DARK,
+            address: "127.0.0.1:52878",
+            uptime_seconds: 57.0,
+            models: &models,
+            statuses: &statuses,
+        };
+        for chosen in [0, 6, 11] {
+            let mut choices = Choices {
+                view: View::Models,
+                model: chosen,
+                ..Choices::default()
+            };
+            let buf = draw_on_terminal(100, 30, |buf, area| {
+                draw_chrome(buf, area, &screen, &mut choices, &[]);
+            });
+            let row = read_row(&buf, 2);
+            assert!(row.contains(&format!(" model-number-{chosen} ")), "{row}");
+            assert_eq!(row.starts_with('‹'), chosen > 0, "{row}");
+            assert_eq!(row.contains('›'), chosen < 11, "{row}");
+            assert!(row.contains("│  States    Experts"), "{row}");
+        }
     }
 
     #[test]
