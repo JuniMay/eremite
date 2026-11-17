@@ -234,6 +234,20 @@ pub struct ViewOptions {
     /// The number of tokens whose experts the status keeps for each decoding
     /// request. 0 keeps none.
     pub kept_route_tokens: usize,
+    /// Receives each log line about a model, with the model's index, instead of
+    /// the log.
+    pub on_model_log: Option<fn(usize, &str)>,
+}
+
+impl ViewOptions {
+    /// Writes `line`, a line about the model at `model_index`, to the terminal
+    /// UI's hook. Without the hook, it writes the line to the log.
+    fn write_model_line(&self, model_index: usize, line: &str) {
+        match self.on_model_log {
+            Some(hook) => hook(model_index, line),
+            None => engine::log(line),
+        }
+    }
 }
 
 /// What the HTTP handlers and the worker share under one lock.
@@ -672,6 +686,12 @@ pub fn start(
     ok
 }
 
+/// Writes `line`, a line about the model at `model_index`, to the log, as the
+/// worker writes its own lines about that model.
+pub fn log_model_line(model_index: usize, line: &str) {
+    clone_shared().view.write_model_line(model_index, line);
+}
+
 /// Requests the stop as SIGINT does. A second request ends the saving of states
 /// at the stop.
 pub fn request_stop() {
@@ -755,7 +775,10 @@ pub fn submit(
     let request_id = queue.last_request_id;
     if !request.note.is_empty() {
         // The log shows the note before the worker can take the request.
-        engine::log(&format!("req {request_id} {}", request.note));
+        shared.view.write_model_line(
+            request.model_index,
+            &format!("req {request_id} {}", request.note),
+        );
     }
     let (prompt_tokens, max_tokens, model_index) = (
         request.prompt.len(),
@@ -769,7 +792,7 @@ pub fn submit(
         flags: flags.clone(),
         queued_at: Instant::now(),
     });
-    engine::log(&format!(
+    shared.view.write_model_line(model_index, &format!(
         "req {request_id}: queued for {}, waiting={}, prompt_tokens={prompt_tokens}, max_new={max_tokens}",
         shared.models[model_index].settings.id,
         queue.waiting[model_index].len()
@@ -1782,7 +1805,7 @@ impl Worker {
             }
             let freed = worker_model.model.unload();
             if freed > 0 {
-                engine::log(&format!(
+                worker_model.log_line(&format!(
                     "{}: unloaded after {after:.0} s without requests; {:.1} GiB back",
                     worker_model.settings.id,
                     freed as f64 / GIB
@@ -2148,7 +2171,7 @@ impl Worker {
                     queue.waiting[worker_model.model_index].drain(..).collect()
                 };
                 if !admitted.is_empty() {
-                    engine::log(&format!(
+                    worker_model.log_line(&format!(
                         "{}: admitted={}, running={}",
                         worker_model.settings.id,
                         admitted.len(),
@@ -2201,7 +2224,10 @@ impl Worker {
 /// Refuses `job` with `message`. It logs the refusal and sends it as the last
 /// event.
 fn refuse(job: Job, message: &str) {
-    engine::log(&format!("req {}: refused: {message}", job.id));
+    log_model_line(
+        job.request.model_index,
+        &format!("req {}: refused: {message}", job.id),
+    );
     job.send_last_event(Event::Refused(message.into()));
 }
 
@@ -2216,20 +2242,28 @@ fn format_prompt_too_long(tokens: usize, ctx: usize) -> String {
 /// Ends `job` before its prefill with `reason`. It logs the end and sends Done
 /// as the last event.
 fn end_before_prefill(job: Job, reason: FinishReason) {
-    engine::log(&format!(
-        "req {}: ended before prefill ({}), waited {:.3} s",
-        job.id,
-        if reason == FinishReason::Cancelled {
-            "cancelled"
-        } else {
-            "shutdown"
-        },
-        job.queued_at.elapsed().as_secs_f64()
-    ));
+    log_model_line(
+        job.request.model_index,
+        &format!(
+            "req {}: ended before prefill ({}), waited {:.3} s",
+            job.id,
+            if reason == FinishReason::Cancelled {
+                "cancelled"
+            } else {
+                "shutdown"
+            },
+            job.queued_at.elapsed().as_secs_f64()
+        ),
+    );
     job.send_last_event(Event::Done { reason });
 }
 
 impl WorkerModel {
+    /// Writes `line`, a line about the model, to the log.
+    fn log_line(&self, line: &str) {
+        self.view.write_model_line(self.model_index, line);
+    }
+
     /// Lists the ways `prompt` can resume from this model's states, the
     /// cheapest first. The last way is a cold start.
     fn list_resume_plans(&self, prompt: &[i32], states: &States) -> Vec<Plan> {
@@ -2293,7 +2327,7 @@ impl WorkerModel {
             if engine::is_stopping() {
                 end_before_prefill(job, FinishReason::ServerStop);
             } else if job.flags.cancelled.load(Ordering::SeqCst) {
-                engine::log(&format!("req {}: client gone while waiting", job.id));
+                self.log_line(&format!("req {}: client gone while waiting", job.id));
                 end_before_prefill(job, FinishReason::Cancelled);
             } else {
                 let was_loaded = self.model.is_loaded();
@@ -2311,7 +2345,7 @@ impl WorkerModel {
                         continue;
                     }
                     lock(&shared.models[self.model_index].status).load_error = Some(error.clone());
-                    engine::log(&format!("{}: {error}", self.settings.id));
+                    self.log_line(&format!("{}: {error}", self.settings.id));
                     job.send_last_event(Event::Failed(error));
                     continue;
                 }
@@ -2319,7 +2353,7 @@ impl WorkerModel {
                 self.last_used_at = Instant::now();
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
                 if !was_loaded && self.model.is_loaded() {
-                    engine::log(&format!(
+                    self.log_line(&format!(
                         "{}: loaded; shares the {:.1} GiB state cache limit",
                         self.settings.id, shared.budgets.state_cache_gb
                     ));
@@ -2362,7 +2396,7 @@ impl WorkerModel {
             .filter(|generation| generation.is_decoding())
             .count();
         if decoding_count > 1 && decoding_count != self.logged_decoding_count {
-            engine::log(&format!(
+            self.log_line(&format!(
                 "{}: {decoding_count} requests decoding together",
                 self.settings.id
             ));
@@ -2390,14 +2424,17 @@ impl WorkerModel {
                 && generation.progress_logged_at.elapsed().as_secs_f64() >= progress_log_s
             {
                 generation.progress_logged_at = Instant::now();
-                engine::log(&format!(
-                    "req {}: {} tokens, {:.1} tokens/s",
-                    generation.job.id,
-                    generation.generated,
-                    generation.generated as f64
-                        / (generation.progress_logged_at - generation.decode_started_at)
-                            .as_secs_f64()
-                ));
+                self.view.write_model_line(
+                    self.model_index,
+                    &format!(
+                        "req {}: {} tokens, {:.1} tokens/s",
+                        generation.job.id,
+                        generation.generated,
+                        generation.generated as f64
+                            / (generation.progress_logged_at - generation.decode_started_at)
+                                .as_secs_f64()
+                    ),
+                );
             }
         }
         let phase = if self
@@ -2441,7 +2478,7 @@ impl WorkerModel {
         states.free_evicted(shared, evicted);
         let after = states.cache.entries[&state_id].bytes;
         if after > before && states.cache.count_bytes_over_limit() > 0 {
-            engine::log(&format!(
+            self.log_line(&format!(
                 "{}: a decoding state grows to {:.2} GiB at {positions} positions; with only decoding states left, the state cache takes {:.2} GiB of the {:.1} GiB it allows",
                 self.settings.id,
                 after as f64 / GIB,
@@ -2695,7 +2732,7 @@ impl WorkerModel {
                                 self.model.snapshot_free(snapshot);
                             }
                         }
-                        engine::log(&format!(
+                        self.log_line(&format!(
                             "req {}: {at} positions of saved state {saved} read in {:.2} s",
                             job.id,
                             load_started_at.elapsed().as_secs_f64()
@@ -2708,14 +2745,14 @@ impl WorkerModel {
                         // this request.
                         match error {
                             LoadError::Damaged(message) => {
-                                engine::log(&format!(
+                                self.log_line(&format!(
                                     "req {}: saved state {saved} cannot be read ({message}); it is deleted",
                                     job.id
                                 ));
                                 store.delete_saved_state(&mut states.cache, saved);
                             }
                             LoadError::Unavailable(message) => {
-                                engine::log(&format!(
+                                self.log_line(&format!(
                                     "req {}: saved state {saved} cannot be read now ({message}); planned without it",
                                     job.id
                                 ));
@@ -2794,7 +2831,7 @@ impl WorkerModel {
             .entry(plan_kind)
             .or_default() += 1;
         let thinking = self.think_start_token == Some(prompt[prompt_tokens - 1]);
-        engine::log(&format!(
+        self.log_line(&format!(
             "req {}: {} {prompt_tokens} prompt tokens, session {number} ({plan_kind}), {reused_tokens} reused; thinking {}; at most {max_new_tokens} new tokens, {}; waited {wait:.1} s",
             job.id,
             self.settings.id,
@@ -2827,7 +2864,7 @@ impl WorkerModel {
                 }
             };
             if encoded > 0 {
-                engine::log(&format!(
+                self.log_line(&format!(
                     "req {}: {encoded} of {} media encoded in {:.2} s",
                     job.id,
                     job.request.media.len(),
@@ -3238,13 +3275,13 @@ impl WorkerModel {
             };
             // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly
             // is unknown.
-            engine::log(&format!(
+            self.log_line(&format!(
                 "req {}: prefill of {} tokens in {prefill_seconds:.2} s ({:.0} tokens/s), {read:.2} GB of experts read{replayed}",
                 generation.job.id,
                 prompt_tokens - reused_tokens,
                 (prompt_tokens - reused_tokens) as f64 / prefill_seconds.max(1e-9)
             ));
-            engine::log(&format!(
+            self.log_line(&format!(
                 "req {}: prefill plan: {} chunks, {} encoder tokens, {} decoder tokens, ced_applied={}, prune_applied={}, prefix={} (full)",
                 generation.job.id,
                 info.chunks,
@@ -3452,7 +3489,7 @@ impl WorkerModel {
         };
         // 1e-9 keeps the rate finite when no time passed. Why 1e-9 exactly is
         // unknown.
-        engine::log(&format!(
+        self.log_line(&format!(
             "req {}: {reason_text}: {} tokens ({} reasoning) in {decode_seconds:.1} s, {:.1} tokens/s{experts}; states {} sessions, {:.2} GiB; available {:.1} GiB, footprint {:.1} GiB",
             generation.job.id,
             generation.generated,
@@ -3464,7 +3501,7 @@ impl WorkerModel {
             stats.footprint as f64 / GIB
         ));
         let sampling = generation.job.request.sampling;
-        engine::log(&format!(
+        self.log_line(&format!(
             "req {}: sampling temperature {}, top_p {}, top_k {}; {} draft passes, {} drafts accepted",
             generation.job.id,
             sampling.temperature,
@@ -3474,7 +3511,7 @@ impl WorkerModel {
             generation.drafts_accepted
         ));
         if generation.lookup.is_some() {
-            engine::log(&format!(
+            self.log_line(&format!(
                 "req {}: context lookup {} passes, {} offered, {} accepted",
                 generation.job.id,
                 generation.lookup_passes,
@@ -3511,7 +3548,7 @@ impl WorkerModel {
             let generation = self.generations.remove(i);
             let snapshots = states.cache.remove_state(generation.state_id);
             states.free_snapshots_and_states(Vec::new(), vec![(generation.state_id, snapshots)]);
-            engine::log(&format!(
+            self.log_line(&format!(
                 "req {}: a pass could not load its experts: memory is short",
                 generation.job.id
             ));
@@ -3906,6 +3943,30 @@ impl WorkerModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lines that the test's hook for model lines received.
+    static MODEL_LINES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+    /// Keeps a line about a model, as the terminal UI's hook does.
+    fn keep_model_line(model_index: usize, line: &str) {
+        MODEL_LINES
+            .lock()
+            .unwrap()
+            .push((model_index, line.to_string()));
+    }
+
+    #[test]
+    fn a_line_about_a_model_reaches_the_hook_with_the_models_index() {
+        let view = ViewOptions {
+            on_model_log: Some(keep_model_line),
+            ..ViewOptions::default()
+        };
+        view.write_model_line(1, "req 6: queued for qwen3.8-27b");
+        assert_eq!(
+            *MODEL_LINES.lock().unwrap(),
+            [(1, "req 6: queued for qwen3.8-27b".to_string())]
+        );
+    }
 
     /// Six requests take turns in one call of four rows at a time. Each call's
     /// rows become ready together. With turn numbers, every request runs in two

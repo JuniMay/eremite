@@ -990,23 +990,26 @@ fn main() {
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
         };
-        engine::log(&format!(
-            "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",
-            if settings
-                .options
-                .deepseek()
-                .is_some_and(|deepseek| deepseek.experts.is_some())
-            {
-                ", GGUF experts"
-            } else {
-                ""
-            },
-            if settings.options.draft > 0 {
-                ", drafts"
-            } else {
-                ""
-            }
-        ));
+        worker::log_model_line(
+            served_models.len(),
+            &format!(
+                "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",
+                if settings
+                    .options
+                    .deepseek()
+                    .is_some_and(|deepseek| deepseek.experts.is_some())
+                {
+                    ", GGUF experts"
+                } else {
+                    ""
+                },
+                if settings.options.draft > 0 {
+                    ", drafts"
+                } else {
+                    ""
+                }
+            ),
+        );
         served_models.push(Served {
             id,
             name,
