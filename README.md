@@ -113,7 +113,6 @@ Each entry under `models` holds one model's settings:
 | `id` | the name that requests give in `model` | `deepseek-v4.1-flash` |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
 | `ctx` | the context in tokens, at most 1048576 and the model's own | the most |
-| `rows_per_call` | the most rows of one decoding call, at most the model's own; fewer rows per call run more calls beside each other | the model's own, 6 for DeepSeek |
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | `off` |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin (8) | `off` |

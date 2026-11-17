@@ -36,9 +36,6 @@ pub struct ModelConfig {
     pub id: Option<String>,
     /// The engine's options for the model.
     pub engine: engine::Options,
-    /// The most rows that a decoding call takes, at most the model's own; None:
-    /// the model's own. DeepSeek's own is 6.
-    pub rows_per_call: Option<usize>,
     /// The seconds without requests before the model's weights and experts
     /// unload, 0 for never; None: the server-wide setting.
     pub idle_unload: Option<f64>,
@@ -55,7 +52,6 @@ impl ModelConfig {
                 ctx: MAX_CONTEXT_TOKENS,
                 ..Default::default()
             },
-            rows_per_call: None,
             idle_unload: None,
         }
     }
@@ -123,15 +119,6 @@ impl ModelConfig {
             | "searxng_idle"
             | "search_session_idle" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
-            }
-            "rows_per_call" => {
-                self.rows_per_call = Some(
-                    integer()
-                        .ok()
-                        .filter(|rows| *rows >= 1)
-                        .ok_or("rows_per_call takes a positive integer")?
-                        as usize,
-                )
             }
             "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
             _ => return Err(format!("no option {name}")),
@@ -882,21 +869,6 @@ mod tests {
         assert_eq!(prunes, [true, false, false, true]);
         let both = parse(&json!({"models": [{"model": "/m", "ced": 128, "prefill_prune": true}]}));
         assert!(both.unwrap_err().contains("prefill_prune needs ced off"));
-    }
-
-    #[test]
-    fn rows_per_call_is_per_model_and_positive() {
-        let models = parse(&json!({"models": [
-            {"model": "/m/deepseek", "rows_per_call": 2}, {"model": "/m/small"}
-        ]}))
-        .unwrap()
-        .models;
-        assert_eq!(
-            (models[0].rows_per_call, models[1].rows_per_call),
-            (Some(2), None)
-        );
-        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": 0}]})).is_err());
-        assert!(parse(&json!({"models": [{"model": "/m", "rows_per_call": "all"}]})).is_err());
     }
 
     #[test]

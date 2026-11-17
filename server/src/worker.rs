@@ -50,14 +50,6 @@ const GB: f64 = 1e9;
 /// gpu_idle_s.
 const THREAD_STATES: [&str; 5] = ["outside", "pass", "wait_gpu", "wait_read", "wait_other"];
 
-/// Limits the rows_per_call `setting` to 1 through `model_max_rows`. Without a
-/// setting, it returns `model_max_rows`, at least 1. The result is the most
-/// rows a decoding call takes.
-fn limit_rows_per_call(model_max_rows: usize, setting: Option<usize>) -> usize {
-    let max_rows = model_max_rows.max(1);
-    setting.map_or(max_rows, |rows| rows.clamp(1, max_rows))
-}
-
 /// What the threads share. The engine thread sets it when it starts.
 static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 /// The engine thread's handle. Stopping the worker joins it.
@@ -234,8 +226,6 @@ pub struct ModelSettings {
     pub id: String,
     /// The engine's options for the model.
     pub options: engine::Options,
-    /// The most rows a decoding call takes. None takes the model's own limit.
-    pub rows_per_call: Option<usize>,
     /// The seconds without requests before the model's weights and experts
     /// unload. 0 keeps them loaded.
     pub idle_unload: f64,
@@ -958,7 +948,6 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
         "lookup_depth": options.lookup,
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prunes_prefill()),
-        "rows_per_call": shared_model.settings.rows_per_call,
         "split_decoding_calls": status.split_calls,
         "drafts": status.drafts_per_pass,
         "model_decode": {
@@ -3587,8 +3576,7 @@ impl WorkerModel {
         // each. A call starts as soon as its requests are free and the chooser
         // allows one more call. Groups of requests run independently. The GPU
         // work of one call fills the waits of the others.
-        let max_rows_per_call =
-            limit_rows_per_call(self.model.max_rows(), self.settings.rows_per_call);
+        let max_rows_per_call = self.model.max_rows().max(1);
         let decoding_count = self
             .generations
             .iter()
@@ -4113,38 +4101,6 @@ mod tests {
             find_session_tokens(&cache, 0, number),
             None,
             "a session of another model"
-        );
-    }
-
-    /// DeepSeek V4.1 Flash's most rows per call.
-    const MAX_ROWS_PER_CALL: usize = 6;
-
-    #[test]
-    fn the_rows_per_call_setting_stays_between_one_and_the_models_most_rows() {
-        assert_eq!(
-            limit_rows_per_call(MAX_ROWS_PER_CALL, None),
-            MAX_ROWS_PER_CALL
-        );
-        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(1)), 1);
-        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(2)), 2);
-        // Never more than the model takes.
-        assert_eq!(
-            limit_rows_per_call(MAX_ROWS_PER_CALL, Some(9)),
-            MAX_ROWS_PER_CALL
-        );
-        assert_eq!(limit_rows_per_call(MAX_ROWS_PER_CALL, Some(0)), 1);
-        let chooser = CallChooser::new();
-        assert_eq!(
-            chooser.choose_calls(4, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(1))),
-            (4, 1)
-        );
-        assert_eq!(
-            chooser.choose_calls(4, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(2))),
-            (2, 2)
-        );
-        assert_eq!(
-            chooser.choose_calls(12, limit_rows_per_call(MAX_ROWS_PER_CALL, Some(4))),
-            (3, 4)
         );
     }
 }

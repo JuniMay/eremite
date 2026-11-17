@@ -19,7 +19,6 @@ fn the_worker_registers_its_models_and_stops() {
             worker::ModelSettings {
                 id: "deepseek".into(),
                 options,
-                rows_per_call: None,
                 idle_unload: 0.0,
             }
         })

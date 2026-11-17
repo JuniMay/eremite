@@ -586,7 +586,6 @@ fn main() {
         served.push(worker::ModelSettings {
             id,
             options,
-            rows_per_call: model.rows_per_call,
             idle_unload: model
                 .idle_unload
                 .unwrap_or(configuration.budgets.idle_unload_s),
