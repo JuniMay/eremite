@@ -20,6 +20,9 @@ const MIN_RESERVE_GIB: f64 = 2.0;
 /// The most requests or states that a count setting takes. The reason for this
 /// value is unknown.
 const MAX_COUNT: f64 = 65536.0;
+/// The most seconds that a time setting takes. The reason for this value is
+/// unknown.
+const MAX_SECONDS: f64 = 1e6;
 
 /// One model's settings.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +92,15 @@ impl ModelConfig {
             "ctx" => options.ctx = integer()?,
             "prefill_prune" => options.deepseek_mut()?.prefill_prune = switch()?,
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
-            "memory" | "reserve" | "gpu_timeout" | "max_waiting_requests" => {
+            "memory"
+            | "reserve"
+            | "gpu_timeout"
+            | "max_waiting_requests"
+            | "port"
+            | "host"
+            | "api_key_file"
+            | "http_timeout"
+            | "keepalive" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "temperature" => {
@@ -126,6 +137,81 @@ impl ModelConfig {
                 )
             }
             _ => return Err(format!("no option {name}")),
+        }
+        Ok(())
+    }
+}
+
+/// The server-wide settings besides the budgets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Server {
+    /// The port that the server listens on. Without one, the server shows its
+    /// usage and exits.
+    pub port: Option<u16>,
+    /// The IPv4 address that the server listens on, or localhost.
+    pub host: String,
+    /// The file that holds the API key; None: the key is in EREMITE_API_KEY.
+    pub api_key_file: Option<String>,
+    /// The seconds that a request's head, each part of its body and a stalled
+    /// write may take (http.rs).
+    pub http_timeout_s: f64,
+    /// The seconds between the comment lines that a streamed response sends
+    /// while it waits for its first event.
+    pub keepalive_s: f64,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            port: None,
+            host: "127.0.0.1".into(),
+            api_key_file: None,
+            http_timeout_s: 60.0,
+            keepalive_s: 15.0,
+        }
+    }
+}
+
+impl Server {
+    /// Sets the server setting `name` to `value`. Returns the setting's message
+    /// when either is invalid.
+    pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
+        let text = || {
+            value
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .ok_or(format!("{name} takes nonempty text"))
+        };
+        match name {
+            "port" => {
+                self.port = Some(
+                    value
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok())
+                        .ok_or("port takes an integer from 0 to 65535")?,
+                )
+            }
+            "host" => {
+                let host = text()?;
+                if host != "localhost" && host.parse::<std::net::Ipv4Addr>().is_err() {
+                    return Err("host takes an IPv4 address or localhost".into());
+                }
+                self.host = host.into();
+            }
+            "api_key_file" => self.api_key_file = Some(text()?.into()),
+            "http_timeout" | "keepalive" => {
+                let seconds = value
+                    .as_f64()
+                    .filter(|seconds| *seconds > 0.0 && *seconds <= MAX_SECONDS)
+                    .ok_or(format!(
+                        "{name} takes more than 0 and up to {MAX_SECONDS} seconds"
+                    ))?;
+                *match name {
+                    "http_timeout" => &mut self.http_timeout_s,
+                    _ => &mut self.keepalive_s,
+                } = seconds;
+            }
+            _ => return Err(format!("no server setting {name}")),
         }
         Ok(())
     }
@@ -211,6 +297,8 @@ impl Budgets {
 /// The server's settings and the models it serves.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
+    /// The server-wide settings besides the budgets.
+    pub server: Server,
     /// The server-wide budgets and limits.
     pub budgets: Budgets,
     /// The models, in the file's order.
@@ -231,6 +319,11 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "reserve",
             "gpu_timeout",
             "max_waiting_requests",
+            "port",
+            "host",
+            "api_key_file",
+            "http_timeout",
+            "keepalive",
         ]
         .contains(&key.as_str())
     }) {
@@ -240,6 +333,12 @@ pub fn parse(root: &Value) -> Result<Config, String> {
     for name in ["memory", "reserve", "gpu_timeout", "max_waiting_requests"] {
         if let Some(value) = object.get(name) {
             budgets.set(name, value)?;
+        }
+    }
+    let mut server = Server::default();
+    for name in ["port", "host", "api_key_file", "http_timeout", "keepalive"] {
+        if let Some(value) = object.get(name) {
+            server.set(name, value)?;
         }
     }
     let list = object
@@ -264,7 +363,11 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         }
         models.push(model);
     }
-    Ok(Config { budgets, models })
+    Ok(Config {
+        server,
+        budgets,
+        models,
+    })
 }
 
 #[cfg(test)]
@@ -309,13 +412,61 @@ mod tests {
 
     #[test]
     fn model_entries_cannot_create_separate_memory_budgets() {
-        for setting in ["memory", "reserve", "gpu_timeout"] {
+        for setting in [
+            "memory",
+            "reserve",
+            "gpu_timeout",
+            "http_timeout",
+            "keepalive",
+        ] {
             let mut model = json!({"model": "/models/second"});
             model[setting] = json!(8);
             assert!(
                 parse(&json!({"models": [model]})).is_err(),
                 "{setting} belongs at the server level"
             );
+        }
+    }
+
+    #[test]
+    fn server_settings_are_global_and_cli_values_can_override_them() {
+        let mut config = parse(
+            &json!({"port": 8008, "host": "localhost", "api_key_file": "key-file",
+                    "models": [{"model": "/models/deepseek"}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                config.server.port,
+                config.server.host.as_str(),
+                config.server.api_key_file.as_deref()
+            ),
+            (Some(8008), "localhost", Some("key-file"))
+        );
+        config.server.set("port", &json!(9008)).unwrap();
+        assert_eq!(config.server.port, Some(9008));
+        assert_eq!(
+            (config.server.http_timeout_s, config.server.keepalive_s),
+            (60.0, 15.0)
+        );
+        config.server.set("http_timeout", &json!(120)).unwrap();
+        config.server.set("keepalive", &json!(2.5)).unwrap();
+        assert_eq!(
+            (config.server.http_timeout_s, config.server.keepalive_s),
+            (120.0, 2.5)
+        );
+        for (name, value) in [
+            ("port", json!(-1)),
+            ("port", json!(65536)),
+            ("port", json!(1.5)),
+            ("port", json!("8008")),
+            ("host", json!("not-an-address")),
+            ("api_key_file", json!("")),
+            ("http_timeout", json!(0)),
+            ("keepalive", json!(-1)),
+            ("keepalive", json!("15")),
+        ] {
+            assert!(config.server.set(name, &value).is_err(), "{name} {value}");
         }
     }
 
