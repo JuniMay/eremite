@@ -163,6 +163,10 @@ pub struct Choices {
     /// The decoding request whose experts Experts shows, by its number. None
     /// takes the first.
     pub request: Option<u64>,
+    /// The layers that the map of Experts scrolled past.
+    pub layer_scroll: usize,
+    /// The rows of the map of Experts, in the frame drawn last.
+    pub layer_page: usize,
     /// The places that a click acts on, in the frame drawn last.
     pub targets: Vec<ClickTarget>,
 }
@@ -181,6 +185,8 @@ impl Default for Choices {
             text_scroll: 0,
             text_page: 0,
             request: None,
+            layer_scroll: 0,
+            layer_page: 0,
             targets: Vec::new(),
         }
     }
