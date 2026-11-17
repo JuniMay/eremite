@@ -39,7 +39,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, http, one_model, root};
+use common::{Server, add_keys, build_config, http, one_model, root};
 
 /// The requests that decode while another request arrives.
 const DECODING_REQUESTS: usize = 4;
@@ -136,8 +136,15 @@ fn stream_chat(port: u16, key: &str, body: &Value, first_token: mpsc::Sender<()>
     }
 }
 
-/// Starts a server with the tests' settings, and `extra`.
-fn start_server(setup: &Setup, extra: &[&str]) -> Server {
+/// Starts a server of the checkpoint with the tests' settings.
+fn start_server(setup: &Setup) -> Server {
+    start_server_with(setup, json!({}), json!({}))
+}
+
+/// Starts a server of the checkpoint with the tests' settings, and with the
+/// server-wide settings `server` and the model's settings `model` in place of
+/// those of the same keys.
+fn start_server_with(setup: &Setup, server: Value, model: Value) -> Server {
     let port = TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("a free port")
@@ -152,25 +159,18 @@ fn start_server(setup: &Setup, extra: &[&str]) -> Server {
     );
     // No saved states: a cold server stays cold, and nothing is written to the
     // SSD.
-    let mut args: Vec<String> = [
-        "-m",
+    let mut settings = json!({"memory": 56, "state_cache": 8, "state_disk": 0});
+    add_keys(&mut settings, server);
+    let mut model_settings = json!({"ctx": 32768});
+    add_keys(&mut model_settings, model);
+    let config = build_config(
+        port,
+        settings,
         &setup.checkpoint,
-        "--memory",
-        "56",
-        "--state-cache",
-        "8",
-        "--state-disk",
-        "0",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect();
-    if let Some(experts) = &setup.experts {
-        args.extend(["--experts".to_string(), experts.clone()]);
-    }
-    args.extend(["--ctx", "32768", "--serve", &port.to_string()].map(String::from));
-    args.extend(extra.iter().map(|arg| arg.to_string()));
-    Server::start(&setup.server, &args, &key, port)
+        setup.experts.as_deref(),
+        model_settings,
+    );
+    Server::start(&setup.server, &config, &key, port)
 }
 
 /// Sends a chat completion and returns its answer, which must be a success.
@@ -374,19 +374,19 @@ struct Forked {
     text: String,
 }
 
-/// Runs the forks, one after another on one server with the `extra` options,
-/// while the conversation decodes there. A fork whose reuse lies outside
-/// [shared - rows(shared), shared] is added to `wrong`.
+/// Runs the forks, one after another on one server with the model settings
+/// `model`, while the conversation decodes there. A fork whose reuse lies
+/// outside [shared - rows(shared), shared] is added to `wrong`.
 fn run_forks(
     setup: &Setup,
-    extra: &[&str],
+    model: Value,
     rows: fn(usize) -> usize,
     wrong: &mut Vec<String>,
 ) -> Vec<Forked> {
     let (conversation, forks) = conversation_and_forks();
     let source = tokens(setup, &conversation);
     let mut results = Vec::new();
-    let server = start_server(setup, extra);
+    let server = start_server_with(setup, json!({}), model);
     let port = server.port;
     let key = server.key.clone();
     let mut long = request(&conversation, 6000);
@@ -427,10 +427,10 @@ fn forks_reuse_the_shared_prefix_and_give_the_cold_tokens() {
     };
     let _one = one_model();
     let mut wrong = Vec::new();
-    let results = run_forks(&setup, &[], replay_rows, &mut wrong);
+    let results = run_forks(&setup, json!({}), replay_rows, &mut wrong);
     // The same prompts on servers that start without a cache.
     for fork in &results {
-        let cold = start_server(&setup, &[]);
+        let cold = start_server(&setup);
         let reference = content(&chat(&cold, &request(&fork.messages, 16)));
         drop(cold);
         let same = reference == fork.text;
@@ -470,7 +470,7 @@ fn ced_forks_reuse_the_shared_prefix_less_a_ring() {
     };
     let _one = one_model();
     let mut wrong = Vec::new();
-    for fork in run_forks(&setup, &["--ced", "128"], bounded_rows, &mut wrong) {
+    for fork in run_forks(&setup, json!({"ced": 128}), bounded_rows, &mut wrong) {
         println!("{}: {:?}", fork.what, fork.text);
     }
     assert!(
@@ -508,13 +508,14 @@ fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
         "the next turn parts at the first turn's last token"
     );
     let mut wrong = Vec::new();
-    for extra in [&[][..], &["--ced", "128"][..]] {
-        let what = if extra.is_empty() {
-            "without --ced"
+    for model in [json!({}), json!({"ced": 128})] {
+        let without_ced = model.get("ced").is_none();
+        let what = if without_ced {
+            "without ced"
         } else {
-            "with --ced 128"
+            "with ced 128"
         };
-        let server = start_server(&setup, extra);
+        let server = start_server_with(&setup, json!({}), model);
         chat(&server, &body(&first, 16, true));
         let answer = chat(&server, &body(&second, 16, true));
         let (reused, computed) = (hit(&answer), last_prefill(&server));
@@ -535,10 +536,10 @@ fn a_thinking_turn_s_next_turn_resumes_one_position_before_its_prompt_end() {
                 second_tokens.len() - shared
             ));
         }
-        if extra.is_empty() {
+        if without_ced {
             let text = reply(&answer);
             drop(server);
-            let cold = start_server(&setup, &[]);
+            let cold = start_server(&setup);
             let reference = reply(&chat(&cold, &body(&second, 16, true)));
             println!(
                 "{what}: tokens {}",
@@ -665,13 +666,13 @@ fn image_forks_give_the_cold_tokens() {
     let first = turn("Describe the colors of this picture in one sentence.");
     let fork = turn("Which color is in the top left quarter? Answer in one word.");
     let (reused, text) = {
-        let server = start_server(&setup, &[]);
+        let server = start_server(&setup);
         chat(&server, &request(&first, 8));
         let answer = chat(&server, &request(&fork, 16));
         (hit(&answer), content(&answer))
     };
     let reference = {
-        let cold = start_server(&setup, &[]);
+        let cold = start_server(&setup);
         content(&chat(&cold, &request(&fork, 16)))
     };
     println!(
@@ -700,7 +701,7 @@ fn a_prompt_with_an_image_that_does_not_fit_is_refused_with_its_token_count() {
     };
     let _one = one_model();
     let (system, _) = texts();
-    let server = start_server(&setup, &["--ctx", "1024"]);
+    let server = start_server_with(&setup, json!({}), json!({"ctx": 1024}));
     let refused_tokens = |content: Value| {
         let messages = json!([{"role": "user", "content": content}]);
         let (status, answer) = http(
@@ -797,12 +798,12 @@ fn a_saved_prompt_again_fits_a_full_state_cache() {
     let count = tokens(&setup, &prompt).len() as i64;
     // What the first try takes: its state and its prompt-end snapshot.
     let first = {
-        let server = start_server(&setup, &[]);
+        let server = start_server(&setup);
         chat(&server, &request(&prompt, 1));
         settled(&server, 1).states
     };
-    let limit = format!("{:.4}", first + 2.0 / 1024.0);
-    let server = start_server(&setup, &["--state-cache", &limit]);
+    let limit = first + 2.0 / 1024.0;
+    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
     chat(&server, &request(&prompt, 1));
     let again = chat(&server, &request(&prompt, 1));
     let cache = settled(&server, 2);
@@ -845,13 +846,13 @@ fn a_prompt_runs_in_place_of_the_state_whose_reuse_does_not_fit() {
     // What the first conversation takes alone: its state and its prompt-end
     // snapshot.
     let one = {
-        let server = start_server(&setup, &[]);
+        let server = start_server(&setup);
         chat(&server, &request(&first, 8));
         settled(&server, 1).states
     };
     // Room for one such state, not two.
-    let limit = format!("{:.4}", one * 1.5);
-    let server = start_server(&setup, &["--state-cache", &limit]);
+    let limit = one * 1.5;
+    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
     chat(&server, &request(&first, 8));
     let answer = chat(&server, &request(&second, 8));
     let cache = settled(&server, 2);
@@ -913,7 +914,7 @@ fn a_request_is_answered_while_four_others_decode() {
         return;
     };
     let _one = one_model();
-    let server = start_server(&setup, &[]);
+    let server = start_server(&setup);
     let (first_token, first_tokens) = mpsc::channel();
     let decoding: Vec<_> = (0..DECODING_REQUESTS)
         .map(|i| {
@@ -956,7 +957,7 @@ fn the_status_follows_a_running_prefill() {
         return;
     };
     let _one = one_model();
-    let server = start_server(&setup, &[]);
+    let server = start_server(&setup);
     // The first request loads the model.
     chat(&server, &request(&short_prompt(), 1));
     let (long, _) = sized_prompt(&setup, 4000, 4096);
@@ -1036,7 +1037,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
     // With no limit, the idle state stays beside the long one: the cache's
     // largest size while the long one decodes, with its growth counted.
     let (idle, both) = {
-        let server = start_server(&setup, &[]);
+        let server = start_server(&setup);
         let (idle, _, samples) = run(&server);
         let both = samples
             .iter()
@@ -1048,8 +1049,8 @@ fn a_growing_generation_frees_room_before_it_grows() {
     // Room for the idle state, the long state as it starts (its first room, as
     // the idle one's) and half of the long state's growth.
     let growth = both - 2.0 * idle;
-    let limit = format!("{:.4}", 2.0 * idle + growth / 2.0);
-    let server = start_server(&setup, &["--state-cache", &limit]);
+    let limit = 2.0 * idle + growth / 2.0;
+    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
     let (_, generated, samples) = run(&server);
     // Samples published after the long state grew: it holds more than 16,384
     // positions.
@@ -1106,7 +1107,7 @@ fn quitting_stops_a_long_prefill() {
     };
     let _one = one_model();
     let (long, count) = sized_prompt(&setup, 15_000, 16_000);
-    let mut server = start_server(&setup, &[]);
+    let mut server = start_server(&setup);
     chat(&server, &request(&short_prompt(), 1));
     let body = request(&long, 8);
     let (port, key) = (server.port, server.key.clone());
@@ -1151,7 +1152,7 @@ fn an_idle_model_unloads_and_its_next_request_loads_it_again() {
         return;
     };
     let _one = one_model();
-    let server = start_server(&setup, &["--idle-unload", "3"]);
+    let server = start_server_with(&setup, json!({"idle_unload": 3}), json!({}));
     let footprint = |status: &Value| {
         status["memory"]["footprint_gib"]
             .as_f64()

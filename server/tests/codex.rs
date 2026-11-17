@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, http, one_model, root};
+use common::{Server, build_config, http, one_model, root};
 
 /// The context that the tests' server serves, in tokens.
 const CTX: u64 = 32768;
@@ -33,24 +33,15 @@ fn start_server(checkpoint: &str) -> Server {
         .expect("a free port")
         .port();
     let key = format!("codex-test-{}-{port}-key", std::process::id());
-    let ctx = CTX.to_string();
-    let mut args: Vec<String> = [
-        "-m",
+    let experts = std::env::var("EREMITE_EXPERTS").ok();
+    let config = build_config(
+        port,
+        json!({"memory": 56, "state_disk": 0}),
         checkpoint,
-        "--memory",
-        "56",
-        "--ctx",
-        &ctx,
-        "--state-disk",
-        "0",
-    ]
-    .map(String::from)
-    .to_vec();
-    if let Ok(experts) = std::env::var("EREMITE_EXPERTS") {
-        args.extend(["--experts".to_string(), experts]);
-    }
-    args.extend(["--serve".to_string(), port.to_string()]);
-    Server::start(&program, &args, &key, port)
+        experts.as_deref(),
+        json!({"ctx": CTX}),
+    );
+    Server::start(&program, &config, &key, port)
 }
 
 /// Sends `method` to `path` with `body`. Returns the status and the JSON

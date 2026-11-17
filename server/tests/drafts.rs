@@ -15,14 +15,14 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, http, one_model, root};
+use common::{Server, add_keys, build_config, http, one_model, root};
 
 /// The tokens that each reply has at most.
 const MAX_TOKENS: u32 = 96;
 
-/// Starts a server of the checkpoint `checkpoint` with `extra`. It writes no
-/// saved states.
-fn start_server(checkpoint: &str, extra: &[&str]) -> Server {
+/// Starts a server of the checkpoint `checkpoint` with the model settings
+/// `model`, besides a context of 32768 tokens. It writes no saved states.
+fn start_server(checkpoint: &str, model: Value) -> Server {
     let program = std::env::var("EREMITE_SERVER")
         .map(PathBuf::from)
         .unwrap_or_else(|_| root().join("build/eremite-server"));
@@ -31,24 +31,17 @@ fn start_server(checkpoint: &str, extra: &[&str]) -> Server {
         .expect("a free port")
         .port();
     let key = format!("drafts-test-{}-{port}-key", std::process::id());
-    let mut args: Vec<String> = [
-        "-m",
+    let experts = std::env::var("EREMITE_EXPERTS").ok();
+    let mut settings = json!({"ctx": 32768});
+    add_keys(&mut settings, model);
+    let config = build_config(
+        port,
+        json!({"memory": 56, "state_disk": 0}),
         checkpoint,
-        "--memory",
-        "56",
-        "--ctx",
-        "32768",
-        "--state-disk",
-        "0",
-    ]
-    .map(String::from)
-    .to_vec();
-    if let Ok(experts) = std::env::var("EREMITE_EXPERTS") {
-        args.extend(["--experts".to_string(), experts]);
-    }
-    args.extend(["--serve".to_string(), port.to_string()]);
-    args.extend(extra.iter().map(|arg| arg.to_string()));
-    Server::start(&program, &args, &key, port)
+        experts.as_deref(),
+        settings,
+    );
+    Server::start(&program, &config, &key, port)
 }
 
 /// Sends a greedy chat request of `messages` with thinking off, and returns the
@@ -100,12 +93,12 @@ fn drafts_and_proposals_keep_the_greedy_reply() {
     let messages = json!([{"role": "user", "content":
         "Copy this text twice, exactly, and write nothing else:\n\nThe engine thread runs every \
          model's calls. A stream holds the buffers of one call, and the worker reuses it."}]);
-    let plain = reply(&start_server(&checkpoint, &[]), &messages);
-    let lookup = start_server(&checkpoint, &["--lookup", "15"]);
+    let plain = reply(&start_server(&checkpoint, json!({})), &messages);
+    let lookup = start_server(&checkpoint, json!({"lookup": 15}));
     let with_lookup = reply(&lookup, &messages);
     let proposals = read_line(&lookup, "context lookup");
     drop(lookup);
-    let drafts = start_server(&checkpoint, &["--draft", "2"]);
+    let drafts = start_server(&checkpoint, json!({"draft": 2}));
     let with_drafts = reply(&drafts, &messages);
     let drafted = read_line(&drafts, "draft passes");
     drop(drafts);

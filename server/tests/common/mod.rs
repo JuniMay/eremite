@@ -108,12 +108,57 @@ pub struct Server {
     log: Arc<(Mutex<Log>, Condvar)>,
 }
 
+/// Returns the configuration of a test server with one model: port `port` and
+/// the server-wide settings `server`, then the checkpoint `checkpoint`, with
+/// the GGUF `experts` if given, and the model's own settings `model`. `server`
+/// and `model` are JSON objects of a configuration file's keys.
+pub fn build_config(
+    port: u16,
+    server: Value,
+    checkpoint: &str,
+    experts: Option<&str>,
+    model: Value,
+) -> Value {
+    let mut entry = serde_json::json!({ "model": checkpoint });
+    if let Some(experts) = experts {
+        entry["experts"] = experts.into();
+    }
+    add_keys(&mut entry, model);
+    let mut config = serde_json::json!({ "port": port });
+    add_keys(&mut config, server);
+    config["models"] = serde_json::json!([entry]);
+    config
+}
+
+/// Adds the keys of the JSON object `from` to the object `to`, in place of
+/// those it holds already.
+pub fn add_keys(to: &mut Value, from: Value) {
+    if let (Some(to), Value::Object(from)) = (to.as_object_mut(), from) {
+        to.extend(from);
+    }
+}
+
+/// A configuration file for one server's start. It is removed when dropped.
+struct ConfigFile(PathBuf);
+
+impl Drop for ConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 impl Server {
-    /// Starts `program` with `args` and the API key `key`, and returns once its
-    /// log shows where it serves. Panics if it exits first.
-    pub fn start(program: &Path, args: &[String], key: &str, port: u16) -> Server {
+    /// Starts `program` with the configuration `config`, whose port is `port`,
+    /// and the API key `key`, and returns once its log shows where it serves.
+    /// Panics if it exits first. The configuration's file is removed then.
+    pub fn start(program: &Path, config: &Value, key: &str, port: u16) -> Server {
+        let file = ConfigFile(
+            std::env::temp_dir().join(format!("eremite-test-{}-{port}.json", std::process::id())),
+        );
+        std::fs::write(&file.0, config.to_string()).expect("write the configuration");
         let mut child = Command::new(program)
-            .args(args)
+            .arg("--config")
+            .arg(&file.0)
             .env("EREMITE_API_KEY", key)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -17,7 +17,7 @@ use eremite_server::{config, control, worker};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, http, root};
+use common::{Server, build_config, http, root};
 
 /// Returns the yield request of `operation_id` for the least memory.
 fn ask_for_least(operation_id: &str) -> control::YieldRequest {
@@ -133,14 +133,15 @@ fn the_control_routes_answer_over_http() {
         .port();
     let key = format!("control-test-{}-{port}-key", std::process::id());
     // No saved states: the test writes nothing to the SSD.
-    let mut args: Vec<String> = ["-m", &checkpoint, "--memory", "56", "--state-disk", "0"]
-        .map(String::from)
-        .to_vec();
-    if let Ok(experts) = std::env::var("EREMITE_EXPERTS") {
-        args.extend(["--experts".to_string(), experts]);
-    }
-    args.extend(["--serve".to_string(), port.to_string()]);
-    let server = Server::start(&program, &args, &key, port);
+    let experts = std::env::var("EREMITE_EXPERTS").ok();
+    let config = build_config(
+        port,
+        json!({"memory": 56, "state_disk": 0}),
+        &checkpoint,
+        experts.as_deref(),
+        json!({}),
+    );
+    let server = Server::start(&program, &config, &key, port);
     let ask = |method: &str, path: &str, body: Option<&Value>| {
         let (code, answer) = http(port, &key, method, path, body);
         (

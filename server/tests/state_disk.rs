@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, http, one_model, root};
+use common::{Server, add_keys, build_config, http, one_model, root};
 
 /// What the tests run: the checkpoint, its experts and the server's program.
 struct Setup {
@@ -86,29 +86,33 @@ impl Drop for Folder {
 }
 
 /// Starts a server of the checkpoint with saved states in `dir`, or none
-/// without it. The states are written for 256 tokens of their own. `extra`
-/// comes last.
-fn start_server(setup: &Setup, dir: Option<&Folder>, extra: &[&str]) -> Server {
+/// without it. The states are written for 256 tokens of their own.
+fn start_server(setup: &Setup, dir: Option<&Folder>) -> Server {
+    start_server_with(setup, dir, json!({}))
+}
+
+/// Starts a server of the checkpoint with saved states in `dir`, or none
+/// without it, and with the server-wide settings `server` in place of those of
+/// the same keys. The states are written for 256 tokens of their own.
+fn start_server_with(setup: &Setup, dir: Option<&Folder>, server: Value) -> Server {
     let port = TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("a free port")
         .port();
     let key = format!("state-disk-test-{}-{port}-key", std::process::id());
-    let mut args: Vec<String> = ["-m", &setup.checkpoint, "--memory", "56", "--ctx", "32768"]
-        .map(String::from)
-        .to_vec();
-    if let Some(experts) = &setup.experts {
-        args.extend(["--experts".to_string(), experts.clone()]);
-    }
-    match dir {
-        Some(dir) => {
-            args.extend(["--state-dir", dir.path(), "--state-disk-tokens", "256"].map(String::from))
-        }
-        None => args.extend(["--state-disk", "0"].map(String::from)),
-    }
-    args.extend(["--serve".to_string(), port.to_string()]);
-    args.extend(extra.iter().map(|arg| arg.to_string()));
-    Server::start(&setup.server, &args, &key, port)
+    let mut settings = match dir {
+        Some(dir) => json!({"memory": 56, "state_dir": dir.path(), "state_disk_tokens": 256}),
+        None => json!({"memory": 56, "state_disk": 0}),
+    };
+    add_keys(&mut settings, server);
+    let config = build_config(
+        port,
+        settings,
+        &setup.checkpoint,
+        setup.experts.as_deref(),
+        json!({"ctx": 32768}),
+    );
+    Server::start(&setup.server, &config, &key, port)
 }
 
 /// Sends a greedy chat completion of `messages` and returns its answer, which
@@ -199,7 +203,7 @@ fn an_evicted_state_continues_from_the_ssd_as_from_memory() {
     );
     // The reference: the state stays in memory.
     let (first, next, then, room) = {
-        let server = start_server(&setup, None, &[]);
+        let server = start_server(&setup, None);
         let first = chat(&server, &first_conversation, 24);
         let room = server.settled(1)["state_cache_gib"]
             .as_f64()
@@ -211,8 +215,8 @@ fn an_evicted_state_continues_from_the_ssd_as_from_memory() {
     // Room for one such state: the second conversation's state evicts the
     // first's, and the first conversation's next turn evicts the second's.
     let folder = Folder::new("evict");
-    let limit = format!("{:.4}", room * 1.5);
-    let server = start_server(&setup, Some(&folder), &["--state-cache", &limit]);
+    let limit = room * 1.5;
+    let server = start_server_with(&setup, Some(&folder), json!({"state_cache": limit}));
     let first_again = chat(&server, &first_conversation, 24);
     assert_eq!(
         content(&first_again),
@@ -269,7 +273,7 @@ fn a_state_saved_at_quit_answers_its_prompt_again_after_a_restart() {
         "When does the store read ahead?",
     );
     let first = {
-        let server = start_server(&setup, Some(&folder), &[]);
+        let server = start_server(&setup, Some(&folder));
         let first = chat(&server, &messages, 24);
         server.settled(1);
         server.stop();
@@ -280,7 +284,7 @@ fn a_state_saved_at_quit_answers_its_prompt_again_after_a_restart() {
         1,
         "one saved state after the quit"
     );
-    let server = start_server(&setup, Some(&folder), &[]);
+    let server = start_server(&setup, Some(&folder));
     let start = server.status();
     let again = chat(&server, &messages, 24);
     let end = server.settled(1);
@@ -321,13 +325,13 @@ fn a_saved_state_damaged_after_the_start_is_refused_when_read() {
     let folder = Folder::new("damage");
     let messages = conversation("src/eremite.h", 5000, "What does a stream do?");
     let first = {
-        let server = start_server(&setup, Some(&folder), &[]);
+        let server = start_server(&setup, Some(&folder));
         let first = chat(&server, &messages, 24);
         server.settled(1);
         server.stop();
         first
     };
-    let server = start_server(&setup, Some(&folder), &[]);
+    let server = start_server(&setup, Some(&folder));
     assert_eq!(disk(&server.status()).0, 1);
     for part in folder.files(".rows") {
         let mut bytes = std::fs::read(&part).expect("a part");
@@ -372,7 +376,7 @@ fn saved_states_stay_within_their_budget_most_recent_first() {
     // conversation also keeps a snapshot where it parts from the first. At quit
     // the most recently used is written first, so its number is the lowest.
     let sizes: Vec<f64> = {
-        let server = start_server(&setup, Some(&folder), &[]);
+        let server = start_server(&setup, Some(&folder));
         for prompt in &prompts {
             chat(&server, prompt, 1);
         }
@@ -398,16 +402,16 @@ fn saved_states_stay_within_their_budget_most_recent_first() {
     };
     assert_eq!(sizes.len(), 3, "all three saved: {sizes:?}");
     // Room for the two most recent.
-    let limit = format!("{:.6}", sizes[0] + sizes[1] + sizes[2] / 2.0);
+    let limit = sizes[0] + sizes[1] + sizes[2] / 2.0;
     {
-        let server = start_server(&setup, Some(&folder), &["--state-disk", &limit]);
+        let server = start_server_with(&setup, Some(&folder), json!({"state_disk": limit}));
         for prompt in &prompts {
             chat(&server, prompt, 1);
         }
         server.settled(3);
         server.stop();
     }
-    let server = start_server(&setup, Some(&folder), &["--state-disk", &limit]);
+    let server = start_server_with(&setup, Some(&folder), json!({"state_disk": limit}));
     let start = server.status();
     let hits: Vec<i64> = prompts
         .iter()
@@ -442,8 +446,8 @@ fn a_second_server_on_the_same_folder_runs_without_saved_states() {
     };
     let _one = one_model();
     let folder = Folder::new("lock");
-    let first = start_server(&setup, Some(&folder), &[]);
-    let second = start_server(&setup, Some(&folder), &[]);
+    let first = start_server(&setup, Some(&folder));
+    let second = start_server(&setup, Some(&folder));
     assert!(
         first.status()["state_disk"].is_object(),
         "the first server has its saved states"
