@@ -53,6 +53,11 @@
 //! and snapshot. Each row written at a state's end replaces one stale row. The
 //! rewind room is the rewind margin less the stale rows. A plan resumes at most
 //! that many positions before a state's end or a snapshot's position.
+//!
+//! The worker carries out a plan with engine calls. Then it tells the cache
+//! what changed: the states, snapshots and tokens it added, and the rows that a
+//! pass rejected. The cache holds no engine handles. So its tests need no
+//! model.
 
 use std::collections::BTreeMap;
 
@@ -186,6 +191,20 @@ impl Plan {
             Plan::Snapshot { .. } | Plan::Replay { .. } => "forked",
         }
     }
+
+    /// Finds where the plan's prefill takes a branch snapshot, if anywhere. A
+    /// replay takes it where the replay starts. A snapshot plan takes it at the
+    /// branch point. It does so only when the branch point lies after `from`
+    /// and before the prompt's end. A later fork there then resumes at once.
+    pub fn find_branch_snapshot_pos(&self, prompt_len: usize) -> Option<usize> {
+        match *self {
+            Plan::Replay { from, .. } => Some(from),
+            Plan::Snapshot {
+                from, branch_point, ..
+            } if branch_point > from && branch_point < prompt_len => Some(branch_point),
+            _ => None,
+        }
+    }
 }
 
 /// The engine's limits and costs that plans depend on, for one model.
@@ -204,6 +223,22 @@ pub struct PlanLimits<'a> {
     /// position that each layer computes again, on average. It is at most the
     /// position.
     pub replay_cost: &'a dyn Fn(usize) -> usize,
+}
+
+/// Where the rows of a prefill continue from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origin {
+    /// The position that the rows continue from.
+    pub pos: usize,
+    /// The stale rows at `pos`.
+    pub stale_rows: usize,
+}
+
+/// Counts the stale rows at `pos` in rows that continue from `origin`. Each row
+/// written after the origin replaces one stale row. Each of the origin's old
+/// rows after `pos` is one more stale row.
+pub fn count_stale_rows_at(origin: Origin, pos: usize) -> usize {
+    (origin.stale_rows + origin.pos).saturating_sub(pos)
 }
 
 /// Counts the positions that two token sequences share from the start.
@@ -389,6 +424,47 @@ impl Cache {
             .collect()
     }
 
+    /// Finds the origin of a prefill on `plan` for a prompt of `prompt_len`
+    /// tokens. The origin is the position that the prefill's rows continue
+    /// from, with its stale rows. It is a state's end, a snapshot's position,
+    /// where a replay starts, or 0. A replay rebuilds its rows. They have no
+    /// stale rows.
+    pub fn find_origin(&self, plan: &Plan, prompt_len: usize) -> Origin {
+        let snapshot_stale_rows = |id: StateId, pos: usize| {
+            self.find_snapshot(id, pos)
+                .expect("the plan's snapshot")
+                .stale_rows
+        };
+        match *plan {
+            Plan::Cold => Origin {
+                pos: 0,
+                stale_rows: 0,
+            },
+            Plan::Replay { from, .. } => Origin {
+                pos: from,
+                stale_rows: 0,
+            },
+            Plan::Snapshot {
+                source,
+                snapshot_pos,
+                ..
+            } => Origin {
+                pos: snapshot_pos,
+                stale_rows: snapshot_stale_rows(source, snapshot_pos),
+            },
+            // the same prompt again: its prompt-end snapshot is restored into
+            // it
+            Plan::InPlace { state, from } if from == prompt_len => Origin {
+                pos: prompt_len,
+                stale_rows: snapshot_stale_rows(state, prompt_len),
+            },
+            Plan::InPlace { state, .. } => Origin {
+                pos: self.entries[&state].tokens.len(),
+                stale_rows: self.entries[&state].stale_rows,
+            },
+        }
+    }
+
     /// Adds an empty, busy state of model `model` that takes `bytes`. Returns
     /// its id.
     pub fn add_state(&mut self, model: usize, bytes: u64) -> StateId {
@@ -495,12 +571,33 @@ impl Cache {
         }
     }
 
+    /// Finds the snapshot of state `id` at `pos`.
+    pub fn find_snapshot(&self, id: StateId, pos: usize) -> Option<Snapshot> {
+        self.entries
+            .get(&id)?
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.pos == pos)
+            .copied()
+    }
+
     /// Adds a decoded token at the end of state `id`. Its row replaces one
     /// stale row.
     pub fn add_decoded_token(&mut self, id: StateId, token: i32) {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.tokens.push(token);
             entry.stale_rows = entry.stale_rows.saturating_sub(1);
+        }
+    }
+
+    /// Records that a pass wrote `rejected_rows` rows past the end of state
+    /// `id`. They are the rows after the tokens the pass accepted: rejected
+    /// drafts, or rows after a stop token. They took the places of the margin's
+    /// oldest rows. The stale rows were already there. So the state's stale
+    /// rows become the larger of the two counts.
+    pub fn record_rejected_rows(&mut self, id: StateId, rejected_rows: usize) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.stale_rows = entry.stale_rows.max(rejected_rows);
         }
     }
 
@@ -818,6 +915,217 @@ mod tests {
                 state: idle,
                 from: 3999
             }
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_differs_just_before_a_snapshot_resumes_from_it() {
+        // A thinking prompt ends with <think>. The next turn's history has
+        // </think> there. So the next turn differs from the state one position
+        // before its prompt-end snapshot. The snapshot still holds that
+        // position's rows.
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let source = add_idle_state(&mut cache, &prompt, &[4000]);
+        for offset in 0..300 {
+            // its reply, past the rewind margin
+            cache.add_decoded_token(source, 100000 + offset);
+        }
+        let next_prompt = [&prompt[..3999], &collect_tokens(-60..0)[..]].concat();
+        let plan = cache.find_cheapest_plan(0, &next_prompt, PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4000,
+                from: 3999,
+                branch_point: 3999
+            }
+        );
+        assert_eq!(
+            (
+                plan.count_reused_tokens(),
+                plan.find_branch_snapshot_pos(next_prompt.len()),
+                plan.describe_for_log(next_prompt.len())
+            ),
+            (3999, None, "forked")
+        );
+        // the new state's rings hold all of the margin at its prompt's end
+        assert_eq!(
+            count_stale_rows_at(
+                cache.find_origin(&plan, next_prompt.len()),
+                next_prompt.len()
+            ),
+            0
+        );
+        // also with the bounded replay (--ced): it recomputes a ring
+        let ced = PlanLimits {
+            replay_cost: &|pos| pos.min(RING_ROWS),
+            ..PLAN_LIMITS
+        };
+        assert_eq!(cache.find_cheapest_plan(0, &next_prompt, ced), plan);
+        // the rewind margin's edge: 5 positions before it, not 6
+        let edge = [&prompt[..3995], &collect_tokens(-60..0)[..]].concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &edge, PLAN_LIMITS),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4000,
+                from: 3995,
+                branch_point: 3995
+            }
+        );
+        let past = [&prompt[..3994], &collect_tokens(-60..0)[..]].concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &past, PLAN_LIMITS),
+            Plan::Replay { source, from: 3994 }
+        );
+        // a prompt that ends before the snapshot: its rows after the prompt's
+        // end stay in the new state's rings, 2 stale rows
+        let short = [&prompt[..3997], &[-1][..]].concat();
+        let plan = cache.find_cheapest_plan(0, &short, PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4000,
+                from: 3997,
+                branch_point: 3997
+            }
+        );
+        assert_eq!(
+            count_stale_rows_at(cache.find_origin(&plan, short.len()), short.len()),
+            2
+        );
+        // the same prompt again resumes at its prompt end, not before it
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4000,
+                from: 4000,
+                branch_point: 4000
+            }
+        );
+    }
+
+    #[test]
+    fn rows_a_verify_pass_writes_past_its_accepted_tokens_shrink_the_rewind_room() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let state = add_idle_state(&mut cache, &prompt, &[]);
+        // a pass of 6 rows that accepts 2 tokens: its 4 rows after them took
+        // the places of the margin's 4 oldest rows. That leaves 1 position of
+        // rewind room.
+        cache.add_decoded_token(state, 100000);
+        cache.add_decoded_token(state, 100001);
+        cache.record_rejected_rows(state, 4);
+        assert_eq!(cache.entries[&state].stale_rows, 4);
+        // its end is 4002: a resume 2 positions before it would read a stale
+        // row
+        let two = [&prompt[..], &collect_tokens(-90..-60)[..]].concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &two, PLAN_LIMITS),
+            Plan::Replay {
+                source: state,
+                from: 4000
+            }
+        );
+        let one = [&prompt[..], &[100000][..], &collect_tokens(-90..-60)[..]].concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &one, PLAN_LIMITS),
+            Plan::InPlace { state, from: 4001 }
+        );
+        // the generation-end snapshot carries them; the same snapshot without
+        // stale rows would serve the resume 2 positions before it
+        cache.add_snapshot(
+            state,
+            Snapshot {
+                pos: 4002,
+                kind: SnapshotKind::GenerationEnd,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 4,
+            },
+        );
+        assert_eq!(
+            cache.find_cheapest_plan(0, &two, PLAN_LIMITS),
+            Plan::Replay {
+                source: state,
+                from: 4000
+            }
+        );
+        cache.add_snapshot(
+            state,
+            Snapshot {
+                pos: 4002,
+                kind: SnapshotKind::GenerationEnd,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+        );
+        assert_eq!(
+            cache.find_cheapest_plan(0, &two, PLAN_LIMITS),
+            Plan::Snapshot {
+                source: state,
+                snapshot_pos: 4002,
+                from: 4000,
+                branch_point: 4000
+            }
+        );
+        // a second pass that accepts 1 token and writes 1 row after it: the
+        // stale rows already hold the oldest places
+        cache.add_decoded_token(state, 100002);
+        cache.record_rejected_rows(state, 1);
+        assert_eq!(cache.entries[&state].stale_rows, 3);
+        // tokens written at its end give the rewind room back
+        for offset in 0..3 {
+            cache.add_decoded_token(state, 100003 + offset);
+        }
+        assert_eq!(cache.entries[&state].stale_rows, 0);
+        let again = [
+            &prompt[..],
+            &[100000, 100001, 100002, 100003][..],
+            &collect_tokens(-90..-60)[..],
+        ]
+        .concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &again, PLAN_LIMITS),
+            Plan::InPlace { state, from: 4004 }
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_ends_before_a_continued_state_s_old_end_shrinks_its_rewind_room() {
+        // A prompt continues a state before its end. The prompt also ends
+        // before that end. The state's rings then keep its old rows after the
+        // prompt's end. The rows of 4000..4002 took the places of the margin's
+        // oldest positions, 3867..3869. A resume 5 positions before the new end
+        // would read them.
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let state = add_idle_state(&mut cache, &prompt, &[4000]);
+        for offset in 0..3 {
+            cache.add_decoded_token(state, 100000 + offset); // ends at 4003
+        }
+        let mut retry = prompt.clone();
+        *retry.last_mut().unwrap() = -7; // differs at 3999, ends at 4000
+        let plan = cache.find_cheapest_plan(0, &retry, PLAN_LIMITS);
+        assert_eq!(plan, Plan::InPlace { state, from: 3999 });
+        let stale_rows = count_stale_rows_at(cache.find_origin(&plan, retry.len()), retry.len());
+        assert_eq!(stale_rows, 3);
+        cache.start_request(state, &retry, 3999, STATE_BYTES, stale_rows);
+        cache.add_prefilled_tokens(state, &retry, stale_rows);
+        cache.set_idle(state, STATE_BYTES);
+        let again = [&retry[..3995], &collect_tokens(-90..-60)[..]].concat();
+        assert_ne!(
+            cache.find_cheapest_plan(0, &again, PLAN_LIMITS),
+            Plan::InPlace { state, from: 3995 }
+        );
+        // 2 positions before its end, within what its rings still hold
+        let near = [&retry[..3998], &collect_tokens(-90..-60)[..]].concat();
+        assert_eq!(
+            cache.find_cheapest_plan(0, &near, PLAN_LIMITS),
+            Plan::InPlace { state, from: 3998 }
         );
     }
 
