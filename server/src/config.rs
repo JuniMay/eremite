@@ -9,6 +9,9 @@ use crate::engine;
 const MAX_MEMORY_GIB: f64 = 1024.0;
 /// The fewest GiB that the reserve takes. The reason for this value is unknown.
 const MIN_RESERVE_GIB: f64 = 2.0;
+/// The most requests or states that a count setting takes. The reason for this
+/// value is unknown.
+const MAX_COUNT: f64 = 65536.0;
 
 /// The server-wide budgets and limits. The engine's memory policy keeps its
 /// defaults. Settings that can slow the server stay out of the configuration.
@@ -22,6 +25,9 @@ pub struct Budgets {
     /// A wait for the GPU that lasts this many seconds ends the server. Only a
     /// failed command buffer or a stopped GPU takes that long.
     pub gpu_timeout_s: f64,
+    /// The most requests that wait for one model. Another request then gets
+    /// HTTP 429, too many requests.
+    pub max_waiting_requests: usize,
 }
 
 impl Default for Budgets {
@@ -30,6 +36,7 @@ impl Default for Budgets {
             memory_gb: 0.0,
             reserve_gb: 10.0,
             gpu_timeout_s: 60.0,
+            max_waiting_requests: 16,
         }
     }
 }
@@ -42,6 +49,7 @@ impl Budgets {
             .as_f64()
             .filter(|number| number.is_finite())
             .ok_or(format!("{name} takes a finite number"))?;
+        let is_count = |most: f64| (1.0..=most).contains(&number) && number.fract() == 0.0;
         match name {
             "memory" if (0.0..=MAX_MEMORY_GIB).contains(&number) => self.memory_gb = number,
             "memory" => {
@@ -59,6 +67,14 @@ impl Budgets {
             }
             "gpu_timeout" if number > 0.0 => self.gpu_timeout_s = number,
             "gpu_timeout" => return Err("gpu_timeout takes a positive number of seconds".into()),
+            "max_waiting_requests" if is_count(MAX_COUNT) => {
+                self.max_waiting_requests = number as usize
+            }
+            "max_waiting_requests" => {
+                return Err(format!(
+                    "max_waiting_requests takes 1 to {MAX_COUNT} requests"
+                ));
+            }
             _ => return Err(format!("no server budget {name}")),
         }
         Ok(())
@@ -89,6 +105,8 @@ mod tests {
         budgets.set("memory", &json!(64)).unwrap();
         budgets.set("reserve", &json!(12)).unwrap();
         budgets.set("gpu_timeout", &json!(120)).unwrap();
+        budgets.set("max_waiting_requests", &json!(4)).unwrap();
+        assert_eq!(budgets.max_waiting_requests, 4);
         let settings = budgets.process_settings();
         assert_eq!(
             (
@@ -104,6 +122,8 @@ mod tests {
             ("reserve", json!(1)),
             ("gpu_timeout", json!(0)),
             ("gpu_timeout", json!("long")),
+            ("max_waiting_requests", json!(0)),
+            ("max_waiting_requests", json!(1.5)),
             ("cache", json!(8)),
         ] {
             assert!(budgets.set(name, &value).is_err(), "{name} {value}");
