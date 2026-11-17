@@ -1,5 +1,5 @@
-//! eremite-server: the OpenAI Chat Completions API over eremite's engine, for
-//! one model or several in one process.
+//! eremite-server: the OpenAI Chat Completions and Responses APIs over
+//! eremite's engine, for one model or several in one process.
 //!
 //! - The engine (src/eremite.h, and engine.rs here) runs the models. It owns
 //!   the stop on SIGINT or SIGTERM.
@@ -707,6 +707,15 @@ async fn answer_chat_completions(
     answer_generation(shared, peer, body, Api::ChatCompletions).await
 }
 
+/// Answers POST /v1/responses.
+async fn answer_responses(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    answer_generation(shared, peer, body, Api::Responses).await
+}
+
 /// Answers a generation request of either API from `peer`. It reads the
 /// request's `body` and finds its model. It renders and queues the request. It
 /// answers as a stream or as one response.
@@ -1008,6 +1017,14 @@ fn main() {
         .route(
             "/chat/completions",
             post(answer_chat_completions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/responses",
+            post(answer_responses).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/responses",
+            post(answer_responses).fallback(refuse_other_than_post),
         )
         .fallback(refuse_unknown_endpoint)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))
