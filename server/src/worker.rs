@@ -274,6 +274,19 @@ struct ModelStatus {
     total_prompt_tokens: u64,
     /// The number of tokens that the ended requests generated.
     total_generated_tokens: u64,
+    /// The number of prompt tokens of the ended requests that came from the
+    /// state cache.
+    total_reused_tokens: u64,
+    /// The number of prompt tokens that the ended prefills computed.
+    total_prefilled_tokens: u64,
+    /// The seconds that the ended prefills took.
+    total_prefill_seconds: f64,
+    /// The number of requests that started with each kind of plan, by the
+    /// plan's word in the log.
+    plan_counts: HashMap<&'static str, u64>,
+    /// The model's requests that run, and those that wait for their prefill's
+    /// turn.
+    requests: Vec<RequestStatus>,
     /// The plan of the latest prefill.
     last_prefill: PrefillInfo,
     /// Whether the decoding requests split evenly over at least two calls.
@@ -286,6 +299,39 @@ struct ModelStatus {
     /// The bytes that the engine allocated for the model's states and their
     /// snapshots.
     state_allocated_bytes: u64,
+}
+
+/// A request of a model, for the model's status.
+#[derive(Clone, Debug, PartialEq)]
+struct RequestStatus {
+    /// The request's id: its number in the log.
+    id: u64,
+    /// What the request does: "waiting", "prefill" or "decoding".
+    status: &'static str,
+    /// The number of the session whose state the request uses. None while the
+    /// request waits.
+    session: Option<u64>,
+    /// The number of prompt tokens. Once the prefill starts, it counts the
+    /// media expanded.
+    prompt_tokens: usize,
+    /// The number of prompt tokens that came from the state cache.
+    reused_tokens: usize,
+    /// The number of tokens that the reply generated.
+    generated_tokens: usize,
+}
+
+impl RequestStatus {
+    /// Returns the status of `job`, a request that waits for its prefill.
+    fn for_waiting_job(job: &Job) -> RequestStatus {
+        RequestStatus {
+            id: job.id,
+            status: "waiting",
+            session: None,
+            prompt_tokens: job.request.prompt.len(),
+            reused_tokens: 0,
+            generated_tokens: 0,
+        }
+    }
 }
 
 /// A model as the HTTP handlers and the worker share it. The tokenizer works on
@@ -714,12 +760,17 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let Some(shared_model) = shared.models.get(model_index) else {
         return Value::Null;
     };
-    let (waiting, control_phase, state_limit) = {
+    let (waiting, control_phase, state_limit, queued) = {
         let queue = lock(&shared.queue);
+        let queued: Vec<RequestStatus> = queue.waiting[model_index]
+            .iter()
+            .map(RequestStatus::for_waiting_job)
+            .collect();
         (
             queue.waiting[model_index].len(),
             queue.control.phase,
             queue.control.effective_limits.state_cache_bytes,
+            queued,
         )
     };
     let stats = lock(&shared_model.status).stats;
@@ -751,6 +802,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         .phase_since
         .map_or(0.0, |since| (now - since).as_secs_f64());
     let total_state_bytes = shared.state_committed_bytes.load(Ordering::Relaxed);
+    let requests: Vec<RequestStatus> = status.requests.iter().cloned().chain(queued).collect();
     let last_prefill = &status.last_prefill;
     let options = &shared_model.settings.options;
     json!({
@@ -764,6 +816,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "reused_tokens": status.shown_reused_tokens,
         "generated_tokens": status.shown_generated_tokens,
         "waiting": waiting,
+        "requests": build_requests_json(&requests),
         "sessions": sessions,
         "state_cache_gib": round(status.state_committed_bytes as f64 / GIB, 3),
         "state_cache_limit_gib": round(state_limit as f64 / GIB, 3),
@@ -783,7 +836,11 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "requests": status.total_requests,
             "prompt_tokens": status.total_prompt_tokens,
             "generated_tokens": status.total_generated_tokens,
+            "reused_tokens": status.total_reused_tokens,
+            "prefilled_tokens": status.total_prefilled_tokens,
+            "prefill_seconds": status.total_prefill_seconds,
         },
+        "plans": status.plan_counts,
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
         "lookup_depth": options.lookup,
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
@@ -819,6 +876,68 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "footprint_gib": round(stats.footprint as f64 / GIB, 1),
         },
         "engine_times": build_engine_times_json(&stats),
+        "engine_counters": build_engine_counters_json(&stats),
+    })
+}
+
+/// Builds `requests` as JSON: each request's id, what it does, its session,
+/// its prompt tokens, its reused tokens and its generated tokens.
+fn build_requests_json(requests: &[RequestStatus]) -> Value {
+    requests
+        .iter()
+        .map(|request| {
+            json!({
+                "request": request.id,
+                "status": request.status,
+                "session": request.session,
+                "prompt_tokens": request.prompt_tokens,
+                "reused_tokens": request.reused_tokens,
+                "generated_tokens": request.generated_tokens,
+            })
+        })
+        .collect()
+}
+
+/// Builds the engine's counters that the rest of the status leaves out or
+/// rounds, as JSON. They hold the model's layers and routed experts, and where
+/// the decoded rows' experts were. They hold the prompt rows and the running
+/// prefill's layer and rows. They also hold the bytes of experts read, the
+/// bytes of experts mapped for the GPU, and the system's memory in bytes.
+fn build_engine_counters_json(stats: &engine::Stats) -> Value {
+    let decode = &stats.decode;
+    // The engine reports i64::MAX as the GPU's limit before the GPU starts.
+    let gpu_limit = (stats.gpu_limit != i64::MAX).then_some(stats.gpu_limit);
+    json!({
+        "layers": stats.layers,
+        "experts_per_row": stats.experts_per_row,
+        "routed_layers": stats.routed_layers,
+        "experts_per_layer": stats.experts_per_layer,
+        "decode_expert_sources": [
+            decode.row_own,
+            decode.row_ahead,
+            decode.row_late,
+            decode.row_sub,
+            decode.row_ssd,
+        ],
+        "prefill_rows": stats.prefill_rows,
+        "prefill_read_bytes": stats.prefill.bytes,
+        "prefill_layer": stats.prefill_layer,
+        "prefill_rows_now": stats.prefill_rows_now,
+        "expert_read_bytes": stats.cache.bytes,
+        "mapped_expert_bytes": stats.mapped.max(0) as u64 * stats.slot_bytes,
+        "memory": {
+            "footprint": stats.footprint,
+            "available": stats.available,
+            "gpu_in_use": stats.gpu_in_use,
+            "gpu_limit": gpu_limit,
+            "total": stats.total,
+            "free": stats.free,
+            "file": stats.file,
+            "file_kept": stats.file_kept,
+            "wired": stats.wired,
+            "swap_used": stats.swap_used,
+            "pressure": stats.pressure,
+        },
     })
 }
 
@@ -901,6 +1020,8 @@ struct Generation {
     sampler: Sampler,
     /// The key of the request's state in the state cache.
     state_id: state_cache::StateId,
+    /// The number of the session whose state the request uses.
+    session: u64,
     /// The number of prompt tokens, with the media expanded.
     prompt_tokens: usize,
     /// The number of prompt tokens taken from the state cache. The prefill
@@ -2194,8 +2315,8 @@ impl WorkerModel {
         }
     }
 
-    /// Updates the model's status: its phase, its counts and the request it
-    /// shows.
+    /// Updates the model's status: its phase, its counts, the request it shows
+    /// and its requests.
     fn update_status(&mut self, shared: &Shared, phase: &'static str) {
         let mut status = lock(&shared.models[self.model_index].status);
         if status.phase != phase || status.phase_since.is_none() {
@@ -2225,6 +2346,23 @@ impl WorkerModel {
                 generation.generated,
             )
         });
+        status.requests = self
+            .generations
+            .iter()
+            .map(|generation| RequestStatus {
+                id: generation.job.id,
+                status: if generation.is_decoding() {
+                    "decoding"
+                } else {
+                    "prefill"
+                },
+                session: Some(generation.session),
+                prompt_tokens: generation.prompt_tokens,
+                reused_tokens: generation.reused_tokens,
+                generated_tokens: generation.generated,
+            })
+            .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
+            .collect();
     }
 
     /// Starts an admitted request. It checks the request's media and prompt. It
@@ -2511,6 +2649,10 @@ impl WorkerModel {
         states.publish_states(shared);
         let number = states.cache.entries[&state_id].number;
         let plan_kind = plan.describe_for_log(prompt_tokens);
+        *lock(&shared.models[self.model_index].status)
+            .plan_counts
+            .entry(plan_kind)
+            .or_default() += 1;
         let thinking = self.think_start_token == Some(prompt[prompt_tokens - 1]);
         engine::log(&format!(
             "req {}: {} {prompt_tokens} prompt tokens, session {number} ({plan_kind}), {reused_tokens} reused; thinking {}; at most {max_new_tokens} new tokens, {}; waited {wait:.1} s",
@@ -2558,6 +2700,7 @@ impl WorkerModel {
             job,
             sampler,
             state_id,
+            session: number,
             prompt_tokens,
             reused_tokens,
             prefill: Some(Prefill {
@@ -2978,6 +3121,10 @@ impl WorkerModel {
         {
             let mut status = lock(&shared.models[self.model_index].status);
             status.last_prefill = info;
+            if reused_tokens < prompt_tokens {
+                status.total_prefilled_tokens += (prompt_tokens - reused_tokens) as u64;
+                status.total_prefill_seconds += prefill_seconds;
+            }
         }
         drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
@@ -3198,6 +3345,7 @@ impl WorkerModel {
         status.total_requests += 1;
         status.total_prompt_tokens += generation.prompt_tokens as u64;
         status.total_generated_tokens += generation.generated as u64;
+        status.total_reused_tokens += generation.reused_tokens as u64;
         drop(status);
         states.publish_states(shared);
     }
@@ -3614,6 +3762,85 @@ mod tests {
             }
         }
         assert_eq!(calls_run, [CALLS * ROWS / REQUESTS; REQUESTS]);
+    }
+
+    /// A request that waits shows no session yet. The running ones show what
+    /// they do and their tokens.
+    #[test]
+    fn the_status_lists_each_request_with_what_it_does() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let job = Job {
+            id: 7,
+            request: Request {
+                model_index: 0,
+                prompt: vec![1, 2, 3],
+                media: Vec::new(),
+                sampling: Sampling {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 0,
+                    seed: None,
+                },
+                max_tokens: 16,
+                note: String::new(),
+            },
+            events,
+            flags: Arc::default(),
+            queued_at: Instant::now(),
+        };
+        let decoding = RequestStatus {
+            id: 5,
+            status: "decoding",
+            session: Some(5),
+            prompt_tokens: 23,
+            reused_tokens: 2,
+            generated_tokens: 516,
+        };
+        let requests = [decoding, RequestStatus::for_waiting_job(&job)];
+        assert_eq!(
+            build_requests_json(&requests),
+            json!([
+                {"request": 5, "status": "decoding", "session": 5,
+                 "prompt_tokens": 23, "reused_tokens": 2, "generated_tokens": 516},
+                {"request": 7, "status": "waiting", "session": null,
+                 "prompt_tokens": 3, "reused_tokens": 0, "generated_tokens": 0},
+            ])
+        );
+    }
+
+    /// The engine's counters keep their whole values. The GPU's limit is null
+    /// until the GPU starts.
+    #[test]
+    fn the_engine_counters_keep_whole_bytes_and_counts() {
+        let mut stats = engine::Stats {
+            layers: 43,
+            experts_per_row: 240,
+            routed_layers: 40,
+            experts_per_layer: 384,
+            prefill_rows: 1_938,
+            prefill_layer: 31,
+            prefill_rows_now: 399,
+            mapped: 3,
+            slot_bytes: 1 << 20,
+            gpu_limit: i64::MAX,
+            total: 128 << 30,
+            pressure: 1,
+            ..engine::Stats::default()
+        };
+        stats.decode.row_own = 222;
+        stats.decode.row_ssd = 11;
+        stats.cache.bytes = 291_000_000_123;
+        let counters = build_engine_counters_json(&stats);
+        assert_eq!(counters["layers"], 43);
+        assert_eq!(counters["decode_expert_sources"], json!([222, 0, 0, 0, 11]));
+        assert_eq!(counters["prefill_layer"], 31);
+        assert_eq!(counters["expert_read_bytes"], 291_000_000_123u64);
+        assert_eq!(counters["mapped_expert_bytes"], 3u64 << 20);
+        assert_eq!(counters["memory"]["gpu_limit"], Value::Null);
+        assert_eq!(counters["memory"]["total"], 128u64 << 30);
+        stats.gpu_limit = 107 << 30;
+        let counters = build_engine_counters_json(&stats);
+        assert_eq!(counters["memory"]["gpu_limit"], 107i64 << 30);
     }
 
     /// DeepSeek V4.1 Flash's most rows per call.
