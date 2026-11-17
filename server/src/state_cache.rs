@@ -61,7 +61,11 @@
 //! model.
 //!
 //! **Saved states** are states written to the SSD by server/src/disk.rs. The
-//! cache holds their tokens, their parts' positions and their snapshots.
+//! cache holds their tokens, their parts' positions and their snapshots. A load
+//! plan takes a saved state as its source, as the other plans take a state in
+//! memory. The new state loads the saved rows before the plan's start. Then a
+//! snapshot is restored into it, or a replay rebuilds the rolling rows. At
+//! equal cost, a state in memory and a cold start go before the SSD.
 
 use std::collections::BTreeMap;
 
@@ -72,11 +76,14 @@ const SHARED_PREFIX_BLOCK: usize = 1024;
 const DEFAULT_MIN_UNSHARED_TOKENS: usize = 8192;
 
 // The order of plans at equal cost. The cost counts only prefilled tokens. A
-// copy takes time it does not count. So in place comes first.
+// copy takes time it does not count. So in place comes first. An SSD read also
+// takes time it does not count. So the SSD comes last.
 const RANK_IN_PLACE: usize = 0;
 const RANK_SNAPSHOT: usize = 1;
 const RANK_REPLAY: usize = 2;
 const RANK_COLD: usize = 3;
+const RANK_LOAD_SNAPSHOT: usize = 4;
+const RANK_LOAD_REPLAY: usize = 5;
 
 /// The id of a state in memory. The worker maps it to the engine's state.
 pub type StateId = u64;
@@ -234,6 +241,16 @@ pub enum Plan {
     /// replay rebuilds the rolling rows there. The prefill takes them as a
     /// branch snapshot.
     Replay { source: StateId, from: usize },
+    /// A new state from saved state `saved_id`. It loads the saved rows before
+    /// `from`. With `snapshot_pos`, it then restores that snapshot, as a
+    /// snapshot plan does. Without one, its prefill replays at `from`, as a
+    /// replay plan does. `branch_point` is as in a snapshot plan.
+    Load {
+        saved_id: SavedStateId,
+        snapshot_pos: Option<usize>,
+        from: usize,
+        branch_point: usize,
+    },
 }
 
 impl Plan {
@@ -243,13 +260,37 @@ impl Plan {
         match *self {
             Plan::Cold => 0,
             Plan::InPlace { from, .. } => from,
-            Plan::Snapshot { from, .. } | Plan::Replay { from, .. } => from,
+            Plan::Snapshot { from, .. } | Plan::Replay { from, .. } | Plan::Load { from, .. } => {
+                from
+            }
+        }
+    }
+
+    /// Returns whether the plan's prefill starts with a replay.
+    pub fn starts_with_replay(&self) -> bool {
+        matches!(
+            self,
+            Plan::Replay { .. }
+                | Plan::Load {
+                    snapshot_pos: None,
+                    ..
+                }
+        )
+    }
+
+    /// Finds the state in memory whose rows the plan uses, if any.
+    pub fn find_source_state(&self) -> Option<StateId> {
+        match *self {
+            Plan::Cold | Plan::Load { .. } => None,
+            Plan::InPlace { state, .. } => Some(state),
+            Plan::Snapshot { source, .. } | Plan::Replay { source, .. } => Some(source),
         }
     }
 
     /// Describes the plan for the log in one word. "cold" is a cold start.
     /// "continued" continues a state in place. "repeated" is the same prompt
     /// again, from its prompt-end snapshot. "forked" copies another state.
+    /// "loaded" loads a saved state.
     pub fn describe_for_log(&self, prompt_len: usize) -> &'static str {
         match *self {
             Plan::Cold => "cold",
@@ -257,17 +298,28 @@ impl Plan {
             Plan::InPlace { .. } => "continued",
             Plan::Snapshot { from, .. } if from == prompt_len => "repeated",
             Plan::Snapshot { .. } | Plan::Replay { .. } => "forked",
+            Plan::Load { .. } => "loaded",
         }
     }
 
     /// Finds where the plan's prefill takes a branch snapshot, if anywhere. A
     /// replay takes it where the replay starts. A snapshot plan takes it at the
     /// branch point. It does so only when the branch point lies after `from`
-    /// and before the prompt's end. A later fork there then resumes at once.
+    /// and before the prompt's end. A later fork there then resumes at once. A
+    /// load with a snapshot takes it as a snapshot plan does. A load without
+    /// one takes it as a replay does.
     pub fn find_branch_snapshot_pos(&self, prompt_len: usize) -> Option<usize> {
         match *self {
-            Plan::Replay { from, .. } => Some(from),
+            Plan::Replay { from, .. }
+            | Plan::Load {
+                snapshot_pos: None,
+                from,
+                ..
+            } => Some(from),
             Plan::Snapshot {
+                from, branch_point, ..
+            }
+            | Plan::Load {
                 from, branch_point, ..
             } if branch_point > from && branch_point < prompt_len => Some(branch_point),
             _ => None,
@@ -387,6 +439,9 @@ pub struct Cache {
     /// The saved state that an admitted request loads next. Until then, no save
     /// appends to it, replaces it or deletes it.
     pub pinned: Option<SavedStateId>,
+    /// The saved state that cannot be loaded now. Planning skips it for the
+    /// request being planned again.
+    pub skipped: Option<SavedStateId>,
     /// The use clock. Each use of a state advances it by one. So does each use
     /// of a saved state.
     clock: u64,
@@ -405,6 +460,7 @@ impl Cache {
             saved_byte_limit: 0,
             min_unshared_tokens: DEFAULT_MIN_UNSHARED_TOKENS,
             pinned: None,
+            skipped: None,
             clock: 0,
             // Ids start at 1. They are the state numbers that the log and the
             // status show.
@@ -487,6 +543,50 @@ impl Cache {
                 },
             )
         };
+        for (&id, saved_state) in &self.saved_states {
+            if saved_state.model != Some(model) || Some(id) == self.skipped {
+                continue;
+            }
+            let (shared, resume_at) = find_resume_point(
+                &saved_state.tokens,
+                saved_state.snapshots.iter().any(|saved_snapshot| {
+                    saved_snapshot.snapshot.pos == prompt_len
+                        && saved_snapshot.snapshot.has_logits()
+                }),
+            );
+            branch_point = branch_point.max(shared.min(prompt_len));
+            if resume_at == 0 {
+                continue;
+            }
+            for snapshot in saved_state
+                .snapshots
+                .iter()
+                .map(|saved_snapshot| saved_snapshot.snapshot)
+            {
+                let from = snapshot.pos.min(resume_at);
+                if snapshot.pos <= resume_at + count_rewind_room(snapshot.stale_rows)
+                    && (from < prompt_len || (snapshot.pos == prompt_len && snapshot.has_logits()))
+                {
+                    let plan = Plan::Load {
+                        saved_id: id,
+                        snapshot_pos: Some(snapshot.pos),
+                        from,
+                        branch_point: 0,
+                    };
+                    add_plan(prompt_len - from, RANK_LOAD_SNAPSHOT, plan);
+                }
+            }
+            if limits.can_replay && resume_at < prompt_len {
+                let plan = Plan::Load {
+                    saved_id: id,
+                    snapshot_pos: None,
+                    from: resume_at,
+                    branch_point: 0,
+                };
+                let cost = prompt_len - resume_at + (limits.replay_cost)(resume_at);
+                add_plan(cost, RANK_LOAD_REPLAY, plan);
+            }
+        }
         for (&id, entry) in &self.entries {
             if entry.model != model {
                 continue;
@@ -563,6 +663,17 @@ impl Cache {
                     from,
                     branch_point: branch_point.max(from),
                 },
+                Plan::Load {
+                    saved_id,
+                    snapshot_pos: Some(snapshot_pos),
+                    from,
+                    ..
+                } => Plan::Load {
+                    saved_id,
+                    snapshot_pos: Some(snapshot_pos),
+                    from,
+                    branch_point: branch_point.max(from),
+                },
                 plan => plan,
             })
             .collect()
@@ -584,7 +695,12 @@ impl Cache {
                 pos: 0,
                 stale_rows: 0,
             },
-            Plan::Replay { from, .. } => Origin {
+            Plan::Replay { from, .. }
+            | Plan::Load {
+                snapshot_pos: None,
+                from,
+                ..
+            } => Origin {
                 pos: from,
                 stale_rows: 0,
             },
@@ -596,6 +712,23 @@ impl Cache {
                 pos: snapshot_pos,
                 stale_rows: snapshot_stale_rows(source, snapshot_pos),
             },
+            Plan::Load {
+                saved_id,
+                snapshot_pos: Some(snapshot_pos),
+                ..
+            } => {
+                let saved_snapshot = self.saved_states[&saved_id]
+                    .snapshots
+                    .iter()
+                    .find(|candidate| candidate.snapshot.pos == snapshot_pos);
+                Origin {
+                    pos: snapshot_pos,
+                    stale_rows: saved_snapshot
+                        .expect("the plan's saved snapshot")
+                        .snapshot
+                        .stale_rows,
+                }
+            }
             // the same prompt again: its prompt-end snapshot is restored into
             // it
             Plan::InPlace { state, from } if from == prompt_len => Origin {
@@ -2063,6 +2196,19 @@ mod tests {
 
     // ---- saved states ----
 
+    /// Makes a saved snapshot at `pos` of kind `kind`, written by save 1.
+    fn make_saved_snapshot(pos: usize, kind: SnapshotKind) -> SavedSnapshot {
+        SavedSnapshot {
+            snapshot: Snapshot {
+                pos,
+                kind,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+            version: 1,
+        }
+    }
+
     /// Adds saved state `id` of model 0 to `cache`. It holds `tokens` in one
     /// part, with `snapshots`.
     fn add_saved_state_in_one_part(
@@ -2096,6 +2242,181 @@ mod tests {
         cache.saved_byte_limit = 1 << 30;
         cache.min_unshared_tokens = 100;
         cache
+    }
+
+    #[test]
+    fn a_saved_state_resumes_a_prompt_that_nothing_in_memory_holds() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            7,
+            &collect_tokens(0..1000),
+            &[
+                make_saved_snapshot(1000, SnapshotKind::GenerationEnd),
+                make_saved_snapshot(640, SnapshotKind::Branch),
+            ],
+        );
+        let plan = cache.find_cheapest_plan(0, &collect_tokens(0..1500), PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Load {
+                saved_id: 7,
+                snapshot_pos: Some(1000),
+                from: 1000,
+                branch_point: 1000
+            }
+        );
+        assert_eq!(
+            (
+                plan.count_reused_tokens(),
+                plan.describe_for_log(1500),
+                plan.find_source_state(),
+                plan.starts_with_replay()
+            ),
+            (1000, "loaded", None, false)
+        );
+        assert_eq!(
+            cache.find_origin(&plan, 1500),
+            Origin {
+                pos: 1000,
+                stale_rows: 0
+            }
+        );
+        // differing before its end, past the rewind room: its branch snapshot
+        let mut prompt = collect_tokens(0..700);
+        prompt.extend(collect_tokens(5000..5100));
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::Load {
+                saved_id: 7,
+                snapshot_pos: Some(640),
+                from: 640,
+                branch_point: 700
+            }
+        );
+        assert_eq!(
+            cache
+                .find_cheapest_plan(0, &prompt, PLAN_LIMITS)
+                .find_branch_snapshot_pos(800),
+            Some(700),
+            "the branch snapshot is taken as in memory"
+        );
+    }
+
+    #[test]
+    fn a_saved_state_replays_where_no_snapshot_is_near() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            3,
+            &collect_tokens(0..5000),
+            &[make_saved_snapshot(200, SnapshotKind::Branch)],
+        );
+        let mut prompt = collect_tokens(0..4000);
+        prompt.extend(collect_tokens(9000..9010));
+        let plan = cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Load {
+                saved_id: 3,
+                snapshot_pos: None,
+                from: 4000,
+                branch_point: 0
+            }
+        );
+        assert!(plan.starts_with_replay());
+        assert_eq!(
+            (
+                plan.find_branch_snapshot_pos(prompt.len()),
+                cache.find_origin(&plan, prompt.len())
+            ),
+            (
+                Some(4000),
+                Origin {
+                    pos: 4000,
+                    stale_rows: 0
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_saved_prompt_end_answers_the_same_prompt_again() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            1,
+            &collect_tokens(0..300),
+            &[make_saved_snapshot(300, SnapshotKind::PromptEnd)],
+        );
+        let plan = cache.find_cheapest_plan(0, &collect_tokens(0..300), PLAN_LIMITS);
+        assert_eq!(
+            plan,
+            Plan::Load {
+                saved_id: 1,
+                snapshot_pos: Some(300),
+                from: 300,
+                branch_point: 300
+            }
+        );
+        assert_eq!(plan.find_branch_snapshot_pos(300), None);
+        // without logits there, its last token runs again
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            1,
+            &collect_tokens(0..300),
+            &[make_saved_snapshot(299, SnapshotKind::Branch)],
+        );
+        assert_eq!(
+            cache
+                .find_cheapest_plan(0, &collect_tokens(0..300), PLAN_LIMITS)
+                .count_reused_tokens(),
+            299
+        );
+    }
+
+    #[test]
+    fn at_equal_cost_memory_and_a_cold_start_go_before_the_ssd() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            1,
+            &collect_tokens(0..1000),
+            &[make_saved_snapshot(1000, SnapshotKind::GenerationEnd)],
+        );
+        let idle = add_idle_state(&mut cache, &collect_tokens(0..1000), &[1000]);
+        let plan = cache.find_cheapest_plan(0, &collect_tokens(0..1200), PLAN_LIMITS);
+        assert!(matches!(plan, Plan::InPlace { state, from: 1000 } if state == idle));
+        // a saved state of another model, or of no model here, is never loaded
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            1,
+            &collect_tokens(0..1000),
+            &[make_saved_snapshot(1000, SnapshotKind::GenerationEnd)],
+        );
+        cache.saved_states.get_mut(&1).unwrap().model = None;
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..1200), PLAN_LIMITS),
+            Plan::Cold
+        );
+        cache.saved_states.get_mut(&1).unwrap().model = Some(1);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..1200), PLAN_LIMITS),
+            Plan::Cold
+        );
+        // a replay that costs as much as a cold start: the cold start
+        let mut cache = make_saving_cache();
+        let limits = PlanLimits {
+            replay_cost: &|pos| 2 * pos,
+            ..PLAN_LIMITS
+        };
+        add_saved_state_in_one_part(&mut cache, 1, &collect_tokens(0..1000), &[]);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(0..1200), limits),
+            Plan::Cold
+        );
     }
 
     #[test]
