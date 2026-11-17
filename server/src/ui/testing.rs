@@ -35,6 +35,14 @@ pub fn read_row(buf: &Buffer, y: u16) -> String {
         .collect()
 }
 
+/// Returns the text of every row of `buf`, one line each.
+pub fn read_screen(buf: &Buffer) -> String {
+    (0..buf.area.height)
+        .map(|y| read_row(buf, y))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Returns the column where `text` starts in row `y` of `buf`, or None.
 pub fn find_in_row(buf: &Buffer, y: u16, text: &str) -> Option<u16> {
     let wanted: Vec<char> = text.chars().collect();
