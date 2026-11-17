@@ -62,6 +62,8 @@ const USAGE: &str =
                   (default 16)
   --max-cached-states N  states that the state cache keeps, for all models together
                   (default 256)
+  --snapshot-interval N  positions between the snapshots of a long prompt, for a model that
+                  resumes only from snapshots (default 2048)
   --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
@@ -153,7 +155,8 @@ fn parse_arguments(args: &[String]) -> Arguments {
                     | "--progress-log"
                     | "--state-cache"
                     | "--max-waiting-requests"
-                    | "--max-cached-states" => {
+                    | "--max-cached-states"
+                    | "--snapshot-interval" => {
                         let name = flag[2..].replace('-', "_");
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         budgets.push((name, value));
@@ -300,13 +303,19 @@ fn the_queue_and_state_limits_come_from_the_command_line() {
             "4",
             "--max-cached-states",
             "32",
+            "--snapshot-interval",
+            "1024",
         ]
         .map(String::from),
     );
     let budgets = &parsed.budgets;
     assert_eq!(
-        (budgets.max_waiting_requests, budgets.max_cached_states),
-        (4, 32)
+        (
+            budgets.max_waiting_requests,
+            budgets.max_cached_states,
+            budgets.snapshot_interval
+        ),
+        (4, 32, 1024)
     );
 }
 

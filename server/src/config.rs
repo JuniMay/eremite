@@ -116,6 +116,7 @@ impl ModelConfig {
             | "state_cache"
             | "max_waiting_requests"
             | "max_cached_states"
+            | "snapshot_interval"
             | "port"
             | "host"
             | "api_key_file"
@@ -269,6 +270,9 @@ pub struct Budgets {
     pub max_waiting_requests: usize,
     /// The most states that the state cache keeps, for all models together.
     pub max_cached_states: usize,
+    /// For a model that resumes only from snapshots, a prompt prefilled in
+    /// several calls takes a snapshot at every multiple of this many positions.
+    pub snapshot_interval: usize,
 }
 
 impl Default for Budgets {
@@ -281,6 +285,7 @@ impl Default for Budgets {
             state_cache_gb: 8.0,
             max_waiting_requests: 16,
             max_cached_states: 256,
+            snapshot_interval: 2048,
         }
     }
 }
@@ -336,6 +341,14 @@ impl Budgets {
             "max_cached_states" if is_count(MAX_COUNT) => self.max_cached_states = number as usize,
             "max_cached_states" => {
                 return Err(format!("max_cached_states takes 1 to {MAX_COUNT} states"));
+            }
+            "snapshot_interval" if is_count(MAX_CONTEXT_TOKENS as f64) => {
+                self.snapshot_interval = number as usize
+            }
+            "snapshot_interval" => {
+                return Err(format!(
+                    "snapshot_interval takes 1 to {MAX_CONTEXT_TOKENS} positions"
+                ));
             }
             _ => return Err(format!("no server budget {name}")),
         }
@@ -399,6 +412,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "state_cache",
             "max_waiting_requests",
             "max_cached_states",
+            "snapshot_interval",
             "port",
             "host",
             "api_key_file",
@@ -418,6 +432,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "state_cache",
         "max_waiting_requests",
         "max_cached_states",
+        "snapshot_interval",
     ] {
         if let Some(value) = object.get(name) {
             budgets.set(name, value)?;
@@ -640,22 +655,31 @@ mod tests {
     fn the_queue_and_state_limits_are_server_settings() {
         let defaults = Budgets::default();
         assert_eq!(
-            (defaults.max_waiting_requests, defaults.max_cached_states),
-            (16, 256)
+            (
+                defaults.max_waiting_requests,
+                defaults.max_cached_states,
+                defaults.snapshot_interval
+            ),
+            (16, 256, 2048)
         );
         let budgets = parse(
             &json!({"models": [{"model": "/m"}], "max_waiting_requests": 8,
-                              "max_cached_states": 64}),
+                              "max_cached_states": 64, "snapshot_interval": 512}),
         )
         .unwrap()
         .budgets;
         assert_eq!(
-            (budgets.max_waiting_requests, budgets.max_cached_states),
-            (8, 64)
+            (
+                budgets.max_waiting_requests,
+                budgets.max_cached_states,
+                budgets.snapshot_interval
+            ),
+            (8, 64, 512)
         );
         for (name, value) in [
             ("max_waiting_requests", json!(0)),
             ("max_cached_states", json!(1.5)),
+            ("snapshot_interval", json!(-1)),
         ] {
             let mut root = json!({"models": [{"model": "/m"}]});
             root[name] = value;

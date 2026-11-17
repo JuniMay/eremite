@@ -8,11 +8,12 @@
 //!
 //! Each turn of the worker's loop gives every model one step. A step admits
 //! every waiting request. It starts a prefill call for each prefilling request
-//! with no call running. Prefills run beside each other and beside decoding.
-//! The call prefills the rest of the prompt. The step then starts decoding
-//! calls for the decoding requests with no call running. A request starts
-//! decoding as soon as its prefill ends. Several decoding requests run
-//! together, at most the model's rows per call.
+//! with no call running. Prefills run beside each other and beside decoding. A
+//! model that prefills a whole prompt in one call gets the rest of the prompt.
+//! Otherwise the call takes at most the model's prefill rows. The step then
+//! starts decoding calls for the decoding requests with no call running. A
+//! request starts decoding as soon as its prefill ends. Several decoding
+//! requests run together, at most the model's rows per call.
 //!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
@@ -762,6 +763,9 @@ struct Prefill {
     started_at: Instant,
     /// The expert cache's counters when the prefill started.
     expert_counts_at_start: CacheCounts,
+    /// Whether its calls run only while no other prefill call runs. It is set
+    /// when its working memory did not fit beside another prefill's.
+    must_run_alone: bool,
 }
 
 /// A request from its prefill to its end.
@@ -822,11 +826,12 @@ impl Generation {
 
 /// An engine call that runs on a stream, and what to do when it ends.
 enum Call {
-    /// One prefill call of the request. It prefills the rest of the prompt.
+    /// One prefill call of the request. It prefills the prompt up to `end`.
     /// `call_capture` is the position where the engine takes a snapshot during
     /// the call, if any.
     Prefill {
         request_id: u64,
+        end: usize,
         call_capture: Option<usize>,
     },
     /// One token for each of these requests, one row each.
@@ -871,6 +876,10 @@ struct WorkerModel {
     experts_per_row: usize,
     /// The calls that run now.
     running_calls: Vec<RunningCall>,
+    /// The streams that ended a prefill call of a prompt that is still
+    /// prefilling, and wait for another. They hold large working buffers. The
+    /// worker drops them when no request is left.
+    idle_prefill_streams: Vec<Stream>,
     /// The streams that ended a decoding call and wait for the next one.
     idle_decode_streams: Vec<Stream>,
     /// Chooses how the decoding requests split into calls.
@@ -950,15 +959,20 @@ struct States {
     cache: Cache,
     /// Each state's engine handles, by the state's key.
     handles: HashMap<state_cache::StateId, StateHandles>,
+    /// For a model that resumes only from snapshots, a prefill takes a snapshot
+    /// at every multiple of this many positions.
+    snapshot_interval: usize,
 }
 
 impl States {
     /// Creates the states of all models: an empty state cache of at most
-    /// `limit` bytes and `max_states` states.
-    fn new(limit: u64, max_states: usize) -> Self {
+    /// `limit` bytes and `max_states` states. `snapshot_interval` is the
+    /// prefills' snapshot interval.
+    fn new(limit: u64, max_states: usize, snapshot_interval: usize) -> Self {
         Self {
             cache: Cache::new(limit, max_states),
             handles: HashMap::new(),
+            snapshot_interval,
         }
     }
 
@@ -1107,6 +1121,7 @@ impl Worker {
                     logged_decoding_count: 0,
                     experts_per_row: model.read_stats().experts_per_row.max(0) as usize,
                     running_calls: Vec::new(),
+                    idle_prefill_streams: Vec::new(),
                     idle_decode_streams: Vec::new(),
                     call_chooser: CallChooser::new(),
                     round: None,
@@ -1119,6 +1134,7 @@ impl Worker {
         let states = States::new(
             (shared.budgets.state_cache_gb * GIB) as u64,
             shared.budgets.max_cached_states,
+            shared.budgets.snapshot_interval,
         );
         let mut worker = Worker {
             shared,
@@ -1476,6 +1492,7 @@ impl WorkerModel {
         }
         self.logged_decoding_count = decoding_count;
         if self.generations.is_empty() {
+            self.idle_prefill_streams.clear();
             self.idle_decode_streams.clear();
             self.update_status(shared, "idle");
             return;
@@ -1772,6 +1789,7 @@ impl WorkerModel {
                 media,
                 started_at: now,
                 expert_counts_at_start: self.model.read_stats().cache,
+                must_run_alone: false,
             }),
             pos: prompt_tokens,
             generated: 0,
@@ -1832,7 +1850,7 @@ impl WorkerModel {
     }
 
     /// Starts a prefill call for each request still prefilling with no call
-    /// running.
+    /// running. The calls run beside each other and beside the decoding calls.
     fn start_prefill_calls(&mut self, states: &mut States) {
         for i in 0..self.generations.len() {
             self.start_prefill_call(i, states);
@@ -1840,17 +1858,59 @@ impl WorkerModel {
     }
 
     /// Starts a prefill call for request `i` if it is still prefilling with no
-    /// call running. The call prefills the rest of the prompt. The engine takes
-    /// the prefill's branch snapshot during the call.
+    /// call running. A request that must run alone waits while another prefill
+    /// call runs. A model that prefills a whole prompt in one call gets the
+    /// rest of the prompt. Otherwise the call takes at most the model's prefill
+    /// rows. Such a call also ends at the capture position. For a model that
+    /// resumes only from snapshots, it also ends at the next multiple of the
+    /// snapshot interval. Such a model takes a snapshot there, while the state
+    /// cache has room. A later prompt may share a long prefix with this prompt
+    /// but part from it before its end. That prompt then resumes from the last
+    /// snapshot before the point where they part. It computes the positions
+    /// after that snapshot again.
     fn start_prefill_call(&mut self, i: usize, states: &mut States) {
         let generation = &self.generations[i];
-        if generation.prefill.is_none() || generation.in_call {
+        let Some(prefill) = generation.prefill.as_ref() else {
+            return;
+        };
+        if generation.in_call
+            || (prefill.must_run_alone
+                && self
+                    .running_calls
+                    .iter()
+                    .any(|running_call| matches!(running_call.call, Call::Prefill { .. })))
+        {
             return;
         }
-        let state_id = self.generations[i].state_id;
+        let prefill_rows = self.model.prefill_rows();
+        // Any position tells whether the model rebuilds its rolling rows from
+        // the rows it keeps.
+        let can_replay = self.model.replay_rows(1).is_some();
+        let (state_id, prompt_tokens) = (
+            self.generations[i].state_id,
+            self.generations[i].prompt_tokens,
+        );
         let engine_state = states.handles[&state_id].engine_state;
         let prefill = self.generations[i].prefill.as_ref().expect("a prefill");
         let (next_position, capture_position) = (prefill.next_position, prefill.capture_position);
+        let end = match prefill_rows {
+            None => prompt_tokens,
+            Some(max_rows) => {
+                let mut end = (next_position + max_rows).min(prompt_tokens);
+                if !can_replay {
+                    // The next multiple of the snapshot interval.
+                    let interval = states.snapshot_interval;
+                    end = end.min((next_position / interval + 1) * interval);
+                }
+                if let Some(at) = capture_position
+                    && next_position < at
+                    && at < end
+                {
+                    end = at;
+                }
+                end
+            }
+        };
         if self.generations[i]
             .job
             .flags
@@ -1860,13 +1920,24 @@ impl WorkerModel {
             // The next step ends the cancelled request.
             return;
         }
-        let stream = Stream::new(&self.model);
+        let replays = prefill.replays && next_position == self.generations[i].reused_tokens;
+        // In one call, the engine takes the capture snapshot during the
+        // prefill. In several calls, the worker takes it where a call ends.
+        let call_capture = if prefill_rows.is_none() {
+            capture_position
+        } else {
+            None
+        };
+        let stream = self
+            .idle_prefill_streams
+            .pop()
+            .unwrap_or_else(|| Stream::new(&self.model));
         stream.prefill(
             engine_state,
-            &prefill.prompt,
+            &prefill.prompt[..end],
             next_position,
-            prefill.replays,
-            capture_position,
+            replays,
+            call_capture,
             prefill.media.as_ref(),
         );
         let request_id = self.generations[i].job.id;
@@ -1875,23 +1946,29 @@ impl WorkerModel {
             stream,
             call: Call::Prefill {
                 request_id,
-                call_capture: capture_position,
+                end,
+                call_capture,
             },
         });
     }
 
     /// Finishes a prefill call that ended. It keeps the request's new
-    /// snapshots. The request starts decoding.
+    /// snapshots. At the prompt's end, the request starts decoding.
     fn finish_prefill_call(
         &mut self,
         stream: Stream,
         request_id: u64,
+        end: usize,
         call_capture: Option<usize>,
         shared: &Shared,
         states: &mut States,
     ) {
         let i = self.find_generation_index(request_id);
         self.generations[i].in_call = false;
+        let prefill_rows = self.model.prefill_rows();
+        // Any position tells whether the model rebuilds its rolling rows from
+        // the rows it keeps.
+        let can_replay = self.model.replay_rows(1).is_some();
         let (state_id, prompt_tokens) = (
             self.generations[i].state_id,
             self.generations[i].prompt_tokens,
@@ -1901,6 +1978,21 @@ impl WorkerModel {
             if engine::is_stopping() {
                 // The stop cut the prefill short. The stop also ends the
                 // request.
+                return;
+            }
+            // Its working memory did not fit beside another prefill call. It
+            // runs again alone.
+            if self
+                .running_calls
+                .iter()
+                .any(|running_call| matches!(running_call.call, Call::Prefill { .. }))
+            {
+                self.generations[i]
+                    .prefill
+                    .as_mut()
+                    .expect("a prefill")
+                    .must_run_alone = true;
+                self.idle_prefill_streams.push(stream);
                 return;
             }
             let generation = self.generations.remove(i);
@@ -1914,11 +2006,11 @@ impl WorkerModel {
         };
         let (captured, info) = (stream.captured_snapshot(), stream.prefill_info());
         let prefill = self.generations[i].prefill.as_ref().expect("a prefill");
-        let origin = prefill.origin;
+        let (origin, capture_position) = (prefill.origin, prefill.capture_position);
         states.cache.add_prefilled_tokens(
             state_id,
-            &prefill.prompt,
-            state_cache::count_stale_rows_at(origin, prompt_tokens),
+            &prefill.prompt[..end],
+            state_cache::count_stale_rows_at(origin, end),
         );
         if let Some(at) = call_capture
             && let Some(captured) = captured
@@ -1934,6 +2026,47 @@ impl WorkerModel {
                     stale_rows: stale,
                 },
             );
+        }
+        let last = end == prompt_tokens;
+        if prefill_rows.is_some() && !last {
+            let at_interval = !can_replay
+                && end.is_multiple_of(states.snapshot_interval)
+                && states.cache.find_snapshot(state_id, end).is_none();
+            if capture_position == Some(end) || at_interval {
+                let bytes = self.model.snapshot_bytes(false);
+                let fits = capture_position == Some(end)
+                    || states
+                        .cache
+                        .find_eviction(bytes, false, &[state_id])
+                        .is_some_and(|eviction| {
+                            let evicted = states.cache.evict(&eviction);
+                            states.free_evicted(evicted);
+                            true
+                        });
+                if fits {
+                    let snapshot = self.model.snapshot_take(engine_state, end, None);
+                    states.insert_snapshot(state_id, end, snapshot);
+                    let stale = state_cache::count_stale_rows_at(origin, end);
+                    states.cache.add_snapshot(
+                        state_id,
+                        Snapshot {
+                            pos: end,
+                            kind: SnapshotKind::Branch,
+                            bytes,
+                            stale_rows: stale,
+                        },
+                    );
+                }
+            }
+        }
+        if !last {
+            self.generations[i]
+                .prefill
+                .as_mut()
+                .expect("a prefill")
+                .next_position = end;
+            self.idle_prefill_streams.push(stream);
+            return;
         }
         let snapshot = self
             .model
@@ -1963,8 +2096,9 @@ impl WorkerModel {
         match call {
             Call::Prefill {
                 request_id,
+                end,
                 call_capture,
-            } => self.finish_prefill_call(stream, request_id, call_capture, shared, states),
+            } => self.finish_prefill_call(stream, request_id, end, call_capture, shared, states),
             Call::DecodeRows {
                 request_ids,
                 tokens,
