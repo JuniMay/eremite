@@ -16,9 +16,9 @@ deepseek-recipe-encoding = "=0.2.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
-# File locks, free disk space, process groups, exit statuses and the local time
-# of the terminal UI's log lines (disk.rs, codex/search.rs, chat/deepseek.rs,
-# ui/log.rs).
+# File locks, free disk space, process groups, exit statuses, the local time of
+# the terminal UI's log lines and the terminal UI's capture of stderr (disk.rs,
+# codex/search.rs, chat/deepseek.rs, ui/log.rs, ui/capture.rs).
 libc = "0.2"
 rand = "0.9"
 # The terminal UI (ui/): ratatui on its crossterm backend.

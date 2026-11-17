@@ -1,7 +1,7 @@
 //! The terminal UI's log: the lines of the engine, of the server and of each
-//! model, each with the model it is about. The engine's log hook and the
-//! worker's hook for model lines keep them here. The log view draws the newest
-//! lines that pass its filter.
+//! model, each with the model it is about. The engine's log hook, the
+//! worker's hook for model lines and the capture of stderr keep them here.
+//! The log view draws the newest lines that pass its filter.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char};
@@ -154,6 +154,23 @@ pub fn keep_model_line(model_index: usize, line: &str) {
         model: Some(model_index),
         text: line.to_string(),
     });
+}
+
+/// Keeps `text`, a line that something wrote to stderr while the view
+/// captured it, as a line about no model with the time it was read. It never
+/// writes to stderr, which is the pipe that the line came from.
+pub fn keep_captured_line(text: &str) {
+    let line = LogLine {
+        time: format_time_of_day(SystemTime::now()),
+        model: None,
+        text: text.to_string(),
+    };
+    let mut kept = lock_kept();
+    kept.logged += 1;
+    if kept.lines.len() == KEPT_LINES {
+        kept.lines.pop_front();
+    }
+    kept.lines.push_back(line);
 }
 
 /// Sets whether the view is on the screen.
@@ -431,6 +448,14 @@ mod tests {
         let unprinted = take_unprinted_lines();
         assert!(unprinted.contains(&"19:19:22.784 http 4: arrived from 127.0.0.1".to_string()));
         assert!(take_unprinted_lines().is_empty(), "each line once");
+        // a captured line stays unprinted, even off the screen
+        set_on_screen(false);
+        keep_captured_line("a line that a library wrote");
+        set_on_screen(true);
+        let unprinted = take_unprinted_lines();
+        assert_eq!(unprinted.len(), 1);
+        assert!(unprinted[0].ends_with(" a line that a library wrote"));
+        assert_eq!(copy_lines().last().map(|line| line.model), Some(None));
         // the seconds and the milliseconds do not depend on the time zone
         let at = UNIX_EPOCH + std::time::Duration::from_millis(3_723_456);
         assert!(format_time_of_day(at).ends_with(":03.456"));
