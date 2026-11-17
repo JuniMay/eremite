@@ -13,10 +13,13 @@
 //! One server at a time uses the folder. It holds a lock on the folder's `lock`
 //! file. Another server runs without saved states.
 
-use crate::engine;
-use crate::state_cache::{Part, SavedSnapshot, SavedState, SavedStateId, Snapshot, SnapshotKind};
+use crate::engine::{self, Model};
+use crate::state_cache::{
+    Cache, Part, SavedSnapshot, SavedState, SavedStateId, Snapshot, SnapshotKind,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::c_int;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -64,6 +67,90 @@ const MAX_NUMBER_DIGITS: usize = 19;
 const FOLDER_MODE: u32 = 0o700;
 /// Only the owner may read and write the files.
 const FILE_MODE: u32 = 0o600;
+
+/// The writes and reads of one state's rows and snapshots, for saving and
+/// loading. An engine state implements it. So does the tests' fake state.
+pub trait StateIo {
+    /// What the state's snapshots are known by.
+    type SnapshotHandle: Copy;
+
+    /// Writes the rows that positions `from..to` wrote to `fd`. Returns the
+    /// bytes written, or None when the write fails or a second stop request
+    /// ends it. With fd -1, it writes nothing and returns the bytes it would
+    /// write.
+    fn write_rows(&self, from: usize, to: usize, fd: c_int) -> Option<u64>;
+
+    /// Writes `snapshot` to `fd`, without its logits. With no `snapshot`, it
+    /// writes the state's rolling rows at its end, `pos`. Returns the bytes
+    /// written, or None when the write fails. With fd -1, it writes nothing and
+    /// returns the bytes it would write.
+    fn write_snapshot(
+        &self,
+        snapshot: Option<Self::SnapshotHandle>,
+        pos: usize,
+        fd: c_int,
+    ) -> Option<u64>;
+
+    /// Reads the model's identity: what its saved states depend on.
+    fn read_model_identity(&self) -> [u8; IDENTITY_BYTES];
+
+    /// Reads the rows before `positions` into the state from the part files
+    /// `fds`, in the order the parts were written. Returns false when a part is
+    /// short, damaged or of another shape.
+    fn read_rows(&self, positions: usize, fds: &[c_int]) -> bool;
+
+    /// Reads a snapshot from `fd`. Returns None when the file is short, damaged
+    /// or of another shape.
+    fn read_snapshot(&self, fd: c_int) -> Option<Self::SnapshotHandle>;
+}
+
+/// A state of an engine model, for saving and loading.
+pub struct EngineState<'a> {
+    /// The model that owns the state.
+    pub model: &'a Model,
+    /// The engine's state.
+    pub state: engine::StateHandle,
+}
+
+impl StateIo for EngineState<'_> {
+    type SnapshotHandle = engine::SnapshotHandle;
+
+    fn write_rows(&self, from: usize, to: usize, fd: c_int) -> Option<u64> {
+        self.model.state_write(self.state, from, to, fd)
+    }
+
+    fn write_snapshot(
+        &self,
+        snapshot: Option<engine::SnapshotHandle>,
+        pos: usize,
+        fd: c_int,
+    ) -> Option<u64> {
+        self.model.snapshot_write(snapshot, self.state, pos, fd)
+    }
+
+    fn read_model_identity(&self) -> [u8; IDENTITY_BYTES] {
+        self.model.state_identity()
+    }
+
+    fn read_rows(&self, positions: usize, fds: &[c_int]) -> bool {
+        self.model.state_read(self.state, positions, fds)
+    }
+
+    fn read_snapshot(&self, fd: c_int) -> Option<engine::SnapshotHandle> {
+        self.model.snapshot_read(fd)
+    }
+}
+
+/// Why a saved state was not loaded.
+#[derive(Debug, PartialEq)]
+pub enum LoadError {
+    /// A file is missing, short, damaged or of another shape. The caller
+    /// deletes the saved state. The text says what failed.
+    Damaged(String),
+    /// A file exists but cannot be opened now. The saved state stays. The text
+    /// says what failed.
+    Unavailable(String),
+}
 
 /// The saved states' folder, locked for this server, and counts of this run's
 /// loads, saves and bytes written.
@@ -435,6 +522,71 @@ impl Store {
     pub fn get_folder(&self) -> &Path {
         &self.folder
     }
+
+    /// Sets the last use of saved state `id` to `when`. Its index's
+    /// modification time keeps it for the next start.
+    fn set_last_used(&self, id: SavedStateId, when: SystemTime) {
+        if let Ok(index) = fs::OpenOptions::new()
+            .write(true)
+            .open(self.folder.join(format_index_file_name(id)))
+        {
+            let _ = index.set_modified(when);
+        }
+    }
+
+    /// Loads saved state `id` into a new state through `io`. It reads the saved
+    /// rows before `from`. With `snapshot_pos`, it also reads the snapshot at
+    /// that position. It returns the snapshot without restoring it, or None
+    /// without one. Marks the saved state used now.
+    pub fn load_saved_state<S: StateIo>(
+        &mut self,
+        cache: &mut Cache,
+        io: &S,
+        id: SavedStateId,
+        snapshot_pos: Option<usize>,
+        from: usize,
+    ) -> Result<Option<S::SnapshotHandle>, LoadError> {
+        let damage = |message: String| LoadError::Damaged(message);
+        let saved_state = cache
+            .saved_states
+            .get(&id)
+            .ok_or(damage("it is gone".into()))?;
+        // A missing file is damage. Other open errors may pass, such as
+        // permissions or too many open files.
+        let open_file = |name: String| {
+            File::open(self.folder.join(&name)).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => damage(format!("{name}: {e}")),
+                _ => LoadError::Unavailable(format!("{name}: {e}")),
+            })
+        };
+        let files = saved_state
+            .parts
+            .iter()
+            .map(|part| open_file(format_part_file_name(id, part)))
+            .collect::<Result<Vec<File>, LoadError>>()?;
+        let fds: Vec<c_int> = files.iter().map(|file| file.as_raw_fd()).collect();
+        if !io.read_rows(from, &fds) {
+            return Err(damage("its rows are damaged or of another shape".into()));
+        }
+        let mut snapshot = None;
+        if let Some(pos) = snapshot_pos {
+            let saved_snapshot = saved_state
+                .snapshots
+                .iter()
+                .find(|candidate| candidate.snapshot.pos == pos)
+                .ok_or(damage("its snapshot is gone".into()))?;
+            snapshot = io.read_snapshot(
+                open_file(format_snapshot_file_name(id, saved_snapshot))?.as_raw_fd(),
+            );
+            if snapshot.is_none() {
+                return Err(damage("its snapshot is damaged or of another shape".into()));
+            }
+        }
+        self.set_last_used(id, SystemTime::now());
+        cache.mark_saved_state_used(id);
+        self.load_count += 1;
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +712,153 @@ mod tests {
         ] {
             assert_eq!(parse_file_name(other), None, "{other}");
         }
+    }
+
+    /// A test state whose writes put zeros in the files.
+    struct FakeState {
+        /// The bytes it writes for its rows.
+        row_bytes: u64,
+        /// The bytes it writes for a snapshot.
+        snapshot_bytes: u64,
+        /// Whether every write to a file fails.
+        fails_writes: bool,
+    }
+
+    impl FakeState {
+        /// Writes `bytes` zero bytes to `fd`. With fd -1, it returns `bytes`
+        /// without writing.
+        fn write_zeros(&self, bytes: u64, fd: c_int) -> Option<u64> {
+            if fd < 0 {
+                return Some(bytes);
+            }
+            if self.fails_writes {
+                return None;
+            }
+            let mut file = std::mem::ManuallyDrop::new(unsafe {
+                <File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+            });
+            std::io::Write::write_all(&mut *file, &vec![0u8; bytes as usize])
+                .ok()
+                .map(|_| bytes)
+        }
+    }
+
+    impl StateIo for FakeState {
+        type SnapshotHandle = ();
+
+        fn write_rows(&self, _from: usize, _to: usize, fd: c_int) -> Option<u64> {
+            self.write_zeros(self.row_bytes, fd)
+        }
+
+        fn write_snapshot(&self, _snapshot: Option<()>, _pos: usize, fd: c_int) -> Option<u64> {
+            self.write_zeros(self.snapshot_bytes, fd)
+        }
+
+        fn read_model_identity(&self) -> [u8; IDENTITY_BYTES] {
+            [3; IDENTITY_BYTES]
+        }
+
+        fn read_rows(&self, _positions: usize, _fds: &[c_int]) -> bool {
+            true
+        }
+
+        fn read_snapshot(&self, _fd: c_int) -> Option<()> {
+            Some(())
+        }
+    }
+
+    /// Opens a store in a new folder named after `name`. Returns the folder,
+    /// the store, and a cache that saves states of 100 unshared tokens or more.
+    fn open_test_store(name: &str) -> (PathBuf, Store, Cache) {
+        let dir = std::env::temp_dir().join(format!("eremite-disk-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (store, _) = Store::open(&dir).expect("the store");
+        let mut cache = Cache::new(1 << 30, 16);
+        cache.min_unshared_tokens = 100;
+        cache.saved_byte_limit = 1 << 30;
+        (dir, store, cache)
+    }
+
+    /// Writes saved state `id` of model 0 to `dir`, and adds it to `cache`. It
+    /// holds `tokens` in one part of `row_bytes` bytes. It has a generation-end
+    /// snapshot of `snapshot_bytes` bytes.
+    fn write_saved_state(
+        dir: &Path,
+        cache: &mut Cache,
+        id: SavedStateId,
+        tokens: std::ops::Range<i32>,
+        row_bytes: u64,
+        snapshot_bytes: u64,
+    ) {
+        let len = tokens.len();
+        let saved_state = SavedState {
+            model: Some(0),
+            tokens: tokens.collect(),
+            parts: vec![Part {
+                from: 0,
+                to: len,
+                bytes: row_bytes,
+                file_number: 0,
+            }],
+            snapshots: vec![SavedSnapshot {
+                snapshot: Snapshot {
+                    pos: len,
+                    kind: SnapshotKind::GenerationEnd,
+                    bytes: snapshot_bytes,
+                    stale_rows: 0,
+                },
+                version: 1,
+            }],
+            replaced_positions: 0,
+            last_used: 0,
+            version: 1,
+        };
+        fs::write(
+            dir.join(format_index_file_name(id)),
+            encode_index(&[3; IDENTITY_BYTES], &saved_state),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format_part_file_name(id, &saved_state.parts[0])),
+            vec![0u8; row_bytes as usize],
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format_snapshot_file_name(id, &saved_state.snapshots[0])),
+            vec![0u8; snapshot_bytes as usize],
+        )
+        .unwrap();
+        cache.add_saved_state(id, saved_state);
+    }
+
+    #[test]
+    fn a_saved_state_that_cannot_be_opened_now_is_not_damaged() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut store, mut cache) = open_test_store("load-errors");
+        write_saved_state(&dir, &mut cache, 4, 0..1000, 1000, 500);
+        let io = FakeState {
+            row_bytes: 0,
+            snapshot_bytes: 0,
+            fails_writes: false,
+        };
+        let part = dir.join("4-0.rows");
+        fs::set_permissions(&part, fs::Permissions::from_mode(0o000)).unwrap();
+        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 1000);
+        fs::set_permissions(&part, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        assert!(matches!(read, Err(LoadError::Unavailable(_))), "{read:?}");
+        assert!(
+            store
+                .load_saved_state(&mut cache, &io, 4, Some(1000), 1000)
+                .is_ok()
+        );
+        fs::remove_file(&part).unwrap();
+        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 1000);
+        assert!(
+            matches!(read, Err(LoadError::Damaged(_))),
+            "a missing part: {read:?}"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
