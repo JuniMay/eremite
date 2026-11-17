@@ -8,7 +8,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use super::draw::{fit_line, format_duration, label, plain, strong};
-use super::theme::Theme;
+use super::status::{ModelStatus, Phase};
+use super::theme::{Rgb, Theme};
 
 /// The views of the top tab row. Each one shows what all models share, except
 /// Models, which shows one model at a time.
@@ -32,6 +33,54 @@ pub const VIEWS: [(View, &str); 4] = [
     (View::Models, "Models"),
 ];
 
+/// A kind of model. Each kind has its own sub-views in Models, and every model
+/// of the kind shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A language model: it keeps sessions, and it may route its tokens to
+    /// experts.
+    Llm,
+}
+
+/// A sub-view of Models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubView {
+    /// An LLM's sessions as a tree of their shared prefixes, and the text of
+    /// the chosen one.
+    States,
+    /// The experts that a decoding request's latest tokens chose.
+    Experts,
+}
+
+impl Kind {
+    /// Returns the sub-views of a model of this kind, in the order of their
+    /// tabs.
+    pub fn list_sub_views(self) -> &'static [SubView] {
+        match self {
+            Kind::Llm => &[SubView::States, SubView::Experts],
+        }
+    }
+}
+
+impl SubView {
+    /// Returns the sub-view's name on its tab.
+    pub fn name(self) -> &'static str {
+        match self {
+            SubView::States => "States",
+            SubView::Experts => "Experts",
+        }
+    }
+}
+
+/// A model as the views show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelInfo {
+    /// The model's name, as requests give it.
+    pub name: String,
+    /// The model's kind.
+    pub kind: Kind,
+}
+
 /// What every view draws from.
 pub struct Screen<'a> {
     /// The colors.
@@ -40,6 +89,10 @@ pub struct Screen<'a> {
     pub address: &'a str,
     /// The seconds since the server started.
     pub uptime_seconds: f64,
+    /// The served models, in their configured order.
+    pub models: &'a [ModelInfo],
+    /// Each model's latest status, in the same order.
+    pub statuses: &'a [ModelStatus],
 }
 
 /// The keys that the keys row names: each key, and what it does.
@@ -94,6 +147,50 @@ impl Choices {
             .iter()
             .find(|target| target.y == y && (target.x0..target.x1).contains(&x))
             .map(|target| target.target)
+    }
+}
+
+/// What a model's tab shows that the model does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// It runs a request.
+    Busy,
+    /// It is loaded and runs nothing.
+    Idle,
+    /// It loads its weights.
+    Loading,
+    /// It is not loaded, or a yield holds it.
+    Unloaded,
+    /// Its last load failed.
+    Failed,
+}
+
+impl Mark {
+    /// Returns the mark of a model with `status`.
+    pub fn of(status: &ModelStatus) -> Mark {
+        if status.load_error.is_some() {
+            Mark::Failed
+        } else if status.phase == Phase::Loading {
+            Mark::Loading
+        } else if status.phase == Phase::Held || !status.loaded {
+            Mark::Unloaded
+        } else if status.count_requests().0 > 0 {
+            Mark::Busy
+        } else {
+            Mark::Idle
+        }
+    }
+
+    /// Returns the mark's symbol and color. None takes the terminal's own
+    /// text color.
+    pub fn look(self, theme: &Theme) -> (&'static str, Option<Rgb>) {
+        match self {
+            Mark::Busy => ("●", Some(theme.accent)),
+            Mark::Idle => ("○", None),
+            Mark::Loading => ("●", Some(theme.amber)),
+            Mark::Unloaded => ("○", Some(theme.label)),
+            Mark::Failed => ("●", Some(theme.red)),
+        }
     }
 }
 
@@ -245,6 +342,7 @@ pub fn list_chrome_keys(choices: &Choices) -> (Keys, Keys) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::status::{Activity, Request};
     use crate::ui::testing::{draw_on_terminal, find_in_row, read_row};
     use crate::ui::theme::DARK;
 
@@ -254,6 +352,8 @@ mod tests {
             theme: &DARK,
             address: "127.0.0.1:52878",
             uptime_seconds: 57.0,
+            models: &[],
+            statuses: &[],
         };
         let (mut keys, last) = list_chrome_keys(choices);
         keys.extend(last);
@@ -288,6 +388,65 @@ mod tests {
         choices.mouse = false;
         let (buf, _) = draw(100, 30, &mut choices);
         assert!(read_row(&buf, 29).contains("m mouse: selects text"));
+    }
+
+    #[test]
+    fn a_models_mark_shows_what_it_does() {
+        let busy = ModelStatus {
+            loaded: true,
+            requests: vec![Request {
+                status: Activity::Prefill,
+                ..Request::default()
+            }],
+            ..ModelStatus::default()
+        };
+        let loading = ModelStatus {
+            phase: Phase::Loading,
+            ..ModelStatus::default()
+        };
+        let failed = ModelStatus {
+            load_error: Some("does not fit".into()),
+            ..ModelStatus::default()
+        };
+        let idle = ModelStatus {
+            loaded: true,
+            ..ModelStatus::default()
+        };
+        let held = ModelStatus {
+            loaded: true,
+            phase: Phase::Held,
+            ..ModelStatus::default()
+        };
+        let marks = [
+            &busy,
+            &loading,
+            &failed,
+            &idle,
+            &held,
+            &ModelStatus::default(),
+        ]
+        .map(Mark::of);
+        assert_eq!(
+            marks,
+            [
+                Mark::Busy,
+                Mark::Loading,
+                Mark::Failed,
+                Mark::Idle,
+                Mark::Unloaded,
+                Mark::Unloaded
+            ]
+        );
+        assert_eq!(Mark::Busy.look(&DARK), ("●", Some(DARK.accent)));
+        assert_eq!(Mark::Loading.look(&DARK), ("●", Some(DARK.amber)));
+        assert_eq!(Mark::Failed.look(&DARK), ("●", Some(DARK.red)));
+        assert_eq!(Mark::Unloaded.look(&DARK), ("○", Some(DARK.label)));
+        assert_eq!(Mark::Idle.look(&DARK), ("○", None));
+        assert_eq!(
+            Kind::Llm.list_sub_views(),
+            [SubView::States, SubView::Experts]
+        );
+        assert_eq!(SubView::Experts.name(), "Experts");
     }
 
     #[test]
