@@ -66,6 +66,10 @@
 //! memory. The new state loads the saved rows before the plan's start. Then a
 //! snapshot is restored into it, or a replay rebuilds the rolling rows. At
 //! equal cost, a state in memory and a cold start go before the SSD.
+//!
+//! A state may have a saved link: its rows before some position equal a saved
+//! state's rows. Then the state was loaded from that saved state, or copied
+//! from a state that was.
 
 use std::collections::BTreeMap;
 
@@ -152,6 +156,21 @@ pub struct Entry {
     pub reserved_snapshots: Vec<Snapshot>,
     /// Its number in the log and the status.
     pub number: u64,
+    /// The link to a saved state whose rows equal this state's rows before some
+    /// position.
+    pub saved_link: Option<SavedLink>,
+}
+
+/// A link from a state to a saved state. The state was loaded from the saved
+/// state, or copied from a state that was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedLink {
+    /// The saved state.
+    pub saved_id: SavedStateId,
+    /// The saved state's version when the link was made.
+    pub version: u64,
+    /// The positions from 0 whose rows the state and the saved state share.
+    pub shared_positions: usize,
 }
 
 /// One part of a saved state: one file of rows.
@@ -760,6 +779,7 @@ impl Cache {
                 snapshots: Vec::new(),
                 reserved_snapshots: Vec::new(),
                 number: id,
+                saved_link: None,
             },
         );
         id
@@ -769,7 +789,8 @@ impl Cache {
     /// it continues in place. Its tokens become those of `prompt` before
     /// `from`, with `stale_rows` stale rows there. The request writes the
     /// state's rows from `from` on. So the cache removes the state's snapshots
-    /// after `from`. It returns them for the worker to free. The state becomes
+    /// after `from`. It returns them for the worker to free. The state's saved
+    /// link then covers at most the positions before `from`. The state becomes
     /// busy and used now. It takes `bytes`.
     pub fn start_request(
         &mut self,
@@ -788,6 +809,10 @@ impl Cache {
         entry.reserved_snapshots.clear();
         entry.tokens.clear();
         entry.tokens.extend_from_slice(&prompt[..from]);
+        if let Some(link) = &mut entry.saved_link {
+            // its rows from `from` on are written again
+            link.shared_positions = link.shared_positions.min(from);
+        }
         let (kept, dropped): (Vec<Snapshot>, Vec<Snapshot>) = entry
             .snapshots
             .drain(..)
@@ -1112,6 +1137,45 @@ impl Cache {
         let now = self.advance_clock();
         if let Some(saved_state) = self.saved_states.get_mut(&id) {
             saved_state.last_used = now;
+        }
+    }
+
+    /// Links state `id` to saved state `saved_id`. State `id` loaded its rows
+    /// before `shared_positions` from it. The link records the saved state's
+    /// version now.
+    pub fn link_to_saved_state(
+        &mut self,
+        id: StateId,
+        saved_id: SavedStateId,
+        shared_positions: usize,
+    ) {
+        let link = self
+            .saved_states
+            .get(&saved_id)
+            .map(|saved_state| SavedLink {
+                saved_id,
+                version: saved_state.version,
+                shared_positions,
+            });
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.saved_link = link;
+        }
+    }
+
+    /// Copies the saved link of state `source` to state `id`. State `id` copied
+    /// the source's rows before `copied_positions`. The copy covers at most
+    /// those positions.
+    pub fn copy_saved_link(&mut self, id: StateId, source: StateId, copied_positions: usize) {
+        let link = self
+            .entries
+            .get(&source)
+            .and_then(|entry| entry.saved_link)
+            .map(|source_link| SavedLink {
+                shared_positions: source_link.shared_positions.min(copied_positions),
+                ..source_link
+            });
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.saved_link = link;
         }
     }
 
@@ -2416,6 +2480,39 @@ mod tests {
         assert_eq!(
             cache.find_cheapest_plan(0, &collect_tokens(0..1200), limits),
             Plan::Cold
+        );
+    }
+
+    #[test]
+    fn saved_links_follow_copies_and_continuations() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..1000), &[]);
+        let loaded = add_idle_state(&mut cache, &collect_tokens(0..1000), &[]);
+        cache.link_to_saved_state(loaded, 4, 1000);
+        assert_eq!(
+            cache.entries[&loaded].saved_link,
+            Some(SavedLink {
+                saved_id: 4,
+                version: 1,
+                shared_positions: 1000
+            })
+        );
+        // a copy of its rows before 600 shares them up to there
+        let copy = cache.add_state(0, STATE_BYTES);
+        cache.copy_saved_link(copy, loaded, 600);
+        assert_eq!(
+            cache.entries[&copy]
+                .saved_link
+                .map(|link| link.shared_positions),
+            Some(600)
+        );
+        // continuing before its end: its rows from there are written again
+        cache.start_request(loaded, &collect_tokens(0..1000), 950, STATE_BYTES, 0);
+        assert_eq!(
+            cache.entries[&loaded]
+                .saved_link
+                .map(|link| link.shared_positions),
+            Some(950)
         );
     }
 
