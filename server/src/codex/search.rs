@@ -5,6 +5,8 @@
 //!
 //! - `search_query` runs on SearXNG.
 //!   SearXNG listens on a Unix socket, so it occupies no TCP port.
+//!   The server starts SearXNG on demand.
+//!   It stops SearXNG after [`Times::searxng_idle`] without a search.
 //! - `open` shows a page from a reference or a URL, and `click` follows one
 //!   of its links.
 //! - `find` shows the lines of a page that contain a text.
@@ -298,7 +300,10 @@ impl Session {
 pub struct Times {
     /// What each fetch may take.
     /// Each search may take as long.
+    /// Each health check of SearXNG, and SearXNG's start, may take as long too.
     pub timeout: Duration,
+    /// SearXNG stops after this long without a search.
+    pub searxng_idle: Duration,
     /// A session without calls for this long is forgotten.
     pub session_idle: Duration,
 }
@@ -344,13 +349,30 @@ impl Call {
 impl Service {
     /// Creates the service with no sessions.
     /// SearXNG listens on `searxng_socket`.
-    pub fn new(searxng_socket: PathBuf, address_policy: AddressPolicy, times: Times) -> Self {
+    /// SearXNG's installation is in `searxng_dir`.
+    pub fn new(
+        searxng_dir: PathBuf,
+        searxng_socket: PathBuf,
+        address_policy: AddressPolicy,
+        times: Times,
+    ) -> Self {
         Service {
             sessions: Mutex::new(HashMap::new()),
-            searxng: Searxng::new(searxng_socket, times),
+            searxng: Searxng::new(searxng_dir, searxng_socket, times),
             address_policy,
             times,
         }
+    }
+
+    /// Stops SearXNG if this server started it.
+    pub fn stop_searxng(&self) {
+        self.searxng.stop();
+    }
+
+    /// Stops SearXNG once it has gone [`Times::searxng_idle`] without a search,
+    /// after each start. It runs for the server's life.
+    pub async fn stop_searxng_when_idle(&self) {
+        self.searxng.stop_when_idle().await;
     }
 
     /// Returns the call's number in its session and a copy of the session's
@@ -665,10 +687,20 @@ struct SearxngResult {
 
 /// What the handles to SearXNG share.
 struct SearxngState {
+    /// The folder of SearXNG's installation.
+    dir: PathBuf,
     /// The Unix socket that SearXNG listens on.
     socket: PathBuf,
     /// The web tool's time limit and lifetimes.
     times: Times,
+    /// The process group of the SearXNG this server started.
+    process_group: Mutex<Option<i32>>,
+    /// When a search last used SearXNG.
+    last_used: Mutex<Instant>,
+    /// Lets one search at a time start SearXNG.
+    start_lock: tokio::sync::Mutex<()>,
+    /// Wakes the idle stop when this server starts SearXNG.
+    started: tokio::sync::Notify,
 }
 
 /// A handle to the SearXNG that runs the searches.
@@ -676,8 +708,16 @@ struct Searxng(Arc<SearxngState>);
 
 impl Searxng {
     /// Creates a handle to the SearXNG on `socket`.
-    fn new(socket: PathBuf, times: Times) -> Self {
-        Searxng(Arc::new(SearxngState { socket, times }))
+    fn new(dir: PathBuf, socket: PathBuf, times: Times) -> Self {
+        Searxng(Arc::new(SearxngState {
+            dir,
+            socket,
+            times,
+            process_group: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
+            start_lock: tokio::sync::Mutex::new(()),
+            started: tokio::sync::Notify::new(),
+        }))
     }
 
     /// Returns another handle to the same SearXNG.
@@ -685,13 +725,193 @@ impl Searxng {
         Searxng(self.0.clone())
     }
 
+    /// Records that a search uses SearXNG now.
+    fn mark_used(&self) {
+        *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// Checks whether SearXNG answers its health check on the socket.
+    async fn is_answering(&self) -> bool {
+        let socket = self.0.socket.to_string_lossy().to_string();
+        Command::new(CURL_PATH)
+            .args([
+                "-q",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+            ])
+            .arg(self.0.times.timeout.as_secs_f64().to_string())
+            .arg("--unix-socket")
+            .arg(&socket)
+            .arg("http://localhost/healthz")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .is_ok_and(|o| o.stdout == b"200")
+    }
+
+    /// Starts SearXNG unless its socket already answers. After each line that
+    /// SearXNG logs, it checks whether the socket answers. It gives up when
+    /// SearXNG exits, or after the time limit.
+    async fn start_unless_answering(&self) -> Result<(), String> {
+        let _starting = self.0.start_lock.lock().await;
+        self.mark_used();
+        if self.is_answering().await {
+            return Ok(());
+        }
+        let state = &self.0;
+        let granian = state.dir.join("venv/bin/granian");
+        if !granian.exists() {
+            return Err(format!(
+                "SearXNG is not installed in {}",
+                state.dir.display()
+            ));
+        }
+        // a stale socket from an earlier run
+        let _ = std::fs::remove_file(&state.socket);
+        let mut command = std::process::Command::new(&granian);
+        // 384 is 0o600: only this user may use the socket.
+        command
+            .args(["--interface", "wsgi", "--uds"])
+            .arg(&state.socket)
+            .args(["--uds-permissions", "384", "searx.webapp:app"])
+            .current_dir(state.dir.join("src"));
+        // SearXNG's output and errors go to one pipe. Each line on it starts a
+        // check of the socket.
+        let (output, writer) = std::io::pipe().map_err(|e| format!("cannot start SearXNG: {e}"))?;
+        let errors = writer
+            .try_clone()
+            .map_err(|e| format!("cannot start SearXNG: {e}"))?;
+        command.stdin(Stdio::null()).stdout(writer).stderr(errors);
+        let settings = state.dir.join("settings.yml");
+        if settings.exists() {
+            command.env("SEARXNG_SETTINGS_PATH", settings);
+        }
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("cannot start SearXNG: {e}"))?;
+        // The pipe ends when its last writer closes it. Dropping the command
+        // closes this process's copies.
+        drop(command);
+        *state
+            .process_group
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(child.id() as i32);
+        state.started.notify_one();
+        engine::log(&format!("SearXNG started on {}", state.socket.display()));
+        // A thread reads the pipe while SearXNG runs, so that the pipe never
+        // fills. Then it reaps SearXNG.
+        let (line_sender, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for _ in std::io::BufRead::lines(std::io::BufReader::new(output)) {
+                let _ = line_sender.send(());
+            }
+            let _ = child.wait();
+        });
+        let answering = tokio::time::timeout(state.times.timeout, async {
+            while lines.recv().await.is_some() {
+                if self.is_answering().await {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        match answering {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.stop();
+                Err("SearXNG exited before it answered".into())
+            }
+            Err(_) => {
+                self.stop();
+                Err(format!(
+                    "SearXNG did not start within {} s",
+                    state.times.timeout.as_secs_f64()
+                ))
+            }
+        }
+    }
+
+    /// Stops the SearXNG that this server started, if any, and removes its
+    /// socket.
+    fn stop(&self) {
+        if let Some(group) = self
+            .0
+            .process_group
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            // SAFETY: signals the process group this server created.
+            unsafe {
+                libc::killpg(group, libc::SIGTERM);
+            }
+            let _ = std::fs::remove_file(&self.0.socket);
+            engine::log("SearXNG stopped");
+        }
+    }
+
+    /// Waits until SearXNG, once this server started it, has gone the idle time
+    /// without a search, and stops it then.
+    async fn stop_when_idle(&self) {
+        loop {
+            let is_started = self
+                .0
+                .process_group
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if !is_started {
+                // A start before this wait leaves its wake for it.
+                self.0.started.notified().await;
+                continue;
+            }
+            let last_used = *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::time::sleep_until((last_used + self.0.times.searxng_idle).into()).await;
+            self.stop_if_idle();
+        }
+    }
+
+    /// Stops SearXNG if this server started it and it has gone the idle time
+    /// without a search.
+    fn stop_if_idle(&self) {
+        let is_idle = self
+            .0
+            .last_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            >= self.0.times.searxng_idle;
+        if is_idle
+            && self
+                .0
+                .process_group
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
+            self.stop();
+        }
+    }
+
     /// Runs one query on SearXNG and returns its results.
+    /// It starts SearXNG first unless SearXNG answers.
     async fn search(
         &self,
         query: &SearchQuery,
         allowed_domains: &[String],
         length: ResponseLength,
     ) -> Result<Vec<SearxngResult>, String> {
+        self.start_unless_answering().await?;
         let domains: Vec<String> = query
             .domains
             .iter()
@@ -730,6 +950,7 @@ impl Searxng {
             .output()
             .await
             .map_err(|e| e.to_string())?;
+        self.mark_used();
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -1618,6 +1839,7 @@ mod tests {
     /// The web tool's times in the tests: the settings' defaults.
     const TEST_TIMES: Times = Times {
         timeout: TEST_TIMEOUT,
+        searxng_idle: Duration::from_secs(600),
         session_idle: Duration::from_secs(7200),
     };
 
@@ -1666,6 +1888,18 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Spawns a process that runs until a signal ends it, in a process group
+    /// of its own, as SearXNG runs.
+    fn spawn_process_group() -> tokio::process::Child {
+        Command::new("/usr/bin/tail")
+            .args(["-f", "/dev/null"])
+            .stdin(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
     }
 
     #[test]
@@ -1736,9 +1970,75 @@ mod tests {
         assert_eq!(u.host(), Some(Host::Ipv4(Ipv4Addr::LOCALHOST)));
     }
 
+    /// SearXNG's start returns once SearXNG answers, and the stop ends it. It
+    /// sends no search. Set EREMITE_SEARXNG_DIR to a SearXNG installation to
+    /// run it.
+    #[tokio::test]
+    async fn searxng_answers_after_its_start_and_not_after_its_stop() {
+        let Some(dir) = std::env::var_os("EREMITE_SEARXNG_DIR").map(PathBuf::from) else {
+            eprintln!("skipped: set EREMITE_SEARXNG_DIR");
+            return;
+        };
+        let socket = dir.join(format!("eremite-test-{}.sock", std::process::id()));
+        let searxng = Searxng::new(dir, socket, TEST_TIMES);
+        searxng
+            .start_unless_answering()
+            .await
+            .expect("SearXNG starts");
+        assert!(
+            searxng.is_answering().await,
+            "SearXNG answers after its start"
+        );
+        searxng.stop();
+        assert!(
+            !searxng.is_answering().await,
+            "SearXNG answers no more after its stop"
+        );
+    }
+
+    /// The stop ends the process group that the server started. A process in
+    /// a group of its own stands in for SearXNG.
+    #[tokio::test]
+    async fn the_stop_ends_the_searxng_that_the_server_started() {
+        let s = Service::new(
+            "/nonexistent".into(),
+            "/nonexistent.sock".into(),
+            AddressPolicy::Public,
+            TEST_TIMES,
+        );
+        let mut searxng = spawn_process_group();
+        *s.searxng.0.process_group.lock().unwrap() = searxng.id().map(|id| id as i32);
+        s.stop_searxng();
+        assert!(!searxng.wait().await.unwrap().success(), "SIGTERM ends it");
+        assert!(s.searxng.0.process_group.lock().unwrap().is_none());
+    }
+
+    /// SearXNG stops once it has gone its idle time without a search. A
+    /// process in a group of its own stands in for SearXNG.
+    #[tokio::test]
+    async fn searxng_stops_after_its_idle_time() {
+        let times = Times {
+            searxng_idle: Duration::ZERO,
+            ..TEST_TIMES
+        };
+        let s = Service::new(
+            "/nonexistent".into(),
+            "/nonexistent.sock".into(),
+            AddressPolicy::Public,
+            times,
+        );
+        let mut searxng = spawn_process_group();
+        *s.searxng.0.process_group.lock().unwrap() = searxng.id().map(|id| id as i32);
+        tokio::select! {
+            _ = s.stop_searxng_when_idle() => unreachable!("the idle stop never returns"),
+            status = searxng.wait() => assert!(!status.unwrap().success(), "SIGTERM ends it"),
+        }
+    }
+
     #[test]
     fn references_stay_in_their_session_between_calls() {
         let s = Service::new(
+            "/nonexistent".into(),
             "/nonexistent.sock".into(),
             AddressPolicy::Public,
             TEST_TIMES,
@@ -1759,6 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_answers_each_of_its_commands() {
         let s = Service::new(
+            "/nonexistent".into(),
             "/nonexistent.sock".into(),
             AddressPolicy::Public,
             TEST_TIMES,
@@ -1807,6 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn cached_web_access_fetches_nothing() {
         let s = Service::new(
+            "/nonexistent".into(),
             "/nonexistent.sock".into(),
             AddressPolicy::Public,
             TEST_TIMES,
@@ -1904,7 +2206,12 @@ mod tests {
                 let _ = stream.write_all(reply.as_bytes()).await;
             }
         });
-        let s = Service::new(socket.clone(), AddressPolicy::Public, TEST_TIMES);
+        let s = Service::new(
+            "/nonexistent".into(),
+            socket.clone(),
+            AddressPolicy::Public,
+            TEST_TIMES,
+        );
         let request: SearchRequest = serde_json::from_value(serde_json::json!({
             "id": "s",
             "commands": {"search_query": [{"q": "url crate", "domains": ["docs.rs"]}]},
@@ -1973,7 +2280,12 @@ mod tests {
     #[tokio::test]
     async fn pages_are_fetched_followed_and_clicked() {
         let port = serve_test_pages().await;
-        let s = Service::new("/nonexistent.sock".into(), AddressPolicy::Any, TEST_TIMES);
+        let s = Service::new(
+            "/nonexistent".into(),
+            "/nonexistent.sock".into(),
+            AddressPolicy::Any,
+            TEST_TIMES,
+        );
         let request = |commands: serde_json::Value| -> SearchRequest {
             serde_json::from_value(
                 serde_json::json!({"id": "t", "commands": commands, "max_output_tokens": 2500}),
