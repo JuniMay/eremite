@@ -5,7 +5,8 @@
 #   make test           run the tests that need neither a GPU nor model files
 #   make gpu-test       run the tests that need a GPU but no model files
 #   make server         build/eremite-server, the HTTP server in server/
-#   make server-test    run the tests of the server in server/
+#   make server-test    run the server's tests; those that need model files
+#                       run when EREMITE_CHECKPOINT names a checkpoint
 #   make format         format the sources in place with clang-format and
 #                       rustfmt
 #   make format-check   fail if clang-format or rustfmt would change a source
@@ -76,7 +77,8 @@ TESTS := $(foreach t,$(TEST_SRC),$(BUILD)/tests/$(subst /,-,$(t:tests/%.c=%)))
 group_tests = $(filter $(BUILD)/tests/$(1)-%,$(TESTS))
 # Each test runs with a time limit, so that a hang fails the run: after
 # TEST_SECONDS, the test and the processes it started end. 0 sets no limit.
-# The server's tests run under one limit together.
+# The server's tests run under one limit together; with the model tests, set
+# TEST_SECONDS to fit them.
 TEST_SECONDS ?= 600
 TIME_LIMIT := $(BUILD)/tests/time-limit
 

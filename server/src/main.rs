@@ -1,24 +1,32 @@
-//! eremite-server: eremite's engine behind an HTTP server, for one model or
-//! several in one process.
+//! eremite-server: the OpenAI Chat Completions API over eremite's engine, for
+//! one model or several in one process.
 //!
 //! - The engine (src/eremite.h, and engine.rs here) runs the models. It owns
 //!   the stop on SIGINT or SIGTERM.
 //! - The worker (worker.rs) runs every model's requests on the engine thread.
+//! - Each model family's chat format (chat/) renders its requests and reads its
+//!   replies.
 
 use eremite_server::{chat, config, engine, http, worker};
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::exit;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::http::{StatusCode, header};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use serde_json::Value;
+use axum::routing::{get, post};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use eremite_server::chat::{Family, deepseek};
+use eremite_server::chat::{Api, Family, deepseek};
 use eremite_server::config::ModelConfig;
 
 /// The fewest characters that the API key has.
@@ -34,7 +42,7 @@ const USAGE: &str =
   Without --config or -m, read ~/.config/eremite/server.json.
   -m DIR          a supported model checkpoint directory, with its options below
   --config FILE   server settings and models in JSON; a request's model field picks its model
-  --serve PORT    override the JSON port; serve at http://HOST:PORT/v1
+  --serve PORT    override the JSON port; serve OpenAI Chat Completions at http://HOST:PORT/v1
   --host ADDR     the IPv4 address to serve on (default 127.0.0.1)
   --api-key-file FILE  the API key clients must send (16 to 256 characters)
   --http-timeout S   seconds a request's head, each part of its body and a stalled write may take
@@ -240,6 +248,200 @@ fn one_model_takes_its_options_from_the_command_line() {
     );
 }
 
+/// A file that a test writes. It is removed when the test ends.
+#[cfg(test)]
+struct TestFile(PathBuf);
+
+#[cfg(test)]
+impl Drop for TestFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn command_line_server_settings_override_the_file_in_either_order() {
+    let path = std::env::temp_dir().join(format!("eremite-server-{}.json", std::process::id()));
+    let config = json!({"port": 8008, "host": "127.0.0.1", "api_key_file": "/dev/null",
+                        "reserve": 10, "models": [{"model": "unused-model"}]});
+    std::fs::write(&path, config.to_string()).unwrap();
+    let written = TestFile(path);
+    let file = written.0.to_string_lossy().into_owned();
+    let parsed = parse_arguments(&["--config".into(), file.clone()]);
+    assert_eq!(parsed.server.port, Some(8008));
+    assert_eq!(parsed.server.api_key_file.as_deref(), Some("/dev/null"));
+    for before in [false, true] {
+        let flags: Vec<String> = [
+            "--serve",
+            "9008",
+            "--host",
+            "127.0.0.2",
+            "--api-key-file",
+            "override-key",
+            "--reserve",
+            "12",
+        ]
+        .map(String::from)
+        .into();
+        let config = vec!["--config".into(), file.clone()];
+        let parsed = parse_arguments(&if before {
+            [flags, config].concat()
+        } else {
+            [config, flags].concat()
+        });
+        assert_eq!(
+            (
+                parsed.server.port,
+                parsed.server.host.as_str(),
+                parsed.server.api_key_file.as_deref()
+            ),
+            (Some(9008), "127.0.0.2", Some("override-key"))
+        );
+        assert_eq!(parsed.budgets.reserve_gb, 12.0);
+    }
+}
+
+/// A served model: its names, its context, its tokenizer and its family's chat
+/// format.
+struct Served {
+    /// The name that requests give in `model`.
+    id: String,
+    /// The name that the model lists show.
+    name: String,
+    /// The number of tokens in the model's context.
+    ctx: usize,
+    /// The model's tokenizer.
+    tokenizer: engine::Tokenizer,
+    /// The model's chat format, with the model's defaults.
+    format: Format,
+}
+
+/// A model family's chat format, with a served model's defaults.
+enum Format {
+    /// DeepSeek V4.1's format (chat/deepseek.rs).
+    DeepSeek(deepseek::Defaults),
+}
+
+/// What the HTTP handlers share.
+struct Shared {
+    /// The API key's SHA-256 digest.
+    key: [u8; 32],
+    /// When the server started, in seconds since the Unix epoch.
+    started: u64,
+    /// The number of chat requests that arrived. The log names each request by
+    /// its number.
+    arrivals: AtomicU64,
+    /// The served models, in their configured order.
+    models: Vec<Served>,
+    /// The limits on connections and requests.
+    limits: http::Limits,
+    /// The time between the comment lines of a streamed response that waits for
+    /// its first event.
+    keepalive: Duration,
+}
+
+/// Finds the index of the model that the request's `body` names, in any case.
+/// With one model served, it returns that model for any name. Among several
+/// models, it returns an error message when the body names an unknown model, or
+/// none.
+fn find_model_index(shared: &Shared, body: &[u8]) -> Result<usize, String> {
+    /// The part of a request's body that names its model.
+    #[derive(serde::Deserialize)]
+    struct Named {
+        /// The model's name.
+        model: Option<String>,
+    }
+    let name = serde_json::from_slice::<Named>(body)
+        .ok()
+        .and_then(|named| named.model);
+    if let Some(name) = &name
+        && let Some(index) = shared
+            .models
+            .iter()
+            .position(|model| name.eq_ignore_ascii_case(&model.id))
+    {
+        return Ok(index);
+    }
+    if shared.models.len() == 1 {
+        return Ok(0);
+    }
+    let known: Vec<&str> = shared
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    Err(match name {
+        Some(name) => format!(
+            "no model {name:?} here; the models are {}",
+            known.join(", ")
+        ),
+        None => format!(
+            "the request names no model; the models are {}",
+            known.join(", ")
+        ),
+    })
+}
+
+/// The handlers' state: what they share.
+type App = State<Arc<Shared>>;
+
+/// Lets a request through when it carries the API key, as Authorization: Bearer
+/// KEY or x-api-key: KEY. GET /health needs no key. It compares the digests in
+/// constant time, so the time taken tells nothing about the key. It answers any
+/// other request with 401.
+async fn authorize(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    /// The scheme at the start of an Authorization header that carries the key.
+    const BEARER: &str = "bearer ";
+    if matches!(request.uri().path(), "/health" | "/v1/health") {
+        return next.run(request).await;
+    }
+    let headers: &HeaderMap = request.headers();
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .get(..BEARER.len())
+                .filter(|scheme| scheme.eq_ignore_ascii_case(BEARER))
+                .map(|_| value[BEARER.len()..].trim_start())
+        })
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        });
+    let given: [u8; 32] = Sha256::digest(key.unwrap_or_default().as_bytes()).into();
+    let same = given
+        .iter()
+        .zip(shared.key.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0;
+    if key.is_some() && same {
+        return next.run(request).await;
+    }
+    engine::log(&format!(
+        "{}: 401: {} {} with {}",
+        peer.ip(),
+        request.method(),
+        request.uri().path(),
+        if key.is_some() {
+            "a wrong API key"
+        } else {
+            "no API key"
+        }
+    ));
+    chat::build_error_response(
+        StatusCode::UNAUTHORIZED,
+        "authentication_error",
+        "a valid API key is required (Authorization: Bearer KEY)",
+    )
+}
+
 /// Builds a 200 response with the JSON text `body`.
 fn build_json_response(body: String) -> Response {
     (
@@ -255,12 +457,178 @@ async fn report_health() -> Response {
     build_json_response(r#"{"status": "ok"}"#.into())
 }
 
+/// Builds `model`'s object as GET /v1/models lists it: OpenAI's fields, and the
+/// context's length as servers commonly add it.
+fn build_model_object(shared: &Shared, model: &Served) -> Value {
+    json!({
+        "id": model.id, "object": "model", "created": shared.started, "owned_by": "eremite",
+        "name": model.name, "context_length": model.ctx, "max_model_len": model.ctx,
+        "max_output_tokens": (model.ctx as i64).min(chat::DEFAULT_MAX_TOKENS),
+    })
+}
+
+/// Answers GET /v1/models with the served models' objects.
+async fn list_served_models(State(shared): App) -> Response {
+    let data: Vec<Value> = shared
+        .models
+        .iter()
+        .map(|model| build_model_object(&shared, model))
+        .collect();
+    build_json_response(json!({"object": "list", "data": data}).to_string())
+}
+
+/// Logs `error` from `peer`, which ends a request before its response starts,
+/// and builds the error's response.
+fn refuse_request(peer: &str, error: chat::Error) -> Response {
+    engine::log(&format!(
+        "{peer}: {}: {}",
+        error.status.as_u16(),
+        error.message
+    ));
+    let error_type = match error.status {
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::BAD_REQUEST | StatusCode::REQUEST_TIMEOUT | StatusCode::PAYLOAD_TOO_LARGE => {
+            "invalid_request_error"
+        }
+        _ => "server_error",
+    };
+    chat::build_error_response(error.status, error_type, &error.message)
+}
+
+/// Submits `request` to the worker. Returns its cancel guard and the receiver
+/// of its events, or a 429 error when the worker is busy or stopping.
+fn submit_request(
+    request: worker::Request,
+) -> Result<
+    (
+        worker::CancelGuard,
+        tokio::sync::mpsc::UnboundedReceiver<worker::Event>,
+    ),
+    chat::Error,
+> {
+    worker::submit(request).map_err(|error| match error {
+        worker::SubmitError::Busy(message) => chat::Error {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+        },
+    })
+}
+
+/// Answers POST /v1/chat/completions.
+async fn answer_chat_completions(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    answer_generation(shared, peer, body, Api::ChatCompletions).await
+}
+
+/// Answers a generation request of either API from `peer`. It reads the
+/// request's `body` and finds its model. It renders and queues the request. It
+/// answers as a stream or as one response.
+async fn answer_generation(
+    shared: Arc<Shared>,
+    peer: SocketAddr,
+    body: Body,
+    api: Api,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let body = match http::read_body(body, shared.limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
+    let index = match find_model_index(&shared, &body) {
+        Ok(index) => index,
+        Err(message) => {
+            return chat::build_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                &message,
+            );
+        }
+    };
+    // Rendering and tokenization take a while for long prompts.
+    let (from, handlers) = (peer.clone(), shared.clone());
+    let queued = tokio::task::spawn_blocking(move || match &handlers.models[index].format {
+        Format::DeepSeek(defaults) => {
+            let prepared =
+                deepseek::prepare_request(&body, defaults, handlers.models[index].tokenizer, api)?;
+            let note = match api {
+                Api::ChatCompletions => format!(
+                    "{} messages, {} tools",
+                    prepared.message_count, prepared.tool_count
+                ),
+                Api::Responses => format!(
+                    "Responses API: {} input items, {} tools ({} not supported and left out)",
+                    prepared.message_count, prepared.tool_count, prepared.dropped_tool_count
+                ),
+            };
+            let note = format!(
+                "http {arrival} from {from}: {note}, {}; {}",
+                if prepared.is_streamed {
+                    "streamed"
+                } else {
+                    "one response"
+                },
+                prepared.describe_thinking()
+            );
+            let (cancel, events) = submit_request(prepared.build_worker_request(index, note)?)?;
+            Ok::<_, chat::Error>((Prepared::DeepSeek(prepared), cancel, events))
+        }
+    })
+    .await;
+    match queued {
+        Ok(Ok((Prepared::DeepSeek(prepared), cancel, events))) => {
+            if prepared.is_streamed {
+                deepseek::stream_response(prepared, cancel, events, shared.keepalive)
+            } else {
+                deepseek::collect_response(prepared, cancel, events).await
+            }
+        }
+        Ok(Err(error)) => refuse_request(&peer, error),
+        Err(error) => chat::build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &error.to_string(),
+        ),
+    }
+}
+
+/// A request that its family's chat format prepared for the worker.
+enum Prepared {
+    /// A request in DeepSeek V4.1's format.
+    DeepSeek(deepseek::PreparedRequest),
+}
+
 /// Answers a request for an unknown path with 404.
 async fn refuse_unknown_endpoint() -> Response {
     chat::build_error_response(
         StatusCode::NOT_FOUND,
         "invalid_request_error",
         "no such endpoint",
+    )
+}
+
+/// Answers a request with a method other than GET with 405.
+async fn refuse_other_than_get() -> Response {
+    chat::build_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "use GET",
+    )
+}
+
+/// Answers a request with a method other than POST with 405.
+async fn refuse_other_than_post() -> Response {
+    chat::build_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "use POST",
     )
 }
 
@@ -306,6 +674,7 @@ fn main() {
 
     // Each model's family, name and context.
     let mut served = Vec::new();
+    let mut families = Vec::new();
     for model in &arguments.models {
         let family = Family::of(&model.engine.model).unwrap_or_else(|error| die(&error));
         let mut options = model.engine.clone();
@@ -322,15 +691,36 @@ fn main() {
             die(&format!("two models named {id}: give one an id"));
         }
         served.push(worker::ModelSettings { id, options });
+        families.push(family);
     }
     if !worker::start(served.clone(), arguments.budgets.clone(), None, None) {
         exit(2);
     }
-    for settings in &served {
+    let loaded = worker::list_models();
+    let mut served_models = Vec::new();
+    for ((model, settings), family) in arguments.models.iter().zip(&served).zip(&families) {
+        let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
+        let format = match family {
+            Family::DeepSeek => Format::DeepSeek(deepseek::Defaults {
+                model_id: id.clone(),
+                sampling: worker::Sampling {
+                    temperature: model.temperature.unwrap_or(1.0),
+                    top_p: model.top_p.unwrap_or(1.0),
+                    top_k: model.top_k.unwrap_or(0),
+                    seed: model.seed,
+                },
+                is_thinking_on: model.think != Some(0),
+                effort: model
+                    .think
+                    .filter(|&effort| effort > 0)
+                    .unwrap_or(deepseek::EFFORT_HIGH),
+            }),
+        };
+        let name = match family {
+            Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
+        };
         engine::log(&format!(
-            "serving {} at http://{host}:{port}/v1 (context {} tokens{})",
-            settings.id,
-            settings.options.ctx,
+            "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{})",
             if settings
                 .options
                 .deepseek()
@@ -341,20 +731,55 @@ fn main() {
                 ""
             }
         ));
+        served_models.push(Served {
+            id,
+            name,
+            ctx,
+            tokenizer: loaded[served_models.len()].1,
+            format,
+        });
     }
     if !host.is_loopback() {
         engine::log(&format!(
             "warning: plain HTTP on {host}: keys and conversations cross the network unencrypted"
         ));
     }
-    let limits = http::Limits {
-        timeout: Duration::from_secs_f64(arguments.server.http_timeout_s),
-        ..http::DEFAULT_LIMITS
-    };
+    let shared = Arc::new(Shared {
+        key: Sha256::digest(key.as_bytes()).into(),
+        started: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+        arrivals: AtomicU64::new(0),
+        models: served_models,
+        limits: http::Limits {
+            timeout: Duration::from_secs_f64(arguments.server.http_timeout_s),
+            ..http::DEFAULT_LIMITS
+        },
+        keepalive: Duration::from_secs_f64(arguments.server.keepalive_s),
+    });
+    let limits = shared.limits;
     let app = Router::new()
         .route("/health", get(report_health))
         .route("/v1/health", get(report_health))
-        .fallback(refuse_unknown_endpoint);
+        .route(
+            "/v1/models",
+            get(list_served_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/models",
+            get(list_served_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(answer_chat_completions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/chat/completions",
+            post(answer_chat_completions).fallback(refuse_other_than_post),
+        )
+        .fallback(refuse_unknown_endpoint)
+        .layer(middleware::from_fn_with_state(shared.clone(), authorize))
+        .with_state(shared);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
