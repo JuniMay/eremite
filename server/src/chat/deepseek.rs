@@ -1116,62 +1116,45 @@ where
     }
 }
 
-// ---- the --render command ----
+// ---- test cases of DeepSeek's encoding tests ----
 
-/// Replaces the URL of each image part in `value` with a numbered data URL.
-/// With data URLs, deepseek-recipe converts any test case.
-/// `original_urls` gets the replaced URLs, in order.
-fn replace_image_urls(value: &mut Value, original_urls: &mut Vec<String>) {
+/// Replaces each image URL in `value` with a numbered data URL, so that
+/// deepseek-recipe converts any test case. `count` counts the images replaced
+/// so far.
+fn replace_image_urls(value: &mut Value, count: &mut usize) {
     match value {
         Value::Array(a) => a
             .iter_mut()
-            .for_each(|item| replace_image_urls(item, original_urls)),
+            .for_each(|item| replace_image_urls(item, count)),
         Value::Object(object) => {
             if object.get("type").and_then(Value::as_str) == Some("image_url")
                 && let Some(Value::Object(image_url)) = object.get_mut("image_url")
             {
-                let url = image_url
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
                 // Base64 data comes in groups of four characters.
                 // So the number's eight digits are valid base64 data.
                 image_url.insert(
                     "url".into(),
-                    format!("data:image/png;base64,{:08}", original_urls.len()).into(),
+                    format!("data:image/png;base64,{:08}", *count).into(),
                 );
-                original_urls.push(url);
+                *count += 1;
             }
             object
                 .values_mut()
-                .for_each(|item| replace_image_urls(item, original_urls));
+                .for_each(|item| replace_image_urls(item, count));
         }
         _ => {}
     }
 }
 
-/// Renders a test case of the checkpoint's encoding/tests folder, for --render
-/// FILE.
-/// A test case is a message list, or an object with messages, tools,
-/// thinking_mode and reasoning_effort.
-/// Prints the prompt that the server renders for the case on stdout.
-/// Prints each image's URL on stderr, in prompt order.
-/// A case that ends with an assistant message renders without the next turn's
-/// start.
-/// The checkpoint's encoding.py renders such a case the same way.
-/// The server refuses such a request.
-/// Returns the process's exit status.
-pub fn render_test_case_file(path: &str) -> i32 {
-    let case = match std::fs::read_to_string(path).map(|t| serde_json::from_str::<Value>(&t)) {
-        Ok(Ok(case)) => case,
-        _ => {
-            eprintln!("eremite-server: {path}: not a JSON test case");
-            return libc::EXIT_FAILURE;
-        }
-    };
+/// Returns the prompt that the server renders for a test case of DeepSeek's
+/// encoding tests, or why it cannot render it. A test case is a message list,
+/// or an object with messages, tools, thinking_mode and reasoning_effort. A
+/// case that ends with an assistant message renders without the next turn's
+/// start, as the checkpoint's encoding.py renders it. The server refuses such
+/// a request.
+pub fn render_test_case(case: &Value) -> Result<String, Error> {
     let empty = Map::new();
-    let (messages, fields) = match &case {
+    let (messages, fields) = match case {
         Value::Array(_) => (case.clone(), &empty),
         Value::Object(object) => (
             object.get("messages").cloned().unwrap_or(Value::Null),
@@ -1190,8 +1173,7 @@ pub fn render_test_case_file(path: &str) -> i32 {
     if let Some(effort) = fields.get("reasoning_effort") {
         root.insert("reasoning_effort".into(), effort.clone());
     }
-    let mut urls = Vec::new();
-    replace_image_urls(&mut root["messages"], &mut urls);
+    replace_image_urls(&mut root["messages"], &mut 0);
     let defaults = Defaults {
         model_id: DEFAULT_MODEL_ID.into(),
         // Rendering does not use the sampling settings.
@@ -1204,13 +1186,7 @@ pub fn render_test_case_file(path: &str) -> i32 {
         is_thinking_on: false,
         effort: EFFORT_HIGH,
     };
-    let rendered = match render_request(root, &defaults, Api::ChatCompletions) {
-        Ok(rendered) => rendered,
-        Err(e) => {
-            eprintln!("eremite-server: {path}: {}", e.message);
-            return libc::EXIT_FAILURE;
-        }
-    };
+    let rendered = render_request(root, &defaults, Api::ChatCompletions)?;
     let mut prompt = rendered.prompt;
     // The next turn starts with the Assistant token and a thinking token.
     if let Some(InputMessage::Assistant { prefix: false, .. }) =
@@ -1221,21 +1197,7 @@ pub fn render_test_case_file(path: &str) -> i32 {
     {
         prompt.truncate(assistant.start);
     }
-    print!("{prompt}");
-    for source in &rendered.image_sources {
-        let url = match source {
-            ImageSource::DataUrl { data_url, .. } => data_url
-                .rsplit(',')
-                .next()
-                .and_then(|n| n.parse::<usize>().ok())
-                .and_then(|n| urls.get(n).cloned())
-                .unwrap_or_else(|| data_url.clone()),
-            ImageSource::Url { url, .. } => url.clone(),
-            ImageSource::Bytes { .. } => "(bytes)".into(),
-        };
-        eprintln!("image {url}");
-    }
-    libc::EXIT_SUCCESS
+    Ok(prompt)
 }
 
 #[cfg(test)]
@@ -2180,9 +2142,9 @@ mod tests {
             {"type": "text", "text": "and"},
             {"type": "image_url", "image_url": {"url": "b.png"}},
         ]}]);
-        let mut urls = Vec::new();
-        replace_image_urls(&mut messages, &mut urls);
-        assert_eq!(urls, ["https://example.com/a.png", "b.png"]);
+        let mut count = 0;
+        replace_image_urls(&mut messages, &mut count);
+        assert_eq!(count, 2);
         let content = &messages[0]["content"];
         assert_eq!(
             content[0]["image_url"]["url"],
@@ -2196,30 +2158,45 @@ mod tests {
     }
 
     #[test]
-    fn rendering_a_test_case_file_returns_the_exit_status() {
-        let path =
-            std::env::temp_dir().join(format!("eremite-render-test-{}.json", std::process::id()));
-        let path_text = path.to_str().expect("a UTF-8 path");
-        for (case, status) in [
-            (
-                r#"{"messages": [{"role": "user", "content": "hi"}], "thinking_mode": "thinking"}"#,
-                libc::EXIT_SUCCESS,
-            ),
-            (
-                r#"[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]"#,
-                libc::EXIT_SUCCESS,
-            ),
-            ("not JSON", libc::EXIT_FAILURE),
-            (r#"{"messages": "hi"}"#, libc::EXIT_FAILURE),
-        ] {
-            std::fs::write(&path, case).expect("a written case");
-            assert_eq!(render_test_case_file(path_text), status, "{case}");
-        }
-        std::fs::remove_file(&path).expect("a removed case");
-        assert_eq!(
-            render_test_case_file(path_text),
-            libc::EXIT_FAILURE,
-            "a missing file"
+    fn a_test_case_renders_or_says_why_not() {
+        let thinking = render_test_case(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_mode": "thinking"
+        }))
+        .expect("a message list in an object renders");
+        assert!(thinking.contains("hi"), "{thinking}");
+        let answered = render_test_case(&json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}
+        ]))
+        .expect("a message list renders");
+        assert!(
+            answered.ends_with("hello<｜end▁of▁sentence｜>"),
+            "without the next turn's start: {answered}"
         );
+        assert!(render_test_case(&json!({"messages": "hi"})).is_err());
+        assert!(render_test_case(&json!("hi")).is_err());
+    }
+
+    /// The test renders the test cases of the checkpoint that
+    /// EREMITE_CHECKPOINT names, in its encoding/tests folder. Without
+    /// EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[test]
+    fn deepseek_s_encoding_test_cases_render_as_expected() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tests = std::path::Path::new(&dir).join("encoding/tests");
+        // Case 3 declares its tools in a system message, and case 4 gives a
+        // user message a task. Chat Completions requests carry neither.
+        for case in [1, 2, 5] {
+            let input = std::fs::read(tests.join(format!("test_input_{case}.json")))
+                .expect("the test case");
+            let input: Value = serde_json::from_slice(&input).expect("JSON");
+            let expected = std::fs::read_to_string(tests.join(format!("test_output_{case}.txt")))
+                .expect("the expected prompt");
+            let rendered = render_test_case(&input).expect("the case renders");
+            assert_eq!(rendered, expected, "test case {case}");
+        }
     }
 }

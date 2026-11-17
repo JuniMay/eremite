@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{Server, add_keys, build_config, http, one_model, root};
+use eremite_server::chat::deepseek;
 
 /// The requests that decode while another request arrives.
 const DECODING_REQUESTS: usize = 4;
@@ -201,25 +202,9 @@ fn tokens(setup: &Setup, messages: &Value) -> Vec<i64> {
 
 /// Returns the tokens of `messages`' prompt, with thinking on or off.
 fn rendered_tokens(setup: &Setup, messages: &Value, thinking: bool) -> Vec<i64> {
-    let case = std::env::temp_dir().join(format!("eremite-fork-{}.json", std::process::id()));
     let mode = if thinking { "thinking" } else { "chat" };
-    std::fs::write(
-        &case,
-        json!({"messages": messages, "thinking_mode": mode}).to_string(),
-    )
-    .expect("a render case");
-    let rendered = Command::new(&setup.server)
-        .arg("--render")
-        .arg(&case)
-        .output()
-        .expect("render");
-    let _ = std::fs::remove_file(&case);
-    assert!(
-        rendered.status.success(),
-        "render: {}",
-        String::from_utf8_lossy(&rendered.stderr)
-    );
-    let prompt = String::from_utf8(rendered.stdout).expect("UTF-8");
+    let prompt = deepseek::render_test_case(&json!({"messages": messages, "thinking_mode": mode}))
+        .unwrap_or_else(|error| panic!("render: {}", error.message));
     let ids = Command::new(&setup.cli)
         .args([
             "-m",

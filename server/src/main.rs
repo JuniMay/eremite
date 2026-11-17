@@ -93,7 +93,6 @@ const USAGE: &str =
   --tui-history-window S  seconds that its history charts span, a sample a column (default 60)
   --tui-expert-map-tokens N  the latest tokens of a decoding request whose experts its expert
                   map shows (default 12)
-  --render FILE   print the prompt of a JSON test case of DeepSeek's encoding/tests, and exit
  a model's options:
   --id NAME       the name requests give in model (default: deepseek-v4.1-flash)
   --rows-per-call N  rows of one decoding call at most, at most the model's own; fewer rows per
@@ -139,8 +138,6 @@ struct Arguments {
     budgets: config::Budgets,
     /// The server-wide settings besides the budgets.
     server: config::Server,
-    /// The JSON test case whose prompt --render prints, if given.
-    render: Option<String>,
 }
 
 /// Parses the command line's arguments `args`, without the program's name.
@@ -152,7 +149,6 @@ fn parse_arguments(args: &[String]) -> Arguments {
         models: Vec::new(),
         budgets: config::Budgets::default(),
         server: config::Server::default(),
-        render: None,
     };
     let mut model: Option<ModelConfig> = None;
     // -m's options, in their order.
@@ -219,7 +215,6 @@ fn parse_arguments(args: &[String]) -> Arguments {
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         server.push((flag[2..].replace('-', "_"), value));
                     }
-                    "--render" => parsed.render = Some(text.clone()),
                     _ => {
                         let name = match flag {
                             "-t" => "temperature".to_string(),
@@ -239,7 +234,7 @@ fn parse_arguments(args: &[String]) -> Arguments {
         }
         i += 1;
     }
-    if model.is_none() && file.is_none() && parsed.render.is_none() {
+    if model.is_none() && file.is_none() {
         file = Some(config::default_path().unwrap_or_else(|error| die(&error)));
     }
     match (model, file) {
@@ -936,9 +931,6 @@ async fn refuse_other_than_post() -> Response {
 fn main() {
     let started = Instant::now();
     let arguments = parse_arguments(&std::env::args().skip(1).collect::<Vec<_>>());
-    if let Some(file) = &arguments.render {
-        exit(deepseek::render_test_case_file(file));
-    }
     let (Some(port), false) = (arguments.server.port, arguments.models.is_empty()) else {
         exit_with_usage()
     };
