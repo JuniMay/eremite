@@ -10,3 +10,4 @@ pub mod status;
 #[cfg(test)]
 mod testing;
 pub mod theme;
+pub mod tiles;
