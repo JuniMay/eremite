@@ -52,6 +52,8 @@ const RENDERED_EFFORTS: &[u32] = &[EFFORT_LOW, EFFORT_HIGH, EFFORT_MAX];
 const RENDERED_EFFORT_LINE: &str = "Reasoning Effort: 75 (range 1-100";
 /// The text before the effort's number in that line.
 const EFFORT_LINE_PREFIX: &str = "Reasoning Effort: ";
+/// The tool types that deepseek-recipe keeps in a Responses request.
+const KEPT_TOOL_TYPES: &[&str] = &["function", "namespace", "custom", "tool_search"];
 
 /// The V4.1 prompt encoding with the server's special tokens.
 /// It is made at its first use.
@@ -155,6 +157,12 @@ fn read_effort(value: Option<&Value>, default: u32) -> u32 {
 /// Removes the settings that the server reads itself. Returns those settings.
 /// Writes the model name, thinking and the effort level in deepseek-recipe's
 /// forms.
+/// Turns developer messages into system messages.
+/// Gives each tool call an id, the type "function" and its arguments as JSON
+/// text.
+/// Gives tool messages without a `tool_call_id` the ids of the calls before
+/// them, in order.
+/// Removes `stream_options` when the request does not stream.
 fn rewrite_chat_request(
     root: &mut Map<String, Value>,
     defaults: &Defaults,
@@ -205,6 +213,64 @@ fn rewrite_chat_request(
         };
         root.insert("reasoning_effort".into(), level.into());
     }
+    if root.get("stream") != Some(&Value::Bool(true)) {
+        root.remove("stream_options");
+    }
+
+    if let Some(Value::Array(messages)) = root.get_mut("messages") {
+        // The ids of the tool calls in the last assistant message.
+        let mut call_ids: Vec<String> = Vec::new();
+        // The number of tool messages since that assistant message.
+        let mut answered_calls = 0;
+        for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+            match message.get("role").and_then(Value::as_str) {
+                Some("developer") => {
+                    message.insert("role".into(), "system".into());
+                }
+                Some("assistant") => {
+                    call_ids.clear();
+                    answered_calls = 0;
+                    match message.get_mut("tool_calls") {
+                        Some(Value::Array(tool_calls)) if !tool_calls.is_empty() => {
+                            for (call_index, call) in tool_calls
+                                .iter_mut()
+                                .filter_map(Value::as_object_mut)
+                                .enumerate()
+                            {
+                                if !call.get("id").is_some_and(Value::is_string) {
+                                    call.insert("id".into(), format!("call_{call_index}").into());
+                                }
+                                if !call.contains_key("type") {
+                                    call.insert("type".into(), "function".into());
+                                }
+                                if let Some(Value::Object(function)) = call.get_mut("function")
+                                    && let Some(arguments) =
+                                        function.get("arguments").filter(|a| !a.is_string())
+                                {
+                                    let text = arguments.to_string();
+                                    function.insert("arguments".into(), text.into());
+                                }
+                                call_ids.push(call["id"].as_str().unwrap_or_default().to_string());
+                            }
+                        }
+                        Some(Value::Array(_)) | Some(Value::Null) => {
+                            message.remove("tool_calls");
+                        }
+                        _ => {}
+                    }
+                }
+                Some("tool") => {
+                    if !message.get("tool_call_id").is_some_and(Value::is_string)
+                        && let Some(id) = call_ids.get(answered_calls)
+                    {
+                        message.insert("tool_call_id".into(), id.clone().into());
+                    }
+                    answered_calls += 1;
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(RequestSettings {
         sampling,
         max_tokens,
@@ -218,10 +284,20 @@ fn rewrite_chat_request(
 /// Writes the model name for deepseek-recipe.
 /// When thinking is on, writes the effort back as the level that
 /// deepseek-recipe renders.
+/// Returns an error for a request with `previous_response_id` or
+/// `conversation`.
+/// The server stores no responses. It cannot continue one.
 fn rewrite_responses_request(
     root: &mut Map<String, Value>,
     defaults: &Defaults,
 ) -> Result<RequestSettings, Error> {
+    for key in ["previous_response_id", "conversation"] {
+        if root.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(Error::new_bad_request(format!(
+                "{key} is not supported: the server keeps no responses, so send the whole conversation in input"
+            )));
+        }
+    }
     let sampling = super::read_sampling(root, defaults.sampling)?;
     let max_tokens = match root.get("max_output_tokens") {
         None | Some(Value::Null) => DEFAULT_MAX_TOKENS,
@@ -265,6 +341,25 @@ fn rewrite_responses_request(
         max_tokens,
         effort: is_thinking_on.then_some(effort),
     })
+}
+
+/// Counts the declared tools that deepseek-recipe drops from a Responses
+/// request.
+/// It drops the hosted web search tool. The server cannot run that tool.
+/// It also drops tool types that it does not know.
+fn count_dropped_tools(root: &Map<String, Value>) -> usize {
+    root.get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, |tools| {
+            tools
+                .iter()
+                .filter(|t| {
+                    !t.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tool_type| KEPT_TOOL_TYPES.contains(&tool_type))
+                })
+                .count()
+        })
 }
 
 // ---- conversion and rendering ----
@@ -391,6 +486,13 @@ pub struct PreparedRequest {
     pub api: Api,
     /// Whether the response streams as server-sent events.
     pub is_streamed: bool,
+    /// The number of the request's messages, or of its input items for
+    /// Responses.
+    pub message_count: usize,
+    /// The number of tools that the request declares.
+    pub tool_count: usize,
+    /// The number of declared tools that deepseek-recipe drops.
+    pub dropped_tool_count: usize,
 }
 
 impl PreparedRequest {
@@ -427,6 +529,14 @@ impl PreparedRequest {
             note,
         })
     }
+
+    /// Describes the thinking setting for the log: "thinking effort N" or
+    /// "thinking off".
+    pub fn describe_thinking(&self) -> String {
+        self.settings
+            .effort
+            .map_or("thinking off".into(), |e| format!("thinking effort {e}"))
+    }
 }
 
 /// Prepares a request's `body` for the worker.
@@ -442,6 +552,44 @@ pub fn prepare_request(
 ) -> Result<PreparedRequest, Error> {
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(body) else {
         return Err(Error::new_bad_request("the body is not a JSON object"));
+    };
+    let tool_count = root
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let (message_count, dropped_tool_count) = match api {
+        Api::ChatCompletions => {
+            let message_count = root
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if message_count == 0 {
+                return Err(Error::new_bad_request("messages must be a non-empty array"));
+            }
+            let last = root["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .and_then(|m| m.get("role"));
+            if last.and_then(Value::as_str) == Some("assistant") {
+                return Err(Error::new_bad_request(
+                    "the last message must not be the assistant's",
+                ));
+            }
+            (message_count, 0)
+        }
+        Api::Responses => {
+            let items = match root.get("input") {
+                // A string input is one item.
+                Some(Value::String(s)) if !s.is_empty() => 1,
+                Some(Value::Array(items)) if !items.is_empty() => items.len(),
+                _ => {
+                    return Err(Error::new_bad_request(
+                        "input must be a non-empty string or array",
+                    ));
+                }
+            };
+            (items, count_dropped_tools(&root))
+        }
     };
     let rendered = render_request(root, defaults, api)?;
     let mut images = Vec::new();
@@ -477,6 +625,9 @@ pub fn prepare_request(
         images,
         settings: rendered.settings,
         api,
+        message_count,
+        tool_count,
+        dropped_tool_count,
     })
 }
 
@@ -551,6 +702,13 @@ mod tests {
                 && !root.contains_key("top_p")
                 && !root.contains_key("seed")
         );
+        let m = &root["messages"];
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[2]["tool_calls"][0]["id"], "call_0");
+        assert_eq!(m[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], r#"{"a":1}"#);
+        assert_eq!(m[3]["tool_call_id"], "call_0");
+        assert!(m[4].get("tool_calls").is_none());
     }
 
     #[test]
@@ -722,6 +880,169 @@ mod tests {
 
         let (_, s) = rewrite_responses_json(json!({"input": "hi"})).expect("settings");
         assert_eq!(s.max_tokens, DEFAULT_MAX_TOKENS);
+        for key in ["previous_response_id", "conversation"] {
+            let mut root = Map::new();
+            root.insert("input".into(), "hi".into());
+            root.insert(key.into(), "resp_1".into());
+            let e = rewrite_responses_request(&mut root, &build_test_defaults())
+                .err()
+                .expect("refused");
+            assert!(e.message.contains(key), "{}", e.message);
+        }
         assert!(rewrite_responses_json(json!({"input": "hi", "max_output_tokens": 0})).is_err());
+    }
+
+    /// A request in the shape that Codex 0.167 sends.
+    /// It has developer and user messages, a function and a namespace of
+    /// functions.
+    /// It also declares the hosted web search tool.
+    /// deepseek-recipe drops that tool.
+    /// It replays a tool call with its reasoning.
+    #[test]
+    fn codex_requests_render_without_the_web_search_tool() {
+        let request = json!({
+            "model": "deepseek-v4.1-flash", "stream": true, "store": false, "tool_choice": "auto",
+            "parallel_tool_calls": true, "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "k", "client_metadata": {"thread_id": "t"},
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+            "tools": [
+                {"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": false,
+                 "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}},
+                                "required": ["cmd"], "additionalProperties": false}},
+                {"type": "namespace", "name": "multi_agent_v1", "description": "Agents.", "tools": [
+                    {"type": "function", "name": "spawn_agent", "description": "Starts an agent.", "strict": false,
+                     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}]},
+                {"type": "web_search", "external_web_access": false},
+            ],
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a coding agent."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List the files."}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": null,
+                 "content": [{"type": "reasoning_text", "text": "I should run ls."}]},
+                {"type": "function_call", "call_id": "call_0", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "a.txt\nb.txt"},
+            ],
+        });
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        assert_eq!(count_dropped_tools(&root), 1);
+        let r = render_request(root, &build_test_defaults(), Api::Responses).expect("rendered");
+        assert!(r.converted_request.stream);
+        for text in [
+            "You are a coding agent.",
+            "exec_command",
+            "multi_agent_v1::spawn_agent",
+            "I should run ls.",
+            "a.txt",
+        ] {
+            assert!(
+                r.prompt.contains(text),
+                "{text} is not in the prompt:\n{}",
+                r.prompt
+            );
+        }
+        assert!(!r.prompt.contains("web_search"), "{}", r.prompt);
+    }
+
+    /// A part of the web.run tool of Codex 0.167.
+    /// The tool is a namespace with one function.
+    /// That function has a generated schema.
+    /// The test keeps three of the schema's eleven properties.
+    #[test]
+    fn codex_web_run_renders() {
+        let tool = json!({
+            "type": "namespace", "name": "web", "description": "Tools in the web namespace.",
+            "tools": [{
+                "type": "function", "name": "run", "strict": false,
+                "description": "Tool for accessing the internet.",
+                "parameters": {"type": "object", "properties": {
+                    "open": {
+                        "type": "array", "description": "Open pages by reference id or URL.",
+                        "items": {"type": "object", "required": ["ref_id"], "properties": {
+                            "lineno": {"type": "integer",
+                                       "description": "Line number to position the page at."},
+                            "ref_id": {"type": "string",
+                                       "description": "Reference id or URL to open."}}}},
+                    "response_length": {
+                        "type": "string", "enum": ["short", "medium", "long"],
+                        "description": "Set the length of the response to be returned."},
+                    "search_query": {
+                        "type": "array",
+                        "description": "Query the internet search engine for a given list of queries.",
+                        "items": {"type": "object", "required": ["q"], "properties": {
+                            "domains": {"type": "array", "items": {"type": "string"},
+                                        "description": "Whether to filter by a specific list of domains."},
+                            "q": {"type": "string", "description": "Search query."},
+                            "recency": {"type": "integer",
+                                        "description": "Whether to filter by recency, as a number of recent days."}}}}}}
+            }]
+        });
+        let request = json!({
+            "model": "deepseek-v4.1-flash", "stream": true, "tools": [tool],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Search the web."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "run", "namespace": "web",
+                 "arguments": "{\"search_query\": [{\"q\": \"eremite\"}]}"},
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": [{"type": "input_text", "text": "[turn0search0] Example https://example.com/"}]},
+            ],
+        });
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let r = render_request(root, &build_test_defaults(), Api::Responses).expect("rendered");
+        for text in ["web::run", "search_query", "turn0search0"] {
+            assert!(r.prompt.contains(text), "{text} is not in the prompt");
+        }
+    }
+
+    /// Checks and counts the messages, the input items and the tools of
+    /// prepared requests.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[test]
+    fn prepared_requests_count_their_messages_and_tools() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let user = json!({"role": "user", "content": "hi"});
+        let assistant = json!({"role": "assistant", "content": "hello"});
+        for (request, api) in [
+            (json!({"messages": []}), Api::ChatCompletions),
+            (json!({"messages": [user, assistant]}), Api::ChatCompletions),
+            (json!({"input": ""}), Api::Responses),
+            (json!({"input": []}), Api::Responses),
+        ] {
+            let prepared = prepare_test_request(&request, api, tokenizer);
+            assert!(prepared.is_err(), "{request}");
+        }
+        let request = json!({
+            "messages": [user], "reasoning_effort": 62, "stream": true,
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+        });
+        let prepared =
+            prepare_test_request(&request, Api::ChatCompletions, tokenizer).expect("prepared");
+        let counts = (
+            prepared.message_count,
+            prepared.tool_count,
+            prepared.dropped_tool_count,
+        );
+        assert_eq!(counts, (1, 1, 0));
+        assert!(prepared.is_streamed);
+        assert_eq!(prepared.describe_thinking(), "thinking effort 62");
+        let request = json!({
+            "input": "hi", "reasoning": {"effort": "none"}, "tools": [{"type": "web_search"}],
+        });
+        let prepared = prepare_test_request(&request, Api::Responses, tokenizer).expect("prepared");
+        let counts = (
+            prepared.message_count,
+            prepared.tool_count,
+            prepared.dropped_tool_count,
+        );
+        assert_eq!(counts, (1, 1, 1));
+        assert_eq!(prepared.describe_thinking(), "thinking off");
     }
 }
