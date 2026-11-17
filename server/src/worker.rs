@@ -28,11 +28,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::calls::CallChooser;
-use crate::control::GIB;
+use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
     self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
@@ -235,6 +236,8 @@ struct Queue {
     closed: bool,
     /// The id of the last queued request. The first request gets 1.
     last_request_id: u64,
+    /// The yield and resume control.
+    control: Control,
 }
 
 /// What a model is doing and has done, for its status.
@@ -295,10 +298,10 @@ pub struct SharedModel {
 
 /// What the HTTP handlers and the worker share.
 struct Shared {
-    /// The waiting requests.
+    /// The waiting requests and the control.
     queue: Mutex<Queue>,
     /// Wakes the worker when it has work: a new request, a cancellation, a
-    /// status reader's request, or the stop.
+    /// status reader's request, a control request, or the stop.
     worker_wakeup: Condvar,
     /// The served models, in their configured order.
     models: Vec<SharedModel>,
@@ -389,6 +392,59 @@ pub async fn refresh_status() {
     published.await;
 }
 
+/// Builds the control's status as JSON.
+pub fn build_control_status_json() -> Value {
+    let shared = clone_shared();
+    lock(&shared.queue).control.build_status_json()
+}
+
+/// Starts a yield for `request`, and wakes the worker. Returns the HTTP status
+/// and the control's status as JSON. Returns an error while the server is
+/// stopping.
+pub fn start_yield(request: control::YieldRequest) -> Result<(u16, Value), control::Error> {
+    let shared = clone_shared();
+    let mut queue = lock(&shared.queue);
+    if queue.closed || engine::is_stopping() {
+        return Err(control::Error {
+            http_status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            code: "server_stopping",
+            message: "the server is stopping".into(),
+        });
+    }
+    let http_status = queue.control.start_yield(request)?;
+    let status_json = queue.control.build_status_json();
+    notify_worker(&shared);
+    Ok((http_status, status_json))
+}
+
+/// Starts the resume for `request`, and wakes the worker. Returns the HTTP
+/// status and the control's status as JSON. For an operation that ended
+/// already, the JSON also holds resumed_operation_id. Returns an error while
+/// the server is stopping.
+pub fn start_resume(request: control::ResumeRequest) -> Result<(u16, Value), control::Error> {
+    let shared = clone_shared();
+    let mut queue = lock(&shared.queue);
+    if queue.closed || engine::is_stopping() {
+        return Err(control::Error {
+            http_status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            code: "server_stopping",
+            message: "the server is stopping".into(),
+        });
+    }
+    let ended = queue.control.start_resume(&request.operation_id)?;
+    let mut status_json = queue.control.build_status_json();
+    if ended {
+        status_json["resumed_operation_id"] = json!(request.operation_id);
+    }
+    notify_worker(&shared);
+    let http_status = if ended {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((http_status.as_u16(), status_json))
+}
+
 /// Lists the models the worker serves, in their configured order: each one's
 /// id, tokenizer and settings. A request's model_index is an index into this
 /// list.
@@ -453,6 +509,10 @@ pub fn start(
             let shared = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     waiting: (0..model_count).map(|_| VecDeque::new()).collect(),
+                    control: Control::new(control::MemoryBytes {
+                        model_bytes: engine::read_memory().limit,
+                        state_cache_bytes: (budgets.state_cache_gb * GIB) as u64,
+                    }),
                     ..Queue::default()
                 }),
                 worker_wakeup: Condvar::new(),
@@ -650,8 +710,14 @@ pub fn build_model_status_json(model_index: usize) -> Value {
     let Some(shared_model) = shared.models.get(model_index) else {
         return Value::Null;
     };
-    let waiting = lock(&shared.queue).waiting[model_index].len();
-    let state_limit = (shared.budgets.state_cache_gb * GIB) as u64;
+    let (waiting, control_phase, state_limit) = {
+        let queue = lock(&shared.queue);
+        (
+            queue.waiting[model_index].len(),
+            queue.control.phase,
+            queue.control.effective_limits.state_cache_bytes,
+        )
+    };
     let stats = lock(&shared_model.status).stats;
     let allocations = build_model_memory_json(&shared);
     let status = lock(&shared_model.status);
@@ -670,7 +736,9 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             })
         })
         .collect();
-    let phase = if status.phase.is_empty() {
+    let phase = if control_phase != Phase::Running {
+        control_phase.as_str()
+    } else if status.phase.is_empty() {
         "idle"
     } else {
         status.phase
@@ -1385,13 +1453,16 @@ impl Worker {
 
     /// Unloads each model that had no request for its idle_unload seconds and
     /// has none waiting. It frees the model's expert cache and weights. The
-    /// model's states stay. Its next request loads it again.
+    /// model's states stay. Its next request loads it again. Nothing unloads
+    /// during a yield.
     fn unload_idle_models(&mut self) {
-        let waiting: Vec<bool> = lock(&self.shared.queue)
-            .waiting
-            .iter()
-            .map(|jobs| !jobs.is_empty())
-            .collect();
+        let waiting: Vec<bool> = {
+            let queue = lock(&self.shared.queue);
+            if queue.control.phase != Phase::Running {
+                return;
+            }
+            queue.waiting.iter().map(|jobs| !jobs.is_empty()).collect()
+        };
         let mut drained = false;
         for worker_model in &self.models {
             let after = worker_model.settings.idle_unload;
@@ -1470,13 +1541,19 @@ impl Worker {
             .saturating_sub(self.reserve_kept_free_at.elapsed())
     }
 
-    /// Publishes each model's engine counters to its status.
+    /// Publishes each model's engine counters to its status, and the memory in
+    /// use to the control.
     fn publish_counters(&self) {
         for worker_model in &self.models {
             let mut status = lock(&self.shared.models[worker_model.model_index].status);
             status.stats = worker_model.model.read_stats();
             status.loaded = worker_model.model.is_loaded();
         }
+        let memory_in_use = engine::read_memory();
+        lock(&self.shared.queue).control.retained = control::MemoryBytes {
+            model_bytes: memory_in_use.model_bytes,
+            state_cache_bytes: memory_in_use.state_bytes,
+        };
     }
 
     /// Publishes the counters and the states when a status reader asked for
@@ -1539,9 +1616,42 @@ impl Worker {
         }
     }
 
+    /// Restarts each model that has running requests. It loads the model when
+    /// needed, and sets it as running requests. A model that fails to load ends
+    /// its requests with the error.
+    fn restart_models_with_running_requests(&mut self) {
+        for worker_model in &mut self.models {
+            if worker_model.generations.is_empty() {
+                continue;
+            }
+            if !worker_model.model.is_loaded()
+                && let Err(error) = load_model(&self.shared, &worker_model.model)
+            {
+                if engine::is_stopping() {
+                    // The stop cut the load short. The stop also ends the
+                    // model's requests.
+                    continue;
+                }
+                lock(&self.shared.models[worker_model.model_index].status).load_error =
+                    Some(error.clone());
+                for generation in std::mem::take(&mut worker_model.generations) {
+                    let snapshots = self.states.cache.remove_state(generation.state_id);
+                    self.states.free_snapshots_and_states(
+                        Vec::new(),
+                        vec![(generation.state_id, snapshots)],
+                    );
+                    generation.job.send_last_event(Event::Failed(error.clone()));
+                }
+                continue;
+            }
+            worker_model.model.set_request_running(true);
+        }
+    }
+
     /// Advances the running calls of every model until one ends, and finishes
-    /// the call that ended. A new request, a cancellation or the stop wakes the
-    /// engine, so that the worker serves it without waiting for a call to end.
+    /// the call that ended. A new request, a cancellation, a control request or
+    /// the stop wakes the engine, so that the worker serves it without waiting
+    /// for a call to end.
     fn advance_running_calls(&mut self) {
         let mut streams = Vec::new();
         let mut owners = Vec::new();
@@ -1576,6 +1686,102 @@ impl Worker {
         }
     }
 
+    /// Runs a yield or a resume. It first finishes the running calls, and waits
+    /// for the GPU work and the reads. A yield stops every model from running
+    /// requests. It frees model memory and evicts states down to the targets.
+    /// If more memory than a target is still in use, the yield fails and the
+    /// models restart. Otherwise the lower limits take effect. A resume
+    /// restores the configured limits and restarts the models.
+    fn run_control_action(&mut self, action: Action) {
+        let shared = self.shared.clone();
+        let _long = LongOperation::start(&shared);
+        self.finish_running_calls();
+        let configured = lock(&self.shared.queue).control.configured_limits;
+        engine::drain();
+        match action {
+            Action::Yield(targets) => {
+                for worker_model in &self.models {
+                    worker_model.model.set_request_running(false);
+                }
+                let before = engine::read_memory();
+                engine::reclaim(match targets.model {
+                    // u64::MAX frees all that can be freed.
+                    YieldTarget::Minimum => u64::MAX,
+                    YieldTarget::Bytes(cap) => before.model_bytes.saturating_sub(cap),
+                });
+                let evicted = self.states.cache.evict_bytes(match targets.state_cache {
+                    // u64::MAX frees all that can be freed.
+                    YieldTarget::Minimum => u64::MAX,
+                    YieldTarget::Bytes(cap) => self.states.cache.count_bytes().saturating_sub(cap),
+                });
+                self.states.free_evicted(&self.shared, evicted);
+                engine::drain();
+                let memory_in_use = engine::read_memory();
+                let retained = control::MemoryBytes {
+                    model_bytes: memory_in_use.model_bytes,
+                    state_cache_bytes: memory_in_use.state_bytes,
+                };
+                let protected_states = memory_in_use
+                    .state_bytes
+                    .max(self.states.cache.count_bytes());
+                let limits = control::MemoryBytes {
+                    model_bytes: match targets.model {
+                        YieldTarget::Minimum => memory_in_use.model_bytes,
+                        YieldTarget::Bytes(cap) => cap,
+                    },
+                    state_cache_bytes: match targets.state_cache {
+                        YieldTarget::Minimum => protected_states,
+                        YieldTarget::Bytes(cap) => cap,
+                    },
+                };
+                if memory_in_use.model_bytes > limits.model_bytes
+                    || protected_states > limits.state_cache_bytes
+                {
+                    self.restart_models_with_running_requests();
+                    let memory_in_use = engine::read_memory();
+                    let message = format!(
+                        "limits cannot retain protected buffers: {} model bytes and {} state bytes are required",
+                        retained.model_bytes, protected_states
+                    );
+                    lock(&self.shared.queue).control.fail_yield(
+                        message,
+                        control::MemoryBytes {
+                            model_bytes: memory_in_use.model_bytes,
+                            state_cache_bytes: memory_in_use.state_bytes,
+                        },
+                    );
+                } else {
+                    engine::set_memory_limit(limits.model_bytes);
+                    self.states.cache.byte_limit = limits.state_cache_bytes;
+                    lock(&self.shared.queue)
+                        .control
+                        .finish_yield(limits, retained);
+                    engine::log(&format!(
+                        "yielded: {} model bytes and {} state bytes retained",
+                        retained.model_bytes, retained.state_cache_bytes
+                    ));
+                }
+            }
+            Action::Resume => {
+                engine::set_memory_limit(configured.model_bytes);
+                self.states.cache.byte_limit = configured.state_cache_bytes;
+                lock(&self.shared.queue).control.effective_limits = configured;
+                self.restart_models_with_running_requests();
+                let memory_in_use = engine::read_memory();
+                lock(&self.shared.queue)
+                    .control
+                    .finish_resume(control::MemoryBytes {
+                        model_bytes: memory_in_use.model_bytes,
+                        state_cache_bytes: memory_in_use.state_bytes,
+                    });
+                engine::log("resumed: configured model and state limits restored");
+            }
+        }
+        engine::refresh_stats();
+        self.states.publish_states(&self.shared);
+        self.publish_counters();
+    }
+
     /// Runs the worker's loop until the stop. Each turn gives every model one
     /// step. A step admits requests, starts a prefill call and starts decoding
     /// calls. Once per available-memory reading interval, the loop keeps the
@@ -1589,8 +1795,26 @@ impl Worker {
             }
             self.publish_status_if_wanted();
             let mut queue = lock(&shared.queue);
+            if let Some(action) = queue.control.take_next_action() {
+                drop(queue);
+                self.run_control_action(action);
+                continue;
+            }
+            if queue.control.phase != Phase::Running {
+                // A status reader's request is published at the loop's start,
+                // and so is the reserve's keeping once its interval has passed.
+                if !shared.status_wanted.load(Ordering::Acquire) {
+                    let (guard, _) = shared
+                        .worker_wakeup
+                        .wait_timeout(queue, self.wait_before_keeping_reserve())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    drop(guard);
+                }
+                continue;
+            }
             let idle = |queue: &Queue, models: &[WorkerModel]| {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
+                    && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
                         worker_model.generations.is_empty() && worker_model.admitted.is_empty()
                     })
@@ -1616,6 +1840,9 @@ impl Worker {
                     .wait_timeout(queue, wait)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 queue = guard;
+            }
+            if queue.control.phase != Phase::Running {
+                continue;
             }
             let mut admitted_by_model: Vec<Vec<Job>> = Vec::new();
             for worker_model in &self.models {

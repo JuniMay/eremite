@@ -9,7 +9,7 @@
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
 
-use eremite_server::{chat, config, engine, http, worker};
+use eremite_server::{chat, config, control, engine, http, worker};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -550,6 +550,62 @@ async fn report_health() -> Response {
     build_json_response(r#"{"status": "ok"}"#.into())
 }
 
+/// Builds the response of a control request from its `result`: the HTTP status
+/// and the control's status, or the control's error.
+fn build_control_response(result: Result<(u16, Value), control::Error>) -> Response {
+    let (status, body) = match result {
+        Ok((status, body)) => (status, body),
+        Err(error) => (
+            error.http_status,
+            json!({"error": {
+                "type":"control_error", "code":error.code, "message":error.message,
+            }}),
+        ),
+    };
+    (
+        StatusCode::from_u16(status).unwrap(),
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Answers GET /v1/control with the control's status.
+async fn report_control_status() -> Response {
+    build_json_response(worker::build_control_status_json().to_string())
+}
+
+/// Answers POST /v1/control/yield: starts a yield of the memory that `body`
+/// asks for.
+async fn request_yield(body: axum::body::Bytes) -> Response {
+    let request = match serde_json::from_slice::<control::YieldRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return chat::build_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &error.to_string(),
+            );
+        }
+    };
+    build_control_response(worker::start_yield(request))
+}
+
+/// Answers POST /v1/control/resume: starts the resume that `body` names.
+async fn request_resume(body: axum::body::Bytes) -> Response {
+    let request = match serde_json::from_slice::<control::ResumeRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return chat::build_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &error.to_string(),
+            );
+        }
+    };
+    build_control_response(worker::start_resume(request))
+}
+
 /// Builds `model`'s object as GET /v1/models lists it: OpenAI's fields, and the
 /// context's length as servers commonly add it.
 fn build_model_object(shared: &Shared, model: &Served) -> Value {
@@ -898,6 +954,18 @@ fn main() {
     let app = Router::new()
         .route("/health", get(report_health))
         .route("/v1/health", get(report_health))
+        .route(
+            "/v1/control",
+            get(report_control_status).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/control/yield",
+            post(request_yield).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/control/resume",
+            post(request_resume).fallback(refuse_other_than_post),
+        )
         .route(
             "/v1/models",
             get(list_served_models).fallback(refuse_other_than_get),
