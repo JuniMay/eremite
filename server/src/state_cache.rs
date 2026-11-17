@@ -67,9 +67,14 @@
 //! snapshot is restored into it, or a replay rebuilds the rolling rows. At
 //! equal cost, a state in memory and a cold start go before the SSD.
 //!
-//! A state may have a saved link: its rows before some position equal a saved
-//! state's rows. Then the state was loaded from that saved state, or copied
-//! from a state that was.
+//! A state's unshared tokens are those after the longest prefix that it shares
+//! with another state in memory or a saved state of its model. Saving an
+//! evicted state writes it only when it has at least
+//! [`Cache::min_unshared_tokens`] unshared tokens. A state may have a saved
+//! link: its rows before some position equal a saved state's rows. Then the
+//! state was loaded from that saved state, or copied from a state that was.
+//! Saving such a state writes only its rows from that position. They become one
+//! more part of the saved state.
 
 use std::collections::BTreeMap;
 
@@ -78,6 +83,8 @@ use std::collections::BTreeMap;
 const SHARED_PREFIX_BLOCK: usize = 1024;
 /// The default of --state-disk-tokens. The worker sets the configured value.
 const DEFAULT_MIN_UNSHARED_TOKENS: usize = 8192;
+/// The most parts a saved state has. A load opens one file for each part.
+const MAX_PARTS: usize = 64;
 
 // The order of plans at equal cost. The cost counts only prefilled tokens. A
 // copy takes time it does not count. So in place comes first. An SSD read also
@@ -230,6 +237,19 @@ impl SavedState {
                 .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
                 .sum::<u64>()
     }
+}
+
+/// What saving an evicted state writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveDecision {
+    /// Writes nothing. Saving is off, or the state has too few unshared tokens.
+    Skip,
+    /// Writes one more part of saved state `saved_id`: the state's rows from
+    /// position `from` to its end.
+    Append { saved_id: SavedStateId, from: usize },
+    /// Writes a new saved state. Once it is written, saved state `replaces` is
+    /// deleted.
+    New { replaces: Option<SavedStateId> },
 }
 
 /// How a prompt resumes.
@@ -429,7 +449,8 @@ pub struct Eviction {
 }
 
 /// What the cache evicted, for the worker to free: snapshots with their states'
-/// ids, and whole states with their entries.
+/// ids, and whole states with their entries. The worker may save a whole state
+/// before it frees it.
 #[derive(Debug, Default)]
 pub struct Evicted {
     /// The evicted snapshots, each with its state's id.
@@ -450,7 +471,8 @@ pub struct Cache {
     pub max_states: usize,
     /// The saved states, by id.
     pub saved_states: BTreeMap<SavedStateId, SavedState>,
-    /// The bytes that saved states may take on the SSD (--state-disk).
+    /// The bytes that saved states may take on the SSD (--state-disk). With 0,
+    /// no state is saved.
     pub saved_byte_limit: u64,
     /// The fewest unshared tokens that make a state worth keeping on the SSD
     /// (--state-disk-tokens).
@@ -469,7 +491,8 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Returns a new, empty cache with these limits.
+    /// Returns a new, empty cache with these limits. Saving to the SSD is off
+    /// until `saved_byte_limit` is set.
     pub fn new(byte_limit: u64, max_states: usize) -> Self {
         Cache {
             entries: BTreeMap::new(),
@@ -1090,7 +1113,7 @@ impl Cache {
     }
 
     /// Evicts the snapshots and states in `eviction`. Returns them for the
-    /// worker to free.
+    /// worker to free. The worker may save the states first.
     pub fn evict(&mut self, eviction: &Eviction) -> Evicted {
         let mut snapshots = Vec::new();
         for &(id, pos) in &eviction.snapshots {
@@ -1176,6 +1199,78 @@ impl Cache {
             });
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.saved_link = link;
+        }
+    }
+
+    /// Decides what saving the evicted state `entry` writes. `others_stay`
+    /// tells whether the states in the cache stay in memory. Saving writes
+    /// nothing when saving is off, or when the state has fewer than
+    /// `min_unshared_tokens` unshared tokens. Otherwise it appends one part to
+    /// the linked saved state, if that saved state has not changed since the
+    /// link. It writes a new saved state instead when the saved state's
+    /// replaced positions would then outnumber the state's tokens. It does the
+    /// same when the saved state has `MAX_PARTS` parts. That new saved state
+    /// replaces the linked one. An append or a replacement drops the linked
+    /// saved state's tail: its tokens after the prefix it shares with the
+    /// state. So neither happens when that tail has `min_unshared_tokens`
+    /// tokens or more. Neither happens while an admitted request loads the
+    /// linked saved state next. In every other case, saving writes a new saved
+    /// state.
+    pub fn decide_save(&self, entry: &Entry, others_stay: bool) -> SaveDecision {
+        let len = entry.tokens.len();
+        if self.saved_byte_limit == 0 || len == 0 {
+            return SaveDecision::Skip;
+        }
+        let in_memory = self
+            .entries
+            .values()
+            .filter(|other| others_stay && other.model == entry.model)
+            .map(|other| &other.tokens[..]);
+        let in_saved_states = self
+            .saved_states
+            .values()
+            .filter(|saved_state| saved_state.model == Some(entry.model))
+            .map(|saved_state| &saved_state.tokens[..]);
+        let shared = in_memory
+            .chain(in_saved_states)
+            .map(|tokens| count_shared_prefix(&entry.tokens, tokens))
+            .max()
+            .unwrap_or(0);
+        if len < shared + self.min_unshared_tokens {
+            return SaveDecision::Skip;
+        }
+        let has_short_tail = |saved_state: &SavedState| {
+            saved_state.tokens.len()
+                < count_shared_prefix(&entry.tokens, &saved_state.tokens) + self.min_unshared_tokens
+        };
+        match entry.saved_link {
+            Some(link)
+                if Some(link.saved_id) != self.pinned
+                    && self
+                        .saved_states
+                        .get(&link.saved_id)
+                        .is_some_and(|saved_state| {
+                            saved_state.version == link.version && has_short_tail(saved_state)
+                        }) =>
+            {
+                let saved_state = &self.saved_states[&link.saved_id];
+                let replaced_positions = saved_state.replaced_positions
+                    + saved_state
+                        .tokens
+                        .len()
+                        .saturating_sub(link.shared_positions);
+                if replaced_positions > len || saved_state.parts.len() >= MAX_PARTS {
+                    SaveDecision::New {
+                        replaces: Some(link.saved_id),
+                    }
+                } else {
+                    SaveDecision::Append {
+                        saved_id: link.saved_id,
+                        from: link.shared_positions,
+                    }
+                }
+            }
+            _ => SaveDecision::New { replaces: None },
         }
     }
 
@@ -2484,6 +2579,82 @@ mod tests {
     }
 
     #[test]
+    fn a_state_is_saved_when_it_holds_enough_unshared_tokens() {
+        let mut cache = make_saving_cache();
+        let state = add_idle_state(&mut cache, &collect_tokens(0..1000), &[1000]);
+        let entry = cache.entries.remove(&state).unwrap();
+        assert_eq!(
+            cache.decide_save(&entry, true),
+            SaveDecision::New { replaces: None }
+        );
+        cache.saved_byte_limit = 0;
+        assert_eq!(
+            cache.decide_save(&entry, true),
+            SaveDecision::Skip,
+            "no room on the SSD: nothing saved"
+        );
+        cache.saved_byte_limit = 1 << 30;
+        // a state kept in memory holds all but 60 of its tokens
+        let mut longer = collect_tokens(0..940);
+        longer.extend(collect_tokens(7000..7500));
+        add_idle_state(&mut cache, &longer, &[]);
+        assert_eq!(cache.decide_save(&entry, true), SaveDecision::Skip);
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::New { replaces: None },
+            "at quit no state stays in memory"
+        );
+        // a saved state holds all but 60
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(&mut cache, 9, &longer, &[]);
+        assert_eq!(cache.decide_save(&entry, false), SaveDecision::Skip);
+        // too short to be worth it
+        let mut cache = make_saving_cache();
+        let short = add_idle_state(&mut cache, &collect_tokens(0..99), &[99]);
+        let entry = cache.entries.remove(&short).unwrap();
+        assert_eq!(cache.decide_save(&entry, false), SaveDecision::Skip);
+    }
+
+    #[test]
+    fn a_state_loaded_from_a_saved_one_adds_a_part_to_it() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(
+            &mut cache,
+            4,
+            &collect_tokens(0..1000),
+            &[make_saved_snapshot(1000, SnapshotKind::GenerationEnd)],
+        );
+        let id = add_idle_state(&mut cache, &collect_tokens(0..1000), &[]);
+        cache.link_to_saved_state(id, 4, 1000);
+        // it continued past the saved state's end
+        cache.start_request(id, &collect_tokens(0..1400), 1000, STATE_BYTES, 0);
+        cache.add_prefilled_tokens(id, &collect_tokens(0..1400), 0);
+        cache.set_idle(id, STATE_BYTES);
+        let entry = cache.entries.remove(&id).unwrap();
+        assert_eq!(
+            cache.decide_save(&entry, true),
+            SaveDecision::Append {
+                saved_id: 4,
+                from: 1000
+            }
+        );
+        // a save into the saved state since: its link is old, a new saved state
+        cache.saved_states.get_mut(&4).unwrap().version = 2;
+        assert_eq!(
+            cache.decide_save(&entry, true),
+            SaveDecision::New { replaces: None }
+        );
+        cache.saved_states.get_mut(&4).unwrap().version = 1;
+        // its replaced positions would outnumber the state's tokens: a new
+        // saved state replaces it
+        cache.saved_states.get_mut(&4).unwrap().replaced_positions = 1500;
+        assert_eq!(
+            cache.decide_save(&entry, true),
+            SaveDecision::New { replaces: Some(4) }
+        );
+    }
+
+    #[test]
     fn saved_links_follow_copies_and_continuations() {
         let mut cache = make_saving_cache();
         add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..1000), &[]);
@@ -2513,6 +2684,75 @@ mod tests {
                 .saved_link
                 .map(|link| link.shared_positions),
             Some(950)
+        );
+        // a part from there replaces the saved state's 50 rows after it. They
+        // are fewer than min_unshared_tokens. So the saved state's tail is not
+        // worth keeping.
+        let mut prompt = collect_tokens(0..950);
+        prompt.extend(collect_tokens(3000..3200));
+        cache.add_prefilled_tokens(loaded, &prompt, 0);
+        cache.set_idle(loaded, STATE_BYTES);
+        let entry = cache.entries.remove(&loaded).unwrap();
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::Append {
+                saved_id: 4,
+                from: 950
+            }
+        );
+    }
+
+    #[test]
+    fn a_save_leaves_the_saved_state_a_request_loads_next_as_it_is() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..1000), &[]);
+        let mut prompt = collect_tokens(0..990);
+        prompt.extend(collect_tokens(8000..8300));
+        let id = add_idle_state(&mut cache, &prompt, &[]);
+        cache.link_to_saved_state(id, 4, 990);
+        let entry = cache.entries.remove(&id).unwrap();
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::Append {
+                saved_id: 4,
+                from: 990
+            }
+        );
+        cache.pinned = Some(4);
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::New { replaces: None },
+            "not appended to"
+        );
+        cache.saved_states.get_mut(&4).unwrap().replaced_positions = 5000;
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::New { replaces: None },
+            "nor replaced"
+        );
+    }
+
+    #[test]
+    fn a_state_that_differs_early_does_not_cut_off_a_saved_state_s_tail() {
+        let mut cache = make_saving_cache();
+        add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..1000), &[]);
+        // a state loaded from it that differs at 500, with 200 unshared tokens.
+        // The saved state's 500 tokens after position 500 stay.
+        let mut prompt = collect_tokens(0..500);
+        prompt.extend(collect_tokens(9000..9200));
+        let id = add_idle_state(&mut cache, &prompt, &[]);
+        cache.link_to_saved_state(id, 4, 500);
+        let entry = cache.entries.remove(&id).unwrap();
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::New { replaces: None },
+            "not appended to"
+        );
+        cache.saved_states.get_mut(&4).unwrap().replaced_positions = 5000;
+        assert_eq!(
+            cache.decide_save(&entry, false),
+            SaveDecision::New { replaces: None },
+            "nor replaced"
         );
     }
 
