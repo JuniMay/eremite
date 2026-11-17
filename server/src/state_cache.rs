@@ -8,18 +8,64 @@
 //! state holds, and the state's bytes. It also holds the state's snapshots,
 //! whether a request runs in the state, and the state's last use.
 //!
-//! All models share one byte limit and one use clock.
+//! All models share one byte limit and one use clock. A prompt reuses only
+//! states of its own model.
 //!
 //! A state's rolling rows are the rows that later positions overwrite: each
 //! layer's window ring. A snapshot holds a state's rolling rows at one
 //! position. After a snapshot is restored into a state, the state continues at
 //! the snapshot's position.
+//!
+//! [`Cache::list_plans`] compares a prompt with every state, busy or idle. For
+//! each state, `k` is the length of the prefix that the prompt shares with it.
+//! The branch point is the end of the longest prefix that the prompt shares
+//! with any state. The plans are:
+//!
+//! - **In place**: the prompt continues an idle state without a copy. The
+//!   state's end lies at most its rewind room after `k`.
+//! - **Snapshot**: a new state copies a source state's rows before a position
+//!   `b`, at most `k`. It restores a snapshot at `b`, or one at most the
+//!   snapshot's rewind room after `b`. Its prefill starts at `b`. When the
+//!   branch point lies after `b` and before the prompt's end, the prefill takes
+//!   a branch snapshot there. A later fork there then resumes at once. The
+//!   rewind room after `b` serves the turn after a thinking prompt. That prompt
+//!   ends with `<think>`. The next turn has `</think>` at that position. So the
+//!   next turn differs one position before the prompt-end snapshot. It still
+//!   resumes from that snapshot.
+//! - **Replay**: a new state copies a source state's rows before `k`. Its
+//!   prefill starts at `k` with the engine's replay. The replay rebuilds the
+//!   rolling rows at `k`. The prefill takes them as a branch snapshot.
+//! - **Cold start**: the prompt shares nothing. A new state prefills it from
+//!   position 0.
+//!
+//! A snapshot plan and a replay plan fork the source state. Every plan gives
+//! exact rows, except a replay under --ced. The --ced option is DeepSeek's
+//! approximate prefill. Under it, a replay recomputes only the last ring of
+//! positions.
+//!
+//! **Rewind room.** Before its window, each layer's ring also holds the rows of
+//! a few more positions: the rewind margin. So a state can continue up to that
+//! many positions before its end. A row written past where the state then
+//! continues is stale. It takes the place of one of the margin's oldest rows. A
+//! verify pass writes stale rows after the tokens it accepts. A prompt that
+//! continues a state before its end also leaves stale rows: the state's old
+//! rows after the prompt's end. The cache counts the stale rows of each state
+//! and snapshot. Each row written at a state's end replaces one stale row. The
+//! rewind room is the rewind margin less the stale rows. A plan resumes at most
+//! that many positions before a state's end or a snapshot's position.
 
 use std::collections::BTreeMap;
 
 /// How many tokens one slice comparison takes. Slices compare faster than
 /// single tokens.
 const SHARED_PREFIX_BLOCK: usize = 1024;
+
+// The order of plans at equal cost. The cost counts only prefilled tokens. A
+// copy takes time it does not count. So in place comes first.
+const RANK_IN_PLACE: usize = 0;
+const RANK_SNAPSHOT: usize = 1;
+const RANK_REPLAY: usize = 2;
+const RANK_COLD: usize = 3;
 
 /// The id of a state in memory. The worker maps it to the engine's state.
 pub type StateId = u64;
@@ -52,6 +98,14 @@ pub struct Snapshot {
     pub stale_rows: usize,
 }
 
+impl Snapshot {
+    /// Returns whether the snapshot has logits. Only a prompt-end snapshot has
+    /// them.
+    pub fn has_logits(&self) -> bool {
+        self.kind == SnapshotKind::PromptEnd
+    }
+}
+
 /// One attention state as the cache sees it.
 #[derive(Debug)]
 pub struct Entry {
@@ -77,6 +131,54 @@ pub struct Entry {
     pub reserved_snapshots: Vec<Snapshot>,
     /// Its number in the log and the status.
     pub number: u64,
+}
+
+/// How a prompt resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// A cold start: a new state prefills the prompt from position 0.
+    Cold,
+    /// The idle state `state` continues at position `from`. When `from` is the
+    /// prompt's length, its prompt-end snapshot there is restored. No prefill
+    /// runs then.
+    InPlace { state: StateId, from: usize },
+    /// A new state from a snapshot of state `source`. It copies the source's
+    /// rows before `from`. It restores the snapshot at `snapshot_pos`: `from`,
+    /// or at most the snapshot's rewind room after it. Its prefill then starts
+    /// at `from`. No prefill runs when `from` is the prompt's length: the
+    /// snapshot's logits are the prompt's. `branch_point` is the end of the
+    /// longest prefix that the prompt shares with any state. When it lies after
+    /// `from` and before the prompt's end, the prefill takes a branch snapshot
+    /// there. A later fork there then resumes at once.
+    Snapshot {
+        source: StateId,
+        snapshot_pos: usize,
+        from: usize,
+        branch_point: usize,
+    },
+    /// A new state that replays from state `source`. It copies the source's
+    /// rows before `from`. Its prefill starts with a replay at `from`. The
+    /// replay rebuilds the rolling rows there. The prefill takes them as a
+    /// branch snapshot.
+    Replay { source: StateId, from: usize },
+}
+
+/// The engine's limits and costs that plans depend on, for one model.
+#[derive(Clone, Copy)]
+pub struct PlanLimits<'a> {
+    /// The rewind margin: the positions whose rows each ring holds before its
+    /// window. A state can continue this many positions before its end, less
+    /// its stale rows. The same holds before a snapshot's position.
+    pub rewind_margin: usize,
+    /// Whether the model rebuilds its rolling rows from the rows it keeps. A
+    /// model that does not resumes only from snapshots, and computes the
+    /// positions after the snapshot again.
+    pub can_replay: bool,
+    /// Returns what a replay at a position costs beyond the prompt's new
+    /// tokens, counted in prefilled tokens. The cost is the rows before that
+    /// position that each layer computes again, on average. It is at most the
+    /// position.
+    pub replay_cost: &'a dyn Fn(usize) -> usize,
 }
 
 /// Counts the positions that two token sequences share from the start.
@@ -145,6 +247,121 @@ impl Cache {
     fn advance_clock(&mut self) -> u64 {
         self.clock += 1;
         self.clock
+    }
+
+    /// Finds the cheapest plan that resumes `prompt` for model `model`.
+    #[cfg(test)]
+    pub fn find_cheapest_plan(&self, model: usize, prompt: &[i32], limits: PlanLimits<'_>) -> Plan {
+        self.list_plans(model, prompt, limits)[0]
+    }
+
+    /// Lists the plans that resume `prompt` for model `model`, the cheapest
+    /// first. The list ends at the cold start. A plan that reuses a state in
+    /// memory keeps that state. That state may not fit beside the prompt's new
+    /// state. Every plan gives exact rows, except a replay under --ced.
+    pub fn list_plans(&self, model: usize, prompt: &[i32], limits: PlanLimits<'_>) -> Vec<Plan> {
+        let prompt_len = prompt.len();
+        // each plan with its cost and rank
+        let mut plans = vec![(prompt_len, RANK_COLD, Plan::Cold)];
+        // the branch point: the end of the longest prefix that the prompt
+        // shares with any state
+        let mut branch_point = 0;
+        let mut add_plan = |cost: usize, rank: usize, plan: Plan| plans.push((cost, rank, plan));
+        let count_rewind_room = |stale_rows: usize| limits.rewind_margin.saturating_sub(stale_rows);
+        // Finds the prefix that a state's tokens share with the prompt, and
+        // where the prompt resumes. It resumes at the prefix's end. At the
+        // prompt's end it resumes only with logits there. Otherwise the
+        // prompt's last token runs again.
+        let find_resume_point = |tokens: &[i32], has_logits_at_end: bool| {
+            let shared = count_shared_prefix(prompt, tokens);
+            (
+                shared,
+                if shared >= prompt_len && !has_logits_at_end {
+                    prompt_len - 1
+                } else {
+                    shared.min(prompt_len)
+                },
+            )
+        };
+        for (&id, entry) in &self.entries {
+            if entry.model != model {
+                continue;
+            }
+            let (shared, resume_at) = find_resume_point(
+                &entry.tokens,
+                entry
+                    .snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.pos == prompt_len && snapshot.has_logits()),
+            );
+            branch_point = branch_point.max(shared.min(prompt_len));
+            if resume_at == 0 {
+                continue;
+            }
+            if !entry.busy && entry.tokens.len() <= resume_at + count_rewind_room(entry.stale_rows)
+            {
+                let plan = Plan::InPlace {
+                    state: id,
+                    from: resume_at,
+                };
+                add_plan(prompt_len - resume_at, RANK_IN_PLACE, plan);
+            }
+            for snapshot in &entry.snapshots {
+                // A snapshot serves a resume at its position, or up to its
+                // rewind room before it. Without a prefill, it serves only at
+                // the prompt's end, with logits.
+                let from = snapshot.pos.min(resume_at);
+                if snapshot.pos <= resume_at + count_rewind_room(snapshot.stale_rows)
+                    && (from < prompt_len || (snapshot.pos == prompt_len && snapshot.has_logits()))
+                {
+                    add_plan(
+                        prompt_len - from,
+                        RANK_SNAPSHOT,
+                        Plan::Snapshot {
+                            source: id,
+                            snapshot_pos: snapshot.pos,
+                            from,
+                            branch_point: 0,
+                        },
+                    );
+                }
+            }
+            if limits.can_replay && resume_at < prompt_len {
+                add_plan(
+                    prompt_len - resume_at + (limits.replay_cost)(resume_at),
+                    RANK_REPLAY,
+                    Plan::Replay {
+                        source: id,
+                        from: resume_at,
+                    },
+                );
+            }
+        }
+        plans.sort_by_key(|&(cost, rank, _)| (cost, rank));
+        plans.truncate(
+            plans
+                .iter()
+                .position(|&(_, _, plan)| plan == Plan::Cold)
+                .expect("the cold start")
+                + 1,
+        );
+        plans
+            .into_iter()
+            .map(|(_, _, plan)| match plan {
+                Plan::Snapshot {
+                    source,
+                    snapshot_pos,
+                    from,
+                    ..
+                } => Plan::Snapshot {
+                    source,
+                    snapshot_pos,
+                    from,
+                    branch_point: branch_point.max(from),
+                },
+                plan => plan,
+            })
+            .collect()
     }
 
     /// Adds an empty, busy state of model `model` that takes `bytes`. Returns
@@ -245,6 +462,15 @@ impl Cache {
         }
     }
 
+    /// Adds a decoded token at the end of state `id`. Its row replaces one
+    /// stale row.
+    pub fn add_decoded_token(&mut self, id: StateId, token: i32) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.tokens.push(token);
+            entry.stale_rows = entry.stale_rows.saturating_sub(1);
+        }
+    }
+
     /// Sets state `id` idle and used now. Sets its bytes to `bytes` and clears
     /// its reserved snapshots.
     pub fn set_idle(&mut self, id: StateId, bytes: u64) {
@@ -270,10 +496,35 @@ impl Cache {
 mod tests {
     use super::*;
 
+    /// DeepSeek's layers.
+    const LAYERS: usize = 40;
+    /// DeepSeek's attention window, in positions.
+    const WINDOW: usize = 128;
+    /// The test model's limits: a rewind margin of 5 positions and a replay in
+    /// DeepSeek's shape.
+    const PLAN_LIMITS: PlanLimits<'static> = PlanLimits {
+        rewind_margin: 5,
+        can_replay: true,
+        replay_cost: &count_replay_rows,
+    };
+    /// A layer's ring: its window and the rewind margin.
+    const RING_ROWS: usize = WINDOW + PLAN_LIMITS.rewind_margin;
     /// A test state's bytes, 1 MiB.
     const STATE_BYTES: u64 = 1 << 20;
     /// A test snapshot's bytes, 6 MiB.
     const SNAPSHOT_BYTES: u64 = 6 << 20;
+
+    /// Counts the rows a replay at `pos` computes again, in the shape of
+    /// DeepSeek's replay. The rewind margin is 5, as in PLAN_LIMITS. The top
+    /// layer computes again the last RING_ROWS positions before `pos`. Each
+    /// layer below starts WINDOW - 1 positions earlier. The count is the
+    /// average over the LAYERS layers, rounded up.
+    fn count_replay_rows(pos: usize) -> usize {
+        (0..LAYERS)
+            .map(|depth| pos.min(RING_ROWS + (WINDOW - 1) * depth))
+            .sum::<usize>()
+            .div_ceil(LAYERS)
+    }
 
     /// Collects the tokens of `range`.
     fn collect_tokens(range: std::ops::Range<i32>) -> Vec<i32> {
@@ -356,11 +607,102 @@ mod tests {
     }
 
     #[test]
+    fn the_longest_shared_prefix_wins_in_a_busy_or_idle_state() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let _short = add_idle_state(&mut cache, &collect_tokens(0..3000), &[3000]);
+        let long = add_idle_state(&mut cache, &collect_tokens(0..20000), &[10000, 20000]);
+        cache.entries.get_mut(&long).unwrap().busy = true;
+        let mut prompt = collect_tokens(0..15000);
+        prompt.extend(90000..90010);
+        // a busy state is a source like any other, but never continued in place
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::Replay {
+                source: long,
+                from: 15000
+            }
+        );
+    }
+
+    #[test]
+    fn a_retry_after_a_short_reply_and_a_changed_last_token_stay_in_place() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let prompt = collect_tokens(0..4000);
+        let idle = add_idle_state(&mut cache, &prompt, &[4000]);
+        for offset in 0..3 {
+            // a reply within the rewind margin
+            cache.add_decoded_token(idle, 100000 + offset);
+        }
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::InPlace {
+                state: idle,
+                from: 4000
+            }
+        );
+        let mut changed = prompt.clone();
+        *changed.last_mut().unwrap() = -7;
+        assert_eq!(
+            cache.find_cheapest_plan(0, &changed, PLAN_LIMITS),
+            Plan::InPlace {
+                state: idle,
+                from: 3999
+            }
+        );
+    }
+
+    #[test]
+    fn a_fork_resumed_from_an_earlier_snapshot_carries_its_own_branch_point() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        let source = add_idle_state(&mut cache, &collect_tokens(0..6000), &[]);
+        cache.add_snapshot(
+            source,
+            Snapshot {
+                pos: 4125,
+                kind: SnapshotKind::Branch,
+                bytes: SNAPSHOT_BYTES,
+                stale_rows: 0,
+            },
+        ); // an earlier fork's
+        let mut prompt = collect_tokens(0..4262);
+        prompt.extend(-20..0);
+        // 137 tokens from the snapshot cost less than a replay at 4,262 (~2,610
+        // rows)
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::Snapshot {
+                source,
+                snapshot_pos: 4125,
+                from: 4125,
+                branch_point: 4262
+            }
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_shares_nothing_gets_a_cold_start() {
+        let mut cache = Cache::new(u64::MAX, 256);
+        add_idle_state(&mut cache, &collect_tokens(0..100), &[100]);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &collect_tokens(500..700), PLAN_LIMITS),
+            Plan::Cold
+        );
+        assert_eq!(
+            Cache::new(u64::MAX, 256).find_cheapest_plan(0, &collect_tokens(0..10), PLAN_LIMITS),
+            Plan::Cold
+        );
+    }
+
+    #[test]
     fn continuing_in_place_truncates_the_state_and_its_later_snapshots() {
         let mut cache = Cache::new(u64::MAX, 256);
         let state = add_idle_state(&mut cache, &collect_tokens(0..1000), &[400, 998, 1000]);
         let mut prompt = collect_tokens(0..998);
         prompt.extend(7000..7050);
+        assert_eq!(
+            cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
+            Plan::InPlace { state, from: 998 }
+        );
         let dropped = cache.start_request(state, &prompt, 998, STATE_BYTES, 0);
         assert_eq!(
             dropped
