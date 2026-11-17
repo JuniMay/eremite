@@ -30,6 +30,7 @@ use deepseek_recipe::response::{Accumulate, ProtocolResponse};
 use deepseek_recipe::stream::{
     ChunkGenerator, InferenceChunk, InferenceFinishReason, PromptUsage, StreamProcessor,
 };
+use deepseek_recipe_core::messages::InputMessage;
 use deepseek_recipe_core::multimodal::ImageSource;
 use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens, SpecialTokensMap};
 use deepseek_recipe_encoding::PromptEncoding;
@@ -1100,6 +1101,128 @@ where
     }
 }
 
+// ---- the --render command ----
+
+/// Replaces the URL of each image part in `value` with a numbered data URL.
+/// With data URLs, deepseek-recipe converts any test case.
+/// `original_urls` gets the replaced URLs, in order.
+fn replace_image_urls(value: &mut Value, original_urls: &mut Vec<String>) {
+    match value {
+        Value::Array(a) => a
+            .iter_mut()
+            .for_each(|item| replace_image_urls(item, original_urls)),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("image_url")
+                && let Some(Value::Object(image_url)) = object.get_mut("image_url")
+            {
+                let url = image_url
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // Base64 data comes in groups of four characters.
+                // So the number's eight digits are valid base64 data.
+                image_url.insert(
+                    "url".into(),
+                    format!("data:image/png;base64,{:08}", original_urls.len()).into(),
+                );
+                original_urls.push(url);
+            }
+            object
+                .values_mut()
+                .for_each(|item| replace_image_urls(item, original_urls));
+        }
+        _ => {}
+    }
+}
+
+/// Renders a test case of the checkpoint's encoding/tests folder, for --render
+/// FILE.
+/// A test case is a message list, or an object with messages, tools,
+/// thinking_mode and reasoning_effort.
+/// Prints the prompt that the server renders for the case on stdout.
+/// Prints each image's URL on stderr, in prompt order.
+/// A case that ends with an assistant message renders without the next turn's
+/// start.
+/// The checkpoint's encoding.py renders such a case the same way.
+/// The server refuses such a request.
+/// Returns the process's exit status.
+pub fn render_test_case_file(path: &str) -> i32 {
+    let case = match std::fs::read_to_string(path).map(|t| serde_json::from_str::<Value>(&t)) {
+        Ok(Ok(case)) => case,
+        _ => {
+            eprintln!("eremite-server: {path}: not a JSON test case");
+            return libc::EXIT_FAILURE;
+        }
+    };
+    let empty = Map::new();
+    let (messages, fields) = match &case {
+        Value::Array(_) => (case.clone(), &empty),
+        Value::Object(object) => (
+            object.get("messages").cloned().unwrap_or(Value::Null),
+            object,
+        ),
+        _ => (Value::Null, &empty),
+    };
+    let mut root = Map::new();
+    root.insert("model".into(), DEFAULT_MODEL_ID.into());
+    root.insert("messages".into(), messages);
+    if let Some(tools) = fields.get("tools") {
+        root.insert("tools".into(), tools.clone());
+    }
+    let is_thinking_on = fields.get("thinking_mode").and_then(Value::as_str) == Some("thinking");
+    root.insert("thinking".into(), is_thinking_on.into());
+    if let Some(effort) = fields.get("reasoning_effort") {
+        root.insert("reasoning_effort".into(), effort.clone());
+    }
+    let mut urls = Vec::new();
+    replace_image_urls(&mut root["messages"], &mut urls);
+    let defaults = Defaults {
+        model_id: DEFAULT_MODEL_ID.into(),
+        // Rendering does not use the sampling settings.
+        sampling: Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: None,
+        },
+        is_thinking_on: false,
+        effort: EFFORT_HIGH,
+    };
+    let rendered = match render_request(root, &defaults, Api::ChatCompletions) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            eprintln!("eremite-server: {path}: {}", e.message);
+            return libc::EXIT_FAILURE;
+        }
+    };
+    let mut prompt = rendered.prompt;
+    // The next turn starts with the Assistant token and a thinking token.
+    if let Some(InputMessage::Assistant { prefix: false, .. }) =
+        rendered.converted_request.conversation.messages.last()
+        && let [.., assistant, thinking] = rendered.special_ranges.as_slice()
+        && assistant.end == thinking.start
+        && thinking.end == prompt.len()
+    {
+        prompt.truncate(assistant.start);
+    }
+    print!("{prompt}");
+    for source in &rendered.image_sources {
+        let url = match source {
+            ImageSource::DataUrl { data_url, .. } => data_url
+                .rsplit(',')
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| urls.get(n).cloned())
+                .unwrap_or_else(|| data_url.clone()),
+            ImageSource::Url { url, .. } => url.clone(),
+            ImageSource::Bytes { .. } => "(bytes)".into(),
+        };
+        eprintln!("image {url}");
+    }
+    libc::EXIT_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2024,5 +2147,55 @@ mod tests {
         let text = stream(Api::ChatCompletions, &chat, vec![started, stopped]).await;
         let failure = format_error_json("server_error", "the server is stopping");
         assert!(text.ends_with(&format!("data: {failure}\n\n")), "{text}");
+    }
+
+    #[test]
+    fn image_urls_become_numbered_data_urls() {
+        let mut messages = json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "text", "text": "and"},
+            {"type": "image_url", "image_url": {"url": "b.png"}},
+        ]}]);
+        let mut urls = Vec::new();
+        replace_image_urls(&mut messages, &mut urls);
+        assert_eq!(urls, ["https://example.com/a.png", "b.png"]);
+        let content = &messages[0]["content"];
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,00000000"
+        );
+        assert_eq!(content[1]["text"], "and");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "data:image/png;base64,00000001"
+        );
+    }
+
+    #[test]
+    fn rendering_a_test_case_file_returns_the_exit_status() {
+        let path =
+            std::env::temp_dir().join(format!("eremite-render-test-{}.json", std::process::id()));
+        let path_text = path.to_str().expect("a UTF-8 path");
+        for (case, status) in [
+            (
+                r#"{"messages": [{"role": "user", "content": "hi"}], "thinking_mode": "thinking"}"#,
+                libc::EXIT_SUCCESS,
+            ),
+            (
+                r#"[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]"#,
+                libc::EXIT_SUCCESS,
+            ),
+            ("not JSON", libc::EXIT_FAILURE),
+            (r#"{"messages": "hi"}"#, libc::EXIT_FAILURE),
+        ] {
+            std::fs::write(&path, case).expect("a written case");
+            assert_eq!(render_test_case_file(path_text), status, "{case}");
+        }
+        std::fs::remove_file(&path).expect("a removed case");
+        assert_eq!(
+            render_test_case_file(path_text),
+            libc::EXIT_FAILURE,
+            "a missing file"
+        );
     }
 }

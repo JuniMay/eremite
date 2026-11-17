@@ -16,7 +16,8 @@ deepseek-recipe-encoding = "=0.2.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
-# File locks, free disk space and process groups (disk.rs, codex/search.rs).
+# File locks, free disk space, process groups and exit statuses (disk.rs,
+# codex/search.rs, chat/deepseek.rs).
 libc = "0.2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
