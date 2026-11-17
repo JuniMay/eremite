@@ -117,7 +117,7 @@ Each entry under `models` holds one model's settings:
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | `off` |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin (8) | `off` |
-| `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; needs `ced` off | `false` |
+| `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; it changes no result, and needs `ced` off | `true` without `ced` |
 | `packed_state_rows` | DeepSeek: a state keeps its compressed rows and index keys packed: the same values in about 28% of BF16's bytes | `false` |
 | `idle_unload` | the model's own `idle_unload` | the server-wide one |
 

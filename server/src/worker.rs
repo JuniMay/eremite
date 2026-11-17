@@ -957,7 +957,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "plans": status.plan_counts,
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
         "lookup_depth": options.lookup,
-        "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
+        "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prunes_prefill()),
         "rows_per_call": shared_model.settings.rows_per_call,
         "split_decoding_calls": status.split_calls,
         "drafts": status.drafts_per_pass,

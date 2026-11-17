@@ -101,7 +101,7 @@ impl ModelConfig {
                     _ => integer()?,
                 }
             }
-            "prefill_prune" => options.deepseek_mut()?.prefill_prune = switch()?,
+            "prefill_prune" => options.deepseek_mut()?.prefill_prune = Some(switch()?),
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
             "memory"
             | "reserve"
@@ -611,6 +611,12 @@ pub fn parse(root: &Value) -> Result<Config, String> {
                 .set(name, value)
                 .map_err(|error| format!("models[{i}]: {error}"))?;
         }
+        if let Some(deepseek) = model.engine.deepseek()
+            && deepseek.prefill_prune == Some(true)
+            && deepseek.ced != 0
+        {
+            return Err(format!("models[{i}]: prefill_prune needs ced off"));
+        }
         models.push(model);
     }
     Ok(Config {
@@ -857,6 +863,25 @@ mod tests {
             (Some("small"), 1, 32768)
         );
         assert!(small.engine.deepseek().is_none());
+    }
+
+    #[test]
+    fn prefill_prune_is_on_unless_ced_is_on() {
+        let models = parse(&json!({"models": [
+            {"model": "/m/a", "experts": "/m/a.gguf"},
+            {"model": "/m/b", "ced": 128},
+            {"model": "/m/c", "prefill_prune": false},
+            {"model": "/m/d", "ced": "off", "prefill_prune": true}
+        ]}))
+        .unwrap()
+        .models;
+        let prunes: Vec<bool> = models
+            .iter()
+            .map(|model| model.engine.deepseek().unwrap().prunes_prefill())
+            .collect();
+        assert_eq!(prunes, [true, false, false, true]);
+        let both = parse(&json!({"models": [{"model": "/m", "ced": 128, "prefill_prune": true}]}));
+        assert!(both.unwrap_err().contains("prefill_prune needs ced off"));
     }
 
     #[test]
