@@ -18,3 +18,4 @@ pub mod terminal;
 mod testing;
 pub mod theme;
 pub mod tiles;
+pub mod view;
