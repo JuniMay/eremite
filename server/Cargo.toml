@@ -29,5 +29,7 @@ serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
+# The columns that a character takes on the terminal (ui/).
+unicode-width = "0.2"
 # Links on fetched pages, and the hosts they name (codex/search.rs).
 url = "2"
