@@ -6,14 +6,18 @@ use std::ops::Range;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::ui::draw::{fit_line, format_percent, label, plain, strong};
-use crate::ui::frame::{Choices, Screen};
-use crate::ui::status::Session;
-use crate::ui::theme::{Rgb, mix};
+use crate::ui::draw::{
+    colored, fit_line, format_count, format_duration, format_percent, label, plain, strong,
+};
+use crate::ui::frame::{Choices, ClickTarget, Screen, Target};
+use crate::ui::status::{Activity, ModelStatus, Session};
+use crate::ui::theme::{Rgb, Theme, mix};
 
+/// The bytes of one GiB.
+const GIB: f64 = (1u64 << 30) as f64;
 /// The text panel takes three eighths of the columns, and the tree the rest.
 const PANEL_SHARE: (u16, u16) = (3, 8);
 /// The columns at the right of the tree for the label after a session's end.
@@ -151,6 +155,22 @@ fn place_rows(nodes: &mut [TreeNode], i: usize, rows: &mut usize) -> usize {
     row
 }
 
+/// Returns the index of the session that `choices` chose in `status`. Without
+/// a choice, or once that session is gone, it is the session used last.
+pub fn find_chosen_session(status: &ModelStatus, choices: &Choices) -> Option<usize> {
+    let sessions = &status.sessions;
+    choices
+        .session
+        .and_then(|number| sessions.iter().position(|session| session.number == number))
+        .or_else(|| {
+            (0..sessions.len()).min_by(|&a, &b| {
+                sessions[a]
+                    .idle_seconds
+                    .total_cmp(&sessions[b].idle_seconds)
+            })
+        })
+}
+
 /// Formats a token position briefly, such as 950, 12K or 1.2M.
 fn format_position(position: u64) -> String {
     const THOUSAND: u64 = 1_000;
@@ -164,10 +184,47 @@ fn format_position(position: u64) -> String {
     }
 }
 
+/// Describes the session at `index` of `status` for its label: what it does
+/// or how long it has been idle, then its tokens and its GiB.
+fn describe_session(theme: &Theme, status: &ModelStatus, index: usize) -> Vec<Span<'static>> {
+    let session = &status.sessions[index];
+    let running = status
+        .requests
+        .iter()
+        .find(|request| request.session == Some(session.number));
+    let mut spans = Vec::new();
+    match running {
+        Some(request) => {
+            let what = match request.status {
+                Activity::Prefill => "prefill",
+                Activity::Decoding | Activity::Waiting => "decoding",
+            };
+            spans.push(colored(
+                theme,
+                theme.accent,
+                format!("  #{} {what}", request.id),
+            ));
+        }
+        None => spans.push(plain(format!(
+            "  idle {}",
+            format_duration(session.idle_seconds)
+        ))),
+    }
+    spans.push(label(
+        theme,
+        format!(
+            "  {} tok  {:.2} GiB",
+            format_count(session.tokens as f64),
+            session.bytes as f64 / GIB
+        ),
+    ));
+    spans
+}
+
 /// Draws the States of the model chosen in `choices` in `area`: the first
-/// line, then the axis of positions and the tree of the sessions. The columns
-/// at the right stay for the text panel.
-pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choices) {
+/// line, the axis of positions and the tree of the sessions, and the text
+/// panel's frame at the right. The places of the sessions go to `choices`.
+pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &mut Choices) {
     let theme = screen.theme;
     let Some(status) = screen.statuses.get(choices.model) else {
         return;
@@ -215,6 +272,7 @@ pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
         buf.set_line(area.x, area.y + 2.min(area.height - 1), &note, area.width);
         return;
     }
+    let chosen = find_chosen_session(status, choices);
     let (nodes, rows) = build_session_tree(sessions);
     let span = nodes.iter().map(|node| node.end).max().unwrap_or(1).max(1) as f64;
     let column =
@@ -290,6 +348,15 @@ pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
                 .set_symbol(symbol)
                 .set_style(style_of(i));
         }
+        // A click on the line chooses a session that ends there, or else the
+        // first session through it.
+        let first = node.ending.first().copied().unwrap_or(node.sessions.start);
+        choices.targets.push(ClickTarget {
+            y: row_y(node.row),
+            x0: from,
+            x1: to + 1,
+            target: Target::Session(sessions[first].number),
+        });
     }
     // The forks: a junction on the parent's row, a corner on each later
     // child's row, and the vertical between them.
@@ -347,7 +414,8 @@ pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
             }
         }
     }
-    // Each session's end and its prompt's end.
+    // Each session's end and its prompt's end; a label after each row's end.
+    let label_right = area.x + tree_width;
     for (i, node) in nodes.iter().enumerate() {
         if node.ending.is_empty() || node.row >= fit {
             continue;
@@ -372,10 +440,69 @@ pub fn draw_states(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
                 }
             }
         }
+        if !node.children.is_empty() {
+            continue;
+        }
+        let index = node.ending[0];
+        let session = &sessions[index];
+        let name = format!("session {}", session.number);
+        let name_span = if Some(index) == chosen {
+            Span::styled(
+                format!(" {name} "),
+                Style::new()
+                    .fg(theme.color(theme.on_accent))
+                    .bg(theme.color(theme.accent))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            let color = if session.busy {
+                theme.accent
+            } else {
+                theme.ink
+            };
+            Span::styled(
+                name,
+                Style::new()
+                    .fg(theme.color(color))
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let is_chosen = Some(index) == chosen;
+        let mut spans = vec![name_span];
+        spans.extend(describe_session(theme, status, index));
+        if is_chosen && let Some(after) = spans.get_mut(1) {
+            // The chosen name's spaces on the accent take the gaps around it.
+            after.content = after.content[1..].to_string().into();
+        }
+        let line = Line::from(spans);
+        let x = if is_chosen { end + 1 } else { end + 2 };
+        let room = label_right.saturating_sub(x + 1);
+        buf.set_line(x, y, &line, room);
+        choices.targets.push(ClickTarget {
+            y,
+            x0: x,
+            x1: x + (line.width() as u16).min(room),
+            target: Target::Session(session.number),
+        });
     }
     if rows > fit {
         let more = format!("… {} more rows", rows - fit);
         buf.set_string(x0, area.bottom() - 1, more, label_style);
+    }
+    // The text panel's rule and title.
+    let panel_x = area.x + tree_width;
+    for y in axis_y..area.bottom() {
+        buf[(panel_x, y)].set_symbol("│").set_style(rule);
+    }
+    if let Some(index) = chosen {
+        let mut spans = vec![strong(format!("session {}", sessions[index].number))];
+        spans.extend(
+            describe_session(theme, status, index)
+                .into_iter()
+                .map(|span| label(theme, span.content.to_string())),
+        );
+        let title = fit_line(theme, Line::from(spans), panel.saturating_sub(2) as usize);
+        buf.set_line(panel_x + 2, axis_y, &title, panel.saturating_sub(2));
     }
 }
 
@@ -411,7 +538,7 @@ mod tests {
 
     /// Draws States at `width` x `height` with `choices`, and returns the
     /// cells.
-    fn draw(width: u16, height: u16, status: &str, choices: &Choices) -> Buffer {
+    fn draw(width: u16, height: u16, status: &str, choices: &mut Choices) -> Buffer {
         let models = [ModelInfo {
             name: "deepseek-v4.1-flash".into(),
             kind: Kind::Llm,
@@ -434,7 +561,7 @@ mod tests {
 
     #[test]
     fn the_tree_draws_each_sessions_line_its_forks_and_its_ends() {
-        let buf = draw(160, 40, STATUS, &Choices::default());
+        let buf = draw(160, 40, STATUS, &mut Choices::default());
         assert_eq!(
             read_row(&buf, 0).trim_end(),
             " 5 sessions   this model 0.33 GiB   reused 0.6% of the prompt tokens   cold 1 \
@@ -469,19 +596,51 @@ mod tests {
     }
 
     #[test]
+    fn each_session_has_a_label_and_the_chosen_one_its_text_panel() {
+        let mut choices = Choices {
+            session: Some(2),
+            ..Choices::default()
+        };
+        let buf = draw(160, 40, STATUS, &mut choices);
+        // the decoding session's label in the accent
+        let busy = read_row(&buf, 5);
+        assert!(
+            busy.contains("━● session 5  #5 decoding  604 tok  0.05 GiB"),
+            "{busy}"
+        );
+        let at = find_in_row(&buf, 5, "session 5").unwrap();
+        assert_eq!(buf[(at, 5)].fg, DARK.color(DARK.accent));
+        // the chosen session's name white on the accent
+        let at = find_in_row(&buf, 7, " session 2 ").expect("session 2's label");
+        assert_eq!(buf[(at + 1, 7)].bg, DARK.color(DARK.accent));
+        assert_eq!(buf[(at + 1, 7)].fg, DARK.color(DARK.on_accent));
+        assert!(read_row(&buf, 7).contains("──● session 2  idle 23s  550 tok  0.05 GiB"));
+        // a click on a session's label or line chooses it
+        let three = find_in_row(&buf, 9, "session 3").unwrap();
+        assert_eq!(choices.find_target(three, 9), Some(Target::Session(3)));
+        assert_eq!(choices.find_target(10, 13), Some(Target::Session(1)));
+        // the text panel's rule and title at the right
+        assert_eq!(buf[(100, 3)].symbol(), "│");
+        assert!(read_row(&buf, 2).contains("│ session 2  idle 23s  550 tok  0.05 GiB"));
+        // without a choice, the session used last
+        let status: ModelStatus = serde_json::from_str(STATUS).unwrap();
+        assert_eq!(find_chosen_session(&status, &Choices::default()), Some(0));
+    }
+
+    #[test]
     fn without_sessions_or_room_the_view_says_so() {
-        let choices = Choices::default();
-        let buf = draw(160, 40, r#"{"loaded": true}"#, &choices);
+        let mut choices = Choices::default();
+        let buf = draw(160, 40, r#"{"loaded": true}"#, &mut choices);
         assert_eq!(read_row(&buf, 2).trim_end(), " no sessions yet");
-        let buf = draw(100, 30, STATUS, &choices);
+        let buf = draw(100, 30, STATUS, &mut choices);
         // the tree in the 17 columns left beside the panel and the labels
         assert!(
             read_row(&buf, 5).starts_with("  ┯◆━━"),
             "{}",
             read_screen(&buf)
         );
-        draw(20, 6, STATUS, &choices);
-        draw(1, 1, STATUS, &choices);
+        draw(20, 6, STATUS, &mut choices);
+        draw(1, 1, STATUS, &mut choices);
         assert_eq!(format_position(12_345), "12K");
         assert_eq!(format_position(1_234_567), "1.2M");
     }

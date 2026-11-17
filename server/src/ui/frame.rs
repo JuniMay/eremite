@@ -113,6 +113,8 @@ pub enum Target {
     Model(usize),
     /// A sub-view of the chosen model.
     SubView(SubView),
+    /// A session of the chosen model, by its number.
+    Session(u64),
 }
 
 /// A place that a click acts on: the columns from x0 to before x1 of row y.
@@ -146,6 +148,9 @@ pub struct Choices {
     pub log_back: usize,
     /// The rows of the log, in the frame drawn last.
     pub log_page: usize,
+    /// The session chosen in States, by its number. None takes the session
+    /// used last.
+    pub session: Option<u64>,
     /// The places that a click acts on, in the frame drawn last.
     pub targets: Vec<ClickTarget>,
 }
@@ -160,6 +165,7 @@ impl Default for Choices {
             log_filter: LogFilter::All,
             log_back: 0,
             log_page: 0,
+            session: None,
             targets: Vec::new(),
         }
     }
