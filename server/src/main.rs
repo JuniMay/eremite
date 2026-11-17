@@ -1,5 +1,6 @@
-//! eremite-server: the OpenAI Chat Completions and Responses APIs over
-//! eremite's engine, for one model or several in one process.
+//! eremite-server: the OpenAI Chat Completions and Responses APIs and Codex's
+//! model catalog, over eremite's engine, for one model or several in one
+//! process.
 //!
 //! - The engine (src/eremite.h, and engine.rs here) runs the models. It owns
 //!   the stop on SIGINT or SIGTERM.
@@ -9,7 +10,7 @@
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
 
-use eremite_server::{chat, config, control, engine, http, worker};
+use eremite_server::{chat, codex, config, control, engine, http, worker};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -640,6 +641,20 @@ async fn list_served_models(State(shared): App) -> Response {
     build_json_response(json!({"object": "list", "data": data}).to_string())
 }
 
+/// Answers GET /v1/codex/models with Codex's model catalog (codex/mod.rs) of
+/// the DeepSeek models. They answer the Responses API that Codex uses.
+async fn list_codex_models(State(shared): App) -> Response {
+    let models = shared.models.iter().map(|model| match &model.format {
+        Format::DeepSeek(defaults) => codex::CatalogModel {
+            model_id: &model.id,
+            display_name: &model.name,
+            context_window: model.ctx,
+            default_effort: defaults.is_thinking_on.then_some(defaults.effort),
+        },
+    });
+    build_json_response(codex::build_catalog(models).to_string())
+}
+
 /// Answers GET /v1/models/{id} with the model's object and its live status
 /// under "status". The status shows what the model is doing, its requests, its
 /// state cache, its counters, its expert cache and the process's memory.
@@ -997,6 +1012,14 @@ fn main() {
         .route(
             "/v1/models",
             get(list_served_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/codex/models",
+            get(list_codex_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/codex/models",
+            get(list_codex_models).fallback(refuse_other_than_get),
         )
         .route(
             "/models",
