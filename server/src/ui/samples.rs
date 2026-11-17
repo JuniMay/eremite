@@ -362,6 +362,14 @@ pub fn find_ssd_read_since_start(statuses: &[ModelStatus]) -> Option<f64> {
     (seconds > 0.0).then(|| gb / seconds)
 }
 
+/// Returns the milliseconds that each row that the model of `status` decoded
+/// since the start waited for expert reads.
+pub fn find_read_wait_since_start(status: &ModelStatus) -> Option<f64> {
+    let rows = status.model_decode.computed_rows;
+    (rows > 0)
+        .then(|| status.model_decode.read_wait_seconds / rows as f64 * MILLISECONDS_PER_SECOND)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +502,15 @@ mod tests {
         // a request that no longer decodes is forgotten
         samples.add_sample(100.0, &[status(Vec::new(), 2000, 200)]);
         assert_eq!(samples.find_request_speed(5), None);
+    }
+
+    #[test]
+    fn the_read_wait_since_the_start_is_per_decoded_row() {
+        let first = status(Vec::new(), 0, 20);
+        // 0.2 s for 200 rows
+        let wait = find_read_wait_since_start(&first).unwrap();
+        assert!((wait - 1.0).abs() < 1e-9, "{wait}");
+        assert_eq!(find_read_wait_since_start(&ModelStatus::default()), None);
     }
 
     #[test]

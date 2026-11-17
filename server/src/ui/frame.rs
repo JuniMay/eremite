@@ -118,6 +118,8 @@ pub enum Target {
     SubView(SubView),
     /// A session of the chosen model, by its number.
     Session(u64),
+    /// A decoding request of the chosen model, by its number.
+    Request(u64),
 }
 
 /// A place that a click acts on: the columns from x0 to before x1 of row y.
@@ -158,6 +160,9 @@ pub struct Choices {
     pub text_scroll: usize,
     /// The rows of the text panel, in the frame drawn last.
     pub text_page: usize,
+    /// The decoding request whose experts Experts shows, by its number. None
+    /// takes the first.
+    pub request: Option<u64>,
     /// The places that a click acts on, in the frame drawn last.
     pub targets: Vec<ClickTarget>,
 }
@@ -175,6 +180,7 @@ impl Default for Choices {
             session: None,
             text_scroll: 0,
             text_page: 0,
+            request: None,
             targets: Vec::new(),
         }
     }

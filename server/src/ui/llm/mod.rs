@@ -2,5 +2,6 @@
 //! their shared prefixes, and Experts, the experts of its decoding requests.
 //! Every LLM shows them.
 
+pub mod experts;
 pub mod states;
 pub mod text;
