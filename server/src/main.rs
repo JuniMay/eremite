@@ -58,8 +58,8 @@ const USAGE: &str =
   --progress-log S   seconds between a decoding request's progress lines in the log, 0 none
                   (default 10)
   --state-cache GB   total states and snapshots across all models, GiB (default 8)
-  --state-disk GB    room on the SSD for evicted states, written when evicted and read back for
-                  a prompt that starts like one, GiB; 0 off (default 32)
+  --state-disk GB    room on the SSD for evicted states, written when evicted and at quit and
+                  read back for a prompt that starts like one, GiB; 0 off (default 32)
   --state-dir DIR    the saved states' folder (default ~/.cache/eremite/states)
   --state-disk-tokens N  save a state only when it holds at least N tokens no other kept state
                   holds (default 8192)

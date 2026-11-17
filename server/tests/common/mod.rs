@@ -200,6 +200,12 @@ impl Server {
         }
     }
 
+    /// Stops it as SIGTERM does, and waits for it to exit (it saves its states
+    /// first).
+    pub fn stop(mut self) {
+        self.terminate();
+    }
+
     /// Sends SIGTERM to the server, unless it exited, and waits for it to exit.
     fn terminate(&mut self) {
         if let Ok(Some(_)) = self.child.try_wait() {

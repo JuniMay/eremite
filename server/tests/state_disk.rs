@@ -1,8 +1,11 @@
 //! States saved on the SSD through HTTP (--state-disk, --state-dir,
-//! --state-disk-tokens). A state evicted from memory is written to the SSD. A
-//! later prompt that starts like it continues from it as it would from memory,
-//! byte for byte in its greedy replies. A second server on the same folder runs
-//! without the saved states.
+//! --state-disk-tokens). A state evicted from memory, or idle at quit, is
+//! written to the SSD. A later prompt that starts like it continues from
+//! it as it would from memory, byte for byte in its greedy replies. A saved
+//! state damaged after the start is refused when it is read: the prompt is
+//! prefilled cold and the saved state goes. Saved states stay within their
+//! budget, the most recently used kept. A second server on the same folder
+//! runs without them.
 //!
 //! Set EREMITE_CHECKPOINT to the DeepSeek checkpoint directory and
 //! EREMITE_EXPERTS optionally to GGUF experts. The tests run one model process
@@ -60,6 +63,19 @@ impl Folder {
     /// Returns the folder's path as text.
     fn path(&self) -> &str {
         self.0.to_str().expect("a UTF-8 path")
+    }
+
+    /// Lists the files in it whose names end in `suffix`.
+    fn files(&self, suffix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.0)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.to_string_lossy().ends_with(suffix))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -235,6 +251,185 @@ fn an_evicted_state_continues_from_the_ssd_as_from_memory() {
         content(&then),
         "the reply continues as from memory"
     );
+}
+
+/// The states idle at quit are saved. After a restart the same prompt is
+/// answered from its saved prompt end, without a prefill.
+#[test]
+fn a_state_saved_at_quit_answers_its_prompt_again_after_a_restart() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT (and EREMITE_EXPERTS)");
+        return;
+    };
+    let _one = one_model();
+    let folder = Folder::new("quit");
+    let messages = conversation(
+        "src/engine/expert_store.h",
+        6000,
+        "When does the store read ahead?",
+    );
+    let first = {
+        let server = start_server(&setup, Some(&folder), &[]);
+        let first = chat(&server, &messages, 24);
+        server.settled(1);
+        server.stop();
+        first
+    };
+    assert_eq!(
+        folder.files(".state").len(),
+        1,
+        "one saved state after the quit"
+    );
+    let server = start_server(&setup, Some(&folder), &[]);
+    let start = server.status();
+    let again = chat(&server, &messages, 24);
+    let end = server.settled(1);
+    println!(
+        "after the restart: {:?} (states, saves, loads); the prompt again reused {} of {} tokens; last prefill {}",
+        disk(&start),
+        hit(&again),
+        prompt_tokens(&again),
+        end["last_prefill"]["tokens"]
+    );
+    assert_eq!(
+        disk(&start).0,
+        1,
+        "the restarted server reads the saved state's index"
+    );
+    assert_eq!(
+        hit(&again),
+        prompt_tokens(&again),
+        "the whole prompt from the saved prompt end"
+    );
+    assert_eq!(
+        content(&again),
+        content(&first),
+        "the same reply as before the quit"
+    );
+    assert_eq!(disk(&end).2, 1);
+}
+
+/// A part damaged after the start is refused when it is read. The prompt is
+/// prefilled cold and gives the cold reply, and the saved state is deleted.
+#[test]
+fn a_saved_state_damaged_after_the_start_is_refused_when_read() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT (and EREMITE_EXPERTS)");
+        return;
+    };
+    let _one = one_model();
+    let folder = Folder::new("damage");
+    let messages = conversation("src/eremite.h", 5000, "What does a stream do?");
+    let first = {
+        let server = start_server(&setup, Some(&folder), &[]);
+        let first = chat(&server, &messages, 24);
+        server.settled(1);
+        server.stop();
+        first
+    };
+    let server = start_server(&setup, Some(&folder), &[]);
+    assert_eq!(disk(&server.status()).0, 1);
+    for part in folder.files(".rows") {
+        let mut bytes = std::fs::read(&part).expect("a part");
+        // A byte in the part's first region of rows.
+        bytes[16384 + 100] ^= 0x40;
+        std::fs::write(&part, bytes).expect("damaged");
+    }
+    let again = chat(&server, &messages, 24);
+    let end = server.settled(1);
+    println!(
+        "damaged: reused {} of {}; {:?}",
+        hit(&again),
+        prompt_tokens(&again),
+        disk(&end)
+    );
+    assert_eq!(hit(&again), 0, "a cold prefill");
+    assert_eq!(content(&again), content(&first), "the cold reply");
+    assert_eq!(disk(&end).0, 0, "the damaged saved state is deleted");
+    assert!(folder.files(".state").is_empty());
+}
+
+/// Saved states stay within --state-disk. At quit the most recently used are
+/// written first, and an older one does not take their room.
+#[test]
+fn saved_states_stay_within_their_budget_most_recent_first() {
+    let Some(setup) = setup() else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT (and EREMITE_EXPERTS)");
+        return;
+    };
+    let _one = one_model();
+    let folder = Folder::new("budget");
+    let prompts = [
+        conversation("src/eremite.h", 4000, "Summarize the first section."),
+        conversation("src/model/model.h", 4000, "Summarize the first section."),
+        conversation(
+            "src/engine/expert_store.h",
+            4000,
+            "Summarize the first section.",
+        ),
+    ];
+    // What each saved state takes, all three written. They differ: the second
+    // conversation also keeps a snapshot where it parts from the first. At quit
+    // the most recently used is written first, so its number is the lowest.
+    let sizes: Vec<f64> = {
+        let server = start_server(&setup, Some(&folder), &[]);
+        for prompt in &prompts {
+            chat(&server, prompt, 1);
+        }
+        server.settled(3);
+        server.stop();
+        let mut bytes = std::collections::BTreeMap::<u64, u64>::new();
+        for entry in std::fs::read_dir(&folder.0).expect("the folder").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .split(['-', '.'])
+                .next()
+                .and_then(|number| number.parse().ok())
+            {
+                *bytes.entry(id).or_insert(0) +=
+                    entry.metadata().map_or(0, |metadata| metadata.len());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&folder.0);
+        bytes
+            .values()
+            .map(|&size| size as f64 / (1u64 << 30) as f64)
+            .collect()
+    };
+    assert_eq!(sizes.len(), 3, "all three saved: {sizes:?}");
+    // Room for the two most recent.
+    let limit = format!("{:.6}", sizes[0] + sizes[1] + sizes[2] / 2.0);
+    {
+        let server = start_server(&setup, Some(&folder), &["--state-disk", &limit]);
+        for prompt in &prompts {
+            chat(&server, prompt, 1);
+        }
+        server.settled(3);
+        server.stop();
+    }
+    let server = start_server(&setup, Some(&folder), &["--state-disk", &limit]);
+    let start = server.status();
+    let hits: Vec<i64> = prompts
+        .iter()
+        .map(|prompt| hit(&chat(&server, prompt, 1)))
+        .collect();
+    println!(
+        "saved states of {sizes:.4?} GiB, --state-disk {limit}: {:?} at the start; the prompts again reused {hits:?}",
+        disk(&start)
+    );
+    assert_eq!(disk(&start).0, 2, "two saved states fit");
+    let gib = start["state_disk"]["gib"].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        gib <= start["state_disk"]["limit_gib"].as_f64().unwrap_or(0.0),
+        "{gib} GiB"
+    );
+    // Each state's own tokens are nearly all of its prompt. The prompts share
+    // only their first few tokens with each other.
+    assert!(
+        hits[1] >= 256 && hits[2] >= 256,
+        "the two most recent are kept: {hits:?}"
+    );
+    assert!(hits[0] < 256, "the oldest is not: {hits:?}");
 }
 
 /// One server uses a folder at a time: a second one there runs without saved

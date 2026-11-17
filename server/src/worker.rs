@@ -469,6 +469,7 @@ pub fn start(
                 let mut worker = Worker::new(shared.clone(), model_handles, state_dir);
                 let _ = started_sender.send(true);
                 worker.run_until_stop();
+                worker.save_states_at_stop();
             }));
             if run.is_err() {
                 std::process::exit(1);
@@ -484,7 +485,8 @@ pub fn start(
     ok
 }
 
-/// Requests the stop as SIGINT does.
+/// Requests the stop as SIGINT does. A second request ends the saving of states
+/// at the stop.
 pub fn request_stop() {
     engine::request_stop();
 }
@@ -529,8 +531,9 @@ fn notify_worker(shared: &Shared) {
 }
 
 /// Stops the worker and waits for its thread to end. It requests the stop
-/// unless a stop was requested already. Before its thread ends, the worker ends
-/// every request.
+/// unless a stop was requested already. A second request would end the saving
+/// of states. Before its thread ends, the worker ends every request and saves
+/// the states.
 pub fn stop() {
     if !engine::is_stopping() {
         request_stop();
@@ -1329,6 +1332,48 @@ impl Worker {
             for saved_id in to_delete {
                 store.delete_saved_state(&mut states.cache, saved_id);
             }
+        }
+    }
+
+    /// Saves every state to the SSD at the stop, after the requests ended. The
+    /// state cache decides what each save writes. The most recently used state
+    /// goes first. A state that the stop cut short is not saved. A second stop
+    /// request ends the saving.
+    fn save_states_at_stop(&mut self) {
+        if self.states.store.is_none() {
+            return;
+        }
+        let mut order: Vec<(u64, state_cache::StateId)> = self
+            .states
+            .cache
+            .entries
+            .iter()
+            .map(|(&state_id, entry)| (entry.last_used, state_id))
+            .collect();
+        order.sort_unstable_by(|left, right| right.cmp(left));
+        let (count, started_at) = (order.len(), Instant::now());
+        for (handled, (_, state_id)) in order.into_iter().enumerate() {
+            // The second stop request ends the saving.
+            if engine::count_stop_requests() >= 2 {
+                engine::log(&format!(
+                    "states: a second stop: {} states not saved",
+                    count - handled
+                ));
+                break;
+            }
+            // Take the state out of the cache. The states not saved yet do not
+            // hold its tokens for it.
+            let Some(entry) = self.states.cache.entries.remove(&state_id) else {
+                continue;
+            };
+            self.states
+                .save_state(&self.shared, state_id, &entry, false);
+        }
+        if count > 0 {
+            engine::log(&format!(
+                "states: {count} states considered at quit in {:.1} s",
+                started_at.elapsed().as_secs_f64()
+            ));
         }
     }
 
