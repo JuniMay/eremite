@@ -138,7 +138,10 @@ impl ModelConfig {
             | "host"
             | "api_key_file"
             | "http_timeout"
-            | "keepalive" => {
+            | "keepalive"
+            | "search_timeout"
+            | "searxng_idle"
+            | "search_session_idle" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "rows_per_call" => {
@@ -203,12 +206,26 @@ pub struct Server {
     /// The folder of the states saved on the SSD (disk.rs); None:
     /// [`default_state_dir`].
     pub state_dir: Option<String>,
+    /// SearXNG's installation for Codex's web tool (codex/search.rs); None:
+    /// $HOME/.local/share/searxng.
+    pub searxng_dir: Option<String>,
+    /// The Unix socket that the server starts SearXNG on; None: eremite.sock in
+    /// the SearXNG folder.
+    pub searxng_socket: Option<String>,
     /// The seconds that a request's head, each part of its body and a stalled
     /// write may take (http.rs).
     pub http_timeout_s: f64,
     /// The seconds between the comment lines that a streamed response sends
     /// while it waits for its first event.
     pub keepalive_s: f64,
+    /// The seconds that each fetch, query and health check of the web tool may
+    /// take, and SearXNG's start (codex/search.rs).
+    pub search_timeout_s: f64,
+    /// The seconds without a search after which SearXNG stops.
+    pub searxng_idle_s: f64,
+    /// The seconds without a call after which the web tool forgets a session's
+    /// references.
+    pub search_session_idle_s: f64,
 }
 
 impl Default for Server {
@@ -218,8 +235,13 @@ impl Default for Server {
             host: "127.0.0.1".into(),
             api_key_file: None,
             state_dir: None,
+            searxng_dir: None,
+            searxng_socket: None,
             http_timeout_s: 60.0,
             keepalive_s: 15.0,
+            search_timeout_s: 30.0,
+            searxng_idle_s: 600.0,
+            search_session_idle_s: 7200.0,
         }
     }
 }
@@ -260,7 +282,13 @@ impl Server {
             }
             "api_key_file" => self.api_key_file = Some(text()?.into()),
             "state_dir" => self.state_dir = Some(text()?.into()),
-            "http_timeout" | "keepalive" => {
+            "searxng_dir" => self.searxng_dir = Some(text()?.into()),
+            "searxng_socket" => self.searxng_socket = Some(text()?.into()),
+            "http_timeout"
+            | "keepalive"
+            | "search_timeout"
+            | "searxng_idle"
+            | "search_session_idle" => {
                 let seconds = value
                     .as_f64()
                     .filter(|seconds| *seconds > 0.0 && *seconds <= MAX_SECONDS)
@@ -269,7 +297,10 @@ impl Server {
                     ))?;
                 *match name {
                     "http_timeout" => &mut self.http_timeout_s,
-                    _ => &mut self.keepalive_s,
+                    "keepalive" => &mut self.keepalive_s,
+                    "search_timeout" => &mut self.search_timeout_s,
+                    "searxng_idle" => &mut self.searxng_idle_s,
+                    _ => &mut self.search_session_idle_s,
                 } = seconds;
             }
             _ => return Err(format!("no server setting {name}")),
@@ -494,8 +525,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "port",
             "host",
             "api_key_file",
+            "searxng_dir",
+            "searxng_socket",
             "http_timeout",
             "keepalive",
+            "search_timeout",
+            "searxng_idle",
+            "search_session_idle",
         ]
         .contains(&key.as_str())
     }) {
@@ -525,8 +561,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "host",
         "api_key_file",
         "state_dir",
+        "searxng_dir",
+        "searxng_socket",
         "http_timeout",
         "keepalive",
+        "search_timeout",
+        "searxng_idle",
+        "search_session_idle",
     ] {
         if let Some(value) = object.get(name) {
             server.set(name, value)?;
@@ -660,6 +701,9 @@ mod tests {
             "state_cache",
             "http_timeout",
             "keepalive",
+            "search_timeout",
+            "searxng_idle",
+            "search_session_idle",
         ] {
             let mut model = json!({"model": "/models/second"});
             model[setting] = json!(8);
@@ -697,6 +741,16 @@ mod tests {
             (config.server.http_timeout_s, config.server.keepalive_s),
             (120.0, 2.5)
         );
+        assert_eq!(
+            (
+                config.server.search_timeout_s,
+                config.server.searxng_idle_s,
+                config.server.search_session_idle_s
+            ),
+            (30.0, 600.0, 7200.0)
+        );
+        config.server.set("searxng_idle", &json!(60)).unwrap();
+        assert_eq!(config.server.searxng_idle_s, 60.0);
         for (name, value) in [
             ("port", json!(-1)),
             ("port", json!(65536)),
@@ -707,6 +761,8 @@ mod tests {
             ("http_timeout", json!(0)),
             ("keepalive", json!(-1)),
             ("keepalive", json!("15")),
+            ("search_timeout", json!(0)),
+            ("search_session_idle", json!(2e6)),
         ] {
             assert!(config.server.set(name, &value).is_err(), "{name} {value}");
         }

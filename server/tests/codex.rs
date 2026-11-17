@@ -1,7 +1,8 @@
 //! What the server gives Codex beyond the Responses API, through HTTP. GET
 //! /v1/codex/models returns Codex's model catalog: an entry for each served
 //! model with its served context, Codex's instructions and the apply_patch
-//! tool. The server loads no weights, since no chat request runs.
+//! tool. POST /v1/alpha/search runs the commands of Codex's web tool. The
+//! server loads no weights, since no chat request runs.
 //!
 //! Set EREMITE_CHECKPOINT to the DeepSeek checkpoint directory and
 //! EREMITE_EXPERTS optionally to GGUF experts. EREMITE_SERVER picks the server
@@ -87,4 +88,44 @@ fn the_catalog_lists_the_served_model_with_its_context() {
     }
     let (code, _) = ask(&server, "POST", "/v1/codex/models", Some(&json!({})));
     assert_eq!(code, 405);
+}
+
+/// A command that the web tool lacks gets a note, and so does a call without
+/// commands. A body that is no search request gets 400. No command here
+/// reaches SearXNG or the web.
+#[test]
+fn the_web_tool_answers_each_call_with_its_output() {
+    let Ok(checkpoint) = std::env::var("EREMITE_CHECKPOINT") else {
+        eprintln!("skipped: set EREMITE_CHECKPOINT (and EREMITE_EXPERTS)");
+        return;
+    };
+    let _one = one_model();
+    let server = start_server(&checkpoint);
+    let call = json!({"id": "codex-test", "commands": {"image_query": [{}]}});
+    let (code, answer) = ask(&server, "POST", "/v1/alpha/search", Some(&call));
+    assert_eq!(code, 200, "{answer}");
+    let output = answer["output"].as_str().unwrap_or("");
+    println!("the web tool's output: {output:?}");
+    assert!(output.contains("image_query: not available"), "{output}");
+    assert_eq!(answer["encrypted_output"], Value::Null);
+    let (code, answer) = ask(
+        &server,
+        "POST",
+        "/alpha/search",
+        Some(&json!({"id": "codex-test"})),
+    );
+    assert_eq!(code, 200, "{answer}");
+    assert!(
+        answer["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("No command was given.")),
+        "{answer}"
+    );
+    let (code, _) = ask(
+        &server,
+        "POST",
+        "/v1/alpha/search",
+        Some(&json!({"commands": 5})),
+    );
+    assert_eq!(code, 400);
 }

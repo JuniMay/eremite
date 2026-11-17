@@ -52,6 +52,11 @@ const USAGE: &str =
                   (default 60)
   --keepalive S   seconds between the comment lines of a streamed response that waits for its
                   first token (default 15)
+  --search-timeout S  seconds each fetch, search and health check of Codex's web tool may take,
+                  and SearXNG's start (default 30)
+  --searxng-idle S    seconds without a search before SearXNG stops (default 600)
+  --search-session-idle S  seconds without a call before the web tool forgets a session's
+                  references (default 7200)
   --memory GB     an upper limit of model memory for every model, state memory included
                   (default: none; the memory that other programs leave, less --reserve, decides)
   --reserve GB    memory kept available to other programs, 2-1024 GiB (default 10)
@@ -185,7 +190,11 @@ fn parse_arguments(args: &[String]) -> Arguments {
                     "--host" | "--api-key-file" | "--state-dir" => {
                         server.push((flag[2..].replace('-', "_"), Value::String(text.clone())))
                     }
-                    "--http-timeout" | "--keepalive" => {
+                    "--http-timeout"
+                    | "--keepalive"
+                    | "--search-timeout"
+                    | "--searxng-idle"
+                    | "--search-session-idle" => {
                         let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
                         server.push((flag[2..].replace('-', "_"), value));
                     }
@@ -441,6 +450,8 @@ struct Shared {
     arrivals: AtomicU64,
     /// The served models, in their configured order.
     models: Vec<Served>,
+    /// Codex's web tool (POST /v1/alpha/search).
+    search: codex::search::Service,
     /// The limits on connections and requests.
     limits: http::Limits,
     /// The time between the comment lines of a streamed response that waits for
@@ -653,6 +664,34 @@ async fn list_codex_models(State(shared): App) -> Response {
         },
     });
     build_json_response(codex::build_catalog(models).to_string())
+}
+
+/// Answers POST /v1/alpha/search: runs the commands of Codex's web tool
+/// (codex/search.rs). Each command's result, or why it failed, is text in
+/// `output`.
+async fn answer_search(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let body = match http::read_body(body, shared.limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let request: codex::search::SearchRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return refuse_request(
+                &peer,
+                chat::Error::new_bad_request(format!("not a search request: {error}")),
+            );
+        }
+    };
+    let output = shared.search.answer_call(request).await;
+    build_json_response(
+        json!({"output": output, "encrypted_output": null, "results": null}).to_string(),
+    )
 }
 
 /// Answers GET /v1/models/{id} with the model's object and its live status
@@ -987,13 +1026,41 @@ fn main() {
             .map_or(0, |since| since.as_secs()),
         arrivals: AtomicU64::new(0),
         models: served_models,
+        search: {
+            let dir = arguments
+                .server
+                .searxng_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .filter(|home| !home.is_empty())
+                        .map(|home| PathBuf::from(home).join(".local/share/searxng"))
+                });
+            let dir = dir.unwrap_or_else(|| PathBuf::from(".local/share/searxng"));
+            let socket = arguments
+                .server
+                .searxng_socket
+                .as_deref()
+                .map_or_else(|| dir.join("eremite.sock"), PathBuf::from);
+            codex::search::Service::new(
+                dir,
+                socket,
+                codex::search::AddressPolicy::Public,
+                codex::search::Times {
+                    timeout: Duration::from_secs_f64(arguments.server.search_timeout_s),
+                    searxng_idle: Duration::from_secs_f64(arguments.server.searxng_idle_s),
+                    session_idle: Duration::from_secs_f64(arguments.server.search_session_idle_s),
+                },
+            )
+        },
         limits: http::Limits {
             timeout: Duration::from_secs_f64(arguments.server.http_timeout_s),
             ..http::DEFAULT_LIMITS
         },
         keepalive: Duration::from_secs_f64(arguments.server.keepalive_s),
     });
-    let limits = shared.limits;
+    let (stopper, limits) = (shared.clone(), shared.limits);
     let app = Router::new()
         .route("/health", get(report_health))
         .route("/v1/health", get(report_health))
@@ -1016,6 +1083,14 @@ fn main() {
         .route(
             "/v1/codex/models",
             get(list_codex_models).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/alpha/search",
+            post(answer_search).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/alpha/search",
+            post(answer_search).fallback(refuse_other_than_post),
         )
         .route(
             "/codex/models",
@@ -1057,13 +1132,17 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|error| die(&format!("cannot start the runtime: {error}")));
+    let idle = stopper.clone();
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)
             .unwrap_or_else(|error| die(&error.to_string()));
         // The engine owns the stop on SIGINT or SIGTERM. The server then stops
         // accepting, and the engine ends every open response.
         let stopped = worker::wait_for_stop();
+        // SearXNG, if the web tool started it, stops when idle.
+        tokio::spawn(async move { idle.search.stop_searxng_when_idle().await });
         http::serve(listener, app, stopped, limits).await;
     });
+    stopper.search.stop_searxng();
     worker::stop();
 }
