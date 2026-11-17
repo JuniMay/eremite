@@ -2,6 +2,9 @@
 //! its log, drawn in the terminal with ratatui.
 
 pub mod draw;
+pub mod frame;
 pub mod samples;
 pub mod status;
+#[cfg(test)]
+mod testing;
 pub mod theme;
