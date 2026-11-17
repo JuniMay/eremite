@@ -1,12 +1,28 @@
 //! POST /v1/alpha/search: the service behind Codex's standalone web tool
 //! (`web.run`, Codex 0.167).
 //!
+//! - The system curl fetches pages.
 //! - HTML pages become numbered lines, and their links are numbered too.
 
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use url::Url;
 
+use crate::http::{KIB, MIB};
+
+/// The system's curl.
+const CURL_PATH: &str = "/usr/bin/curl";
+/// A page's bytes at most; a longer page is cut there.
+const MAX_PAGE_BYTES: usize = 5 * MIB;
+/// The redirects that a fetch follows at most.
+const MAX_REDIRECTS: usize = 5;
 /// Lines longer than this are wrapped at a space.
 const MAX_LINE_CHARS: usize = 200;
+/// The User-Agent header that curl sends: Safari's on macOS.
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
 // ---- pages ----
 
@@ -21,6 +37,212 @@ pub struct Page {
     pub lines: Vec<String>,
     /// The URL of each link: link n's URL is `links[n]`.
     pub links: Vec<String>,
+}
+
+// ---- fetching ----
+
+/// Whether the URL's host is one of the domains or inside one. Any host is
+/// when no domain is given.
+fn is_in_domains(url: &Url, domains: &[String]) -> bool {
+    domains.is_empty()
+        || url.host_str().is_some_and(|host| {
+            let host = host.to_ascii_lowercase();
+            domains.iter().any(|domain| {
+                let domain = domain.trim().trim_start_matches("*.").to_ascii_lowercase();
+                host == domain || host.ends_with(&format!(".{domain}"))
+            })
+        })
+}
+
+/// A response that curl fetched.
+struct FetchedResponse {
+    /// The HTTP status.
+    status: u16,
+    /// The headers, with their names in lower case.
+    headers: Vec<(String, String)>,
+    /// The body, at most [`MAX_PAGE_BYTES`].
+    body: Vec<u8>,
+    /// Whether the body was cut at [`MAX_PAGE_BYTES`].
+    is_cut: bool,
+}
+
+impl FetchedResponse {
+    /// Returns the value of a header. The name must be in lower case.
+    fn find_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// One GET with curl: no redirect followed, the body read up to
+/// [`MAX_PAGE_BYTES`].
+async fn get_with_curl(url: &Url, timeout: Duration) -> Result<FetchedResponse, String> {
+    let mut command = Command::new(CURL_PATH);
+    command
+        .args([
+            "-q",
+            "-sS",
+            "--globoff",
+            "--proto",
+            "=http,https",
+            "--compressed",
+            "--max-time",
+        ])
+        .arg(timeout.as_secs_f64().to_string())
+        .args(["-A", USER_AGENT, "-D", "-"]);
+    let mut child = command
+        .arg("--")
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot run curl: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("no curl output")?;
+    let mut data = Vec::new();
+    // curl's output is read 64 KB at a time. The reason for this size is
+    // unknown.
+    let mut buf = vec![0u8; 64 * KIB];
+    let mut is_cut = false;
+    loop {
+        let bytes_read = stdout.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if bytes_read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..bytes_read]);
+        // The output holds the headers before the body: they get 64 KB more.
+        // The reason for this size is unknown.
+        if data.len() > MAX_PAGE_BYTES + 64 * KIB {
+            is_cut = true;
+            let _ = child.start_kill();
+            break;
+        }
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if !is_cut && !status.success() {
+        let mut err = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut err).await;
+        }
+        return Err(format!("the fetch failed: {}", err.trim()));
+    }
+    parse_curl_output(data, is_cut)
+}
+
+/// curl's `-D -` output: the header blocks (one per response, the last one
+/// counts), then the body.
+fn parse_curl_output(output: Vec<u8>, is_cut: bool) -> Result<FetchedResponse, String> {
+    let mut at = 0;
+    let mut last: Option<(u16, Vec<(String, String)>)> = None;
+    while output[at..].starts_with(b"HTTP/") {
+        let Some(end) = output[at..].windows(4).position(|w| w == b"\r\n\r\n") else {
+            return Err("the response has no complete header".into());
+        };
+        let head = String::from_utf8_lossy(&output[at..at + end]).to_string();
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .ok_or("the response has no status")?;
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        last = Some((status, headers));
+        // 4 bytes: the \r\n\r\n that ends a header.
+        at += end + 4;
+        // an interim 1xx answer is followed by the real one
+        if !(100..200).contains(&status) {
+            break;
+        }
+    }
+    let (status, headers) = last.ok_or("the response has no header")?;
+    let mut body = output[at..].to_vec();
+    body.truncate(MAX_PAGE_BYTES);
+    Ok(FetchedResponse {
+        status,
+        headers,
+        body,
+        is_cut,
+    })
+}
+
+/// Fetches a page, following up to [`MAX_REDIRECTS`] redirects, each checked.
+/// Each request may take `timeout`.
+pub async fn fetch_page(
+    url_text: &str,
+    allowed_domains: &[String],
+    timeout: Duration,
+) -> Result<Page, String> {
+    let mut url = Url::parse(url_text).map_err(|e| format!("not a URL: {e}"))?;
+    for _ in 0..=MAX_REDIRECTS {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!(
+                "only http and https pages are fetched, not {}",
+                url.scheme()
+            ));
+        }
+        if !is_in_domains(&url, allowed_domains) {
+            return Err(format!(
+                "{} is outside the allowed domains",
+                url.host_str().unwrap_or("")
+            ));
+        }
+        let response = get_with_curl(&url, timeout).await?;
+        if (300..400).contains(&response.status) {
+            let Some(location) = response.find_header("location") else {
+                return Err(format!("HTTP {} without a location", response.status));
+            };
+            url = url
+                .join(location)
+                .map_err(|e| format!("a bad redirect: {e}"))?;
+            continue;
+        }
+        if response.status >= 400 {
+            return Err(format!("the server answered HTTP {}", response.status));
+        }
+        let content_type = response
+            .find_header("content-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let text = String::from_utf8_lossy(&response.body).to_string();
+        // A page without a content type is HTML when it starts with a
+        // doctype. 15 is the length of "<!doctype html>".
+        let is_html = content_type.contains("html")
+            || (content_type.is_empty()
+                && text
+                    .trim_start()
+                    .get(..15)
+                    .is_some_and(|s| s.to_ascii_lowercase().starts_with("<!doctype html")));
+        let mut page = if is_html {
+            convert_html_to_page(&url, &text)
+        } else if content_type.is_empty()
+            || content_type.starts_with("text/")
+            || content_type.contains("json")
+            || content_type.contains("xml")
+        {
+            Page {
+                url: url.to_string(),
+                title: url.to_string(),
+                lines: wrap_lines(text.lines()),
+                links: Vec::new(),
+            }
+        } else {
+            return Err(format!("not a text page ({content_type})"));
+        };
+        if response.is_cut {
+            page.lines.push(format!(
+                "(The page is longer than {} MB; the rest is not shown.)",
+                MAX_PAGE_BYTES / MIB
+            ));
+        }
+        return Ok(page);
+    }
+    Err(format!("more than {MAX_REDIRECTS} redirects"))
 }
 
 // ---- HTML to lines ----
@@ -396,6 +618,46 @@ fn wrap_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// What each fetch may take in the tests: the setting's default.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Serves the test pages on a local port and returns the port.
+    /// /old redirects to /page, which is HTML with a link to /next.
+    /// /next is plain text. Other paths are missing.
+    async fn serve_test_pages() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    // Each test request fits in one read of 4 KB.
+                    let mut buf = vec![0u8; 4 * KIB];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let reply = match path.as_str() {
+                        "/old" => "HTTP/1.1 302 Found\r\nLocation: /page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                        "/page" => {
+                            let body = "<html><title>Page</title><p>Hello <a href=\"/next\">next page</a></p></html>";
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        }
+                        "/next" => {
+                            let body = "plain text\nsecond line";
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        }
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
     #[test]
     fn html_becomes_lines_with_numbered_links() {
         let base = Url::parse("https://example.com/docs/intro.html").unwrap();
@@ -435,5 +697,33 @@ mod tests {
             !text.contains("color") && !text.contains("hidden") && !text.contains("var x"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn curl_output_parses_past_a_1xx_response() {
+        let data = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 301 Moved\r\nLocation: /b\r\nContent-Type: text/html\r\n\r\nbody".to_vec();
+        let r = parse_curl_output(data, false).unwrap();
+        assert_eq!(
+            (r.status, r.find_header("location"), r.body.as_slice()),
+            (301, Some("/b"), b"body".as_slice())
+        );
+    }
+
+    /// Pages on a local server, through curl: a redirect, a text page, a host
+    /// outside the allowed domains and a missing page.
+    #[tokio::test]
+    async fn pages_are_fetched_through_curl() {
+        let port = serve_test_pages().await;
+        let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+        let page = fetch_page(&url("/old"), &[], TEST_TIMEOUT).await.unwrap();
+        assert_eq!((page.url, page.title), (url("/page"), "Page".to_string()));
+        assert_eq!(page.lines, ["Hello 【0†next page】"]);
+        assert_eq!(page.links, [url("/next")]);
+        let text = fetch_page(&url("/next"), &[], TEST_TIMEOUT).await.unwrap();
+        assert_eq!(text.lines, ["plain text", "second line"]);
+        let outside = fetch_page(&url("/page"), &["example.com".into()], TEST_TIMEOUT).await;
+        assert!(outside.unwrap_err().contains("outside the allowed domains"));
+        let missing = fetch_page(&url("/missing"), &[], TEST_TIMEOUT).await;
+        assert!(missing.unwrap_err().contains("HTTP 404"));
     }
 }
