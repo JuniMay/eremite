@@ -10,11 +10,20 @@
 //! - Each part of a body must arrive within the time limit of the one before.
 //!   A late part gets 408.
 //! - A body may be at most 32 MB. A larger body gets 413.
+//! - A client may stall the server's writes for at most the time limit.
+//!   Then its connection closes. Closing it cancels its request.
 //!
 //! The time limit is the http_timeout setting, 60 s unless set.
+//!
+//! Reads have no time limit of their own.
+//! hyper keeps reading while a response is pending.
+//! So a client that closes its connection ends its request, streamed or not.
 
 use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, HttpBody};
@@ -28,9 +37,10 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::Sleep;
 
 use crate::{chat, engine};
 
@@ -48,7 +58,8 @@ pub struct Limits {
     /// The most connections open at once.
     /// The server answers another one with 503.
     pub max_connections: usize,
-    /// The time limit for a request's head and for each part of its body.
+    /// The time limit for a request's head, for each part of its body and for a
+    /// stalled write.
     pub timeout: Duration,
     /// The largest request head in bytes. A larger head gets 431.
     /// hyper's buffer for a head grows to this size and at most one read more.
@@ -115,8 +126,10 @@ pub async fn serve(
             continue;
         };
         let service = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
-        let connection =
-            graceful_shutdown.watch(builder.serve_connection(TokioIo::new(stream), service));
+        let connection = graceful_shutdown.watch(builder.serve_connection(
+            TokioIo::new(StallLimitedStream::new(stream, limits.timeout)),
+            service,
+        ));
         tokio::spawn(async move {
             let _ = connection.await;
             drop(permit);
@@ -252,13 +265,110 @@ pub async fn read_body(mut body: Body, limits: Limits) -> Result<Bytes, chat::Er
     }
 }
 
+/// A client's TCP connection whose writes may stall for at most `stall_limit`.
+/// A write that stalls longer fails. hyper then closes the connection.
+struct StallLimitedStream {
+    /// The client's connection.
+    stream: TcpStream,
+    /// The longest time that a write may wait for the client.
+    stall_limit: Duration,
+    /// The timer of a write that waits, or None while writes go on.
+    stall_timer: Option<Pin<Box<Sleep>>>,
+}
+
+impl StallLimitedStream {
+    /// Wraps `stream`. Its writes may stall for at most `stall_limit`.
+    fn new(stream: TcpStream, stall_limit: Duration) -> StallLimitedStream {
+        StallLimitedStream {
+            stream,
+            stall_limit,
+            stall_timer: None,
+        }
+    }
+
+    /// Limits how long a write may stall, given the write's `outcome`.
+    /// A write that waits starts the timer.
+    /// A write that goes on clears the timer.
+    /// Returns a TimedOut error when the timer runs out.
+    fn limit_write_stall<T>(
+        &mut self,
+        context: &mut Context<'_>,
+        outcome: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        if outcome.is_ready() {
+            self.stall_timer = None;
+            return outcome;
+        }
+        let stall_limit = self.stall_limit;
+        let stall_timer = self
+            .stall_timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_limit)));
+        match stall_timer.as_mut().poll(context) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client stopped reading",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for StallLimitedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(context, buf)
+    }
+}
+
+impl AsyncWrite for StallLimitedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let outcome = Pin::new(&mut this.stream).poll_write(context, buf);
+        this.limit_write_stall(context, outcome)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let outcome = Pin::new(&mut this.stream).poll_write_vectored(context, bufs);
+        this.limit_write_stall(context, outcome)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let outcome = Pin::new(&mut this.stream).poll_flush(context);
+        this.limit_write_stall(context, outcome)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let outcome = Pin::new(&mut this.stream).poll_shutdown(context);
+        this.limit_write_stall(context, outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::routing::{get, post};
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
 
     /// Small limits for quick tests: 2 connections, 300 ms, a 16 KB head and a
     /// 1000-byte body.
@@ -272,6 +382,48 @@ mod tests {
     /// arrive first, if the server closed the connection with the request
     /// unread.
     const LATE_READ: Duration = Duration::from_millis(200);
+
+    /// What a handler tells the test: that it started, and that it ended. It
+    /// ends when the handler or the response that holds its EndFlag drops it.
+    #[derive(Default)]
+    struct Signals {
+        /// Set when the handler starts.
+        started: AtomicBool,
+        /// Set when the handler ends.
+        ended: AtomicBool,
+        /// Notified each time a flag is set.
+        changed: Notify,
+    }
+
+    impl Signals {
+        /// Sets `flag` and wakes the tasks that wait for a flag.
+        fn mark(&self, flag: &AtomicBool) {
+            flag.store(true, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+
+        /// Waits until `flag` is set.
+        async fn wait_for(&self, flag: &AtomicBool) {
+            loop {
+                // A notified future gets the wake from the time it is made,
+                // before it is polled.
+                let changed = self.changed.notified();
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    /// Marks its handler's end when it is dropped.
+    struct EndFlag(Arc<Signals>);
+
+    impl Drop for EndFlag {
+        fn drop(&mut self) {
+            self.0.mark(&self.0.ended);
+        }
+    }
 
     /// Starts the server on a free local port.
     /// Returns its address and the sender that stops it.
@@ -290,8 +442,11 @@ mod tests {
         (addr, stop)
     }
 
-    /// Builds the test routes: /health and /body.
-    fn build_test_app() -> Router {
+    /// Builds the test routes: /health, /body, /wait and /stream.
+    /// /wait never answers. /stream never ends.
+    /// Both mark `signals` when they start and when they end.
+    fn build_test_app(signals: Arc<Signals>) -> Router {
+        let waits = signals.clone();
         Router::new()
             .route("/health", get(|| async { "ok" }))
             .route(
@@ -300,6 +455,35 @@ mod tests {
                     match read_body(body, TEST_LIMITS).await {
                         Ok(body_bytes) => (StatusCode::OK, format!("{} bytes", body_bytes.len())),
                         Err(e) => (e.status, e.message),
+                    }
+                }),
+            )
+            .route(
+                "/wait",
+                post(move || {
+                    let end_flag = EndFlag(waits.clone());
+                    async move {
+                        end_flag.0.mark(&end_flag.0.started);
+                        std::future::pending::<()>().await;
+                        drop(end_flag);
+                        "never"
+                    }
+                }),
+            )
+            .route(
+                "/stream",
+                get(move || {
+                    let end_flag = EndFlag(signals.clone());
+                    async move {
+                        end_flag.0.mark(&end_flag.0.started);
+                        // Large chunks fill the socket's buffers quickly.
+                        let chunks = async_stream::stream! {
+                            let _end_flag = end_flag;
+                            loop {
+                                yield Ok::<_, io::Error>(Bytes::from(vec![b'x'; 64 * KIB]));
+                            }
+                        };
+                        Body::from_stream(chunks)
                     }
                 }),
             )
@@ -330,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn connections_beyond_the_limit_get_503() {
         let (addr, _stop) = start_server(
-            build_test_app(),
+            build_test_app(Arc::default()),
             Limits {
                 // An idle connection closes after the time limit. A longer
                 // limit keeps the first two connections open during the test.
@@ -381,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_head_above_the_limit_gets_431() {
-        let (addr, _stop) = start_server(build_test_app(), TEST_LIMITS).await;
+        let (addr, _stop) = start_server(build_test_app(Arc::default()), TEST_LIMITS).await;
         // Under, just over and far over the 16 KB head limit.
         for (pad, status) in [
             (15 * KIB, "HTTP/1.1 200"),
@@ -401,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_head_closes_the_connection() {
-        let (addr, _stop) = start_server(build_test_app(), TEST_LIMITS).await;
+        let (addr, _stop) = start_server(build_test_app(Arc::default()), TEST_LIMITS).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         let started = Instant::now();
         client
@@ -419,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_body_gets_408_and_a_large_one_413() {
-        let (addr, _stop) = start_server(build_test_app(), TEST_LIMITS).await;
+        let (addr, _stop) = start_server(build_test_app(Arc::default()), TEST_LIMITS).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
             .write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
@@ -446,5 +630,48 @@ mod tests {
             read.starts_with("HTTP/1.1 200") && read.ends_with("3 bytes"),
             "{read}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_leaves_ends_its_request() {
+        let signals = Arc::new(Signals::default());
+        let (addr, _stop) = start_server(
+            build_test_app(signals.clone()),
+            Limits {
+                // The time limit is longer than the test.
+                // So only the client's close can end the request.
+                timeout: Duration::from_secs(30),
+                ..TEST_LIMITS
+            },
+        )
+        .await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        signals.wait_for(&signals.started).await;
+        assert!(
+            !signals.ended.load(Ordering::SeqCst),
+            "the request waits while its client stays"
+        );
+        drop(client);
+        signals.wait_for(&signals.ended).await;
+    }
+
+    #[tokio::test]
+    async fn the_response_ends_when_its_client_stops_reading() {
+        let signals = Arc::new(Signals::default());
+        let (addr, _stop) = start_server(build_test_app(signals.clone()), TEST_LIMITS).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // The client reads nothing.
+        // Once the socket's buffers are full, the server's writes wait.
+        // After the time limit, the response ends.
+        signals.wait_for(&signals.ended).await;
+        drop(client);
     }
 }
