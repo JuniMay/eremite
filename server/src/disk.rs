@@ -72,10 +72,14 @@ const TOKEN_BYTES: usize = 4;
 const MAX_NUMBER_DIGITS: usize = 19;
 /// The bytes of one GiB.
 const GIB_BYTES: u64 = 1 << 30;
+/// The bytes that a save leaves free on the folder's volume.
+const VOLUME_RESERVE_BYTES: u64 = 10 * GIB_BYTES;
 /// Only the owner may list, read and write the folder.
 const FOLDER_MODE: u32 = 0o700;
 /// Only the owner may read and write the files.
 const FILE_MODE: u32 = 0o600;
+/// A file descriptor that makes a write return its bytes without writing.
+const COUNT_ONLY_FD: c_int = -1;
 
 /// The writes and reads of one state's rows and snapshots, for saving and
 /// loading. An engine state implements it. So does the tests' fake state.
@@ -538,6 +542,19 @@ impl Store {
         &self.folder
     }
 
+    /// Counts the bytes free for this user on the folder's volume. Returns 0
+    /// when it cannot tell.
+    pub fn count_free_bytes(&self) -> u64 {
+        let Ok(path) = std::ffi::CString::new(self.folder.as_os_str().as_encoded_bytes()) else {
+            return 0;
+        };
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut stats) } != 0 {
+            return 0;
+        }
+        stats.f_bavail as u64 * stats.f_bsize as u64
+    }
+
     /// Creates file `name` under its temporary name, `name.tmp`. It first
     /// deletes an old file of that temporary name. Returns the open file, its
     /// temporary path and its final path.
@@ -647,8 +664,10 @@ impl Store {
     /// rows. `find_snapshot` returns its snapshot at a position, or None.
     /// `others_stay` tells whether the states in the cache stay in memory. The
     /// saved state keeps the state's last use, `last_used_time`, also as its
-    /// index's modification time. The save then deletes the saved states that
-    /// the new one replaces or covers. Records the saved state in `cache`.
+    /// index's modification time. So when room is needed, the saved state used
+    /// longest ago is deleted first, also among the states saved at quit. The
+    /// save then deletes the saved states that the new one replaces or covers,
+    /// and those it takes room from. Records the saved state in `cache`.
     /// Returns the log's line, if any.
     pub fn save_state<S: StateIo>(
         &mut self,
@@ -720,6 +739,57 @@ impl Store {
             };
             snapshots.push((end, None));
         }
+        let snapshot_bytes: Option<Vec<u64>> = snapshots
+            .iter()
+            .map(|(snapshot, handle)| io.write_snapshot(*handle, snapshot.pos, COUNT_ONLY_FD))
+            .collect();
+        let (Some(row_bytes), Some(snapshot_bytes)) =
+            (io.write_rows(from, len, COUNT_ONLY_FD), snapshot_bytes)
+        else {
+            return Some(format!(
+                "state {number} not saved: the engine cannot write its state"
+            ));
+        };
+        // The room the save needs: its files' bytes, less the bytes of the
+        // files it replaces. An append replaces the saved state's old
+        // snapshots. A new saved state may replace a whole saved state.
+        let need_bytes = row_bytes + snapshot_bytes.iter().sum::<u64>();
+        let replaced_bytes = match decision {
+            SaveDecision::New {
+                replaces: Some(replaced_id),
+            } => cache
+                .saved_states
+                .get(&replaced_id)
+                .map_or(0, SavedState::count_bytes),
+            _ => old_snapshots
+                .iter()
+                .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
+                .sum(),
+        };
+        let keep = match decision {
+            SaveDecision::New {
+                replaces: Some(replaced_id),
+            } => Some(replaced_id),
+            _ => Some(target),
+        };
+        let Some(to_delete) = cache.find_saved_states_to_delete(
+            need_bytes.saturating_sub(replaced_bytes),
+            keep,
+            Some(entry.last_used),
+        ) else {
+            return Some(format!(
+                "state {number} ({len} tokens, {:.2} GiB) not saved: state_disk ({:.1} GiB) holds states used more recently",
+                need_bytes as f64 / GIB_BYTES as f64,
+                cache.saved_byte_limit as f64 / GIB_BYTES as f64
+            ));
+        };
+        if self.count_free_bytes() < need_bytes + VOLUME_RESERVE_BYTES {
+            return Some(format!(
+                "state {number} ({len} tokens, {:.2} GiB) not saved: it would leave less than {} GiB free on the volume",
+                need_bytes as f64 / GIB_BYTES as f64,
+                VOLUME_RESERVE_BYTES / GIB_BYTES
+            ));
+        }
         let started = Instant::now();
         let mut part = Part {
             from,
@@ -770,14 +840,17 @@ impl Store {
             return Some(format!("state {number} not saved: {message}"));
         }
         self.set_last_used(target, last_used_time);
-        // Once the index is written, it deletes the old snapshots and the saved
-        // state it replaces.
+        // Once the index is written, it deletes the old snapshots, the saved
+        // state it replaces, and the saved states it takes room from.
         self.delete_files(target, &[], &old_snapshots);
         if let SaveDecision::New {
             replaces: Some(replaced_id),
         } = decision
         {
             self.delete_saved_state(cache, replaced_id);
+        }
+        for id in to_delete {
+            self.delete_saved_state(cache, id);
         }
         let bytes = part.bytes
             + saved_state
@@ -792,6 +865,12 @@ impl Store {
             saved_state.last_used = entry.last_used;
         }
         for id in cache.find_covered_saved_states(target) {
+            self.delete_saved_state(cache, id);
+        }
+        for id in cache
+            .find_saved_states_to_delete(0, Some(target), None)
+            .unwrap_or_default()
+        {
             self.delete_saved_state(cache, id);
         }
         self.save_count += 1;
@@ -868,6 +947,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_cache::SavedLink;
 
     /// Makes a saved state of `tokens` tokens in two parts that overlap by one
     /// position. It has one prompt-end snapshot at its end.
@@ -1162,6 +1242,131 @@ mod tests {
             ),
             (2, [3; IDENTITY_BYTES], 800, 300 + 500, last_used_time)
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_takes_no_room_from_other_saved_states() {
+        let (dir, mut store, mut cache) = open_test_store("failed-save");
+        // used before the state
+        write_saved_state(&dir, &mut cache, 7, 5000..5400, 800, 200);
+        cache.saved_byte_limit = 1100;
+        let entry = make_idle_entry(0..500, 100);
+        let failing = FakeState {
+            row_bytes: 300,
+            snapshot_bytes: 500,
+            fails_writes: true,
+        };
+        let line = store.save_state(
+            &mut cache,
+            &failing,
+            &|_| None,
+            &entry,
+            SystemTime::now(),
+            false,
+        );
+        assert!(line.unwrap_or_default().contains("not saved"));
+        assert!(
+            cache.saved_states.contains_key(&7) && dir.join("7.state").exists(),
+            "the older saved state stays"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_append_and_a_replacement_count_what_they_replace_as_room() {
+        let (dir, mut store, mut cache) = open_test_store("room");
+        write_saved_state(&dir, &mut cache, 4, 0..1000, 1000, 500);
+        // used before the states saved below
+        write_saved_state(&dir, &mut cache, 5, 5000..5400, 800, 200);
+        // the new part fits once the saved state's old end snapshot is deleted
+        cache.saved_byte_limit = 1500 + 1000 + 300;
+        let mut entry = make_idle_entry(0..1300, 100);
+        entry.saved_link = Some(SavedLink {
+            saved_id: 4,
+            version: 1,
+            shared_positions: 1000,
+        });
+        let io = FakeState {
+            row_bytes: 300,
+            snapshot_bytes: 500,
+            fails_writes: false,
+        };
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
+        assert!(line.unwrap_or_default().contains("saved to the SSD as 4"));
+        assert!(
+            cache.saved_states.contains_key(&5),
+            "the other saved state stays"
+        );
+        assert_eq!(cache.count_saved_bytes(), 1000 + 300 + 500 + 1000);
+        assert!(
+            !dir.join("4-1-1000.snap").exists(),
+            "the old end snapshot is deleted"
+        );
+        // its replaced positions now outnumber the state's tokens. A new saved
+        // state replaces it, in its room.
+        cache.saved_states.get_mut(&4).unwrap().replaced_positions = 5000;
+        let mut entry = make_idle_entry(0..1500, 200);
+        entry.saved_link = Some(SavedLink {
+            saved_id: 4,
+            version: 2,
+            shared_positions: 1300,
+        });
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
+        assert!(line.unwrap_or_default().contains("saved to the SSD"));
+        assert!(
+            cache.saved_states.contains_key(&5) && !cache.saved_states.contains_key(&4),
+            "it replaced 4, not 5"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_deletes_the_least_recently_used_saved_state_to_make_room() {
+        let (dir, mut store, mut cache) = open_test_store("make-room");
+        write_saved_state(&dir, &mut cache, 7, 5000..5400, 800, 200);
+        write_saved_state(&dir, &mut cache, 8, 6000..6400, 800, 200);
+        // room for one of them and the new saved state
+        cache.saved_byte_limit = 1000 + 300 + 500;
+        let entry = make_idle_entry(0..500, 100);
+        let io = FakeState {
+            row_bytes: 300,
+            snapshot_bytes: 500,
+            fails_writes: false,
+        };
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
+        assert!(line.unwrap_or_default().contains("saved to the SSD as 1:"));
+        assert!(
+            !cache.saved_states.contains_key(&7) && !dir.join("7.state").exists(),
+            "saved state 7, used first, is deleted"
+        );
+        assert!(cache.saved_states.contains_key(&8), "saved state 8 stays");
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_is_refused_when_newer_saved_states_fill_the_limit() {
+        let (dir, mut store, mut cache) = open_test_store("no-room");
+        write_saved_state(&dir, &mut cache, 7, 5000..5400, 800, 200);
+        // room for the new saved state alone
+        cache.saved_byte_limit = 300 + 500;
+        // used before saved state 7
+        let entry = make_idle_entry(0..500, 0);
+        let io = FakeState {
+            row_bytes: 300,
+            snapshot_bytes: 500,
+            fails_writes: false,
+        };
+        let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
+        assert!(line.unwrap_or_default().contains("used more recently"));
+        assert!(
+            cache.saved_states.contains_key(&7) && !dir.join("1.state").exists(),
+            "saved state 7 stays, and nothing is written"
+        );
+        drop(store);
         fs::remove_dir_all(&dir).unwrap();
     }
 
