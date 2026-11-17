@@ -1129,7 +1129,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("eremite-disk-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (store, _) = Store::open(&dir).expect("the store");
-        let mut cache = Cache::new(1 << 30, 16);
+        let mut cache = Cache::new(vec![crate::state_cache::ModelLimits {
+            bytes: 1 << 30,
+            states: 16,
+        }]);
         cache.min_unshared_tokens = 100;
         cache.saved_byte_limit = 1 << 30;
         (dir, store, cache)

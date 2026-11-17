@@ -137,6 +137,7 @@ fn requests_run_to_their_end_and_report_their_events() {
         id: "deepseek".into(),
         options,
         idle_unload: 0.0,
+        max_cached_states: 256,
     };
     assert!(worker::start(
         vec![settings],

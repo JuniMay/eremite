@@ -39,11 +39,14 @@ pub struct ModelConfig {
     /// The seconds without requests before the model's weights and experts
     /// unload, 0 for never; None: the server-wide setting.
     pub idle_unload: Option<f64>,
+    /// The most states of the model that the state cache keeps.
+    pub max_cached_states: usize,
 }
 
 impl ModelConfig {
     /// Creates the settings of the model in the directory `model`. The context
-    /// holds the most tokens. No other option is set.
+    /// holds the most tokens, and the state cache keeps up to 256 of its
+    /// states. No other option is set.
     pub fn new(model: &str) -> ModelConfig {
         ModelConfig {
             id: None,
@@ -53,6 +56,7 @@ impl ModelConfig {
                 ..Default::default()
             },
             idle_unload: None,
+            max_cached_states: 256,
         }
     }
 
@@ -107,7 +111,6 @@ impl ModelConfig {
             | "state_disk"
             | "state_disk_tokens"
             | "max_waiting_requests"
-            | "max_cached_states"
             | "snapshot_interval"
             | "state_dir"
             | "port"
@@ -121,6 +124,13 @@ impl ModelConfig {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
+            "max_cached_states" => {
+                self.max_cached_states = value
+                    .as_u64()
+                    .filter(|states| (1..=MAX_COUNT as u64).contains(states))
+                    .ok_or(format!("max_cached_states takes 1 to {MAX_COUNT} states"))?
+                    as usize
+            }
             _ => return Err(format!("no option {name}")),
         }
         Ok(())
@@ -327,8 +337,8 @@ pub struct Budgets {
     /// The seconds between a decoding request's progress lines in the log; 0:
     /// none.
     pub progress_log_s: f64,
-    /// The GiB of states and snapshots that the state cache keeps, for all
-    /// models together.
+    /// The GiB of states and snapshots that the state cache keeps for each
+    /// model.
     pub state_cache_gb: f64,
     /// The seconds without requests before a model unloads; 0: never. A model's
     /// own idle_unload setting overrides it.
@@ -342,8 +352,6 @@ pub struct Budgets {
     /// The most requests that wait for one model. Another request then gets
     /// HTTP 429, too many requests.
     pub max_waiting_requests: usize,
-    /// The most states that the state cache keeps, for all models together.
-    pub max_cached_states: usize,
     /// For a model that resumes only from snapshots, a prompt prefilled in
     /// several calls takes a snapshot at every multiple of this many positions.
     pub snapshot_interval: usize,
@@ -361,7 +369,6 @@ impl Default for Budgets {
             state_disk_gb: 32.0,
             state_disk_tokens: 8192,
             max_waiting_requests: 16,
-            max_cached_states: 256,
             snapshot_interval: 2048,
         }
     }
@@ -435,10 +442,6 @@ impl Budgets {
                     "max_waiting_requests takes 1 to {MAX_COUNT} requests"
                 ));
             }
-            "max_cached_states" if is_count(MAX_COUNT) => self.max_cached_states = number as usize,
-            "max_cached_states" => {
-                return Err(format!("max_cached_states takes 1 to {MAX_COUNT} states"));
-            }
             "snapshot_interval" if is_count(MAX_CONTEXT_TOKENS as f64) => {
                 self.snapshot_interval = number as usize
             }
@@ -509,7 +512,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "state_disk",
             "state_disk_tokens",
             "max_waiting_requests",
-            "max_cached_states",
             "snapshot_interval",
             "state_dir",
             "idle_unload",
@@ -545,7 +547,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "state_disk",
         "state_disk_tokens",
         "max_waiting_requests",
-        "max_cached_states",
         "snapshot_interval",
         "idle_unload",
     ] {
@@ -872,39 +873,37 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_and_state_limits_are_server_settings() {
+    fn the_queue_is_server_wide_and_each_model_counts_its_own_states() {
         let defaults = Budgets::default();
         assert_eq!(
-            (
-                defaults.max_waiting_requests,
-                defaults.max_cached_states,
-                defaults.snapshot_interval
-            ),
-            (16, 256, 2048)
+            (defaults.max_waiting_requests, defaults.snapshot_interval),
+            (16, 2048)
         );
-        let budgets = parse(
-            &json!({"models": [{"model": "/m"}], "max_waiting_requests": 8,
-                              "max_cached_states": 64, "snapshot_interval": 512}),
-        )
-        .unwrap()
-        .budgets;
+        let config = parse(&json!({"max_waiting_requests": 8, "snapshot_interval": 512,
+                                   "models": [{"model": "/m", "max_cached_states": 64}]}))
+        .unwrap();
         assert_eq!(
             (
-                budgets.max_waiting_requests,
-                budgets.max_cached_states,
-                budgets.snapshot_interval
+                config.budgets.max_waiting_requests,
+                config.budgets.snapshot_interval,
+                config.models[0].max_cached_states
             ),
-            (8, 64, 512)
+            (8, 512, 64)
         );
         for (name, value) in [
             ("max_waiting_requests", json!(0)),
-            ("max_cached_states", json!(1.5)),
             ("snapshot_interval", json!(-1)),
         ] {
             let mut root = json!({"models": [{"model": "/m"}]});
             root[name] = value;
             assert!(parse(&root).is_err(), "{name}");
         }
+        for bad in [json!(0), json!(1.5)] {
+            let entry = json!({"models": [{"model": "/m", "max_cached_states": bad}]});
+            assert!(parse(&entry).is_err(), "max_cached_states {bad}");
+        }
+        let root = json!({"max_cached_states": 64, "models": [{"model": "/m"}]});
+        assert!(parse(&root).is_err(), "a model's setting");
     }
 
     #[test]

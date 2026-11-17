@@ -589,6 +589,7 @@ fn main() {
             idle_unload: model
                 .idle_unload
                 .unwrap_or(configuration.budgets.idle_unload_s),
+            max_cached_states: model.max_cached_states,
         });
         families.push(family);
     }

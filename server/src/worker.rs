@@ -40,7 +40,9 @@ use crate::engine::{
     self, CacheCounts, DraftChoice, ExpandError, Logits, Lookup, Media, Model, PrefillInfo,
     Sampler, SnapshotHandle, StateHandle, Stream,
 };
-use crate::state_cache::{self, Cache, Entry, Evicted, Plan, PlanLimits, Snapshot, SnapshotKind};
+use crate::state_cache::{
+    self, Cache, Entry, Evicted, ModelLimits, Plan, PlanLimits, Snapshot, SnapshotKind,
+};
 
 /// The engine needs a stack of at least 16 MiB on its thread.
 const ENGINE_STACK_BYTES: usize = 16 << 20;
@@ -229,6 +231,8 @@ pub struct ModelSettings {
     /// The seconds without requests before the model's weights and experts
     /// unload. 0 keeps them loaded.
     pub idle_unload: f64,
+    /// The most states of the model that the state cache keeps.
+    pub max_cached_states: usize,
 }
 
 /// What the terminal UI asks of the worker. The default asks for nothing.
@@ -321,6 +325,8 @@ struct ModelStatus {
     /// The state bytes committed for the model: what the state cache counts for
     /// its states and their snapshots, the reserved ones included.
     state_committed_bytes: u64,
+    /// The bytes that the model's states and their snapshots may take.
+    state_limit_bytes: u64,
     /// The bytes that the engine allocated for the model's states and their
     /// snapshots.
     state_allocated_bytes: u64,
@@ -919,8 +925,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         "requests": build_requests_json(&requests),
         "sessions": sessions,
         "state_cache_gib": round(status.state_committed_bytes as f64 / GIB, 3),
-        "state_cache_limit_gib": round(shared.budgets.state_cache_gb, 3),
-        "state_cache_scope": "server",
+        "state_cache_limit_gib": round(status.state_limit_bytes as f64 / GIB, 3),
         "state_cache_total_gib": round(total_state_bytes as f64 / GIB, 3),
         "state_disk": build_disk_status_json(&shared),
         "reserve_gib": shared.budgets.reserve_gb,
@@ -1357,12 +1362,12 @@ struct States {
 }
 
 impl States {
-    /// Creates the states of all models: an empty state cache of at most
-    /// `limit` bytes and `max_states` states, without a store.
+    /// Creates the states of all models: an empty state cache with each
+    /// model's `limits`, by the model's index, without a store.
     /// `snapshot_interval` is the prefills' snapshot interval.
-    fn new(limit: u64, max_states: usize, snapshot_interval: usize) -> Self {
+    fn new(limits: Vec<ModelLimits>, snapshot_interval: usize) -> Self {
         Self {
-            cache: Cache::new(limit, max_states),
+            cache: Cache::new(limits),
             handles: HashMap::new(),
             store: None,
             cut_short: HashSet::new(),
@@ -1543,6 +1548,7 @@ impl States {
                 })
                 .collect();
             status.state_committed_bytes = self.cache.count_model_bytes(model_index);
+            status.state_limit_bytes = self.cache.limits[model_index].bytes;
             status.state_allocated_bytes = entries
                 .iter()
                 .map(|(state_id, entry)| {
@@ -1653,11 +1659,14 @@ impl Worker {
                 }
             })
             .collect();
-        let mut states = States::new(
-            (shared.budgets.state_cache_gb * GIB) as u64,
-            shared.budgets.max_cached_states,
-            shared.budgets.snapshot_interval,
-        );
+        let limits = models
+            .iter()
+            .map(|worker_model| ModelLimits {
+                bytes: (shared.budgets.state_cache_gb * GIB) as u64,
+                states: worker_model.settings.max_cached_states,
+            })
+            .collect();
+        let mut states = States::new(limits, shared.budgets.snapshot_interval);
         if let Some(dir) = state_dir {
             Self::open_store(&mut states, &models, &shared.budgets, &dir);
         }
@@ -2338,8 +2347,9 @@ impl WorkerModel {
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
                 if !was_loaded && self.model.is_loaded() {
                     self.log_line(&format!(
-                        "{}: loaded; shares the {:.1} GiB state cache limit",
-                        self.settings.id, shared.budgets.state_cache_gb
+                        "{}: loaded; its states may take {:.1} GiB",
+                        self.settings.id,
+                        states.cache.limits[self.model_index].bytes as f64 / GIB
                     ));
                 }
                 self.start_request(shared, job, states);
@@ -2461,13 +2471,13 @@ impl WorkerModel {
         );
         states.free_evicted(shared, evicted);
         let after = states.cache.entries[&state_id].bytes;
-        if after > before && states.cache.count_bytes_over_limit() > 0 {
+        if after > before && states.cache.count_bytes_over_limit(self.model_index) > 0 {
             self.log_line(&format!(
-                "{}: a decoding state grows to {:.2} GiB at {positions} positions; with only decoding states left, the state cache takes {:.2} GiB of the {:.1} GiB it allows",
+                "{}: a decoding state grows to {:.2} GiB at {positions} positions; with only decoding states left, the model's states take {:.2} GiB of the {:.1} GiB they may",
                 self.settings.id,
                 after as f64 / GIB,
-                states.cache.count_bytes() as f64 / GIB,
-                states.cache.byte_limit as f64 / GIB
+                states.cache.count_model_bytes(self.model_index) as f64 / GIB,
+                states.cache.limits[self.model_index].bytes as f64 / GIB
             ));
         }
         if after > before {
@@ -2580,11 +2590,12 @@ impl WorkerModel {
         for plan in self.list_resume_plans(&prompt, states) {
             need = self.count_plan_bytes(&plan, prompt_tokens, states);
             let keep: Vec<state_cache::StateId> = plan.find_source_state().into_iter().collect();
-            if let Some(eviction) =
-                states
-                    .cache
-                    .find_eviction(need, !matches!(plan, Plan::InPlace { .. }), &keep)
-            {
+            if let Some(eviction) = states.cache.find_eviction(
+                self.model_index,
+                need,
+                !matches!(plan, Plan::InPlace { .. }),
+                &keep,
+            ) {
                 chosen = Some((plan, eviction));
                 break;
             }
@@ -2594,15 +2605,15 @@ impl WorkerModel {
                 .cache
                 .entries
                 .values()
-                .filter(|entry| entry.busy)
+                .filter(|entry| entry.busy && entry.model == self.model_index)
                 .map(|entry| entry.bytes)
                 .sum();
             // The state's bytes count the prompt and its first token.
             let message = format!(
-                "the conversation's attention state needs {:.1} GiB ({:.1} GiB with its snapshots); the state cache allows {:.1} GiB, and the requests running take {:.1} GiB of it",
+                "the conversation's attention state needs {:.1} GiB ({:.1} GiB with its snapshots); the model's states may take {:.1} GiB, and its requests running take {:.1} GiB of it",
                 self.model.state_bytes(None, prompt_tokens + 1) as f64 / GIB,
                 need as f64 / GIB,
-                states.cache.byte_limit as f64 / GIB,
+                states.cache.limits[self.model_index].bytes as f64 / GIB,
                 busy as f64 / GIB
             );
             return refuse(job, &message);
@@ -3134,7 +3145,7 @@ impl WorkerModel {
                 let fits = capture_position == Some(end)
                     || states
                         .cache
-                        .find_eviction(bytes, false, &[state_id])
+                        .find_eviction(self.model_index, bytes, false, &[state_id])
                         .is_some_and(|eviction| {
                             let evicted = states.cache.evict(&eviction);
                             states.free_evicted(shared, evicted);
@@ -4072,7 +4083,11 @@ mod tests {
             "[1, 2, 3] comes before [1, 2, 3, 9], then [1, 2, 7], then [5]"
         );
         assert!(order_by_tokens(&[]).is_empty());
-        let mut cache = Cache::new(1 << 30, 8);
+        let limits = ModelLimits {
+            bytes: 1 << 30,
+            states: 8,
+        };
+        let mut cache = Cache::new(vec![limits; 2]);
         let first = cache.add_state(0, 0);
         let other_model = cache.add_state(1, 0);
         cache.entries.get_mut(&first).unwrap().tokens = vec![4, 5, 6];

@@ -44,10 +44,20 @@ pub fn draw_memory(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
     if first.memory_gib > 0.0 {
         figures.push(label(theme, format!(" (setting {} GiB)", first.memory_gib)));
     }
+    // The chosen model's state room.
+    if let (Some(model), Some(status)) = (
+        screen.models.get(choices.model),
+        screen.statuses.get(choices.model),
+    ) {
+        figures.extend([
+            label(theme, "   "),
+            plain(model.name.clone()),
+            label(theme, "'s states up to "),
+            plain(format!("{:.1} GiB", status.state_cache_limit_gib)),
+        ]);
+    }
     figures.extend([
-        label(theme, "   states' budget "),
-        plain(format!("{:.1} GiB", first.state_cache_limit_gib)),
-        label(theme, ", shared   wired "),
+        label(theme, "   wired "),
         plain(gib(memory.wired)),
         label(theme, "   swap "),
         plain(gib(memory.swap_used)),
@@ -257,8 +267,8 @@ mod tests {
         let buf = draw(160, 41);
         assert_eq!(
             read_row(&buf, 0).trim_end(),
-            " Mac  128 GiB installed   total limit now 68.0 GiB (setting 80 GiB)   states' \
-             budget 8.0 GiB, shared   wired 73.7 GiB   swap 0.0 GiB"
+            " Mac  128 GiB installed   total limit now 68.0 GiB (setting 80 GiB)   qwen3.8-27b's \
+             states up to 8.0 GiB   wired 73.7 GiB   swap 0.0 GiB"
         );
         let screen = read_screen(&buf);
         // each model under its name and its memory without its states
@@ -302,9 +312,9 @@ mod tests {
         );
     }
 
-    /// Returns the cell where `text` starts, in any row of `buf`.
+    /// Returns the cell where `text` starts, in the map's rows of `buf`.
     fn find_tile(buf: &Buffer, text: &str) -> (u16, u16) {
-        (0..buf.area.height)
+        (ROWS_ABOVE_MAP..buf.area.height)
             .find_map(|y| find_in_row(buf, y, text).map(|x| (x, y)))
             .unwrap_or_else(|| panic!("no {text}:\n{}", read_screen(buf)))
     }

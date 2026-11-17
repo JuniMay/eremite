@@ -56,7 +56,7 @@ pub struct ModelStatus {
     pub sessions: Vec<Session>,
     /// The GiB that the state cache counts for this model's states.
     pub state_cache_gib: f64,
-    /// The GiB that the states of all models may take: the states' budget.
+    /// The GiB that the model's states may take.
     pub state_cache_limit_gib: f64,
     /// The states saved on the SSD, or None without them.
     pub state_disk: Option<StateDisk>,

@@ -8,9 +8,11 @@
 //! state holds, and the state's bytes. It also holds the state's snapshots,
 //! whether a request runs in the state, and the state's last use.
 //!
-//! All models share one byte limit and one use clock. A prompt reuses only
-//! states of its own model. Eviction picks from all models' states, the least
-//! recently used first.
+//! Each model has its own limits: the bytes that its states and snapshots may
+//! take, and the most states of it that the cache keeps. All models share one
+//! use clock. A prompt reuses only states of its own model, and makes room
+//! only among them, the least recently used first. Keeping the memory reserve
+//! free evicts the least recently used of any model's.
 //!
 //! A state's rolling rows are the rows that later positions overwrite: each
 //! layer's window ring. A snapshot holds a state's rolling rows at one
@@ -459,16 +461,23 @@ pub struct Evicted {
     pub states: Vec<(StateId, Entry)>,
 }
 
+/// The limits of one model's states and snapshots in the cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelLimits {
+    /// The bytes that the model's states and snapshots may take.
+    pub bytes: u64,
+    /// The most states of the model that the cache keeps.
+    pub states: usize,
+}
+
 /// The state cache of all models: their states and snapshots. It also holds
 /// their saved states.
 #[derive(Debug)]
 pub struct Cache {
     /// The states in memory, by id.
     pub entries: BTreeMap<StateId, Entry>,
-    /// The bytes that states and snapshots may take (state_cache).
-    pub byte_limit: u64,
-    /// The most states that the cache keeps (max_cached_states).
-    pub max_states: usize,
+    /// Each model's limits, by the model's index.
+    pub limits: Vec<ModelLimits>,
     /// The saved states, by id.
     pub saved_states: BTreeMap<SavedStateId, SavedState>,
     /// The bytes that saved states may take on the SSD (state_disk). With 0,
@@ -491,13 +500,12 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Returns a new, empty cache with these limits. Saving to the SSD is off
-    /// until `saved_byte_limit` is set.
-    pub fn new(byte_limit: u64, max_states: usize) -> Self {
+    /// Returns a new, empty cache with each model's `limits`, by the model's
+    /// index. Saving to the SSD is off until `saved_byte_limit` is set.
+    pub fn new(limits: Vec<ModelLimits>) -> Self {
         Cache {
             entries: BTreeMap::new(),
-            byte_limit,
-            max_states,
+            limits,
             saved_states: BTreeMap::new(),
             saved_byte_limit: 0,
             min_unshared_tokens: DEFAULT_MIN_UNSHARED_TOKENS,
@@ -938,25 +946,31 @@ impl Cache {
         }
     }
 
-    /// Counts the bytes by which the states and snapshots exceed the limit.
-    pub fn count_bytes_over_limit(&self) -> u64 {
-        self.count_bytes().saturating_sub(self.byte_limit)
+    /// Counts the bytes by which model `model`'s states and snapshots exceed
+    /// its limit.
+    pub fn count_bytes_over_limit(&self, model: usize) -> u64 {
+        self.count_model_bytes(model)
+            .saturating_sub(self.limits[model].bytes)
     }
 
     /// Grows the bytes counted for busy state `id` to `bytes`, before the pass
-    /// that grows the state. First it evicts spare snapshots and idle states to
-    /// stay within the limit. When that is not enough, it evicts all the other
-    /// states' spare snapshots and idle states. The cache then exceeds its
-    /// limit. It does nothing when `bytes` is not more than the state takes.
-    /// Returns what it evicted.
+    /// that grows the state. First it evicts its model's spare snapshots and
+    /// idle states to stay within the model's limit. When that is not enough,
+    /// it evicts all of them. The model's states then exceed its limit. It does
+    /// nothing when `bytes` is not more than the state takes. Returns what it
+    /// evicted.
     pub fn grow_state(&mut self, id: StateId, bytes: u64) -> Evicted {
-        let Some(old_bytes) = self.entries.get(&id).map(|entry| entry.bytes) else {
+        let Some((model, old_bytes)) = self
+            .entries
+            .get(&id)
+            .map(|entry| (entry.model, entry.bytes))
+        else {
             return Evicted::default();
         };
         if bytes <= old_bytes {
             return Evicted::default();
         }
-        let (eviction, _) = self.list_evictions(bytes - old_bytes, false, &[id]);
+        let (eviction, _) = self.list_evictions(model, bytes - old_bytes, false, &[id]);
         let evicted = self.evict(&eviction);
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.bytes = bytes;
@@ -967,18 +981,22 @@ impl Cache {
     /// Finishes the request in state `id`. The state becomes idle and used now.
     /// It takes `bytes`. `generation_end` is the snapshot at the generation's
     /// end, when the state has none there. The cache evicts what makes room for
-    /// it within the limit. Then it adds the snapshot. When that room cannot be
-    /// made, the cache adds no snapshot. It then evicts what brings it back
-    /// within its limit, if it can. Returns whether the worker takes the
-    /// snapshot, and what the cache evicted.
+    /// it within the model's limit. Then it adds the snapshot. When that room
+    /// cannot be made, the cache adds no snapshot. It then evicts what brings
+    /// the model back within its limit, if it can. Returns whether the worker
+    /// takes the snapshot, and what the cache evicted.
     pub fn finish_request(
         &mut self,
         id: StateId,
         bytes: u64,
         generation_end: Option<Snapshot>,
     ) -> (bool, Evicted) {
+        let Some(model) = self.entries.get(&id).map(|entry| entry.model) else {
+            return (false, Evicted::default());
+        };
         self.set_idle(id, bytes);
         if let Some(eviction) = self.find_eviction(
+            model,
             generation_end.map_or(0, |snapshot| snapshot.bytes),
             false,
             &[id],
@@ -990,7 +1008,7 @@ impl Cache {
             return (generation_end.is_some(), evicted);
         }
         let evicted = self
-            .find_eviction(0, false, &[id])
+            .find_eviction(model, 0, false, &[id])
             .map(|eviction| self.evict(&eviction))
             .unwrap_or_default();
         (false, evicted)
@@ -1030,49 +1048,75 @@ impl Cache {
             .collect()
     }
 
-    /// Finds what to evict so that `need` more bytes fit within the limit. With
-    /// `adds_state`, one more state must fit too. It picks spare snapshots
-    /// first, from the least recently used states. Then it picks whole idle
-    /// states, the least recently used first. It picks nothing of the states in
-    /// `keep`. Returns None when no eviction makes the room.
-    pub fn find_eviction(&self, need: u64, adds_state: bool, keep: &[StateId]) -> Option<Eviction> {
-        let (eviction, fits) = self.list_evictions(need, adds_state, keep);
+    /// Finds what to evict so that `need` more bytes of model `model` fit
+    /// within its limit. With `adds_state`, one more of its states must fit
+    /// too. It picks the model's spare snapshots first, from its least recently
+    /// used states. Then it picks the model's whole idle states, the least
+    /// recently used first. It picks nothing of the states in `keep`. Returns
+    /// None when no eviction makes the room.
+    pub fn find_eviction(
+        &self,
+        model: usize,
+        need: u64,
+        adds_state: bool,
+        keep: &[StateId],
+    ) -> Option<Eviction> {
+        let (eviction, fits) = self.list_evictions(model, need, adds_state, keep);
         fits.then_some(eviction)
     }
 
-    /// Lists what to evict for `need` more bytes within the limit, and one more
-    /// state with `adds_state`. The list stops when the room is there or
-    /// nothing more can be evicted. Returns the list and whether the room is
-    /// there.
-    fn list_evictions(&self, need: u64, adds_state: bool, keep: &[StateId]) -> (Eviction, bool) {
-        self.list_evictions_under(self.byte_limit, need, adds_state, keep)
-    }
-
-    /// Evicts spare snapshots and idle states until the cache takes `bytes`
-    /// fewer bytes, or nothing more can be evicted. Returns what it evicted.
-    pub fn evict_bytes(&mut self, bytes: u64) -> Evicted {
-        let target = self.count_bytes().saturating_sub(bytes);
-        let (eviction, _) = self.list_evictions_under(target, 0, false, &[]);
-        self.evict(&eviction)
-    }
-
-    /// Lists what to evict for `need` more bytes within `limit`, and one more
-    /// state with `adds_state`. It picks spare snapshots first, from the least
-    /// recently used states. Then it picks whole idle states, the least
-    /// recently used first. It picks nothing of the states in `keep`. The list
-    /// stops when the room is there or nothing more can be evicted. Returns the
-    /// list and whether the room is there.
-    fn list_evictions_under(
+    /// Lists what to evict for `need` more bytes of model `model` within its
+    /// limit, and one more of its states with `adds_state`. The list stops when
+    /// the room is there or nothing more can be evicted. Returns the list and
+    /// whether the room is there.
+    fn list_evictions(
         &self,
-        limit: u64,
+        model: usize,
         need: u64,
         adds_state: bool,
         keep: &[StateId],
     ) -> (Eviction, bool) {
-        let mut by_use: Vec<(&StateId, &Entry)> = self.entries.iter().collect();
+        let limits = self.limits[model];
+        self.list_evictions_under(Some(model), limits, need, adds_state, keep)
+    }
+
+    /// Evicts spare snapshots and idle states of any model until the cache
+    /// takes `bytes` fewer bytes, or nothing more can be evicted. Returns what
+    /// it evicted.
+    pub fn evict_bytes(&mut self, bytes: u64) -> Evicted {
+        let target = ModelLimits {
+            bytes: self.count_bytes().saturating_sub(bytes),
+            states: usize::MAX,
+        };
+        let (eviction, _) = self.list_evictions_under(None, target, 0, false, &[]);
+        self.evict(&eviction)
+    }
+
+    /// Lists what to evict for `need` more bytes within `limits`, and one more
+    /// state with `adds_state`: of model `model`'s states, or of all states
+    /// without it. It picks spare snapshots first, from the least recently
+    /// used states. Then it picks whole idle states, the least recently used
+    /// first. It picks nothing of the states in `keep`. The list stops when the
+    /// room is there or nothing more can be evicted. Returns the list and
+    /// whether the room is there.
+    fn list_evictions_under(
+        &self,
+        model: Option<usize>,
+        limits: ModelLimits,
+        need: u64,
+        adds_state: bool,
+        keep: &[StateId],
+    ) -> (Eviction, bool) {
+        let mut by_use: Vec<(&StateId, &Entry)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| model.is_none_or(|model| entry.model == model))
+            .collect();
         by_use.sort_by_key(|(_, entry)| entry.last_used);
-        let mut total = self.count_bytes() + need;
-        let mut state_count = self.entries.len() + usize::from(adds_state);
+        let limit = limits.bytes;
+        let mut total =
+            model.map_or_else(|| self.count_bytes(), |model| self.count_model_bytes(model)) + need;
+        let mut state_count = by_use.len() + usize::from(adds_state);
         let mut eviction = Eviction::default();
         for &(&id, entry) in &by_use {
             if total <= limit {
@@ -1090,7 +1134,7 @@ impl Cache {
             }
         }
         for &(&id, entry) in &by_use {
-            if total <= limit && state_count <= self.max_states {
+            if total <= limit && state_count <= limits.states {
                 break;
             }
             if keep.contains(&id) || entry.busy {
@@ -1108,7 +1152,7 @@ impl Cache {
             eviction.snapshots.retain(|&(state, _)| state != id);
             eviction.states.push(id);
         }
-        let fits = total <= limit && state_count <= self.max_states;
+        let fits = total <= limit && state_count <= limits.states;
         (eviction, fits)
     }
 
@@ -1372,6 +1416,15 @@ mod tests {
         range.collect()
     }
 
+    /// The models that the tests' caches serve.
+    const TEST_MODELS: usize = 2;
+
+    /// Returns a new, empty cache whose models may each keep `bytes` bytes and
+    /// `states` states.
+    fn new_cache(bytes: u64, states: usize) -> Cache {
+        Cache::new(vec![ModelLimits { bytes, states }; TEST_MODELS])
+    }
+
     /// Adds an idle state of model 0 that holds `tokens`. It has prompt-end
     /// snapshots at `prompt_ends`. Returns its id.
     fn add_idle_state(cache: &mut Cache, tokens: &[i32], prompt_ends: &[usize]) -> StateId {
@@ -1397,7 +1450,7 @@ mod tests {
     /// start can take the place of the state that the other plans keep.
     #[test]
     fn plans_end_with_a_cold_start_that_needs_no_state_kept() {
-        let mut cache = Cache::new(3 << 20, 16);
+        let mut cache = new_cache(3 << 20, 16);
         let source = add_idle_state(&mut cache, &collect_tokens(0..1000), &[]);
         let mut prompt = collect_tokens(0..8);
         prompt.extend(collect_tokens(5000..5900));
@@ -1405,18 +1458,20 @@ mod tests {
         assert_eq!(plans.first(), Some(&Plan::Replay { source, from: 8 }));
         assert_eq!(plans.last(), Some(&Plan::Cold));
         assert!(
-            cache.find_eviction(5 << 20 >> 1, true, &[source]).is_none(),
+            cache
+                .find_eviction(0, 5 << 20 >> 1, true, &[source])
+                .is_none(),
             "beside the state it reuses"
         );
         let eviction = cache
-            .find_eviction(5 << 20 >> 1, true, &[])
+            .find_eviction(0, 5 << 20 >> 1, true, &[])
             .expect("in the state's place");
         assert_eq!(eviction.states, vec![source]);
     }
 
     #[test]
-    fn models_share_the_limit_but_never_reuse_each_others_prefixes() {
-        let mut cache = Cache::new(10, 16);
+    fn each_model_keeps_its_own_limit_and_never_reuses_another_s_prefixes() {
+        let mut cache = new_cache(10, 16);
         let idle = cache.add_state(0, 6);
         cache.start_request(idle, &collect_tokens(0..100), 100, 6, 0);
         cache.set_idle(idle, 6);
@@ -1432,8 +1487,16 @@ mod tests {
             (6, 3)
         );
         let eviction = cache
-            .find_eviction(2, true, &[busy])
-            .expect("room within the shared limit");
+            .find_eviction(1, 6, true, &[busy])
+            .expect("room within model 1's own limit");
+        assert!(eviction.states.is_empty(), "model 0's state stays");
+        assert!(
+            cache.find_eviction(1, 8, true, &[busy]).is_none(),
+            "model 1 has no idle state of its own"
+        );
+        let eviction = cache
+            .find_eviction(0, 5, true, &[])
+            .expect("room within model 0's own limit");
         assert_eq!(eviction.states, vec![idle]);
         cache.evict(&eviction);
         assert_eq!(cache.count_bytes(), 3);
@@ -1444,23 +1507,27 @@ mod tests {
     }
 
     #[test]
-    fn growth_evicts_idle_states_of_other_models() {
-        let mut cache = Cache::new(10, 16);
-        let idle = cache.add_state(0, 3);
-        cache.set_idle(idle, 3);
+    fn growth_evicts_only_idle_states_of_its_own_model() {
+        let mut cache = new_cache(10, 16);
+        let other = cache.add_state(0, 3);
+        cache.set_idle(other, 3);
+        let own = cache.add_state(1, 2);
+        cache.set_idle(own, 2);
         let busy = cache.add_state(1, 6);
         let evicted = cache.grow_state(busy, 9);
         assert_eq!(
             evicted.states.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
-            vec![idle]
+            vec![own]
         );
-        assert_eq!(cache.count_bytes(), 9);
-        assert!(cache.entries[&busy].busy);
+        let evicted = cache.grow_state(busy, 12);
+        assert!(evicted.states.is_empty(), "model 0's state stays");
+        assert_eq!(cache.count_bytes_over_limit(1), 2);
+        assert!(cache.entries.contains_key(&other) && cache.entries[&busy].busy);
     }
 
     #[test]
-    fn reserved_snapshots_count_once_toward_the_shared_limit() {
-        let mut cache = Cache::new(8, 16);
+    fn reserved_snapshots_count_once_toward_the_limit() {
+        let mut cache = new_cache(8, 16);
         let admitted = cache.add_state(0, 5);
         let prompt_end = Snapshot {
             pos: 100,
@@ -1470,7 +1537,7 @@ mod tests {
         };
         cache.set_reserved_snapshots(admitted, vec![prompt_end]);
         assert_eq!(cache.count_bytes(), 7);
-        assert!(cache.find_eviction(2, true, &[]).is_none());
+        assert!(cache.find_eviction(0, 2, true, &[]).is_none());
         cache.add_snapshot(admitted, prompt_end);
         assert_eq!(
             cache.count_bytes(),
@@ -1497,7 +1564,7 @@ mod tests {
 
     #[test]
     fn cleared_reserved_snapshots_stop_counting_and_the_state_stays_busy() {
-        let mut cache = Cache::new(8, 16);
+        let mut cache = new_cache(8, 16);
         let admitted = cache.add_state(0, 5);
         cache.set_reserved_snapshots(
             admitted,
@@ -1515,7 +1582,7 @@ mod tests {
 
     #[test]
     fn evict_bytes_evicts_idle_states_of_any_model_and_keeps_busy_ones() {
-        let mut cache = Cache::new(100, 16);
+        let mut cache = new_cache(100, 16);
         let idle = cache.add_state(0, 4);
         cache.set_idle(idle, 4);
         let busy = cache.add_state(1, 3);
@@ -1530,7 +1597,7 @@ mod tests {
 
     #[test]
     fn a_prefilling_state_is_reused_only_up_to_its_computed_tokens() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let source = add_idle_state(&mut cache, &collect_tokens(0..13772), &[13772]);
         cache.entries.get_mut(&source).unwrap().busy = true;
         let prefilling = cache.add_state(0, STATE_BYTES);
@@ -1559,7 +1626,7 @@ mod tests {
 
     #[test]
     fn a_prompt_that_extends_an_idle_state_continues_it_in_place() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let idle = add_idle_state(&mut cache, &collect_tokens(0..1000), &[1000]);
         let prompt = collect_tokens(0..1200);
         assert_eq!(
@@ -1583,7 +1650,7 @@ mod tests {
 
     #[test]
     fn the_longest_shared_prefix_wins_in_a_busy_or_idle_state() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let _short = add_idle_state(&mut cache, &collect_tokens(0..3000), &[3000]);
         let long = add_idle_state(&mut cache, &collect_tokens(0..20000), &[10000, 20000]);
         cache.entries.get_mut(&long).unwrap().busy = true;
@@ -1601,7 +1668,7 @@ mod tests {
 
     #[test]
     fn a_nearby_snapshot_beats_a_replay_and_a_far_one_loses_to_it() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let source = add_idle_state(&mut cache, &collect_tokens(0..20000), &[9000, 19000]);
         let mut near = collect_tokens(0..19500);
         near.push(-1);
@@ -1646,7 +1713,7 @@ mod tests {
 
     #[test]
     fn the_same_prompt_again_resumes_from_its_prompt_end_without_a_prefill() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let source = add_idle_state(&mut cache, &prompt, &[4000]);
         // its reply, decoded past the rewind margin
@@ -1666,7 +1733,7 @@ mod tests {
         assert_eq!(plan.count_reused_tokens(), 4000);
         assert_eq!(plan.describe_for_log(prompt.len()), "repeated");
         // without logits there, its last token runs again
-        let mut other_cache = Cache::new(u64::MAX, 256);
+        let mut other_cache = new_cache(u64::MAX, 256);
         let idle = add_idle_state(&mut other_cache, &prompt, &[]);
         assert_eq!(
             other_cache.find_cheapest_plan(0, &prompt, PLAN_LIMITS),
@@ -1679,7 +1746,7 @@ mod tests {
 
     #[test]
     fn a_retry_after_a_short_reply_and_a_changed_last_token_stay_in_place() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let idle = add_idle_state(&mut cache, &prompt, &[4000]);
         for offset in 0..3 {
@@ -1716,7 +1783,7 @@ mod tests {
         // </think> there. So the next turn differs from the state one position
         // before its prompt-end snapshot. The snapshot still holds that
         // position's rows.
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let source = add_idle_state(&mut cache, &prompt, &[4000]);
         for offset in 0..300 {
@@ -1803,7 +1870,7 @@ mod tests {
 
     #[test]
     fn rows_a_verify_pass_writes_past_its_accepted_tokens_shrink_the_rewind_room() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let state = add_idle_state(&mut cache, &prompt, &[]);
         // a pass of 6 rows that accepts 2 tokens: its 4 rows after them took
@@ -1893,7 +1960,7 @@ mod tests {
         // prompt's end. The rows of 4000..4002 took the places of the margin's
         // oldest positions, 3867..3869. A resume 5 positions before the new end
         // would read them.
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let state = add_idle_state(&mut cache, &prompt, &[4000]);
         for offset in 0..3 {
@@ -1928,7 +1995,7 @@ mod tests {
             (count_replay_rows(1999), count_replay_rows(100)),
             (1633, 100)
         );
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let source = add_idle_state(&mut cache, &collect_tokens(0..20000), &[4000]);
         // 12,000 of its tokens: the replay at 11,999 (1 + 2,610) beats the
         // snapshot at 4,000
@@ -1955,7 +2022,7 @@ mod tests {
 
     #[test]
     fn a_fork_resumed_from_an_earlier_snapshot_carries_its_own_branch_point() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let source = add_idle_state(&mut cache, &collect_tokens(0..6000), &[]);
         cache.add_snapshot(
             source,
@@ -1989,7 +2056,7 @@ mod tests {
             replay_cost: &|pos| pos.min(RING_ROWS),
             ..PLAN_LIMITS
         };
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let source = add_idle_state(&mut cache, &collect_tokens(0..6000), &[]);
         cache.add_snapshot(
             source,
@@ -2021,21 +2088,21 @@ mod tests {
 
     #[test]
     fn a_prompt_that_shares_nothing_gets_a_cold_start() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         add_idle_state(&mut cache, &collect_tokens(0..100), &[100]);
         assert_eq!(
             cache.find_cheapest_plan(0, &collect_tokens(500..700), PLAN_LIMITS),
             Plan::Cold
         );
         assert_eq!(
-            Cache::new(u64::MAX, 256).find_cheapest_plan(0, &collect_tokens(0..10), PLAN_LIMITS),
+            new_cache(u64::MAX, 256).find_cheapest_plan(0, &collect_tokens(0..10), PLAN_LIMITS),
             Plan::Cold
         );
     }
 
     #[test]
     fn continuing_in_place_truncates_the_state_and_its_later_snapshots() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let state = add_idle_state(&mut cache, &collect_tokens(0..1000), &[400, 998, 1000]);
         let mut prompt = collect_tokens(0..998);
         prompt.extend(7000..7050);
@@ -2073,7 +2140,7 @@ mod tests {
 
     #[test]
     fn a_removed_state_returns_its_snapshots_and_takes_no_bytes() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let state = add_idle_state(&mut cache, &collect_tokens(0..100), &[50, 100]);
         let snapshots = cache.remove_state(state);
         assert_eq!(
@@ -2089,7 +2156,7 @@ mod tests {
 
     #[test]
     fn a_replay_leaves_its_branch_point_as_a_snapshot_of_the_new_state() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let long = add_idle_state(&mut cache, &collect_tokens(0..8000), &[8000]);
         let mut prompt = collect_tokens(0..5000);
         prompt.extend(-50..0);
@@ -2128,7 +2195,7 @@ mod tests {
 
     #[test]
     fn a_reused_state_becomes_the_most_recently_used() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let reused = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
         let later = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
         cache.record_reuse(reused);
@@ -2137,18 +2204,18 @@ mod tests {
 
     #[test]
     fn a_request_that_cannot_fit_is_refused_before_anything_is_evicted() {
-        let mut cache = Cache::new(10 << 20, 256);
+        let mut cache = new_cache(10 << 20, 256);
         let busy = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
         let idle = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
         assert_eq!(cache.count_bytes(), 2 << 20);
         cache.entries.get_mut(&busy).unwrap().busy = true;
         // 10 MiB more: only the idle state (1 MiB) can be evicted. That is not
         // enough.
-        assert_eq!(cache.find_eviction(10 << 20, true, &[]), None);
+        assert_eq!(cache.find_eviction(0, 10 << 20, true, &[]), None);
         assert_eq!(cache.entries.len(), 2);
         // 9 MiB more fits once the idle state is evicted
         assert_eq!(
-            cache.find_eviction(9 << 20, true, &[]),
+            cache.find_eviction(0, 9 << 20, true, &[]),
             Some(Eviction {
                 snapshots: vec![],
                 states: vec![idle]
@@ -2158,7 +2225,7 @@ mod tests {
 
     #[test]
     fn spare_snapshots_are_evicted_before_states_and_old_states_before_new_ones() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         // 50 is spare: 100 is its last prompt end
         let old = add_idle_state(&mut cache, &collect_tokens(0..100), &[50, 100]);
         let new = add_idle_state(&mut cache, &collect_tokens(200..300), &[300 - 200]);
@@ -2174,10 +2241,10 @@ mod tests {
                 stale_rows: 0,
             });
         let total = cache.count_bytes();
-        cache.byte_limit = total;
+        cache.limits[0].bytes = total;
         // one snapshot's room: the oldest state's spare snapshot
         assert_eq!(
-            cache.find_eviction(SNAPSHOT_BYTES, false, &[]),
+            cache.find_eviction(0, SNAPSHOT_BYTES, false, &[]),
             Some(Eviction {
                 snapshots: vec![(old, 50)],
                 states: vec![]
@@ -2185,7 +2252,7 @@ mod tests {
         );
         // a source in use is kept: the other state's spare snapshot instead
         assert_eq!(
-            cache.find_eviction(SNAPSHOT_BYTES, false, &[old]),
+            cache.find_eviction(0, SNAPSHOT_BYTES, false, &[old]),
             Some(Eviction {
                 snapshots: vec![(new, 40)],
                 states: vec![]
@@ -2194,7 +2261,7 @@ mod tests {
         // more than the spare snapshots: the least recently used state is
         // evicted whole
         let eviction = cache
-            .find_eviction(2 * SNAPSHOT_BYTES + STATE_BYTES, false, &[])
+            .find_eviction(0, 2 * SNAPSHOT_BYTES + STATE_BYTES, false, &[])
             .unwrap();
         assert_eq!(eviction.states, vec![old]);
         let evicted = cache.evict(&eviction);
@@ -2205,7 +2272,7 @@ mod tests {
 
     #[test]
     fn the_same_prompt_again_takes_no_new_snapshot_and_fits_a_full_cache() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let prompt = collect_tokens(0..4000);
         let source = add_idle_state(&mut cache, &prompt, &[4000]);
         // the same prompt again resumes at its prompt end, without a prefill
@@ -2216,9 +2283,10 @@ mod tests {
             0
         );
         // so with the cache full it fits, and nothing is evicted
-        cache.byte_limit = cache.count_bytes();
+        cache.limits[0].bytes = cache.count_bytes();
         assert_eq!(
             cache.find_eviction(
+                0,
                 plan.count_snapshot_bytes(prompt.len(), SNAPSHOT_BYTES, SNAPSHOT_BYTES + 1),
                 false,
                 &[source]
@@ -2237,7 +2305,7 @@ mod tests {
 
     #[test]
     fn a_decoding_state_s_growth_is_counted_before_it_grows_and_others_are_evicted_first() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let old = add_idle_state(&mut cache, &collect_tokens(0..10), &[10]);
         cache.add_snapshot(
             old,
@@ -2251,7 +2319,7 @@ mod tests {
         let busy = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
         // decoding
         cache.start_request(busy, &collect_tokens(20..30), 10, STATE_BYTES, 0);
-        cache.byte_limit = cache.count_bytes();
+        cache.limits[0].bytes = cache.count_bytes();
         // one snapshot's growth: the spare snapshot is evicted before the
         // growth
         let evicted = cache.grow_state(busy, STATE_BYTES + SNAPSHOT_BYTES);
@@ -2265,7 +2333,7 @@ mod tests {
         );
         assert!(evicted.states.is_empty());
         assert_eq!(cache.entries[&busy].bytes, STATE_BYTES + SNAPSHOT_BYTES);
-        assert_eq!(cache.count_bytes_over_limit(), 0);
+        assert_eq!(cache.count_bytes_over_limit(0), 0);
         // more: the idle state is evicted whole
         let evicted = cache.grow_state(busy, (3 << 20) + SNAPSHOT_BYTES);
         assert_eq!(
@@ -2273,7 +2341,7 @@ mod tests {
             vec![old]
         );
         assert_eq!(cache.entries[&busy].bytes, (3 << 20) + SNAPSHOT_BYTES);
-        assert_eq!(cache.count_bytes_over_limit(), 0);
+        assert_eq!(cache.count_bytes_over_limit(0), 0);
         // no growth: nothing happens
         let evicted = cache.grow_state(busy, STATE_BYTES);
         assert!(evicted.snapshots.is_empty() && evicted.states.is_empty());
@@ -2282,13 +2350,13 @@ mod tests {
 
     #[test]
     fn growth_that_cannot_fit_evicts_every_idle_state_and_then_exceeds_the_limit() {
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let idle = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
         let busy = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
         let other_busy = add_idle_state(&mut cache, &collect_tokens(40..50), &[]);
         cache.start_request(busy, &collect_tokens(20..30), 10, STATE_BYTES, 0);
         cache.start_request(other_busy, &collect_tokens(40..50), 10, STATE_BYTES, 0);
-        cache.byte_limit = cache.count_bytes(); // 3 MiB
+        cache.limits[0].bytes = cache.count_bytes(); // 3 MiB
         // 3 MiB more: only the idle state (1 MiB) can be evicted. The busy ones
         // stay.
         let evicted = cache.grow_state(busy, 4 << 20);
@@ -2297,7 +2365,7 @@ mod tests {
             vec![idle]
         );
         assert_eq!(cache.entries[&busy].bytes, 4 << 20);
-        assert_eq!(cache.count_bytes_over_limit(), 2 << 20);
+        assert_eq!(cache.count_bytes_over_limit(0), 2 << 20);
         assert!(cache.entries.contains_key(&other_busy));
     }
 
@@ -2310,20 +2378,20 @@ mod tests {
             stale_rows: 0,
         };
         // the cache full, nothing else to evict: the snapshot is not taken
-        let mut cache = Cache::new(u64::MAX, 256);
+        let mut cache = new_cache(u64::MAX, 256);
         let state = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
         cache.start_request(state, &collect_tokens(0..10), 10, STATE_BYTES, 0);
-        cache.byte_limit = cache.count_bytes();
+        cache.limits[0].bytes = cache.count_bytes();
         let (take, _) = cache.finish_request(state, STATE_BYTES, Some(generation_end));
         assert!(!take);
         assert!(cache.find_snapshot(state, 10).is_none());
-        assert_eq!(cache.count_bytes_over_limit(), 0);
+        assert_eq!(cache.count_bytes_over_limit(0), 0);
         // an idle state to spare: it is evicted first, and the snapshot is kept
-        let mut other_cache = Cache::new(u64::MAX, 256);
+        let mut other_cache = new_cache(u64::MAX, 256);
         let old = add_idle_state(&mut other_cache, &collect_tokens(100..110), &[]);
         let other_state = add_idle_state(&mut other_cache, &collect_tokens(0..10), &[]);
         other_cache.start_request(other_state, &collect_tokens(0..10), 10, STATE_BYTES, 0);
-        other_cache.byte_limit = other_cache.count_bytes() + SNAPSHOT_BYTES - STATE_BYTES;
+        other_cache.limits[0].bytes = other_cache.count_bytes() + SNAPSHOT_BYTES - STATE_BYTES;
         let (take, evicted) =
             other_cache.finish_request(other_state, STATE_BYTES, Some(generation_end));
         assert!(take);
@@ -2332,23 +2400,23 @@ mod tests {
             vec![old]
         );
         assert!(other_cache.find_snapshot(other_state, 10).is_some());
-        assert_eq!(other_cache.count_bytes_over_limit(), 0);
+        assert_eq!(other_cache.count_bytes_over_limit(0), 0);
     }
 
     #[test]
     fn the_state_count_is_bounded_too() {
-        let mut cache = Cache::new(u64::MAX, 2);
+        let mut cache = new_cache(u64::MAX, 2);
         let old = add_idle_state(&mut cache, &collect_tokens(0..10), &[]);
         let _new = add_idle_state(&mut cache, &collect_tokens(20..30), &[]);
         assert_eq!(
-            cache.find_eviction(0, true, &[]),
+            cache.find_eviction(0, 0, true, &[]),
             Some(Eviction {
                 snapshots: vec![],
                 states: vec![old]
             })
         );
         assert_eq!(
-            cache.find_eviction(0, false, &[]),
+            cache.find_eviction(0, 0, false, &[]),
             Some(Eviction::default())
         );
     }
@@ -2397,7 +2465,7 @@ mod tests {
 
     /// Makes a cache that saves states of 100 unshared tokens or more.
     fn make_saving_cache() -> Cache {
-        let mut cache = Cache::new(1 << 30, 16);
+        let mut cache = new_cache(1 << 30, 16);
         cache.saved_byte_limit = 1 << 30;
         cache.min_unshared_tokens = 100;
         cache
