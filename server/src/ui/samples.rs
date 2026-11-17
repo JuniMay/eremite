@@ -303,6 +303,34 @@ pub fn find_hit_share(sources: [u64; 5]) -> Option<f64> {
     (all > 0).then(|| (sources[0] + sources[1] + sources[2]) as f64 / all as f64)
 }
 
+/// Returns the tokens per second that the models of `statuses` decoded since
+/// the start: their tokens over their decoding seconds.
+pub fn find_decoding_since_start(statuses: &[&ModelStatus]) -> Option<f64> {
+    let seconds: f64 = statuses
+        .iter()
+        .map(|status| status.model_decode.seconds)
+        .sum();
+    let tokens: u64 = statuses
+        .iter()
+        .map(|status| status.count_generated_tokens())
+        .sum();
+    (seconds > 0.0).then(|| tokens as f64 / seconds)
+}
+
+/// Returns the prompt tokens per second that the models of `statuses`
+/// prefilled since the start: the ended prefills' tokens over their seconds.
+pub fn find_prefill_since_start(statuses: &[&ModelStatus]) -> Option<f64> {
+    let seconds: f64 = statuses
+        .iter()
+        .map(|status| status.totals.prefill_seconds)
+        .sum();
+    let tokens: u64 = statuses
+        .iter()
+        .map(|status| status.totals.prefilled_tokens)
+        .sum();
+    (seconds > 0.0).then(|| tokens as f64 / seconds)
+}
+
 /// Returns the share of all models' decoding time since the start in which
 /// the GPU was busy.
 pub fn find_gpu_busy_since_start(statuses: &[ModelStatus]) -> Option<f64> {
@@ -413,6 +441,25 @@ mod tests {
         assert_eq!(find_hit_share([0; 5]), None);
         let first = &samples.samples[0];
         assert_eq!(first.sum_models(|model| model.decoding), None);
+    }
+
+    #[test]
+    fn the_speeds_since_the_start_count_each_models_tokens_and_seconds() {
+        let mut first = status(vec![request(5, Activity::Decoding, 100)], 500, 20);
+        first.totals.prefilled_tokens = 1000;
+        first.totals.prefill_seconds = 10.0;
+        let mut second = status(Vec::new(), 300, 0);
+        second.model_decode.seconds = 20.0;
+        second.totals.prefilled_tokens = 9000;
+        second.totals.prefill_seconds = 20.0;
+        // 600 tokens in 10 s, then also the second model's 300 in 20 s
+        assert_eq!(find_decoding_since_start(&[&first]), Some(60.0));
+        assert_eq!(find_decoding_since_start(&[&first, &second]), Some(30.0));
+        assert_eq!(
+            find_prefill_since_start(&[&first, &second]),
+            Some(10_000.0 / 30.0)
+        );
+        assert_eq!(find_prefill_since_start(&[]), None);
     }
 
     #[test]

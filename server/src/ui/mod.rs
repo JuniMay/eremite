@@ -3,6 +3,7 @@
 
 pub mod draw;
 pub mod frame;
+pub mod history;
 pub mod log;
 pub mod memory;
 pub mod overview;
