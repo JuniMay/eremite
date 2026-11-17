@@ -120,11 +120,10 @@ Each entry under `models` holds one model's settings:
 | `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; needs `ced` off | `false` |
 | `packed_state_rows` | DeepSeek: a state keeps its compressed rows and index keys packed: the same values in about 28% of BF16's bytes | `false` |
 | `idle_unload` | the model's own `idle_unload` | the server-wide one |
-| `temperature` | the temperature of requests that set none | 1 |
-| `top_p` | the top_p of requests that set none, 0 to 1 | 1 |
-| `top_k` | the top_k of requests that set none; 0: every token | 0 |
-| `seed` | the seed of requests that set none | random for each request |
-| `think` | the thinking effort of requests that set none, 1 to 100; 0: thinking off | the format's default |
+
+Each request sets its own sampling and thinking effort. A request that sets
+none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
+at high effort.
 
 Codex's web tool searches through eremite's own SearXNG.
 `scripts/setup-searxng.sh` sets it up in `~/.local/share/eremite/searxng`, the

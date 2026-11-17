@@ -94,6 +94,19 @@ pub struct Defaults {
     pub effort: u32,
 }
 
+impl Defaults {
+    /// Returns the defaults of the model `model_id` for what a request does not
+    /// set: OpenAI's sampling, and thinking on at the high effort.
+    pub fn new(model_id: String) -> Defaults {
+        Defaults {
+            model_id,
+            sampling: Sampling::default(),
+            is_thinking_on: true,
+            effort: EFFORT_HIGH,
+        }
+    }
+}
+
 /// Builds deepseek-recipe's special tokens with the V4.1 tokenizer's image
 /// token.
 fn build_special_tokens() -> SpecialTokensMap {

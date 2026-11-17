@@ -39,18 +39,6 @@ pub struct ModelConfig {
     /// The most rows that a decoding call takes, at most the model's own; None:
     /// the model's own. DeepSeek's own is 6.
     pub rows_per_call: Option<usize>,
-    /// The temperature of requests that set none; None: 1.
-    pub temperature: Option<f64>,
-    /// The top_p of requests that set none; None: 1.
-    pub top_p: Option<f64>,
-    /// The top_k of requests that set none; None: 0, every token.
-    pub top_k: Option<u32>,
-    /// The seed of requests that set none; None: a random seed for each
-    /// request.
-    pub seed: Option<u64>,
-    /// The thinking effort of requests that set none, from 1 to 100, or 0 for
-    /// thinking off; None: the format's default.
-    pub think: Option<u32>,
     /// The seconds without requests before the model's weights and experts
     /// unload, 0 for never; None: the server-wide setting.
     pub idle_unload: Option<f64>,
@@ -68,11 +56,6 @@ impl ModelConfig {
                 ..Default::default()
             },
             rows_per_call: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            seed: None,
-            think: None,
             idle_unload: None,
         }
     }
@@ -82,7 +65,6 @@ impl ModelConfig {
     /// value is invalid.
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
         let options = &mut self.engine;
-        let number = || value.as_f64().ok_or(format!("{name} takes a number"));
         let integer = || {
             value
                 .as_i64()
@@ -149,39 +131,6 @@ impl ModelConfig {
                         .filter(|rows| *rows >= 1)
                         .ok_or("rows_per_call takes a positive integer")?
                         as usize,
-                )
-            }
-            "temperature" => {
-                self.temperature = Some(
-                    number()
-                        .ok()
-                        .filter(|temperature| temperature.is_finite() && *temperature >= 0.0)
-                        .ok_or("temperature must be finite and nonnegative")?,
-                )
-            }
-            "top_p" => {
-                self.top_p = Some(
-                    number()
-                        .ok()
-                        .filter(|top_p| (0.0..=1.0).contains(top_p))
-                        .ok_or("top_p must be in [0, 1]")?,
-                )
-            }
-            "top_k" => {
-                self.top_k = Some(
-                    value
-                        .as_u64()
-                        .and_then(|top_k| u32::try_from(top_k).ok())
-                        .ok_or("top_k takes a nonnegative integer")?,
-                )
-            }
-            "seed" => self.seed = Some(value.as_u64().ok_or("seed takes a nonnegative integer")?),
-            "think" => {
-                self.think = Some(
-                    value
-                        .as_u64()
-                        .filter(|effort| *effort <= 100)
-                        .ok_or("think takes 0 (off) or 1 to 100")? as u32,
                 )
             }
             "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
@@ -887,7 +836,7 @@ mod tests {
     fn a_file_gives_each_model_its_own_options() {
         let config = parse(&json!({"memory": 72, "state_cache": 16, "models": [
             {"model": "/m/deepseek", "ced": 128},
-            {"model": "/m/small", "id": "small", "draft": 1, "ctx": 32768, "top_k": 20, "think": 0}
+            {"model": "/m/small", "id": "small", "draft": 1, "ctx": 32768}
         ]}))
         .unwrap();
         let models = config.models;
@@ -904,14 +853,8 @@ mod tests {
         );
         assert_eq!((deepseek.engine.draft, deepseek.id.as_deref()), (0, None));
         assert_eq!(
-            (
-                small.id.as_deref(),
-                small.engine.draft,
-                small.engine.ctx,
-                small.top_k,
-                small.think
-            ),
-            (Some("small"), 1, 32768, Some(20), Some(0))
+            (small.id.as_deref(), small.engine.draft, small.engine.ctx),
+            (Some("small"), 1, 32768)
         );
         assert!(small.engine.deepseek().is_none());
     }
@@ -1020,7 +963,6 @@ mod tests {
                 .contains("cahce")
         );
         assert!(parse(&json!({"models": [{"model": "/m", "ced": 64}]})).is_err());
-        assert!(parse(&json!({"models": [{"model": "/m", "top_p": 2}]})).is_err());
         assert!(parse(&json!({"prt": 8008, "models": [{"model": "/m"}]})).is_err());
         for timeout in [json!(0), json!(-1), json!("long")] {
             assert!(

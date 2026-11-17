@@ -119,6 +119,19 @@ pub struct Sampling {
     pub seed: Option<u64>,
 }
 
+impl Default for Sampling {
+    /// OpenAI's defaults: temperature 1, top_p 1 and every token, with a random
+    /// seed.
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: None,
+        }
+    }
+}
+
 /// A request for one model.
 pub struct Request {
     /// The index of the request's model, in the configured order.

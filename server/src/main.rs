@@ -641,23 +641,10 @@ fn main() {
     }
     let loaded = worker::list_models();
     let mut served_models = Vec::new();
-    for ((model, settings), family) in configuration.models.iter().zip(&served).zip(&families) {
+    for (settings, family) in served.iter().zip(&families) {
         let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
         let format = match family {
-            Family::DeepSeek => Format::DeepSeek(deepseek::Defaults {
-                model_id: id.clone(),
-                sampling: worker::Sampling {
-                    temperature: model.temperature.unwrap_or(1.0),
-                    top_p: model.top_p.unwrap_or(1.0),
-                    top_k: model.top_k.unwrap_or(0),
-                    seed: model.seed,
-                },
-                is_thinking_on: model.think != Some(0),
-                effort: model
-                    .think
-                    .filter(|&effort| effort > 0)
-                    .unwrap_or(deepseek::EFFORT_HIGH),
-            }),
+            Family::DeepSeek => Format::DeepSeek(deepseek::Defaults::new(id.clone())),
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
