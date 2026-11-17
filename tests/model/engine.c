@@ -59,12 +59,13 @@ int main(int argc, char **argv) {
       {.abi = EREMITE_ABI, .model = argv[1], .ctx = 4096, .deepseek.draft = 6},
       {.abi = EREMITE_ABI, .model = argv[1], .ctx = 4096, .lookup = 16},
       {.abi = EREMITE_ABI, .model = argv[1], .ctx = 4096, .deepseek.ced = 100},
+      {.abi = EREMITE_ABI, .model = argv[1], .ctx = 4096, .memory_gb = -1},
       {.abi = EREMITE_ABI + 1, .model = argv[1], .ctx = 4096}};
   int refused = 0;
   for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
     refused += !eremite_open(&bad[i]);
-  check(refused == 5, "a context of 0, 6 drafts, 16 lookups, a CED of 100 and "
-                      "another ABI are refused");
+  check(refused == 6, "a context of 0, 6 drafts, 16 lookups, a CED of 100, a "
+                      "memory limit below 0 and another ABI are refused");
   eremite_config c = {.abi = EREMITE_ABI,
                       .model = argv[1],
                       .ctx = 4096,

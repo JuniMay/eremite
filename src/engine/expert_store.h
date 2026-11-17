@@ -157,6 +157,11 @@ void expert_store_set_pass_rows(ExpertStore *st, int rows);
 // selections, and the stages' slots if the layers in use include them.
 uint64_t expert_store_minimum_bytes(ExpertStore *st, int layers);
 
+// Returns the bytes that the store needs at least for passes of rows, as
+// expert_store_minimum_bytes returns them after expert_store_set_pass_rows,
+// without changing the store's pass rows or limits.
+uint64_t expert_store_pass_minimum_bytes(ExpertStore *st, int rows, int layers);
+
 // Starts the store. It sets the slot limits within budget bytes, or, for 0,
 // within the available memory less the reserve, and at least to the minimum
 // slots. A budget below the minimum ends the program. It starts the readers,

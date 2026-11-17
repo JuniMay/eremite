@@ -23,7 +23,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 2
+#define EREMITE_ABI 3
 
 // ---- the process ----
 
@@ -114,6 +114,9 @@ typedef struct {
   const char *model;
   int ctx;
   int lookup;
+  // Upper limit of the model's own memory: its weights, expert cache,
+  // workspaces and states; 0: none of its own.
+  double memory_gb;
   eremite_deepseek_config deepseek;
 } eremite_config;
 
@@ -479,6 +482,12 @@ typedef struct {
   uint64_t model_memory_limit, model_memory_used, model_memory_committed,
       model_memory_peak;
   uint64_t state_allocated, model_workspace;
+  // The model's own memory: its own limit (0: none), the bytes counted for it
+  // and for its states, and the least that it needs to run a full prompt
+  // pass: its weights, the pass's workspace and its smallest expert cache (0
+  // before it loads).
+  uint64_t own_memory_limit, own_memory_counted, own_state_bytes,
+      required_bytes;
   // Process-wide since the start, to show where the time goes:
   // - thread_s: the engine thread's seconds outside eremite_run_streams,
   // running a

@@ -49,6 +49,9 @@ struct eremite_media {
   int n;
 };
 
+// The bytes in one GiB.
+static constexpr double GiB = 1024.0 * 1024 * 1024;
+
 static eremite_process proc;
 static int initialized;
 // The models registered, one of each family.
@@ -197,6 +200,8 @@ eremite_model *eremite_open(const eremite_config *c) {
                         ? "lookup takes off or 1 to 15 proposals"
                     : d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
                         ? "ced takes off or 128 to 1048576 replay tokens"
+                    : !isfinite(c->memory_gb) || c->memory_gb < 0
+                        ? "memory takes 0 (none) or a GiB limit"
                         : NULL;
   if (bad) {
     say("%s: %s", c->model, bad);
@@ -214,7 +219,7 @@ eremite_model *eremite_open(const eremite_config *c) {
   x->opt.deepseek.experts = copy(options.deepseek.experts);
   x->tk = tokenizer_open(c->model, ops->media_token);
   x->dir = copy(c->model);
-  x->m = model_create(memory, NULL, x->dir);
+  x->m = model_create(memory, NULL, x->dir, (uint64_t)(c->memory_gb * GiB));
   models[nmodels++] = x;
   say("%s: registered %s; weights load on first inference request", c->model,
       ops->family);
@@ -950,6 +955,11 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->model_memory_peak = usage.peak;
   s->state_allocated = state_bytes();
   s->model_workspace = m->m->memory.bytes - c.dense_bytes - c.cache_bytes;
+  const MemoryAccount *own = &m->m->memory;
+  s->own_memory_limit = own->limit == UINT64_MAX ? 0 : own->limit;
+  s->own_memory_counted = memory_counted(own);
+  s->own_state_bytes = own->state_bytes;
+  s->required_bytes = c.required_bytes;
   s->cache = counts(&c.cache);
   s->slots = c.cache_slots;
   s->mapped = c.mapped;

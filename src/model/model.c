@@ -25,10 +25,10 @@ const ModelOps *model_find_family(const char *dir) {
   die("%s: model_type %s is not one this engine runs", path, type->s);
 }
 
-Model *model_create(Memory *memory, Gpu *gpu, const char *dir) {
+Model *model_create(Memory *memory, Gpu *gpu, const char *dir, uint64_t limit) {
   Model *m = xmalloc(sizeof *m);
   *m = (Model){.ops = model_find_family(dir), .dir = dir, .gpu = gpu};
-  memory_account_init(memory, &m->memory, dir, UINT64_MAX);
+  memory_account_init(memory, &m->memory, dir, limit);
   memory_slot_init(&m->work, &m->memory, MEMORY_MODEL, NULL, "model workspace",
                    NULL, NULL);
   m->work.automatic = 1;
@@ -50,7 +50,7 @@ void model_set_request_running(Model *m, int active) {
 }
 
 Model *model_open(Memory *memory, Gpu *gpu, const char *dir, const Options *o) {
-  Model *m = model_create(memory, gpu, dir);
+  Model *m = model_create(memory, gpu, dir, 0);
   if (!model_load(m, o)) return NULL;
   model_set_request_running(m, 1);
   return m;

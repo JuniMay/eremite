@@ -340,6 +340,9 @@ static int K_mm_fp8, K_mm_bf16, K_mv_fp8, K_mv_bf16, K_mvm_fp8, K_mvm_bf16,
     K_vit_rope, K_vit_heads, K_vit_attn, K_vit_swiglu, K_vit_add, K_vit_unfold;
 
 static uint64_t dense_bytes;
+// The least memory that a full prompt pass needs, as the last load noted it.
+static uint64_t required_bytes;
+static void note_required_bytes(void);
 static size_t rows_bytes(int l, int cap, int keys);
 static size_t saved_bytes(void);
 static int start_cap(void);
@@ -986,6 +989,7 @@ int deepseek_load(Gpu *model_gpu, MemorySlot *work, const char *dir,
     model_buffers_ready = 1;
   }
   dense_bytes = weight_group_resident_bytes(core_weights);
+  note_required_bytes();
   fprintf(stderr, "loaded %.1f GiB of dense weights in %.1f s\n",
           dense_bytes / GiB, now() - began);
   return 1;
@@ -2835,6 +2839,31 @@ static uint64_t resizable_bytes(void) {
   return bytes;
 }
 
+// The memory that a pass of rows needs besides its expert cache: the weights,
+// the pass's workspace and its host scratch. fixed is the workspace that no
+// pass resizes.
+static uint64_t pass_memory(int rows, uint64_t fixed) {
+  int small =
+      replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
+  int request_rows = rows > small ? rows : small;
+  int layer_rows = request_rows < MB ? request_rows : MB;
+  uint64_t workspace =
+      fixed + request_plan(request_rows, 0) + work_bytes(layer_rows);
+  uint64_t host = row_scratch(rows) + (uint64_t)rows * 2 * ENGRAM_ROWS * 8 +
+                  (uint64_t)layer_rows * 64;
+  return weight_group_required_bytes(core_weights) + workspace + host;
+}
+
+// Notes required_bytes: the weights, a full prompt pass's workspace and host
+// scratch, and the smallest expert cache for its rows. A load notes it at its
+// end, while no pass holds scratch memory in the workspace.
+static void note_required_bytes(void) {
+  required_bytes =
+      pass_memory(prefill_chunk, work_slot->payload - resizable_bytes()) +
+      expert_store_pass_minimum_bytes(experts_store, prefill_chunk,
+                                      opt.draft ? CACHE_LAYERS : LAYERS);
+}
+
 static int prepare_rows(int rows, int prompt) {
   static int previous_rows;
   static uint64_t previous_payload;
@@ -2843,23 +2872,13 @@ static int prepare_rows(int rows, int prompt) {
       work->payload == previous_payload)
     return rows;
   if (!work || !core_weights) return rows;
-  int small =
-      replay_margin() + 1 > BATCH_ROWS ? replay_margin() + 1 : BATCH_ROWS;
   uint64_t fixed = work->payload - resizable_bytes();
   int candidate = prompt && rows > prefill_chunk ? prefill_chunk : rows;
   for (;;) {
-    int request_rows = candidate > small ? candidate : small;
-    int layer_rows = request_rows < MB ? request_rows : MB;
-    uint64_t workspace =
-        fixed + request_plan(request_rows, 0) + work_bytes(layer_rows);
-    uint64_t host = row_scratch(candidate) +
-                    (uint64_t)candidate * 2 * ENGRAM_ROWS * 8 +
-                    (uint64_t)layer_rows * 64;
     expert_store_set_pass_rows(experts_store, candidate);
-    uint64_t required =
-        weight_group_required_bytes(core_weights) + workspace + host +
-        expert_store_minimum_bytes(experts_store,
-                                   opt.draft ? CACHE_LAYERS : LAYERS);
+    uint64_t required = pass_memory(candidate, fixed) +
+                        expert_store_minimum_bytes(
+                            experts_store, opt.draft ? CACHE_LAYERS : LAYERS);
     MemoryAdmission mode =
         candidate > 1 && prompt ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
     if (memory_set_minimum(work->account, required, mode)) {
@@ -4208,6 +4227,7 @@ static void ds_counters(ModelCounters *c) {
   c->max_slots = expert_store_slot_maximum(experts_store);
   c->uncached_bytes =
       expert_store_bytes_without_slot(experts_store, &c->uncached);
+  c->required_bytes = required_bytes;
 }
 
 // Before the first load there is no store: nothing to mark or count.

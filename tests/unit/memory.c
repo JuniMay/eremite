@@ -146,24 +146,76 @@ static void pinned_slots_and_state_memory(void) {
   REQUIRE(memory_usage(memory).allocated == 90 && b.state_bytes == 0);
 }
 
-static void state_memory_has_its_own_limit(void) {
+// An account's own limit takes its room from the account's own slots, even
+// when another account's idle slots are older.
+static void an_account_keeps_to_its_own_limit(void) {
   Memory *memory = memory_new();
   memory_set_limit(memory, 1000);
-  MemoryAccount model;
+  MemoryAccount model, other;
   memory_account_init(memory, &model, "model", 100);
-  TestSlot weights, older, newer, running;
+  memory_account_init(memory, &other, "other", 0);
+  TestSlot old, weights, expert, growing;
+  test_slot(&old, &other, NULL, 50, 1);
+  old.slot.touched = -1000;
+  test_slot(&weights, &model, NULL, 60, 2);
+  memory_pin(&weights.slot, 1);
+  test_slot(&expert, &model, &weights, 30, 3);
+  test_slot(&growing, &model, NULL, 0, 4);
+  REQUIRE(claim(&growing, 20, MEMORY_REQUIRED));
+  REQUIRE(expert.evicted == 1 && old.evicted == 0);
+  REQUIRE(memory_counted(&model) == 80 && memory_counted(&other) == 50);
+  // Nothing more of the model can go: 30 more bytes are refused, and nothing
+  // is evicted.
+  REQUIRE(!claim(&growing, 30, MEMORY_REQUIRED));
+  REQUIRE(old.evicted == 0 && growing.slot.payload == 20);
+  // A cache grows only into the model's own room: 20 bytes.
+  REQUIRE(memory_room(&model) == 20);
+  REQUIRE(claim(&growing, 20, MEMORY_CACHE));
+  REQUIRE(!claim(&growing, 1, MEMORY_CACHE));
+  REQUIRE(old.evicted == 0 && memory_counted(&model) == 100);
+}
+
+// A model's states may take the part of its own limit that the rest of the
+// model leaves above its minimum. A new state there takes the model's idle
+// memory above its minimum first, then its idle states, oldest first.
+static void a_new_state_takes_idle_model_memory_then_the_oldest_state(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 200);
+  TestSlot weights, expert, older, newer, running;
   test_slot(&weights, &model, NULL, 100, 1);
-  test_state_slot(&older, &model, 40, 2);
+  memory_pin(&weights.slot, 1);
+  test_slot(&expert, &model, &weights, 30, 2);
+  test_state_slot(&older, &model, 30, 3);
   clock_now += 10;
-  test_state_slot(&newer, &model, 40, 3);
-  test_state_slot(&running, &model, 0, 4);
+  test_state_slot(&newer, &model, 30, 4);
+  test_state_slot(&running, &model, 0, 5);
   memory_pin(&running.slot, 1);
+  // 190 of 200 bytes are counted. 20 more take the expert, not a state.
+  REQUIRE(claim(&running, 20, MEMORY_REQUIRED));
+  REQUIRE(expert.evicted == 1 && older.evicted == 0 && newer.evicted == 0);
+  // 180 of 200 bytes are counted. 30 more take the older state.
   REQUIRE(claim(&running, 30, MEMORY_REQUIRED));
   REQUIRE(older.evicted == 1 && newer.evicted == 0 && weights.evicted == 0);
-  REQUIRE(model.state_bytes == 70 && memory_usage(memory).committed == 170);
+  REQUIRE(model.state_bytes == 80 && memory_counted(&model) == 180);
+  // With the newer state pinned, nothing makes room, and nothing goes.
   memory_pin(&newer.slot, 1);
-  REQUIRE(!claim(&running, 40, MEMORY_REQUIRED));
-  REQUIRE(newer.evicted == 0 && model.state_bytes == 70);
+  REQUIRE(!claim(&running, 30, MEMORY_REQUIRED));
+  REQUIRE(newer.evicted == 0 && model.state_bytes == 80);
+}
+
+// At a model's own limit, an expert finds no room: the model's state stays.
+static void loading_experts_at_the_own_limit_never_evicts_state(void) {
+  Memory *memory = memory_new();
+  MemoryAccount model;
+  memory_account_init(memory, &model, "model", 100);
+  TestSlot weights, saved, expert;
+  test_slot(&weights, &model, NULL, 50, 1);
+  memory_pin(&weights.slot, 1);
+  test_state_slot(&saved, &model, 50, 2);
+  test_slot(&expert, &model, &weights, 0, 3);
+  REQUIRE(!claim(&expert, 10, MEMORY_REQUIRED));
+  REQUIRE(saved.evicted == 0 && model.state_bytes == 50);
 }
 
 static void loading_experts_never_evicts_state(void) {
@@ -746,9 +798,14 @@ int main(void) {
       {"dense weights are one slot", dense_weights_are_one_slot},
       {"pinned slots stay, and state memory counts toward the limit",
        pinned_slots_and_state_memory},
-      {"state memory has a limit of its own, and its oldest idle slot goes "
-       "first",
-       state_memory_has_its_own_limit},
+      {"an account keeps to its own limit with its own slots, and its cache "
+       "grows only into its own room",
+       an_account_keeps_to_its_own_limit},
+      {"a new state takes its model's idle memory above the minimum first, "
+       "then its oldest idle state",
+       a_new_state_takes_idle_model_memory_then_the_oldest_state},
+      {"loading experts at a model's own limit never evicts its state",
+       loading_experts_at_the_own_limit_never_evicts_state},
       {"loading experts never evicts state memory",
        loading_experts_never_evicts_state},
       {"state memory goes only after the rest of its model",

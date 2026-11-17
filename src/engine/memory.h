@@ -5,17 +5,21 @@
 #include <stdint.h>
 
 // Tracks how much memory each model uses. Keeps the total under an optional
-// limit, and keeps a reserve free for other programs.
+// limit, each model under an optional limit of its own, and a reserve free for
+// other programs.
 //
 // Each model has one account. Its memory is split into slots: weights, cached
 // experts, workspaces and state. When memory runs short, unused slots are
-// freed. This is called evicting.
+// freed. This is called evicting. Room within an account's own limit comes
+// only from that account's slots.
 //
 // State slots hold the model's requests' and conversations' state, such as KV
-// caches. They count toward the limit, and each account also has a limit for
-// its state. When an account's state reaches it, its idle state slots are
-// evicted, oldest first. Otherwise state is evicted only once the rest of its
-// model is gone, so that loading experts never evicts state.
+// caches. They count toward the limits. A model's state may take any part of
+// its account's limit that the rest of the model leaves above its minimum.
+// When a new state needs room there, the model's idle memory above its minimum
+// goes first, then its idle state slots, oldest first. Otherwise state is
+// evicted only once the rest of its model is gone, so that loading experts
+// never evicts state.
 
 // Holds the accounts, the limit, the reserve and the counts.
 typedef struct Memory Memory;
@@ -71,8 +75,11 @@ struct MemoryAccount {
   uint64_t bytes, minimum;
   // Set while it raises its minimum. Its slots are then not evicted.
   int admitting;
-  // Bytes counted for its state slots, and the most they may hold.
-  uint64_t state_bytes, state_limit;
+  // Bytes counted for its state slots.
+  uint64_t state_bytes;
+  // The most bytes that it may count, its state slots included: its own
+  // limit. UINT64_MAX for none.
+  uint64_t limit;
 };
 
 struct MemorySlot {
@@ -159,10 +166,10 @@ void memory_set_reserve(Memory *memory, uint64_t reserve,
 // The most memory the models may use now, within the limit and the reserve.
 uint64_t memory_current_limit(Memory *memory);
 
-// Starts an empty account and adds it to memory. Its state slots may hold up
-// to state_limit bytes.
+// Starts an empty account and adds it to memory. Its slots may count up to
+// limit bytes together, its state slots included; 0 sets no limit of its own.
 void memory_account_init(Memory *memory, MemoryAccount *account,
-                         const char *name, uint64_t state_limit);
+                         const char *name, uint64_t limit);
 
 // Starts an empty slot. dependency may be null. evict(context) frees its
 // contents; null means the slot is never evicted. Ends the program if
@@ -207,9 +214,10 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
 int memory_wait_for_minimum(MemoryAccount *account, uint64_t bytes);
 
 // Claims bytes for the slot: adds them to its bytes in use, evicting as mode
-// allows. Returns whether they fit. A state slot first stays within its
-// account's state limit: the account's idle state slots are evicted, oldest
-// first, and the bytes are refused if that is not enough.
+// allows. Returns whether they fit. For a state slot whose bytes do not fit
+// within its account's own limit beside the account's idle memory above its
+// minimum, the account's idle state slots are evicted first, oldest first; the
+// bytes are refused, and nothing is evicted, if that is not enough.
 int memory_claim(MemorySlot *slot, uint64_t bytes, MemoryAdmission mode);
 
 // Claims bytes for the slot as memory_claim does in MEMORY_REQUIRED mode.
@@ -242,8 +250,14 @@ void memory_set_eviction_callback(Memory *memory,
 // memory stops being counted as soon as it is freed.
 MemorySlot *memory_shared(Memory *memory);
 
-// Returns the account's room: the bytes it may still add within the limit.
+// Returns the account's room: the bytes it may still add within the limit and
+// its own limit.
 uint64_t memory_room(const MemoryAccount *account);
+
+// Returns the bytes counted for the account: its model memory's bytes, or its
+// minimum if larger, and its state memory's bytes. Its own limit applies to
+// them.
+uint64_t memory_counted(const MemoryAccount *account);
 
 // Reclaims memory: evicts idle slots until bytes are freed or none is left.
 // Returns the bytes freed.

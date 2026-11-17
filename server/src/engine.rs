@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 2;
+const ABI: c_int = 3;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -53,6 +53,7 @@ struct RawConfig {
     model: *const c_char,
     ctx: c_int,
     lookup: c_int,
+    memory_gb: f64,
     deepseek: RawDeepSeekConfig,
 }
 
@@ -261,6 +262,16 @@ pub struct Stats {
     pub state_allocated: u64,
     /// Bytes of the model's working buffers.
     pub model_workspace: u64,
+    /// The model's own memory limit; 0: none.
+    pub own_memory_limit: u64,
+    /// What is counted for the model, its states included.
+    pub own_memory_counted: u64,
+    /// Bytes of the model's states.
+    pub own_state_bytes: u64,
+    /// The least memory that the model needs to run a full prompt pass: its
+    /// weights, the pass's workspace and its smallest expert cache; 0 before
+    /// it loads.
+    pub required_bytes: u64,
     /// Seconds since the start: the engine thread outside run_streams,
     /// running a pass, and with no pass ready while one waits for the GPU,
     /// for reads, or for something else.
@@ -607,6 +618,8 @@ pub struct Options {
     pub model: String,
     /// The context's capacity in tokens.
     pub ctx: i32,
+    /// The model's own memory limit in GiB, its states included; 0: none.
+    pub memory_gb: f64,
     /// The most proposals of the model's draft head that a pass verifies; 0:
     /// none.
     pub draft: i32,
@@ -839,6 +852,7 @@ impl Model {
             model: model.as_ptr(),
             ctx: o.ctx,
             lookup: o.lookup,
+            memory_gb: o.memory_gb,
             deepseek: RawDeepSeekConfig {
                 experts: experts.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 // The engine's approximate substitution stays off: it is for

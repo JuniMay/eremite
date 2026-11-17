@@ -105,10 +105,8 @@ static void start(double model_gib, double reserve_gib) {
                                                    .reserve_gib = reserve_gib});
 }
 
-// Claims bytes of state memory in a new state slot of the account, which may
-// hold that much more state.
+// Claims bytes of state memory in a new state slot of the account.
 static int claim_state(MemoryAccount *account, uint64_t bytes) {
-  account->state_limit += bytes;
   MemorySlot *state = calloc(1, sizeof *state);
   memory_slot_init(state, account, MEMORY_STATE, NULL, "state", NULL, NULL);
   return memory_claim(state, bytes, MEMORY_REQUIRED);

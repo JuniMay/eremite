@@ -115,6 +115,10 @@ typedef struct {
   int routed_layers, experts_per_layer;
   // The weights always resident.
   uint64_t dense_bytes;
+  // The least memory that the model needs to run a full prompt pass: its
+  // weights, the pass's workspace and its smallest expert cache. 0 before it
+  // loads.
+  uint64_t required_bytes;
   // The expert cache's counts of decoded rows and of prompt rows.
   ExpertStoreCounts decode, prefill;
   ExpertStoreCounts cache;
@@ -288,9 +292,10 @@ typedef struct {
 
 // The family that runs the checkpoint directory dir (its config.json's
 // model_type), and the model of dir, loaded on gpu and counted in an account
-// of memory. Both end the process with a message when no family runs it.
+// of memory whose own limit is limit bytes (0: none). Both end the process
+// with a message when no family runs it.
 const ModelOps *model_find_family(const char *dir);
-Model *model_create(Memory *memory, Gpu *gpu, const char *dir);
+Model *model_create(Memory *memory, Gpu *gpu, const char *dir, uint64_t limit);
 int model_load(Model *model, const Options *options);
 void model_set_request_running(Model *model, int active);
 Model *model_open(Memory *memory, Gpu *gpu, const char *dir, const Options *o);

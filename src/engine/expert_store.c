@@ -472,10 +472,15 @@ void expert_store_set_request_running(ExpertStore *st, int running) {
   st->cache_busy = !!running;
 }
 
-void expert_store_set_pass_rows(ExpertStore *st, int rows) {
+// The slots that passes of rows need: two layers' selections.
+static int pass_slots(const ExpertStore *st, int rows) {
   int experts =
       rows * st->chosen < st->experts ? rows * st->chosen : st->experts;
-  int slots = 2 * experts;
+  return 2 * experts;
+}
+
+void expert_store_set_pass_rows(ExpertStore *st, int rows) {
+  int slots = pass_slots(st, rows);
   // Passes that run together each need their slots: while others run, the
   // minimum only rises, and a pass that needs fewer does not take it away.
   if (__atomic_load_n(&st->other_passes, __ATOMIC_RELAXED) > 0 &&
@@ -590,6 +595,13 @@ uint64_t expert_store_minimum_bytes(ExpertStore *st, int layers) {
          st->npinned * gpu_round_up_to_pages(st->pinned_slot_size);
 }
 
+uint64_t expert_store_pass_minimum_bytes(ExpertStore *st, int rows,
+                                         int layers) {
+  expert_store_minimum_bytes(st, layers);  // the slots' sizes
+  return pass_slots(st, rows) * gpu_round_up_to_pages(st->SLOT_SIZE) +
+         st->npinned * gpu_round_up_to_pages(st->pinned_slot_size);
+}
+
 void expert_store_start(ExpertStore *st, uint64_t budget, int layers) {
   expert_store_minimum_bytes(st, layers);
   memset(st->where, 0xff, WHERE_BYTES);
@@ -600,9 +612,13 @@ void expert_store_start(ExpertStore *st, uint64_t budget, int layers) {
   if (!reserve) expert_store_set_reserve(0);
   int fixed = budget > 0;
   if (!budget) budget = avail > reserve ? avail - reserve : 0;
-  if (st->cache_backbone &&
-      memory_usage(st->cache_backbone->account->memory).limit < limit)
-    limit = memory_usage(st->cache_backbone->account->memory).limit;
+  if (st->cache_backbone) {
+    // The limit of all models, and the model's own.
+    const MemoryAccount *account = st->cache_backbone->account;
+    if (memory_usage(account->memory).limit < limit)
+      limit = memory_usage(account->memory).limit;
+    if (account->limit < limit) limit = account->limit;
+  }
   if (budget > limit) budget = limit;
   budget = budget > st->pinned_bytes ? budget - st->pinned_bytes : 0;
   // The cache may grow up to max_slots when memory becomes free; a given
