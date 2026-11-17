@@ -258,6 +258,8 @@ struct ModelStatus {
     total_generated_tokens: u64,
     /// The plan of the latest prefill.
     last_prefill: PrefillInfo,
+    /// Whether the decoding requests split evenly over at least two calls.
+    split_calls: bool,
 }
 
 /// A model as the HTTP handlers and the worker share it. The tokenizer works on
@@ -635,6 +637,7 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         },
         "prefill_prune": options.deepseek().is_some_and(|deepseek| deepseek.prefill_prune),
         "rows_per_call": shared_model.settings.rows_per_call,
+        "split_decoding_calls": status.split_calls,
         "model_decode": {
             "computed_rows": stats.decode_rows,
             "seconds": stats.decode_seconds,
@@ -747,6 +750,10 @@ struct Generation {
     in_call: bool,
     /// The request's turn number since it last became ready to decode (Turns).
     turn: u64,
+    /// When the request got its last token in a steady round, if the rounds
+    /// since then stayed steady and kept their arrangement. The call chooser
+    /// measures the gap from it to the next token.
+    measured_token_at: Option<Instant>,
 }
 
 impl Generation {
@@ -805,6 +812,8 @@ struct WorkerModel {
     idle_decode_streams: Vec<Stream>,
     /// Chooses how the decoding requests split into calls.
     call_chooser: CallChooser,
+    /// The round of decoding that the call chooser measures, if one runs.
+    round: Option<Round>,
     /// The order of the decoding requests' turns.
     turns: Turns,
 }
@@ -829,6 +838,24 @@ impl Turns {
         self.next += count as u64;
         start..self.next
     }
+}
+
+/// A round of decoding that the call chooser measures. It lasts until every
+/// decoding request has a new token.
+struct Round {
+    /// The decoding requests that have no new token yet.
+    waiting: Vec<u64>,
+    /// The number of decoding requests.
+    decoding_count: usize,
+    /// Whether the requests' calls split.
+    is_split: bool,
+    /// Whether only these requests' decoding calls ran: no prompt, no other
+    /// model's calls, and no calls of another arrangement.
+    is_steady: bool,
+    /// The gaps between two tokens of a request that ended in the round.
+    gaps: usize,
+    /// The seconds of those gaps in all.
+    gap_seconds: f64,
 }
 
 /// The worker on the engine thread.
@@ -861,6 +888,7 @@ impl Worker {
                     running_calls: Vec::new(),
                     idle_decode_streams: Vec::new(),
                     call_chooser: CallChooser::new(),
+                    round: None,
                     turns: Turns::default(),
                     model,
                     settings,
@@ -886,6 +914,55 @@ impl Worker {
             engine::refresh_stats();
             self.publish_counters();
             self.shared.status_published.notify_waiters();
+        }
+    }
+
+    /// Watches each model's round of decoding. A round stops being steady while
+    /// a prompt prefills or another model's calls run. It ends without a record
+    /// when its requests change: when their number changes, or when a request
+    /// that it waits for no longer decodes. Either way, the call chooser
+    /// measures no gap that spans the change. The status shows whether the
+    /// calls split.
+    fn watch_rounds(&mut self) {
+        let busy: Vec<bool> = self
+            .models
+            .iter()
+            .map(|worker_model| {
+                !worker_model.running_calls.is_empty() || !worker_model.admitted.is_empty()
+            })
+            .collect();
+        for (i, worker_model) in self.models.iter_mut().enumerate() {
+            let decoding_count = worker_model
+                .generations
+                .iter()
+                .filter(|generation| generation.is_decoding())
+                .count();
+            let is_prefilling = worker_model
+                .generations
+                .iter()
+                .any(|generation| !generation.is_decoding())
+                || !worker_model.admitted.is_empty();
+            let others = busy
+                .iter()
+                .enumerate()
+                .any(|(j, &is_busy)| j != i && is_busy);
+            if let Some(round) = worker_model.round.as_mut() {
+                let left = round.waiting.iter().any(|&id| {
+                    !worker_model
+                        .generations
+                        .iter()
+                        .any(|generation| generation.job.id == id && generation.is_decoding())
+                });
+                if round.decoding_count != decoding_count || left {
+                    worker_model.round = None;
+                    worker_model.forget_token_gaps();
+                } else if is_prefilling || others {
+                    round.is_steady = false;
+                    worker_model.forget_token_gaps();
+                }
+            }
+            lock(&self.shared.models[worker_model.model_index].status).split_calls =
+                worker_model.call_chooser.is_split();
         }
     }
 
@@ -977,6 +1054,7 @@ impl Worker {
                     .set_request_running(!worker_model.generations.is_empty());
             }
             self.advance_running_calls();
+            self.watch_rounds();
             self.publish_status_if_wanted();
         }
         self.finish_running_calls();
@@ -1308,6 +1386,7 @@ impl WorkerModel {
             expert_counts_at_decode_start: CacheCounts::default(),
             in_call: false,
             turn: 0,
+            measured_token_at: None,
         });
     }
 
@@ -1611,6 +1690,35 @@ impl WorkerModel {
             .iter()
             .filter(|generation| generation.is_decoding())
             .count();
+        if decoding_count >= 2 && self.round.is_none() {
+            let was_split = self.call_chooser.is_split();
+            let is_split = self
+                .call_chooser
+                .begin_round(decoding_count, max_rows_per_call);
+            // A gap counts only when both of its tokens came in this
+            // arrangement. Calls of the other arrangement that still run would
+            // give tokens in the round.
+            if is_split != was_split {
+                self.forget_token_gaps();
+            }
+            let calls_run = self
+                .running_calls
+                .iter()
+                .any(|running_call| !matches!(running_call.call, Call::Prefill { .. }));
+            self.round = Some(Round {
+                waiting: self
+                    .generations
+                    .iter()
+                    .filter(|generation| generation.is_decoding())
+                    .map(|generation| generation.job.id)
+                    .collect(),
+                decoding_count,
+                is_split,
+                is_steady: !(calls_run && is_split != was_split),
+                gaps: 0,
+                gap_seconds: 0.0,
+            });
+        }
         let (allowed, rows_per_call) = self
             .call_chooser
             .choose_calls(decoding_count, max_rows_per_call);
@@ -1685,6 +1793,7 @@ impl WorkerModel {
             .iter()
             .map(|&request_id| self.find_generation_index(request_id))
             .collect();
+        let ended_at = Instant::now();
         let turns = self.turns.take(indices.len());
         for (&i, turn) in indices.iter().zip(turns) {
             self.generations[i].in_call = false;
@@ -1707,6 +1816,50 @@ impl WorkerModel {
                 model.sample(unsafe { logits.row(row, vocab) }, &mut generation.sampler);
         }
         self.idle_decode_streams.push(stream);
+        self.count_round_tokens(&indices, ended_at);
+    }
+
+    /// Counts the new tokens that the requests at `indices` got at `ended_at`,
+    /// and the gaps since their previous tokens. Once every request of the
+    /// round has a token, a steady round goes to the call chooser, and the next
+    /// calls begin the next round.
+    fn count_round_tokens(&mut self, indices: &[usize], ended_at: Instant) {
+        let Some(round) = self.round.as_mut() else {
+            for &i in indices {
+                self.generations[i].measured_token_at = None;
+            }
+            return;
+        };
+        for &i in indices {
+            let generation = &mut self.generations[i];
+            round.waiting.retain(|&id| id != generation.job.id);
+            if !round.is_steady {
+                generation.measured_token_at = None;
+            } else if let Some(previous) = generation.measured_token_at.replace(ended_at) {
+                round.gaps += 1;
+                round.gap_seconds += ended_at.duration_since(previous).as_secs_f64();
+            }
+        }
+        if round.waiting.is_empty() {
+            if round.is_steady {
+                self.call_chooser.record_round(
+                    round.decoding_count,
+                    round.is_split,
+                    round.gaps,
+                    round.gap_seconds,
+                );
+            }
+            self.round = None;
+        }
+    }
+
+    /// Forgets each request's last measured token, so that the call chooser
+    /// measures no gap that spans a change of arrangement, a prompt, another
+    /// model's calls or a change of requests.
+    fn forget_token_gaps(&mut self) {
+        for generation in &mut self.generations {
+            generation.measured_token_at = None;
+        }
     }
 }
 
