@@ -26,7 +26,9 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::engine::{self, CacheCounts, Logits, Model, PrefillInfo, Sampler, StateHandle, Stream};
+use crate::engine::{
+    self, CacheCounts, ExpandError, Logits, Media, Model, PrefillInfo, Sampler, StateHandle, Stream,
+};
 
 /// The engine needs a stack of at least 16 MiB on its thread.
 const ENGINE_STACK_BYTES: usize = 16 << 20;
@@ -59,8 +61,8 @@ pub enum FinishReason {
 #[derive(Debug)]
 pub enum Event {
     /// The request starts decoding. Its prefill ended. `prompt_tokens` counts
-    /// the prompt. `reused_tokens` counts the prompt tokens taken from the
-    /// state cache.
+    /// the prompt with its media expanded. `reused_tokens` counts the prompt
+    /// tokens taken from the state cache.
     DecodingStarted {
         prompt_tokens: usize,
         reused_tokens: usize,
@@ -98,8 +100,11 @@ pub struct Sampling {
 pub struct Request {
     /// The index of the request's model, in the configured order.
     pub model_index: usize,
-    /// The prompt's token ids.
+    /// The prompt's token ids. Each image's place holds the model's image
+    /// token.
     pub prompt: Vec<i32>,
+    /// The bytes of each media file, in the prompt's order.
+    pub media: Vec<Vec<u8>>,
     /// How the request samples its tokens.
     pub sampling: Sampling,
     /// The most tokens the reply may have.
@@ -439,8 +444,10 @@ pub fn submit(
 
 /// A prefill in progress: its prompt.
 struct Prefill {
-    /// The prompt's tokens.
+    /// The prompt's tokens, with the media expanded.
     prompt: Vec<i32>,
+    /// The prompt's media. They are kept until the prefill ends.
+    media: Option<Media>,
     /// When the prefill started.
     started_at: Instant,
     /// The expert cache's counters when the prefill started.
@@ -455,7 +462,7 @@ struct Generation {
     sampler: Sampler,
     /// The request's engine state.
     state: StateHandle,
-    /// The number of prompt tokens.
+    /// The number of prompt tokens, with the media expanded.
     prompt_tokens: usize,
     /// Some while the prompt prefills.
     prefill: Option<Prefill>,
@@ -795,13 +802,35 @@ impl WorkerModel {
         }
     }
 
-    /// Starts an admitted request. It checks the request's prompt. It makes the
-    /// request's state, and the prefill follows. It refuses a request that does
-    /// not fit.
+    /// Starts an admitted request. It checks the request's media and prompt. It
+    /// makes the request's state, and the prefill follows. It refuses a request
+    /// that does not fit.
     fn start_request(&mut self, job: Job) {
         // A reply has at least one token, so a prompt has at most ctx - 1.
         let most_prompt_tokens = self.ctx - 1;
-        let prompt = job.request.prompt.clone();
+        let mut prompt = job.request.prompt.clone();
+        let mut media = None;
+        if !job.request.media.is_empty() {
+            match self.model.open_media(&job.request.media) {
+                Err(message) => return refuse(job, &message),
+                Ok(mut opened) => match opened.expand(&prompt, most_prompt_tokens) {
+                    Ok(expanded) => {
+                        prompt = expanded;
+                        media = Some(opened);
+                    }
+                    Err(ExpandError::TooLong(tokens)) => {
+                        return refuse(job, &format_prompt_too_long(tokens, self.ctx));
+                    }
+                    Err(ExpandError::PlacesAndMediaDiffer) => {
+                        let message = format!(
+                            "the prompt's image places and its {} media differ",
+                            job.request.media.len()
+                        );
+                        return refuse(job, &message);
+                    }
+                },
+            }
+        }
         let prompt_tokens = prompt.len();
         if prompt_tokens > most_prompt_tokens {
             return refuse(job, &format_prompt_too_long(prompt_tokens, self.ctx));
@@ -834,6 +863,27 @@ impl WorkerModel {
                 "greedy"
             }
         ));
+        if let Some(opened) = media.as_mut() {
+            // Encode the media that the prefill reaches. The prefill starts at
+            // the prompt's start. So it reaches all of them.
+            let encode_started_at = Instant::now();
+            let encoded = match opened.encode(0) {
+                Ok(count) => count,
+                Err(error) => {
+                    self.model.state_free(state);
+                    job.send_last_event(Event::Failed(error));
+                    return;
+                }
+            };
+            if encoded > 0 {
+                engine::log(&format!(
+                    "req {}: {encoded} of {} media encoded in {:.2} s",
+                    job.id,
+                    job.request.media.len(),
+                    encode_started_at.elapsed().as_secs_f64()
+                ));
+            }
+        }
         let now = Instant::now();
         self.generations.push(Generation {
             job,
@@ -842,6 +892,7 @@ impl WorkerModel {
             prompt_tokens,
             prefill: Some(Prefill {
                 prompt,
+                media,
                 started_at: now,
                 expert_counts_at_start: self.model.read_stats().cache,
             }),
@@ -892,7 +943,14 @@ impl WorkerModel {
             return;
         }
         let stream = Stream::new(&self.model);
-        stream.prefill(generation.state, &prefill.prompt, 0, false, None, None);
+        stream.prefill(
+            generation.state,
+            &prefill.prompt,
+            0,
+            false,
+            None,
+            prefill.media.as_ref(),
+        );
         let request_id = generation.job.id;
         self.generations[i].in_call = true;
         self.running_calls.push(RunningCall {
@@ -971,6 +1029,7 @@ impl WorkerModel {
             prompt_tokens,
             reused_tokens: 0,
         });
+        drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
         generation.decode_started_at = now;
         generation.expert_counts_at_decode_start = stats.cache;
