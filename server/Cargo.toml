@@ -9,6 +9,7 @@ publish = false
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 deepseek-recipe = "=0.2.0"
 # The connections and their limits (http.rs): hyper's HTTP/1 server under axum.
+http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
 libc = "0.2"

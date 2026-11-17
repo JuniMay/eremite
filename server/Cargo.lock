@@ -482,6 +482,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "deepseek-recipe",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
