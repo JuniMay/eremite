@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 use crate::engine;
+use crate::ui::terminal::ThemeChoice;
 
 /// The most tokens that a context holds. A model also takes at most its own
 /// context.
@@ -24,8 +25,8 @@ const MIN_RESERVE_GIB: f64 = 2.0;
 /// The most GiB that saved states may take on the SSD. The reason for this
 /// value is unknown.
 const MAX_STATE_DISK_GIB: f64 = 65536.0;
-/// The most requests or states that a count setting takes. The reason for this
-/// value is unknown.
+/// The most requests, states or tokens that a count setting takes. The reason
+/// for this value is unknown.
 const MAX_COUNT: f64 = 65536.0;
 /// The most seconds that a time setting takes. The reason for this value is
 /// unknown.
@@ -226,6 +227,24 @@ pub struct Server {
     /// The seconds without a call after which the web tool forgets a session's
     /// references.
     pub search_session_idle_s: f64,
+    /// Whether the terminal UI (ui/) shows on stderr's terminal instead of the
+    /// log.
+    pub tui: bool,
+    /// How the terminal UI chooses its colors.
+    pub tui_theme: ThemeChoice,
+    /// The seconds that the terminal UI waits for the terminal's answer about
+    /// its background color.
+    pub tui_background_answer_wait_s: f64,
+    /// The seconds that the terminal UI's "now" figures average.
+    pub tui_now_window_s: f64,
+    /// The seconds that the terminal UI's "recent" figures average.
+    pub tui_recent_window_s: f64,
+    /// The seconds that the terminal UI's history charts span, one sample a
+    /// column.
+    pub tui_history_window_s: f64,
+    /// The latest tokens of a decoding request whose experts the terminal
+    /// UI's expert map shows.
+    pub tui_expert_map_tokens: usize,
 }
 
 impl Default for Server {
@@ -242,6 +261,13 @@ impl Default for Server {
             search_timeout_s: 30.0,
             searxng_idle_s: 600.0,
             search_session_idle_s: 7200.0,
+            tui: false,
+            tui_theme: ThemeChoice::Auto,
+            tui_background_answer_wait_s: 1.0,
+            tui_now_window_s: 5.0,
+            tui_recent_window_s: 60.0,
+            tui_history_window_s: 60.0,
+            tui_expert_map_tokens: 12,
         }
     }
 }
@@ -284,11 +310,32 @@ impl Server {
             "state_dir" => self.state_dir = Some(text()?.into()),
             "searxng_dir" => self.searxng_dir = Some(text()?.into()),
             "searxng_socket" => self.searxng_socket = Some(text()?.into()),
+            "tui" => self.tui = value.as_bool().ok_or("tui takes true or false")?,
+            "tui_theme" => {
+                self.tui_theme = match value.as_str() {
+                    Some("auto") => ThemeChoice::Auto,
+                    Some("light") => ThemeChoice::Light,
+                    Some("dark") => ThemeChoice::Dark,
+                    _ => return Err("tui_theme takes auto, light or dark".into()),
+                }
+            }
+            "tui_expert_map_tokens" => {
+                self.tui_expert_map_tokens = value
+                    .as_u64()
+                    .filter(|tokens| (1..=MAX_COUNT as u64).contains(tokens))
+                    .ok_or(format!(
+                        "tui_expert_map_tokens takes 1 to {MAX_COUNT} tokens"
+                    ))? as usize
+            }
             "http_timeout"
             | "keepalive"
             | "search_timeout"
             | "searxng_idle"
-            | "search_session_idle" => {
+            | "search_session_idle"
+            | "tui_background_answer_wait"
+            | "tui_now_window"
+            | "tui_recent_window"
+            | "tui_history_window" => {
                 let seconds = value
                     .as_f64()
                     .filter(|seconds| *seconds > 0.0 && *seconds <= MAX_SECONDS)
@@ -300,7 +347,11 @@ impl Server {
                     "keepalive" => &mut self.keepalive_s,
                     "search_timeout" => &mut self.search_timeout_s,
                     "searxng_idle" => &mut self.searxng_idle_s,
-                    _ => &mut self.search_session_idle_s,
+                    "search_session_idle" => &mut self.search_session_idle_s,
+                    "tui_background_answer_wait" => &mut self.tui_background_answer_wait_s,
+                    "tui_now_window" => &mut self.tui_now_window_s,
+                    "tui_recent_window" => &mut self.tui_recent_window_s,
+                    _ => &mut self.tui_history_window_s,
                 } = seconds;
             }
             _ => return Err(format!("no server setting {name}")),
@@ -532,6 +583,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "search_timeout",
             "searxng_idle",
             "search_session_idle",
+            "tui",
+            "tui_theme",
+            "tui_background_answer_wait",
+            "tui_now_window",
+            "tui_recent_window",
+            "tui_history_window",
+            "tui_expert_map_tokens",
         ]
         .contains(&key.as_str())
     }) {
@@ -568,6 +626,13 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "search_timeout",
         "searxng_idle",
         "search_session_idle",
+        "tui",
+        "tui_theme",
+        "tui_background_answer_wait",
+        "tui_now_window",
+        "tui_recent_window",
+        "tui_history_window",
+        "tui_expert_map_tokens",
     ] {
         if let Some(value) = object.get(name) {
             server.set(name, value)?;
@@ -763,9 +828,42 @@ mod tests {
             ("keepalive", json!("15")),
             ("search_timeout", json!(0)),
             ("search_session_idle", json!(2e6)),
+            ("tui", json!("yes")),
+            ("tui_theme", json!("blue")),
+            ("tui_now_window", json!(0)),
+            ("tui_expert_map_tokens", json!(0)),
         ] {
             assert!(config.server.set(name, &value).is_err(), "{name} {value}");
         }
+        // the terminal UI's settings, from a file and from the command line
+        let mut config = parse(&json!({"tui": true, "tui_theme": "dark",
+            "tui_history_window": 120, "models": [{"model": "/models/deepseek"}]}))
+        .unwrap();
+        assert_eq!(
+            (
+                config.server.tui,
+                config.server.tui_theme,
+                config.server.tui_history_window_s
+            ),
+            (true, ThemeChoice::Dark, 120.0)
+        );
+        assert_eq!(
+            (
+                config.server.tui_background_answer_wait_s,
+                config.server.tui_now_window_s,
+                config.server.tui_recent_window_s
+            ),
+            (1.0, 5.0, 60.0)
+        );
+        config.server.set("tui", &json!(false)).unwrap();
+        config
+            .server
+            .set("tui_expert_map_tokens", &json!(20))
+            .unwrap();
+        assert_eq!(
+            (config.server.tui, config.server.tui_expert_map_tokens),
+            (false, 20)
+        );
     }
 
     #[test]
