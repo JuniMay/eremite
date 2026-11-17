@@ -520,11 +520,13 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
+ "data-url",
  "deepseek-recipe",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "rand",
  "serde",
  "serde_json",
  "sha2",

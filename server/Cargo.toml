@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 async-stream = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+data-url = "0.3"
 deepseek-recipe = "=0.2.0"
 # The connections and their limits (http.rs): hyper's HTTP/1 server under axum.
 http-body-util = "0.1"
@@ -15,6 +16,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
 # File locks, free disk space and process groups (disk.rs, codex/search.rs).
 libc = "0.2"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
