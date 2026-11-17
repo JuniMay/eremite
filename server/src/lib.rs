@@ -1,7 +1,7 @@
 //! eremite-server's modules: the engine's C interface, the configuration, the
 //! state cache and its saved states, the decoding calls, the yield and resume
-//! control, the worker on the engine thread, the errors that end requests,
-//! Codex's web tool, and the HTTP connections.
+//! control, the worker on the engine thread, the chat formats, Codex's web
+//! tool, and the HTTP connections.
 
 pub mod calls;
 pub mod chat;

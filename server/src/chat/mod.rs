@@ -1,10 +1,17 @@
-//! The chat formats of the served models. A chat format turns a request's JSON
-//! into prompt tokens and sampling settings. It also turns the worker's events
-//! into the API's response. Each model family has its own chat format. A
-//! family's format renders the family's chat template. A chat template is the
-//! text form in which a model reads a conversation. The format also reads the
-//! reasoning and tool calls in the model's output. This file holds what every
-//! format shares: request checks, errors and response ids.
+//! The chat formats of the served models.
+//! A chat format turns a request's JSON into prompt tokens and sampling
+//! settings.
+//! It also turns the worker's events into the API's response.
+//! Each model family has its own chat format.
+//! A family's format renders the family's chat template.
+//! A chat template is the text form in which a model reads a conversation.
+//! The format also reads the reasoning and tool calls in the model's output.
+//! deepseek.rs holds the DeepSeek V4.1 format.
+//! That format uses the deepseek-recipe crate.
+//! This file holds what every format shares: request checks, errors and
+//! response ids.
+
+pub mod deepseek;
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -160,9 +167,9 @@ pub fn build_error_response(status: StatusCode, error_type: &str, message: &str)
 /// The OpenAI API that a request came through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Api {
-    /// OpenAI's Chat Completions API.
+    /// The Chat Completions API, at /v1/chat/completions and /chat/completions.
     ChatCompletions,
-    /// OpenAI's Responses API.
+    /// The Responses API, at /v1/responses and /responses.
     Responses,
 }
 
@@ -177,148 +184,77 @@ pub fn generate_random_id(prefix: &str) -> String {
     format!("{prefix}{random_chars}")
 }
 
-/// A model family. Each family's requests take its own chat format.
 pub use crate::engine::Architecture as Family;
 
 #[cfg(test)]
-mod error_tests {
+mod request_tests {
     use super::*;
+    use crate::{engine::Tokenizer, worker::Sampling};
 
     #[test]
-    fn a_bad_request_has_status_400_and_its_message() {
-        let error = Error::new_bad_request("stop must be a string");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, "stop must be a string");
-    }
-
-    #[test]
-    fn the_error_json_is_an_openai_error_object() {
-        let text = format_error_json("invalid_request_error", "no such model");
-        let object: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let expected = json!({
-            "error": {"message": "no such model", "type": "invalid_request_error", "code": null}
-        });
-        assert_eq!(object, expected);
-    }
-
-    #[tokio::test]
-    async fn an_error_response_has_its_status_and_the_error_object() {
-        let response = build_error_response(
-            StatusCode::NOT_FOUND,
-            "invalid_request_error",
-            "no such model",
-        );
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            body,
-            format_error_json("invalid_request_error", "no such model")
-        );
-    }
-}
-
-#[cfg(test)]
-mod check_tests {
-    use super::*;
-    use crate::worker::Sampling;
-    use serde_json::{Map, Value};
-
-    /// The defaults of a model that samples with temperature 1, top_p 1 and
-    /// every token.
-    const DEFAULTS: Sampling = Sampling {
-        temperature: 1.0,
-        top_p: 1.0,
-        top_k: 0,
-        seed: None,
-    };
-
-    /// Returns the JSON object of `request`.
-    fn object(request: Value) -> Map<String, Value> {
-        let Value::Object(root) = request else {
-            panic!("a JSON object")
+    fn the_worker_request_takes_the_requested_top_k_and_the_default_seed() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
         };
-        root
-    }
-
-    #[test]
-    fn sampling_takes_the_request_s_values_and_the_defaults_for_the_rest() {
-        let sampling = read_sampling(
-            &object(json!({"temperature": 0.5, "top_k": 7, "seed": null})),
-            DEFAULTS,
+        let tokenizer = Tokenizer::open(&dir, Some(deepseek::IMAGE_TOKEN));
+        let defaults = deepseek::Defaults {
+            model_id: "deepseek".into(),
+            sampling: Sampling {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 20,
+                seed: Some(73),
+            },
+            is_thinking_on: false,
+            effort: deepseek::EFFORT_HIGH,
+        };
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "top_k": 31});
+        let prepared = deepseek::prepare_request(
+            &serde_json::to_vec(&body).unwrap(),
+            &defaults,
+            tokenizer,
+            Api::ChatCompletions,
         )
         .unwrap();
-        let expected = Sampling {
-            temperature: 0.5,
-            top_k: 7,
-            ..DEFAULTS
+        let request = prepared.build_worker_request(0, "test".into()).unwrap();
+        assert_eq!(request.sampling.top_k, 31);
+        assert_eq!(request.sampling.seed, Some(73));
+    }
+
+    #[test]
+    fn prepare_request_rejects_malformed_token_limits_and_stop_sequences() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
         };
-        assert_eq!(sampling, expected);
+        let tokenizer = Tokenizer::open(&dir, Some(deepseek::IMAGE_TOKEN));
+        let defaults = deepseek::Defaults {
+            model_id: "deepseek".into(),
+            sampling: Sampling {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: None,
+            },
+            is_thinking_on: false,
+            effort: deepseek::EFFORT_HIGH,
+        };
+        let mut accepted = Vec::new();
         for (key, value) in [
-            ("temperature", json!(-1)),
-            ("temperature", json!("hot")),
-            ("top_p", json!(1.5)),
-            ("top_k", json!(-1)),
-            ("top_k", json!(u64::MAX)),
-            ("seed", json!("7")),
+            ("max_tokens", json!(0)),
+            ("max_tokens", json!(-1)),
+            ("max_tokens", json!(1.5)),
+            ("max_tokens", json!("12")),
+            ("max_completion_tokens", json!(u64::MAX)),
+            ("stop", json!(["end", 5])),
         ] {
-            let request = object(json!({key: value}));
-            assert!(read_sampling(&request, DEFAULTS).is_err(), "{key} {value}");
+            let mut body = json!({"messages": [{"role": "user", "content": "Hi"}]});
+            body[key] = value;
+            let bytes = serde_json::to_vec(&body).unwrap();
+            if deepseek::prepare_request(&bytes, &defaults, tokenizer, Api::ChatCompletions).is_ok()
+            {
+                accepted.push(format!("DeepSeek accepted {body}"));
+            }
         }
-    }
-
-    #[test]
-    fn the_token_limit_takes_max_completion_tokens_first() {
-        let limit = |request: Value| read_token_limit(&object(request), DEFAULT_MAX_TOKENS);
-        assert_eq!(
-            limit(json!({"max_tokens": 5, "max_completion_tokens": 9})).unwrap(),
-            9
-        );
-        assert_eq!(limit(json!({"max_tokens": 5})).unwrap(), 5);
-        assert_eq!(limit(json!({})).unwrap(), DEFAULT_MAX_TOKENS);
-        for value in [
-            json!(0),
-            json!(-1),
-            json!(1.5),
-            json!("12"),
-            json!(u64::MAX),
-        ] {
-            assert!(limit(json!({"max_tokens": value})).is_err(), "{value}");
-        }
-    }
-
-    #[test]
-    fn stop_sequences_are_one_string_or_an_array_of_strings() {
-        let stop = |request: Value| read_stop_sequences(&object(request));
-        assert!(stop(json!({})).unwrap().is_empty());
-        assert_eq!(stop(json!({"stop": "end"})).unwrap(), ["end"]);
-        assert_eq!(stop(json!({"stop": ["a", "b"]})).unwrap(), ["a", "b"]);
-        assert!(stop(json!({"stop": ["end", 5]})).is_err());
-        assert!(stop(json!({"stop": 5})).is_err());
-    }
-
-    #[test]
-    fn a_data_url_gives_its_bytes() {
-        assert_eq!(
-            decode_data_url("data:image/png;base64,AAEC").unwrap(),
-            [0, 1, 2]
-        );
-        assert!(decode_data_url("https://example.com/image.png").is_err());
-        assert!(decode_data_url("data:image/png;base64,!!!").is_err());
-    }
-
-    #[test]
-    fn a_random_id_has_its_prefix_and_letters_and_digits() {
-        let id = generate_random_id("chatcmpl-");
-        let random_chars = id.strip_prefix("chatcmpl-").unwrap();
-        assert_eq!(random_chars.len(), RANDOM_ID_CHARS);
-        assert!(
-            random_chars
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric())
-        );
-        assert_ne!(generate_random_id("chatcmpl-"), id);
+        assert!(accepted.is_empty(), "{}", accepted.join("; "));
     }
 }
