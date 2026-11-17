@@ -13,8 +13,9 @@ use std::ops::Range;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use deepseek_recipe::openai::chat_completion::response::{
@@ -38,7 +39,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::{Stream, StreamExt};
 
-use super::{Api, DEFAULT_MAX_TOKENS, Error, build_error_response, generate_random_id};
+use super::{
+    Api, DEFAULT_MAX_TOKENS, Error, build_error_response, format_error_json, generate_random_id,
+};
 use crate::engine;
 use crate::worker::{self, Event, FinishReason, Sampling};
 
@@ -728,6 +731,16 @@ trait ApiOutput: ProtocolRequest {
     fn should_send(chunk: &Chunk<Self>) -> bool;
     /// Counts the tool calls that `chunk` starts.
     fn count_started_tool_calls(chunk: &Chunk<Self>) -> usize;
+    /// Formats the server-sent event that ends a failed stream.
+    /// The event carries `error_type` and `message`.
+    /// `sequence_number` is the number of the stream's next event.
+    fn format_failure_event(
+        error_type: &str,
+        message: &str,
+        response_id: &str,
+        model_id: &str,
+        sequence_number: usize,
+    ) -> String;
 }
 
 impl ApiOutput for ChatCompletionRequest {
@@ -758,6 +771,10 @@ impl ApiOutput for ChatCompletionRequest {
             .filter(|delta| matches!(delta, ChatCompletionToolCallDelta::Start { .. }))
             .count()
     }
+
+    fn format_failure_event(error_type: &str, message: &str, _: &str, _: &str, _: usize) -> String {
+        format!("data: {}\n\n", format_error_json(error_type, message))
+    }
 }
 
 impl ApiOutput for ResponsesRequest {
@@ -779,6 +796,31 @@ impl ApiOutput for ResponsesRequest {
             ) as usize,
             _ => 0,
         }
+    }
+
+    /// Formats a `response.failed` event. Its response carries the error.
+    fn format_failure_event(
+        error_type: &str,
+        message: &str,
+        response_id: &str,
+        model_id: &str,
+        sequence_number: usize,
+    ) -> String {
+        let event = json!({
+            "type": "response.failed",
+            "sequence_number": sequence_number,
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": read_unix_time(),
+                "status": "failed",
+                "model": model_id,
+                "output": [],
+                "error": {"code": error_type, "message": message},
+                "incomplete_details": null,
+            },
+        });
+        format!("event: response.failed\ndata: {event}\n\n")
     }
 }
 
@@ -824,6 +866,33 @@ where
     (chunks, ended_by_shutdown)
 }
 
+/// Formats `chunk` as a server-sent event. Its data is the chunk's JSON.
+/// When the API names its events, the event also carries the chunk's event
+/// name.
+/// Responses names its events.
+fn format_server_sent_event<ApiRequest: ApiOutput>(
+    chunk: &Chunk<ApiRequest>,
+) -> Result<String, String>
+where
+    Chunk<ApiRequest>: serde::Serialize,
+{
+    let json = serde_json::to_string(chunk).map_err(|e| e.to_string())?;
+    Ok(
+        match <ApiRequest::Response as ProtocolResponse>::sse_event_name(chunk) {
+            Some(name) => format!("event: {name}\ndata: {json}\n\n"),
+            None => format!("data: {json}\n\n"),
+        },
+    )
+}
+
+/// Formats the done event. It ends a stream that finished normally.
+/// Chat Completions ends with `data: [DONE]`.
+/// Responses has no such event. For Responses this returns an empty string.
+fn format_done_event<ApiRequest: ApiOutput>() -> String {
+    <ApiRequest::Response as ProtocolResponse>::sse_done_data()
+        .map_or(String::new(), |d| format!("data: {d}\n\n"))
+}
+
 /// Logs the number of tool calls in a response when it has any.
 fn log_tool_calls(request_id: u64, tool_call_count: usize) {
     if tool_call_count > 0 {
@@ -832,6 +901,97 @@ fn log_tool_calls(request_id: u64, tool_call_count: usize) {
             if tool_call_count == 1 { "" } else { "s" }
         ));
     }
+}
+
+/// Streams the response as server-sent events of deepseek-recipe's chunks.
+/// Until the worker's first event arrives, a comment line goes out after each
+/// `keepalive` without one.
+pub fn stream_response(
+    request: PreparedRequest,
+    cancel: worker::CancelGuard,
+    events: UnboundedReceiver<Event>,
+    keepalive: Duration,
+) -> Response {
+    match request.api {
+        Api::ChatCompletions => {
+            stream_response_as::<ChatCompletionRequest>(request, cancel, events, keepalive)
+        }
+        Api::Responses => {
+            stream_response_as::<ResponsesRequest>(request, cancel, events, keepalive)
+        }
+    }
+}
+
+/// Streams the response of an `ApiRequest` request.
+fn stream_response_as<ApiRequest: ApiOutput>(
+    request: PreparedRequest,
+    cancel: worker::CancelGuard,
+    mut events: UnboundedReceiver<Event>,
+    keepalive: Duration,
+) -> Response
+where
+    Chunk<ApiRequest>: serde::Serialize + Send,
+{
+    let request_id = cancel.id();
+    let response_id = ApiRequest::generate_response_id();
+    let model_id = request.settings.model_id.clone();
+    let body = async_stream::stream! {
+        // The body stream owns `cancel`, even before its first poll.
+        // Dropping the stream drops `cancel`.
+        // That cancels the request if it has not ended.
+        let _cancel = cancel;
+        let first = loop {
+            match tokio::time::timeout(keepalive, events.recv()).await {
+                Ok(event) => break event,
+                Err(_) => yield Ok::<String, std::io::Error>(": waiting\n\n".into()),
+            }
+        };
+        // Nothing was sent yet. The failure event is number 0.
+        let first = match first {
+            Some(Event::Failed(message)) => {
+                yield Ok(ApiRequest::format_failure_event("server_error", &message, &response_id, &model_id, 0) + &format_done_event::<ApiRequest>());
+                return;
+            }
+            Some(Event::Refused(message)) => {
+                yield Ok(ApiRequest::format_failure_event("invalid_request_error", &message, &response_id, &model_id, 0) + &format_done_event::<ApiRequest>());
+                return;
+            }
+            Some(event) => event,
+            None => return,
+        };
+        let (chunks, ended_by_shutdown) = convert_events_to_api_chunks::<ApiRequest>(request.converted_request, response_id.clone(), request.settings.model_id, request.tokenizer, first, events);
+        let mut chunks = pin!(chunks);
+        let (mut tool_call_count, mut sent) = (0, 0);
+        while let Some(chunk) = chunks.next().await {
+            if ended_by_shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            match chunk.and_then(|c| {
+                tool_call_count += ApiRequest::count_started_tool_calls(&c);
+                format_server_sent_event::<ApiRequest>(&c)
+            }) {
+                Ok(event) => {
+                    sent += 1;
+                    yield Ok(event);
+                }
+                Err(message) => {
+                    yield Ok(ApiRequest::format_failure_event("server_error", &message, &response_id, &model_id, sent));
+                    return;
+                }
+            }
+        }
+        if ended_by_shutdown.load(Ordering::Relaxed) {
+            yield Ok(ApiRequest::format_failure_event("server_error", "the server is stopping", &response_id, &model_id, sent));
+            return;
+        }
+        log_tool_calls(request_id, tool_call_count);
+        yield Ok(format_done_event::<ApiRequest>());
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .expect("a valid response")
 }
 
 /// Collects the whole response before it answers.
@@ -1451,6 +1611,47 @@ mod tests {
         assert_eq!(prepared.describe_thinking(), "thinking off");
     }
 
+    #[test]
+    fn each_api_ends_a_failed_stream_with_its_own_event() {
+        let chat = ChatCompletionRequest::format_failure_event(
+            "invalid_request_error",
+            "too long",
+            "chatcmpl-1",
+            "m",
+            3,
+        );
+        let data = chat.strip_prefix("data: ").expect("a data line");
+        let v: Value = serde_json::from_str(data.trim_end()).unwrap();
+        assert_eq!(v["error"]["message"], "too long");
+
+        let event = ResponsesRequest::format_failure_event(
+            "invalid_request_error",
+            "too long",
+            "resp_1",
+            "m",
+            3,
+        );
+        let (name, data) = event.split_once('\n').expect("two lines");
+        assert_eq!(name, "event: response.failed");
+        let v: Value =
+            serde_json::from_str(data.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        assert_eq!(v["type"], "response.failed");
+        assert_eq!(v["sequence_number"], 3);
+        assert_eq!(v["response"]["id"], "resp_1");
+        assert_eq!(v["response"]["status"], "failed");
+        assert_eq!(v["response"]["error"]["message"], "too long");
+        assert!(event.ends_with("\n\n"));
+        assert_eq!(
+            format_done_event::<ResponsesRequest>(),
+            "",
+            "Responses streams end without [DONE]"
+        );
+        assert_eq!(
+            format_done_event::<ChatCompletionRequest>(),
+            "data: [DONE]\n\n"
+        );
+    }
+
     /// Runs worker events through deepseek-recipe's stream processor as
     /// Responses events.
     /// The test uses the checkpoint's tokenizer.
@@ -1518,6 +1719,8 @@ mod tests {
             done["usage"]["input_tokens_details"]["cached_tokens"], 4,
             "{done}"
         );
+        let sse = format_server_sent_event::<ResponsesRequest>(&events[0]).unwrap();
+        assert!(sse.starts_with("event: response.created\ndata: {"), "{sse}");
         // the sequence numbers count the events
         for (i, e) in json.iter().enumerate() {
             assert_eq!(e["sequence_number"], i, "{e}");
@@ -1717,5 +1920,109 @@ mod tests {
             count_test_tool_calls::<ResponsesRequest>(responses, Api::Responses, ids, tokenizer)
                 .await;
         assert_eq!(calls, 1);
+    }
+
+    /// Streams a response of the worker's events.
+    /// A keepalive comment goes out before the first event.
+    /// The done event ends the stream.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn a_stream_sends_a_keepalive_then_the_chunks_and_the_done_event() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let request = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let prepared =
+            prepare_test_request(&request, Api::ChatCompletions, tokenizer).expect("prepared");
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = worker::CancelGuard::new_unsubmitted(1);
+        // With a keepalive of 0, the body's first part finds no event yet.
+        let response = stream_response(prepared, cancel, receiver, Duration::ZERO);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let mut parts = response.into_body().into_data_stream();
+        let keepalive = parts.next().await.expect("a part").expect("bytes");
+        assert_eq!(keepalive, ": waiting\n\n");
+        for event in build_test_answer(tokenizer) {
+            events.send(event).expect("an open channel");
+        }
+        let mut text = String::new();
+        while let Some(part) = parts.next().await {
+            text.push_str(std::str::from_utf8(&part.expect("bytes")).expect("UTF-8"));
+        }
+        let data: Vec<&str> = text
+            .split_terminator("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.last(), Some(&"[DONE]"), "{text}");
+        let content: String = data[..data.len() - 1]
+            .iter()
+            .map(|chunk| serde_json::from_str::<Value>(chunk).expect("a chunk"))
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(content, "Hi there!");
+    }
+
+    /// Ends each stream with its API's failure event when the worker fails or
+    /// the server stops.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn a_stream_ends_with_a_failure_event_when_the_worker_fails() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let stream = async |api, request: &Value, events| {
+            let prepared = prepare_test_request(request, api, tokenizer).expect("prepared");
+            let cancel = worker::CancelGuard::new_unsubmitted(1);
+            let response =
+                stream_response(prepared, cancel, queue_test_events(events), Duration::ZERO);
+            read_response(response).await.1
+        };
+        let chat = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let text = stream(
+            Api::ChatCompletions,
+            &chat,
+            vec![Event::Failed("no memory".into())],
+        )
+        .await;
+        let failure = format_error_json("server_error", "no memory");
+        assert_eq!(text, format!("data: {failure}\n\ndata: [DONE]\n\n"));
+        let responses = json!({"input": "hi", "stream": true});
+        let text = stream(
+            Api::Responses,
+            &responses,
+            vec![Event::Refused("too long".into())],
+        )
+        .await;
+        assert!(
+            text.starts_with("event: response.failed\ndata: {"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"too long\"") && !text.contains("[DONE]"),
+            "{text}"
+        );
+        let started = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let stopped = Event::Done {
+            reason: FinishReason::ServerStop,
+        };
+        let text = stream(Api::ChatCompletions, &chat, vec![started, stopped]).await;
+        let failure = format_error_json("server_error", "the server is stopping");
+        assert!(text.ends_with(&format!("data: {failure}\n\n")), "{text}");
     }
 }
