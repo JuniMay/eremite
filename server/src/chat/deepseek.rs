@@ -724,6 +724,8 @@ type Chunk<ApiRequest> =
 trait ApiOutput: ProtocolRequest {
     /// Generates a new response id with the API's prefix.
     fn generate_response_id() -> String;
+    /// Returns whether to send `chunk` to the client.
+    fn should_send(chunk: &Chunk<Self>) -> bool;
     /// Counts the tool calls that `chunk` starts.
     fn count_started_tool_calls(chunk: &Chunk<Self>) -> usize;
 }
@@ -731,6 +733,20 @@ trait ApiOutput: ProtocolRequest {
 impl ApiOutput for ChatCompletionRequest {
     fn generate_response_id() -> String {
         generate_random_id("chatcmpl-")
+    }
+
+    /// Returns false for a chunk without usage whose choices only add empty
+    /// content.
+    /// The end token's chunk is one such chunk. It only adds to the usage.
+    fn should_send(chunk: &ChatCompletionChunk) -> bool {
+        matches!(chunk.usage, Some(Some(_)))
+            || !chunk.choices.iter().all(|choice| {
+                choice.finish_reason.is_none()
+                    && choice.delta.role.is_none()
+                    && choice.delta.tool_calls.is_none()
+                    && matches!(&choice.delta.content, Some(Some(s)) if s.is_empty())
+                    && matches!(&choice.delta.reasoning_content, None | Some(None))
+            })
     }
 
     fn count_started_tool_calls(chunk: &ChatCompletionChunk) -> usize {
@@ -747,6 +763,10 @@ impl ApiOutput for ChatCompletionRequest {
 impl ApiOutput for ResponsesRequest {
     fn generate_response_id() -> String {
         generate_random_id("resp_")
+    }
+
+    fn should_send(_: &ResponsesStreamEvent) -> bool {
+        true
     }
 
     fn count_started_tool_calls(chunk: &ResponsesStreamEvent) -> usize {
@@ -772,6 +792,7 @@ fn read_unix_time() -> u64 {
 
 /// Converts the worker's events into the API's chunks with deepseek-recipe's
 /// stream processor.
+/// Drops the chunks that the API does not send.
 /// Also returns `ended_by_shutdown`.
 /// It is set when the server's shutdown ended the chunks.
 fn convert_events_to_api_chunks<ApiRequest: ApiOutput>(
@@ -798,6 +819,7 @@ where
             events,
             ended_by_shutdown.clone(),
         ))
+        .filter(|c| c.as_ref().map_or(true, ApiRequest::should_send))
         .map(|c| c.map_err(|e| e.to_string()));
     (chunks, ended_by_shutdown)
 }
@@ -1110,6 +1132,97 @@ mod tests {
         assert!(prepare_test_request(&not_an_object, Api::ChatCompletions, tokenizer).is_err());
     }
 
+    /// Runs worker events through deepseek-recipe's stream processor as chat
+    /// completion chunks.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn worker_events_become_chat_completion_chunks() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let think: Vec<u32> = tokenizer
+            .tokenize("Hmm.")
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        let answer: Vec<u32> = tokenizer
+            .tokenize("Hi there! 你好")
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        let request = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let r =
+            render_request(root, &build_test_defaults(), Api::ChatCompletions).expect("rendered");
+        // the reasoning and </think> in one step, then the answer token by
+        // token
+        let mut ids = think.clone();
+        ids.push(THINK_END_TOKEN);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Event::Tokens(ids.clone())).unwrap();
+        for &t in &answer {
+            tx.send(Event::Tokens(vec![t])).unwrap();
+        }
+        tx.send(Event::Done {
+            reason: FinishReason::StopToken,
+        })
+        .unwrap();
+        let first = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let (chunks, ended_by_shutdown) = convert_events_to_api_chunks::<ChatCompletionRequest>(
+            r.converted_request,
+            "chatcmpl-test".into(),
+            DEFAULT_MODEL_ID.into(),
+            tokenizer,
+            first,
+            rx,
+        );
+        let chunks: Vec<ChatCompletionChunk> = chunks.map(|c| c.expect("a chunk")).collect().await;
+        assert!(!ended_by_shutdown.load(Ordering::Relaxed));
+        let text = |f: fn(&ChatCompletionChunk) -> Option<String>| {
+            chunks.iter().filter_map(f).collect::<String>()
+        };
+        let reasoning = text(|c| c.choices.first()?.delta.reasoning_content.clone().flatten());
+        let content = text(|c| c.choices.first()?.delta.content.clone().flatten());
+        assert_eq!(reasoning, "Hmm.");
+        assert_eq!(content, "Hi there! 你好");
+        let last = serde_json::to_value(chunks.last().unwrap()).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "stop", "{last}");
+        assert_eq!(last["usage"]["prompt_tokens"], 10);
+        assert_eq!(last["usage"]["prompt_cache_hit_tokens"], 4);
+        // The completion counts the tokens of `ids` and `answer`, and the end
+        // token.
+        assert_eq!(
+            last["usage"]["completion_tokens"],
+            ids.len() + answer.len() + 1
+        );
+        let empty = chunks[1..chunks.len() - 1]
+            .iter()
+            .filter(|c| {
+                c.choices
+                    .first()
+                    .is_some_and(|c| c.delta.content == Some(Some(String::new())))
+            })
+            .count();
+        let all: Vec<String> = chunks
+            .iter()
+            .map(|c| serde_json::to_string(c).unwrap())
+            .collect();
+        assert_eq!(
+            empty,
+            0,
+            "no empty deltas before the last chunk:\n{}",
+            all.join("\n")
+        );
+    }
+
     /// Rewrites the Responses request `request` with the tests' defaults.
     /// Returns the rewritten object and the settings, or the request's error.
     fn rewrite_responses_json(
@@ -1336,6 +1449,79 @@ mod tests {
         );
         assert_eq!(counts, (1, 1, 1));
         assert_eq!(prepared.describe_thinking(), "thinking off");
+    }
+
+    /// Runs worker events through deepseek-recipe's stream processor as
+    /// Responses events.
+    /// The test uses the checkpoint's tokenizer.
+    /// EREMITE_CHECKPOINT names its directory.
+    /// Without EREMITE_CHECKPOINT, the test returns at once without checking.
+    #[tokio::test]
+    async fn worker_events_become_responses_events() {
+        let Ok(dir) = std::env::var("EREMITE_CHECKPOINT") else {
+            return;
+        };
+        let tokenizer = engine::Tokenizer::open(&dir, Some(IMAGE_TOKEN));
+        let tokens =
+            |s: &str| -> Vec<u32> { tokenizer.tokenize(s).iter().map(|&t| t as u32).collect() };
+        let request = json!({"input": "hi", "stream": true});
+        let Value::Object(root) = request else {
+            unreachable!()
+        };
+        let r = render_request(root, &build_test_defaults(), Api::Responses).expect("rendered");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ids = tokens("Hmm.");
+        ids.push(THINK_END_TOKEN);
+        tx.send(Event::Tokens(ids)).unwrap();
+        for t in tokens("Hi there! 你好") {
+            tx.send(Event::Tokens(vec![t])).unwrap();
+        }
+        tx.send(Event::Done {
+            reason: FinishReason::StopToken,
+        })
+        .unwrap();
+        let first = Event::DecodingStarted {
+            prompt_tokens: 10,
+            reused_tokens: 4,
+        };
+        let (events, ended_by_shutdown) = convert_events_to_api_chunks::<ResponsesRequest>(
+            r.converted_request,
+            "resp_1".into(),
+            DEFAULT_MODEL_ID.into(),
+            tokenizer,
+            first,
+            rx,
+        );
+        let events: Vec<ResponsesStreamEvent> =
+            events.map(|e| e.expect("an event")).collect().await;
+        assert!(!ended_by_shutdown.load(Ordering::Relaxed));
+        let json: Vec<Value> = events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+        let types: Vec<&str> = json.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types.first(), Some(&"response.created"), "{types:?}");
+        assert_eq!(types.last(), Some(&"response.completed"), "{types:?}");
+        let text = |kind: &str| -> String {
+            json.iter()
+                .filter(|e| e["type"] == kind)
+                .filter_map(|e| e["delta"].as_str())
+                .collect()
+        };
+        assert_eq!(text("response.reasoning_text.delta"), "Hmm.");
+        assert_eq!(text("response.output_text.delta"), "Hi there! 你好");
+        let done = &json.last().unwrap()["response"];
+        assert_eq!(done["id"], "resp_1");
+        assert_eq!(done["model"], DEFAULT_MODEL_ID);
+        assert_eq!(done["usage"]["input_tokens"], 10, "{done}");
+        assert_eq!(
+            done["usage"]["input_tokens_details"]["cached_tokens"], 4,
+            "{done}"
+        );
+        // the sequence numbers count the events
+        for (i, e) in json.iter().enumerate() {
+            assert_eq!(e["sequence_number"], i, "{e}");
+        }
     }
 
     /// Builds the worker's events of a short answer.
