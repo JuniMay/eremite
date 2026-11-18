@@ -28,6 +28,10 @@ const MAX_COUNT: f64 = 65536.0;
 /// The most seconds that a time setting takes. The reason for this value is
 /// unknown.
 const MAX_SECONDS: f64 = 1e6;
+/// The most context-copy proposals of one pass: a verify pass takes its token
+/// and up to 15 more rows. A model's lookup gives up to this many unless its
+/// entry says otherwise.
+const MOST_LOOKUP_PROPOSALS: i32 = 15;
 
 /// One model's settings.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,14 +49,16 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Creates the settings of the model in the directory `model`. The context
-    /// holds the most tokens, and the state cache keeps up to 256 of its
-    /// states. No other option is set.
+    /// holds the most tokens, the context lookup gives up to the most
+    /// proposals per pass, and the state cache keeps up to 256 of its states.
+    /// No other option is set.
     pub fn new(model: &str) -> ModelConfig {
         ModelConfig {
             id: None,
             engine: engine::Options {
                 model: model.into(),
                 ctx: MAX_CONTEXT_TOKENS,
+                lookup: MOST_LOOKUP_PROPOSALS,
                 ..Default::default()
             },
             idle_unload: None,
@@ -980,5 +986,17 @@ mod tests {
                 .ced,
             0
         );
+    }
+
+    #[test]
+    fn lookup_gives_the_most_proposals_unless_the_entry_says_otherwise() {
+        let lookup = |model: Value| {
+            parse(&json!({"models": [model]})).unwrap().models[0]
+                .engine
+                .lookup
+        };
+        assert_eq!(lookup(json!({"model": "/m"})), 15);
+        assert_eq!(lookup(json!({"model": "/m", "lookup": "off"})), 0);
+        assert_eq!(lookup(json!({"model": "/m", "lookup": 4})), 4);
     }
 }

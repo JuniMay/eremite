@@ -49,14 +49,18 @@ const DECODING_REQUESTS: usize = 4;
 /// takes less than 20 s.
 const DECODING_TOKENS: u32 = 500;
 
+/// The positions of a layer's ring: the window's 128 and the rewind margin of
+/// 15, with the default lookup's 15 proposals.
+const RING_POSITIONS: usize = 143;
+
 /// Returns at least the rows that an exact replay at `k` computes again, on
 /// average per layer (the cache's cost of a replay, eremite_replay_rows). Layer
-/// 39 starts a ring before `k`: 136 positions, the window and the rewind margin
-/// of 8, with the default lookup. Each layer below starts at most 128
-/// positions earlier: 127, plus a ratio-2 compressor's pair.
+/// 39 starts a ring before `k`, or one position earlier for a ratio-2
+/// compressor's pair. Each layer below starts at most 128 positions earlier:
+/// 127, plus a pair.
 fn replay_rows(k: usize) -> usize {
     (0..40)
-        .map(|layer| k.min(137 + 128 * layer))
+        .map(|layer| k.min(RING_POSITIONS + 1 + 128 * layer))
         .sum::<usize>()
         .div_ceil(40)
 }
@@ -64,7 +68,7 @@ fn replay_rows(k: usize) -> usize {
 /// Returns what a bounded replay at `k` computes again (ced): a ring's
 /// positions.
 fn bounded_rows(k: usize) -> usize {
-    k.min(136)
+    k.min(RING_POSITIONS)
 }
 
 /// What the tests run: the checkpoint, its experts, and the server's and the
@@ -993,7 +997,9 @@ fn the_status_follows_a_running_prefill() {
 /// A generation that takes its state past the room it started with (16,384
 /// positions) gets that growth counted before the state grows. So an idle state
 /// goes then, not after the generation. The model's states stay within their
-/// room all along.
+/// room all along. The idle conversation ends more than the rewind margin (15
+/// positions, with the default lookup) after the tokens that it shares with
+/// the long prompt. So the long prompt does not continue it in place.
 #[test]
 fn a_growing_generation_frees_room_before_it_grows() {
     let Some(setup) = setup() else {
@@ -1001,7 +1007,11 @@ fn a_growing_generation_frees_room_before_it_grows() {
         return;
     };
     let _one = one_model();
-    let short = short_prompt();
+    let short = json!([
+        {"role": "system", "content": "You answer in one word: the name of a color, in lower \
+                                       case, with no period and no other word."},
+        {"role": "user", "content": "Name a color."}
+    ]);
     let (long, count) = sized_prompt(&setup, 16_330, 16_376);
     let body = request(&long, (16_384 - count + 150) as u32);
     // Leaves the short conversation's state idle, then sends the long request

@@ -93,12 +93,15 @@ fn drafts_and_proposals_keep_the_greedy_reply() {
     let messages = json!([{"role": "user", "content":
         "Copy this text twice, exactly, and write nothing else:\n\nThe engine thread runs every \
          model's calls. A stream holds the buffers of one call, and the worker reuses it."}]);
-    let plain = reply(&start_server(&checkpoint, json!({})), &messages);
+    let plain = reply(
+        &start_server(&checkpoint, json!({"lookup": "off"})),
+        &messages,
+    );
     let lookup = start_server(&checkpoint, json!({"lookup": 15}));
     let with_lookup = reply(&lookup, &messages);
     let proposals = read_line(&lookup, "context lookup");
     drop(lookup);
-    let drafts = start_server(&checkpoint, json!({"draft": 2}));
+    let drafts = start_server(&checkpoint, json!({"draft": 2, "lookup": "off"}));
     let with_drafts = reply(&drafts, &messages);
     let drafted = read_line(&drafts, "draft passes");
     drop(drafts);
