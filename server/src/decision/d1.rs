@@ -319,13 +319,21 @@ fn write_python_json(out: &mut String, value: &Value, depth: usize) {
     }
 }
 
+/// Returns `value` as Python's json.dumps writes it with indent=2 and
+/// ensure_ascii=False.
+pub fn format_python_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_python_json(&mut out, value, 0);
+    out
+}
+
 /// Returns the state as the block before the first question: its text, or
 /// its JSON, then a blank line.
 fn write_state_block(state: &State) -> String {
     let mut out = String::new();
     match state {
         State::Text(text) => out.push_str(text),
-        State::Json(value) => write_python_json(&mut out, value, 0),
+        State::Json(value) => out.push_str(&format_python_json(value)),
     }
     out.push_str("\n\n");
     out
