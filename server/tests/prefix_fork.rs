@@ -12,7 +12,7 @@
 //! Without ced, each fork must give the tokens that the same prompt gives a
 //! server that starts without a cache. With ced, forks are approximate by
 //! design: the replay is bounded to a ring, and their tokens are printed. The
-//! other cache tests check the cache's budget (state_cache).
+//! other cache tests check a model's state room.
 //!
 //! A growing generation frees room in the cache before it grows. A session
 //! stays while its idle model unloads (idle_unload).
@@ -160,7 +160,7 @@ fn start_server_with(setup: &Setup, server: Value, model: Value) -> Server {
     );
     // No saved states: a cold server stays cold, and nothing is written to the
     // SSD.
-    let mut settings = json!({"memory": 56, "state_cache": 8, "state_disk": 0});
+    let mut settings = json!({"memory": 56, "state_disk": 0});
     add_keys(&mut settings, server);
     let mut model_settings = json!({"ctx": 32768});
     add_keys(&mut model_settings, model);
@@ -720,13 +720,13 @@ fn a_prompt_with_an_image_that_does_not_fit_is_refused_with_its_token_count() {
     );
 }
 
-// ---- the cache's budget (state_cache) ----
+// ---- a model's state room ----
 
 /// What the model's status tells of the cache.
 struct Status {
     /// The GiB that the cache counts.
     states: f64,
-    /// The GiB that the cache allows.
+    /// The GiB that the model's states may take: its state room.
     limit: f64,
     /// What the model does.
     phase: String,
@@ -763,6 +763,17 @@ fn settled(server: &Server, requests: i64) -> Status {
     read_status(&server.settled(requests))
 }
 
+/// The bytes in one GiB.
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Returns the GiB that a full prompt pass of the server's loaded model needs,
+/// as its status tells it. A model whose own memory is that much above a room
+/// has that room for its states.
+fn required_gib(server: &Server) -> f64 {
+    let required = server.status()["own_memory"]["required"].as_f64();
+    required.expect("the memory that a full prompt pass needs") / GIB
+}
+
 /// Returns a short conversation with a one-word answer.
 fn short_prompt() -> Value {
     json!([{"role": "system", "content": "You answer in one word."},
@@ -771,7 +782,7 @@ fn short_prompt() -> Value {
 
 /// A retry of a saved prompt resumes at its prompt end from the snapshot there.
 /// It takes no snapshot of its own. So it fits a cache that the first try
-/// filled to within less than a snapshot (5.3 MiB) of state_cache.
+/// filled to within less than a snapshot (5.3 MiB) of its state room.
 #[test]
 fn a_saved_prompt_again_fits_a_full_state_cache() {
     let Some(setup) = setup() else {
@@ -782,18 +793,18 @@ fn a_saved_prompt_again_fits_a_full_state_cache() {
     let prompt = short_prompt();
     let count = tokens(&setup, &prompt).len() as i64;
     // What the first try takes: its state and its prompt-end snapshot.
-    let first = {
+    let (first, required) = {
         let server = start_server(&setup);
         chat(&server, &request(&prompt, 1));
-        settled(&server, 1).states
+        (settled(&server, 1).states, required_gib(&server))
     };
     let limit = first + 2.0 / 1024.0;
-    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
+    let server = start_server_with(&setup, json!({}), json!({"memory": required + limit}));
     chat(&server, &request(&prompt, 1));
     let again = chat(&server, &request(&prompt, 1));
     let cache = settled(&server, 2);
     println!(
-        "saved prompt again: the first try took {first:.3} GiB, state_cache {limit}; the retry reused {} of {count}; the cache takes {:.3} GiB",
+        "saved prompt again: the first try took {first:.3} GiB, a state room of {limit} GiB; the retry reused {} of {count}; the cache takes {:.3} GiB",
         hit(&again),
         cache.states
     );
@@ -830,19 +841,19 @@ fn a_prompt_runs_in_place_of_the_state_whose_reuse_does_not_fit() {
     let second = cut("src/model/model.h", "What does a model family fill in?");
     // What the first conversation takes alone: its state and its prompt-end
     // snapshot.
-    let one = {
+    let (one, required) = {
         let server = start_server(&setup);
         chat(&server, &request(&first, 8));
-        settled(&server, 1).states
+        (settled(&server, 1).states, required_gib(&server))
     };
     // Room for one such state, not two.
     let limit = one * 1.5;
-    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
+    let server = start_server_with(&setup, json!({}), json!({"memory": required + limit}));
     chat(&server, &request(&first, 8));
     let answer = chat(&server, &request(&second, 8));
     let cache = settled(&server, 2);
     println!(
-        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, state_cache {limit}; \
+        "a prompt beside a state it cannot keep: one state takes {one:.3} GiB, a state room of {limit} GiB; \
          the second reused {} tokens; the cache holds states of {:?} positions in {:.3} GiB",
         hit(&answer),
         cache.sessions,
@@ -981,8 +992,8 @@ fn the_status_follows_a_running_prefill() {
 
 /// A generation that takes its state past the room it started with (16,384
 /// positions) gets that growth counted before the state grows. So an idle state
-/// goes then, not after the generation. The cache stays within state_cache
-/// all along.
+/// goes then, not after the generation. The model's states stay within their
+/// room all along.
 #[test]
 fn a_growing_generation_frees_room_before_it_grows() {
     let Some(setup) = setup() else {
@@ -1021,7 +1032,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
     };
     // With no limit, the idle state stays beside the long one: the cache's
     // largest size while the long one decodes, with its growth counted.
-    let (idle, both) = {
+    let (idle, both, required) = {
         let server = start_server(&setup);
         let (idle, _, samples) = run(&server);
         let both = samples
@@ -1029,13 +1040,13 @@ fn a_growing_generation_frees_room_before_it_grows() {
             .filter(|sample| sample.phase == "decode")
             .map(|sample| sample.states)
             .fold(0.0, f64::max);
-        (idle, both)
+        (idle, both, required_gib(&server))
     };
     // Room for the idle state, the long state as it starts (its first room, as
     // the idle one's) and half of the long state's growth.
     let growth = both - 2.0 * idle;
     let limit = 2.0 * idle + growth / 2.0;
-    let server = start_server_with(&setup, json!({"state_cache": limit}), json!({}));
+    let server = start_server_with(&setup, json!({}), json!({"memory": required + limit}));
     let (_, generated, samples) = run(&server);
     // Samples published after the long state grew: it holds more than 16,384
     // positions.
@@ -1051,7 +1062,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
         .count();
     println!(
         "growing generation: {count} prompt tokens, {generated} generated; with no limit the idle state took {idle:.4} GiB \
-         and both {both:.4} GiB, a growth of {growth:.4} GiB; state_cache {limit}; {} samples, {} while decoding past \
+         and both {both:.4} GiB, a growth of {growth:.4} GiB; a state room of {limit} GiB; {} samples, {} while decoding past \
          16,384 positions, of which {} with the idle state still kept; {over} over the limit",
         samples.len(),
         grown.len(),
@@ -1077,7 +1088,7 @@ fn a_growing_generation_frees_room_before_it_grows() {
         grown.iter().all(|sample| sample.sessions.len() == 1),
         "the idle state stayed while the generation grew past its room"
     );
-    assert_eq!(over, 0, "the cache took more than state_cache");
+    assert_eq!(over, 0, "the states took more than their room");
 }
 
 /// Quitting stops a long prompt's prefill. SIGTERM 5 s into the prefill of

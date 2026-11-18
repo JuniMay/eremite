@@ -103,11 +103,17 @@ impl ModelConfig {
             }
             "prefill_prune" => options.deepseek_mut()?.prefill_prune = Some(switch()?),
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
-            "memory"
-            | "reserve"
+            "memory" => {
+                options.memory_gb = value
+                    .as_f64()
+                    .filter(|gib| (0.0..=MAX_MEMORY_GIB).contains(gib))
+                    .ok_or(format!(
+                        "memory takes 0 (none) or a GiB limit up to {MAX_MEMORY_GIB}"
+                    ))?
+            }
+            "reserve"
             | "gpu_timeout"
             | "progress_log"
-            | "state_cache"
             | "state_disk"
             | "state_disk_tokens"
             | "max_waiting_requests"
@@ -337,9 +343,6 @@ pub struct Budgets {
     /// The seconds between a decoding request's progress lines in the log; 0:
     /// none.
     pub progress_log_s: f64,
-    /// The GiB of states and snapshots that the state cache keeps for each
-    /// model.
-    pub state_cache_gb: f64,
     /// The seconds without requests before a model unloads; 0: never. A model's
     /// own idle_unload setting overrides it.
     pub idle_unload_s: f64,
@@ -364,7 +367,6 @@ impl Default for Budgets {
             reserve_gb: 10.0,
             gpu_timeout_s: 60.0,
             progress_log_s: 10.0,
-            state_cache_gb: 8.0,
             idle_unload_s: 600.0,
             state_disk_gb: 32.0,
             state_disk_tokens: 8192,
@@ -408,14 +410,6 @@ impl Budgets {
             "progress_log" => {
                 return Err(format!(
                     "progress_log takes 0 (none) to {MAX_SECONDS} seconds"
-                ));
-            }
-            "state_cache" if number > 0.0 && number <= MAX_MEMORY_GIB => {
-                self.state_cache_gb = number
-            }
-            "state_cache" => {
-                return Err(format!(
-                    "state_cache takes a positive budget up to {MAX_MEMORY_GIB} GiB"
                 ));
             }
             "state_disk" if (0.0..=MAX_STATE_DISK_GIB).contains(&number) => {
@@ -508,7 +502,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "reserve",
             "gpu_timeout",
             "progress_log",
-            "state_cache",
             "state_disk",
             "state_disk_tokens",
             "max_waiting_requests",
@@ -543,7 +536,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "reserve",
         "gpu_timeout",
         "progress_log",
-        "state_cache",
         "state_disk",
         "state_disk_tokens",
         "max_waiting_requests",
@@ -688,42 +680,33 @@ mod tests {
     }
 
     #[test]
-    fn model_memory_is_global_and_separate_from_states() {
-        let root = json!({"memory": 64, "reserve": 10, "state_cache": 12, "models": [
-            {"model": "/models/deepseek"}, {"model": "/models/second"}
-        ]});
-        assert!(
-            parse(&root).is_ok(),
-            "one model-memory budget must serve every architecture"
+    fn memory_limits_all_models_and_each_model_can_have_its_own() {
+        let config = parse(&json!({"memory": 64, "reserve": 10, "models": [
+            {"model": "/models/deepseek", "memory": 40}, {"model": "/models/second"}
+        ]}))
+        .unwrap();
+        assert_eq!(config.budgets.memory_gb, 64.0);
+        assert_eq!(
+            (
+                config.models[0].engine.memory_gb,
+                config.models[1].engine.memory_gb
+            ),
+            (40.0, 0.0)
         );
-        for key in ["cache", "memory"] {
-            let nested = json!({"models": [{"model": "/models/any-model", key: 32}]});
-            assert!(
-                parse(&nested).is_err(),
-                "{key} must not create a per-model memory budget"
-            );
+        for bad in [json!(-1), json!(2048), json!("all")] {
+            let entry = json!({"models": [{"model": "/models/any-model", "memory": bad}]});
+            assert!(parse(&entry).is_err(), "memory {bad}");
         }
+        let cache = json!({"models": [{"model": "/models/any-model", "cache": 32}]});
+        assert!(parse(&cache).is_err());
     }
 
     #[test]
-    fn reserve_and_state_cache_are_server_wide() {
-        let root = json!({"memory": 56, "reserve": 10, "state_cache": 12, "models": [
-            {"model": "/models/deepseek"}, {"model": "/models/second"}
-        ]});
-        assert!(
-            parse(&root).is_ok(),
-            "one reserve and one state budget must cover every model"
-        );
-    }
-
-    #[test]
-    fn model_entries_cannot_create_separate_memory_budgets() {
+    fn model_entries_cannot_set_server_wide_settings() {
         for setting in [
-            "memory",
             "reserve",
             "gpu_timeout",
             "progress_log",
-            "state_cache",
             "http_timeout",
             "keepalive",
             "search_timeout",
@@ -828,8 +811,8 @@ mod tests {
 
     #[test]
     fn a_file_gives_each_model_its_own_options() {
-        let config = parse(&json!({"memory": 72, "state_cache": 16, "models": [
-            {"model": "/m/deepseek", "ced": 128},
+        let config = parse(&json!({"memory": 72, "models": [
+            {"model": "/m/deepseek", "ced": 128, "max_cached_states": 32},
             {"model": "/m/small", "id": "small", "draft": 1, "ctx": 32768}
         ]}))
         .unwrap();
@@ -841,10 +824,11 @@ mod tests {
                 deepseek.engine.model.as_str(),
                 config.budgets.memory_gb,
                 deepseek.engine.deepseek().unwrap().ced,
-                config.budgets.state_cache_gb
+                deepseek.max_cached_states
             ),
-            ("/m/deepseek", 72.0, 128, 16.0)
+            ("/m/deepseek", 72.0, 128, 32)
         );
+        assert_eq!(small.max_cached_states, 256);
         assert_eq!((deepseek.engine.draft, deepseek.id.as_deref()), (0, None));
         assert_eq!(
             (small.id.as_deref(), small.engine.draft, small.engine.ctx),

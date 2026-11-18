@@ -937,6 +937,12 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "committed": stats.model_memory_committed,
             "peak": stats.model_memory_peak,
         },
+        "own_memory": {
+            "limit": stats.own_memory_limit,
+            "counted": stats.own_memory_counted,
+            "states": stats.own_state_bytes,
+            "required": stats.required_bytes,
+        },
         "totals": {
             "requests": status.total_requests,
             "prompt_tokens": status.total_prompt_tokens,
@@ -1662,11 +1668,14 @@ impl Worker {
         let limits = models
             .iter()
             .map(|worker_model| ModelLimits {
-                bytes: (shared.budgets.state_cache_gb * GIB) as u64,
+                bytes: 0,
                 states: worker_model.settings.max_cached_states,
             })
             .collect();
         let mut states = States::new(limits, shared.budgets.snapshot_interval);
+        for worker_model in &models {
+            worker_model.update_state_room(&mut states);
+        }
         if let Some(dir) = state_dir {
             Self::open_store(&mut states, &models, &shared.budgets, &dir);
         }
@@ -2017,7 +2026,8 @@ impl Worker {
     /// requests. It frees the models' idle memory, then their idle states, down
     /// to the target. If more memory than the target is still in use, the yield
     /// fails and the models restart. Otherwise the lower limit takes effect. A
-    /// resume restores the configured limit and restarts the models.
+    /// resume restores the configured limit and restarts the models. Each
+    /// model's state room then follows the limit.
     fn run_control_action(&mut self, action: Action) {
         let shared = self.shared.clone();
         let _long = LongOperation::start(&shared);
@@ -2088,6 +2098,10 @@ impl Worker {
                     });
                 engine::log("resumed: the configured memory limit holds again");
             }
+        }
+        // Each model's state room follows the limit.
+        for worker_model in &self.models {
+            worker_model.update_state_room(&mut self.states);
         }
         engine::refresh_stats();
         self.states.publish_states(&self.shared);
@@ -2301,10 +2315,24 @@ impl WorkerModel {
             )
     }
 
+    /// Sets the model's byte limit in the state cache to its state room: the
+    /// part of its own memory limit, or else of the memory limit now, that a
+    /// full prompt pass leaves to its states. Before the model's first load, a
+    /// full prompt pass's memory is unknown, and the room is the whole limit.
+    fn update_state_room(&self, states: &mut States) {
+        let stats = self.model.read_stats();
+        let limit = match stats.own_memory_limit {
+            0 => stats.model_memory_limit,
+            own => own.min(stats.model_memory_limit),
+        };
+        states.cache.limits[self.model_index].bytes = limit.saturating_sub(stats.required_bytes);
+    }
+
     /// Runs one step of the model. Admitted requests start, one at a time after
     /// the prefills before them. One prefill call starts. The generations that
     /// are done end. The others start decoding calls.
     fn run_step(&mut self, shared: &Shared, admitted: Vec<Job>, states: &mut States) {
+        self.update_state_room(states);
         self.admitted.extend(admitted);
         // A request plans its prefill only after the prefills before it have
         // ended. It can then resume from their states. So one request at a time
@@ -2345,6 +2373,7 @@ impl WorkerModel {
                 lock(&shared.models[self.model_index].status).load_error = None;
                 self.last_used_at = Instant::now();
                 self.experts_per_row = self.model.read_stats().experts_per_row.max(0) as usize;
+                self.update_state_room(states);
                 if !was_loaded && self.model.is_loaded() {
                     self.log_line(&format!(
                         "{}: loaded; its states may take {:.1} GiB",

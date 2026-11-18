@@ -26,7 +26,7 @@ impl Home {
         let folder = dir.join(".config/eremite");
         std::fs::create_dir_all(&folder).unwrap();
         let config = json!({"port": 8008, "host": "127.0.0.1", "api_key_file": "/dev/null",
-                            "reserve": 10, "state_cache": 8, "models": [{"model": "unused-model"}]});
+                            "reserve": 10, "models": [{"model": "unused-model"}]});
         std::fs::write(folder.join("server.json"), config.to_string()).unwrap();
         Home(dir)
     }

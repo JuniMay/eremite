@@ -88,13 +88,14 @@ impl Drop for Folder {
 /// Starts a server of the checkpoint with saved states in `dir`, or none
 /// without it. The states are written for 256 tokens of their own.
 fn start_server(setup: &Setup, dir: Option<&Folder>) -> Server {
-    start_server_with(setup, dir, json!({}))
+    start_server_with(setup, dir, json!({}), json!({}))
 }
 
 /// Starts a server of the checkpoint with saved states in `dir`, or none
-/// without it, and with the server-wide settings `server` in place of those of
-/// the same keys. The states are written for 256 tokens of their own.
-fn start_server_with(setup: &Setup, dir: Option<&Folder>, server: Value) -> Server {
+/// without it, and with the server-wide settings `server` and the model's
+/// settings `model` in place of those of the same keys. The states are written
+/// for 256 tokens of their own.
+fn start_server_with(setup: &Setup, dir: Option<&Folder>, server: Value, model: Value) -> Server {
     let port = TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("a free port")
@@ -105,12 +106,14 @@ fn start_server_with(setup: &Setup, dir: Option<&Folder>, server: Value) -> Serv
         None => json!({"memory": 56, "state_disk": 0}),
     };
     add_keys(&mut settings, server);
+    let mut model_settings = json!({"ctx": 32768});
+    add_keys(&mut model_settings, model);
     let config = build_config(
         port,
         settings,
         &setup.checkpoint,
         setup.experts.as_deref(),
-        json!({"ctx": 32768}),
+        model_settings,
     );
     Server::start(&setup.server, &config, &key, port)
 }
@@ -202,21 +205,33 @@ fn an_evicted_state_continues_from_the_ssd_as_from_memory() {
         "What does a model family fill in?",
     );
     // The reference: the state stays in memory.
-    let (first, next, then, room) = {
+    let (first, next, then, room, required) = {
         let server = start_server(&setup, None);
         let first = chat(&server, &first_conversation, 24);
         let room = server.settled(1)["state_cache_gib"]
             .as_f64()
             .expect("the cache's size");
+        // What a full prompt pass of the loaded model needs, in GiB.
+        let required = server.status()["own_memory"]["required"]
+            .as_f64()
+            .expect("the memory that a full prompt pass needs")
+            / (1u64 << 30) as f64;
         let next = continued(&first_conversation, &first, "And which run on the CPU?");
         let then = chat(&server, &next, 24);
-        (first, next, then, room)
+        (first, next, then, room, required)
     };
     // Room for one such state: the second conversation's state evicts the
-    // first's, and the first conversation's next turn evicts the second's.
+    // first's, and the first conversation's next turn evicts the second's. The
+    // model's own memory that much above what a full prompt pass needs gives
+    // its states that room.
     let folder = Folder::new("evict");
     let limit = room * 1.5;
-    let server = start_server_with(&setup, Some(&folder), json!({"state_cache": limit}));
+    let server = start_server_with(
+        &setup,
+        Some(&folder),
+        json!({}),
+        json!({"memory": required + limit}),
+    );
     let first_again = chat(&server, &first_conversation, 24);
     assert_eq!(
         content(&first_again),
@@ -228,7 +243,7 @@ fn an_evicted_state_continues_from_the_ssd_as_from_memory() {
     let then_again = chat(&server, &next, 24);
     let end = server.settled(3);
     println!(
-        "state-cache {limit} GiB: after the second conversation {:?} (states, saves, loads); the next turn reused {} of {} tokens (in memory: {}); {:?}",
+        "a state room of {limit} GiB: after the second conversation {:?} (states, saves, loads); the next turn reused {} of {} tokens (in memory: {}); {:?}",
         disk(&after_second),
         hit(&then_again),
         prompt_tokens(&then_again),
@@ -404,14 +419,24 @@ fn saved_states_stay_within_their_budget_most_recent_first() {
     // Room for the two most recent.
     let limit = sizes[0] + sizes[1] + sizes[2] / 2.0;
     {
-        let server = start_server_with(&setup, Some(&folder), json!({"state_disk": limit}));
+        let server = start_server_with(
+            &setup,
+            Some(&folder),
+            json!({"state_disk": limit}),
+            json!({}),
+        );
         for prompt in &prompts {
             chat(&server, prompt, 1);
         }
         server.settled(3);
         server.stop();
     }
-    let server = start_server_with(&setup, Some(&folder), json!({"state_disk": limit}));
+    let server = start_server_with(
+        &setup,
+        Some(&folder),
+        json!({"state_disk": limit}),
+        json!({}),
+    );
     let start = server.status();
     let hits: Vec<i64> = prompts
         .iter()
