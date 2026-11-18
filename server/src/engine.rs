@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 3;
+const ABI: c_int = 4;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]

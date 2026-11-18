@@ -5,14 +5,15 @@
 
 // eremite's inference engine behind a C ABI, for a server. The engine runs the
 // models of every checkpoint that the model interface runs (DeepSeek V4.1
-// Flash), several of them in one process, at most one of each family. For
-// each model: loading, the attention states and their snapshots, prefill and
-// decoding, the model's drafts and their verification, sampling,
-// context-copy drafts, the vision encoder, and its tokenizer; for the
-// process: the log and the stop on SIGINT or SIGTERM. The server owns
-// everything about requests: their queue and scheduling, the prefix cache
-// (which states and snapshots to keep, and how a prompt reuses them), HTTP,
-// and the status it builds from eremite_read_stats.
+// Flash, and LiquidAI's d1 decision models), several of them in one process,
+// at most one of each family. For each model: loading, the attention states
+// and their snapshots, prefill and decoding, the model's drafts and their
+// verification, sampling, context-copy drafts, the vision encoder, a decision
+// model's passes, and its tokenizer; for the process: the log and the stop on
+// SIGINT or SIGTERM. The server owns everything about requests: their queue
+// and scheduling, the prefix cache (which states and snapshots to keep, and
+// how a prompt reuses them), HTTP, and the status it builds from
+// eremite_read_stats.
 //
 // Threads: eremite_init, eremite_load and every function on models, states,
 // snapshots, prefill, decoding, drafts, samplers, context lookups and images
@@ -23,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 3
+#define EREMITE_ABI 4
 
 // ---- the process ----
 
@@ -170,13 +171,34 @@ void eremite_drain(void);
 // at once, the drafts per pass it makes itself (the selected model options'
 // draft field, at most its draft head's), the most rows one verify pass takes,
 // the positions a state can continue before its end (the rewind margin), and
-// the vocabulary. And whether a token ends a reply.
+// the vocabulary. And whether a token ends a reply. A decision model's limits
+// are 0, but its vocabulary, and no token ends a reply.
 int eremite_max_rows(const eremite_model *m);
 int eremite_drafts_per_pass(const eremite_model *m);
 int eremite_max_verify(const eremite_model *m);
 int eremite_rewind_margin(const eremite_model *m);
 int eremite_vocab_size(const eremite_model *m);
 int eremite_is_stop_token(const eremite_model *m, int32_t token);
+
+// ---- decision models ----
+
+// A decision model, such as LiquidAI's d1, reads one sequence in one pass: a
+// state, then questions after it. It answers each question with the logits of
+// a few tokens at the question's last row, and keeps nothing between passes.
+// It runs no states, snapshots, prefills, decoding or drafts: those calls end
+// the program. Its eremite_config takes no drafts, lookup or DeepSeek options.
+
+// Returns whether the model is a decision model.
+int eremite_is_decision_model(const eremite_model *m);
+// Runs a decision model's pass over n tokens: the first state_tokens are the
+// state, and question q's tokens end before question_ends[q], the last
+// question's at n. Returns count logits, valid until the next call that runs
+// the model: logit i is token ids[i]'s at row rows[i]. Returns null when the
+// pass's memory does not fit.
+const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
+                            int state_tokens, const int32_t *question_ends,
+                            int questions, const int32_t *rows,
+                            const int32_t *ids, int count);
 
 // ---- attention states and snapshots ----
 
@@ -356,12 +378,18 @@ void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
 void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
                            int drafts, int proposed, int pos,
                            eremite_sampler *sampler);
+// Posts a decision model's pass (eremite_decide). Its logits come from
+// eremite_stream_logits.
+void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
+                           int state_tokens, const int32_t *question_ends,
+                           int questions, const int32_t *rows,
+                           const int32_t *ids, int count);
 // Advances the streams until a call finishes, and returns that stream's index.
 // It returns -1 when no stream has a call posted, and when eremite_wake asks it
-// to. Only this function runs the streams. A prefill lets decoding calls
-// (decodes and verifies) go first: in each layer, it waits until those posted
-// to the streams before its wait have finished. A run whose calls can only
-// wait for each other ends the program.
+// to. Only this function runs the streams. A prefill or a decision lets
+// decoding calls (decodes and verifies) go first: in each layer, it waits
+// until those posted to the streams before its wait have finished. A run whose
+// calls can only wait for each other ends the program.
 int eremite_run_streams(eremite_stream *const *streams, int n);
 // Makes eremite_run_streams return -1 soon: at once if it waits, or else after
 // the call that runs now waits. If its only call waits for the GPU, it returns

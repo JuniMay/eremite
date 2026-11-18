@@ -192,17 +192,21 @@ eremite_model *eremite_open(const eremite_config *c) {
                      .deepseek.ced = d->ced,
                      .deepseek.prefill_prune = d->prefill_prune,
                      .deepseek.packed_state_rows = d->packed_state_rows};
-  const char *bad = options.ctx < 1 || options.ctx > 1 << 20
-                        ? "ctx takes 1 to 1048576 tokens"
-                    : options.draft < 0 || options.draft > BLOCK
-                        ? "draft exceeds this model's proposal limit"
-                    : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
-                        ? "lookup takes off or 1 to 15 proposals"
-                    : d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
-                        ? "ced takes off or 128 to 1048576 replay tokens"
-                    : !isfinite(c->memory_gb) || c->memory_gb < 0
-                        ? "memory takes 0 (none) or a GiB limit"
-                        : NULL;
+  const char *bad =
+      options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
+      : ops->decide && (options.draft || options.lookup || d->experts ||
+                        d->ced || d->substitute || d->packed_state_rows)
+          ? "a decision model takes no drafts, lookup, experts, "
+            "ced, substitute or packed state rows"
+      : options.draft < 0 || options.draft > BLOCK
+          ? "draft exceeds this model's proposal limit"
+      : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
+          ? "lookup takes off or 1 to 15 proposals"
+      : d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
+          ? "ced takes off or 128 to 1048576 replay tokens"
+      : !isfinite(c->memory_gb) || c->memory_gb < 0
+          ? "memory takes 0 (none) or a GiB limit"
+          : NULL;
   if (bad) {
     say("%s: %s", c->model, bad);
     return NULL;
@@ -257,7 +261,10 @@ int eremite_load(eremite_model *m) {
   }
   model_set_request_running(m->m, 1);
   atomic_store_explicit(&m->loaded, 1, memory_order_release);
-  if (!was_loaded)
+  if (!was_loaded && m->ops->decide)
+    say("%s: %s decision model, context %d", m->dir, m->ops->family,
+        m->opt.ctx);
+  else if (!was_loaded)
     say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
         "prefill: ced_depth=%d (%s), dependency "
         "pruning=%s; packed state rows %s",
@@ -283,64 +290,110 @@ double eremite_idle_work_interval_seconds(void) {
   return memory ? memory_times(memory).available_memory_reading_interval : 0;
 }
 
-int eremite_max_rows(const eremite_model *m) { return m->ops->max_rows(); }
+int eremite_max_rows(const eremite_model *m) {
+  return m->ops->max_rows ? m->ops->max_rows() : 0;
+}
 
 int eremite_drafts_per_pass(const eremite_model *m) {
+  if (!m->ops->drafts_per_pass) return 0;
   return eremite_is_loaded(m) ? m->ops->drafts_per_pass() : m->opt.draft;
 }
 
-int eremite_max_verify(const eremite_model *m) { return m->ops->max_verify(); }
+int eremite_max_verify(const eremite_model *m) {
+  return m->ops->max_verify ? m->ops->max_verify() : 0;
+}
 
 int eremite_rewind_margin(const eremite_model *m) {
-  return m->ops->rewind_margin();
+  return m->ops->rewind_margin ? m->ops->rewind_margin() : 0;
 }
 
 int eremite_vocab_size(const eremite_model *m) { return m->ops->vocab_size(); }
 
 int eremite_is_stop_token(const eremite_model *m, int32_t token) {
-  return m->ops->is_stop_token(token);
+  return m->ops->is_stop_token && m->ops->is_stop_token(token);
+}
+
+int eremite_is_decision_model(const eremite_model *m) {
+  return m->ops->decide != NULL;
+}
+
+// Runs a decision model's pass. A non-null wait is waited for in each layer.
+static const float *run_decide(eremite_model *m, const int32_t *tokens, int n,
+                               int state_tokens, const int32_t *question_ends,
+                               int questions, const int32_t *rows,
+                               const int32_t *ids, int count,
+                               const PassWait *wait) {
+  if (!m->ops->decide) die("%s: not a decision model", m->dir);
+  return m->ops->decide(tokens, n, state_tokens, question_ends, questions, rows,
+                        ids, count, wait);
+}
+
+const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
+                            int state_tokens, const int32_t *question_ends,
+                            int questions, const int32_t *rows,
+                            const int32_t *ids, int count) {
+  return run_decide(m, tokens, n, state_tokens, question_ends, questions, rows,
+                    ids, count, NULL);
+}
+
+// Ends the program for a decision model: it keeps no states and runs no
+// prefills, decoding or drafts.
+static void require_states(const eremite_model *m) {
+  if (m->ops->decide)
+    die("%s: a decision model keeps no states and runs no prefills or "
+        "decoding",
+        m->dir);
 }
 
 // ---- attention states and snapshots ----
 
 eremite_state *eremite_state_new(eremite_model *m) {
+  require_states(m);
   return m->ops->state_new();
 }
 
 void eremite_state_free(eremite_model *m, eremite_state *s) {
+  require_states(m);
   m->ops->state_free(s);
 }
 
 size_t eremite_state_bytes(const eremite_model *m, const eremite_state *s,
                            int positions) {
+  require_states(m);
   return m->ops->state_bytes(s, positions);
 }
 
 void eremite_state_copy(eremite_model *m, eremite_state *dst,
                         const eremite_state *src, int positions) {
+  require_states(m);
   m->ops->state_copy(dst, src, positions);
 }
 
 eremite_snapshot *eremite_snapshot_take(eremite_model *m, eremite_state *s,
                                         int pos, const float *logits) {
+  require_states(m);
   return m->ops->snapshot_take(s, pos, logits);
 }
 
 void eremite_snapshot_restore(eremite_model *m, eremite_state *s,
                               const eremite_snapshot *x) {
+  require_states(m);
   m->ops->snapshot_restore(s, x);
 }
 
 void eremite_snapshot_free(eremite_model *m, eremite_snapshot *x) {
+  require_states(m);
   m->ops->snapshot_free(x);
 }
 
 size_t eremite_snapshot_bytes(const eremite_model *m, int with_logits) {
+  require_states(m);
   return m->ops->snapshot_bytes(with_logits);
 }
 
 const float *eremite_snapshot_logits(const eremite_model *m,
                                      const eremite_snapshot *x) {
+  require_states(m);
   return m->ops->snapshot_logits(x);
 }
 
@@ -348,20 +401,24 @@ const float *eremite_snapshot_logits(const eremite_model *m,
 
 int64_t eremite_state_write(eremite_model *m, eremite_state *s, int from,
                             int to, int fd) {
+  require_states(m);
   return state_file_write(m->ops, s, from, to, fd);
 }
 
 int eremite_state_read(eremite_model *m, eremite_state *s, int positions,
                        const int *fds, int count) {
+  require_states(m);
   return state_file_read(m->ops, s, positions, fds, count);
 }
 
 int64_t eremite_snapshot_write(eremite_model *m, const eremite_snapshot *x,
                                eremite_state *s, int pos, int fd) {
+  require_states(m);
   return snapshot_file_write(m->ops, (eremite_snapshot *)x, s, pos, fd);
 }
 
 eremite_snapshot *eremite_snapshot_read(eremite_model *m, int fd) {
+  require_states(m);
   return snapshot_file_read(m->ops, fd);
 }
 
@@ -430,6 +487,7 @@ const float *eremite_prefill(eremite_model *m, eremite_state *s,
                              int capture, eremite_snapshot **captured,
                              eremite_prefill_info *info,
                              const eremite_media *images) {
+  require_states(m);
   return run_prefill(m, s, tokens, n, from, replay, capture, captured, info,
                      images, NULL);
 }
@@ -444,6 +502,7 @@ typedef enum {
   STREAM_PREFILL,
   STREAM_DECODE,
   STREAM_VERIFY,
+  STREAM_DECIDE,
   STREAM_QUIT
 } StreamCall;
 
@@ -464,9 +523,14 @@ struct eremite_stream {
   // the call's arguments
   eremite_state *states[STREAM_ROWS];
   int32_t row_tokens[STREAM_ROWS], row_pos[STREAM_ROWS];
-  // A prefill's prompt; a verify's rows (the token, then the drafts).
+  // A prefill's prompt; a verify's rows (the token, then the drafts); a
+  // decision's sequence.
   const int32_t *tokens;
   int n, from, replay, capture, count, drafts, proposed, pos;
+  // A decision's state rows, its questions' ends, and the rows and token ids
+  // of the logits it returns (count of them).
+  int state_tokens, questions;
+  const int32_t *question_ends, *logit_rows, *logit_ids;
   const eremite_media *images;
   eremite_sampler *sampler;
   // its results
@@ -522,6 +586,11 @@ static void stream_run(eremite_stream *x) {
   case STREAM_DECODE:
     x->logits =
         eremite_decode_rows(m, x->states, x->row_tokens, x->row_pos, x->count);
+    break;
+  case STREAM_DECIDE:
+    x->logits = run_decide(m, x->tokens, x->n, x->state_tokens,
+                           x->question_ends, x->questions, x->logit_rows,
+                           x->logit_ids, x->count, &x->wait_for_decoding);
     break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
@@ -583,6 +652,7 @@ static void post_call(eremite_stream *x, StreamCall call) {
 void eremite_stream_prefill(eremite_stream *x, eremite_state *s,
                             const int32_t *tokens, int n, int from, int replay,
                             int capture, const eremite_media *images) {
+  require_states(x->m);
   x->states[0] = s, x->tokens = tokens, x->n = n, x->from = from,
   x->replay = replay, x->capture = capture, x->images = images;
   x->captured = NULL;
@@ -592,6 +662,7 @@ void eremite_stream_prefill(eremite_stream *x, eremite_state *s,
 void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
                                 const int32_t *tokens, const int32_t *pos,
                                 int count) {
+  require_states(x->m);
   if (count < 1 || count > STREAM_ROWS)
     die("a stream's decoding call takes 1 to %d rows", STREAM_ROWS);
   memcpy(x->states, states, (size_t)count * sizeof *states);
@@ -604,10 +675,22 @@ void eremite_stream_decode_rows(eremite_stream *x, eremite_state **states,
 void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
                            int drafts, int proposed, int pos,
                            eremite_sampler *sampler) {
+  require_states(x->m);
   x->states[0] = s, x->tokens = rows, x->drafts = drafts,
   x->proposed = proposed, x->pos = pos, x->sampler = sampler;
   x->accepted = 0;
   post_call(x, STREAM_VERIFY);
+}
+
+void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
+                           int state_tokens, const int32_t *question_ends,
+                           int questions, const int32_t *rows,
+                           const int32_t *ids, int count) {
+  if (!x->m->ops->decide) die("%s: not a decision model", x->m->dir);
+  x->tokens = tokens, x->n = n, x->state_tokens = state_tokens;
+  x->question_ends = question_ends, x->questions = questions;
+  x->logit_rows = rows, x->logit_ids = ids, x->count = count;
+  post_call(x, STREAM_DECIDE);
 }
 
 // What the streams with a call wait for while none can go on (THREAD_*): the
@@ -691,37 +774,44 @@ int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted) {
 }
 
 int eremite_replay_rows(const eremite_model *m, int k) {
+  require_states(m);
   return m->ops->replay_rows(k);
 }
 
 int eremite_replay_start(const eremite_model *m, int k) {
+  require_states(m);
   return m->ops->replay_start(k);
 }
 
 const float *eremite_decode_rows(eremite_model *m, eremite_state **states,
                                  const int32_t *tokens, const int32_t *pos,
                                  int count) {
+  require_states(m);
   return m->ops->decode_rows(states, tokens, pos, count);
 }
 
 const double *eremite_propose_drafts(eremite_model *m, eremite_state *s,
                                      int32_t token, int pos, int32_t *drafts,
                                      int n, eremite_sampler *sampler) {
+  require_states(m);
   return m->ops->propose_drafts(s, token, pos, drafts, n, &sampler->sp);
 }
 
 const float *eremite_verify(eremite_model *m, eremite_state *s,
                             const int32_t *rows, int count, int pos) {
+  require_states(m);
   return m->ops->verify(s, rows, count, pos);
 }
 
 void eremite_accept(eremite_model *m, eremite_state *s, const int32_t *rows,
                     int n, int pos) {
+  require_states(m);
   m->ops->accept(s, rows, n, pos);
 }
 
 void eremite_set_history(eremite_model *m, eremite_state *s,
                          const int32_t *tokens, int pos) {
+  require_states(m);
   m->ops->set_history(s, tokens, pos);
 }
 
