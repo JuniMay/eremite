@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use eremite_server::chat::{Api, Family, deepseek};
+use eremite_server::decision::d1;
 
 /// The fewest characters that the API key has.
 /// The reason for this value is unknown.
@@ -79,6 +80,9 @@ struct Served {
 enum Format {
     /// DeepSeek V4.1's format (chat/deepseek.rs).
     DeepSeek(deepseek::Defaults),
+    /// d1's prompt (decision/d1.rs). A d1 model is a decision model: it
+    /// answers questions and generates no text.
+    D1,
 }
 
 /// What the HTTP handlers share.
@@ -274,14 +278,18 @@ async fn request_resume(body: axum::body::Bytes) -> Response {
     build_control_response(worker::start_resume(request))
 }
 
-/// Builds `model`'s object as GET /v1/models lists it: OpenAI's fields, and the
-/// context's length as servers commonly add it.
+/// Builds `model`'s object as GET /v1/models lists it: OpenAI's fields, the
+/// context's length as servers commonly add it, and for a model that generates
+/// text, the most tokens of its output.
 fn build_model_object(shared: &Shared, model: &Served) -> Value {
-    json!({
+    let mut object = json!({
         "id": model.id, "object": "model", "created": shared.started, "owned_by": "eremite",
         "name": model.name, "context_length": model.ctx, "max_model_len": model.ctx,
-        "max_output_tokens": (model.ctx as i64).min(chat::DEFAULT_MAX_TOKENS),
-    })
+    });
+    if let Format::DeepSeek(_) = model.format {
+        object["max_output_tokens"] = (model.ctx as i64).min(chat::DEFAULT_MAX_TOKENS).into();
+    }
+    object
 }
 
 /// Answers GET /v1/models with the served models' objects.
@@ -297,14 +305,18 @@ async fn list_served_models(State(shared): App) -> Response {
 /// Answers GET /v1/codex/models with Codex's model catalog (codex/mod.rs) of
 /// the DeepSeek models. They answer the Responses API that Codex uses.
 async fn list_codex_models(State(shared): App) -> Response {
-    let models = shared.models.iter().map(|model| match &model.format {
-        Format::DeepSeek(defaults) => codex::CatalogModel {
-            model_id: &model.id,
-            display_name: &model.name,
-            context_window: model.ctx,
-            default_effort: defaults.is_thinking_on.then_some(defaults.effort),
-        },
-    });
+    let models = shared
+        .models
+        .iter()
+        .filter_map(|model| match &model.format {
+            Format::DeepSeek(defaults) => Some(codex::CatalogModel {
+                model_id: &model.id,
+                display_name: &model.name,
+                context_window: model.ctx,
+                default_effort: defaults.is_thinking_on.then_some(defaults.effort),
+            }),
+            Format::D1 => None,
+        });
     build_json_response(codex::build_catalog(models).to_string())
 }
 
@@ -467,6 +479,10 @@ async fn answer_generation(
             let (cancel, events) = submit_request(prepared.build_worker_request(index, note)?)?;
             Ok::<_, chat::Error>((Prepared::DeepSeek(prepared), cancel, events))
         }
+        Format::D1 => Err(chat::Error::new_bad_request(format!(
+            "{} is a decision model: it answers questions and generates no text",
+            handlers.models[index].id
+        ))),
     })
     .await;
     match queued {
@@ -568,12 +584,20 @@ fn main() {
     let mut families = Vec::new();
     for model in &configuration.models {
         let family = Family::of(&model.engine.model).unwrap_or_else(|error| die(&error));
+        let mut model = model.clone();
+        if family == Family::D1 {
+            let context = d1::read_context(&model.engine.model).unwrap_or_else(|error| die(&error));
+            model
+                .fit_decision_model(context)
+                .unwrap_or_else(|error| die(&error));
+        }
         let mut options = model.engine.clone();
         options
             .configure(family)
             .unwrap_or_else(|error| die(&error));
         let id = model.id.clone().unwrap_or_else(|| match family {
             Family::DeepSeek => deepseek::DEFAULT_MODEL_ID.into(),
+            Family::D1 => d1::derive_model_names(&model.engine.model).0,
         });
         if served
             .iter()
@@ -643,9 +667,11 @@ fn main() {
         let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults::new(id.clone())),
+            Family::D1 => Format::D1,
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
+            Family::D1 => d1::derive_model_names(&settings.options.model).1,
         };
         worker::log_model_line(
             served_models.len(),
@@ -684,11 +710,15 @@ fn main() {
                     name: model.id.clone(),
                     kind: match family {
                         Family::DeepSeek => ui::frame::Kind::Llm,
+                        Family::D1 => ui::frame::Kind::Decision,
                     },
                 },
                 tokenizer: model.tokenizer,
                 find_role: match family {
                     Family::DeepSeek => deepseek::find_role_of_token,
+                    // A decision model keeps no sessions whose text the view
+                    // shows.
+                    Family::D1 => |_| None,
                 },
             })
             .collect();

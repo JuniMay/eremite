@@ -595,6 +595,9 @@ pub fn log(line: &str) {
 pub enum Architecture {
     /// DeepSeek V4.1, model_type deepseek_v41.
     DeepSeek,
+    /// LiquidAI's d1 decision models: model_type lfm3_vl, with d1's question
+    /// layout (d1_attention "set").
+    D1,
 }
 
 impl Architecture {
@@ -607,6 +610,7 @@ impl Architecture {
             serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         match config.get("model_type").and_then(serde_json::Value::as_str) {
             Some("deepseek_v41") => Ok(Architecture::DeepSeek),
+            Some("lfm3_vl") if config["d1_attention"] == "set" => Ok(Architecture::D1),
             Some(t) => Err(format!(
                 "{}: model_type {t} is not one this server runs",
                 path.display()
@@ -670,7 +674,8 @@ impl DeepSeekOptions {
 
 impl Options {
     /// Sets the family's own settings to the checkpoint's family. Returns an
-    /// error if they were set for another family.
+    /// error if they were set for another family, and for a decision model
+    /// with drafts or lookup.
     pub fn configure(&mut self, architecture: Architecture) -> Result<(), String> {
         self.backend = match (&self.backend, architecture) {
             (BackendOptions::Unspecified, Architecture::DeepSeek) => {
@@ -678,6 +683,21 @@ impl Options {
             }
             (BackendOptions::DeepSeek(d), Architecture::DeepSeek) => {
                 BackendOptions::DeepSeek(d.clone())
+            }
+            (BackendOptions::Unspecified, Architecture::D1) => {
+                if self.draft != 0 || self.lookup != 0 {
+                    return Err(format!(
+                        "{}: a decision model takes no drafts and no lookup",
+                        self.model
+                    ));
+                }
+                BackendOptions::Unspecified
+            }
+            (BackendOptions::DeepSeek(_), Architecture::D1) => {
+                return Err(format!(
+                    "{}: DeepSeek's settings for a decision model",
+                    self.model
+                ));
             }
         };
         Ok(())
@@ -1597,6 +1617,17 @@ mod tests {
         assert!(error.starts_with("cannot read"), "{error}");
         std::fs::write(&config, r#"{"model_type": "deepseek_v41"}"#).unwrap();
         assert_eq!(Architecture::of(dir.path()), Ok(Architecture::DeepSeek));
+        std::fs::write(
+            &config,
+            r#"{"model_type": "lfm3_vl", "d1_attention": "set"}"#,
+        )
+        .unwrap();
+        assert_eq!(Architecture::of(dir.path()), Ok(Architecture::D1));
+        std::fs::write(&config, r#"{"model_type": "lfm3_vl"}"#).unwrap();
+        assert!(
+            Architecture::of(dir.path()).is_err(),
+            "an LFM3-VL checkpoint without d1's layout"
+        );
         std::fs::write(&config, r#"{"model_type": "llama"}"#).unwrap();
         let error = Architecture::of(dir.path()).unwrap_err();
         assert!(
@@ -1608,6 +1639,22 @@ mod tests {
         assert!(error.ends_with("no model_type"), "{error}");
         std::fs::write(&config, "{").unwrap();
         assert!(Architecture::of(dir.path()).is_err(), "not JSON");
+    }
+
+    #[test]
+    fn a_decision_model_takes_no_drafts_lookup_or_deepseek_settings() {
+        let mut options = Options::default();
+        options.configure(Architecture::D1).unwrap();
+        assert_eq!(options.backend, BackendOptions::Unspecified);
+        for change in [
+            |o: &mut Options| o.draft = 1,
+            |o: &mut Options| o.lookup = 3,
+            |o: &mut Options| o.deepseek_mut().unwrap().ced = 512,
+        ] {
+            let mut options = Options::default();
+            change(&mut options);
+            assert!(options.configure(Architecture::D1).is_err(), "{options:?}");
+        }
     }
 
     #[test]

@@ -43,6 +43,9 @@ pub enum Kind {
     /// A language model: it keeps sessions, and it may route its tokens to
     /// experts.
     Llm,
+    /// A decision model: it answers questions in one pass over their input,
+    /// and keeps no sessions.
+    Decision,
 }
 
 /// A sub-view of Models.
@@ -61,6 +64,7 @@ impl Kind {
     pub fn list_sub_views(self) -> &'static [SubView] {
         match self {
             Kind::Llm => &[SubView::States, SubView::Experts],
+            Kind::Decision => &[],
         }
     }
 }

@@ -3,10 +3,13 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
+use super::draw::plain;
 use super::frame::{
-    Choices, Keys, Kind, Screen, SubView, View, draw_chrome, list_chrome_keys, list_model_keys,
+    Choices, Keys, Kind, ModelInfo, Screen, SubView, View, draw_chrome, list_chrome_keys,
+    list_model_keys,
 };
 use super::history::draw_history;
 use super::input::list_view_keys;
@@ -44,29 +47,47 @@ pub fn draw_screen(
             match (model.kind, choices.sub_view) {
                 (Kind::Llm, SubView::States) => draw_states(buf, view_area, screen, choices),
                 (Kind::Llm, SubView::Experts) => draw_experts(buf, view_area, screen, choices),
+                (Kind::Decision, _) => draw_decision_model(buf, view_area, model),
             }
         }
     }
 }
 
+/// Draws the one line of a decision model in 4 Models in `area`.
+fn draw_decision_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
+    if area.height == 0 {
+        return;
+    }
+    let line = Line::from(plain(format!(
+        " {} is a decision model: it keeps no sessions and has no experts.",
+        model.name
+    )));
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
 /// Returns the keys of the keys row for `choices` in `columns`: the chrome's
 /// first keys, the model's keys in 4 Models, the view's own keys, and the
-/// chrome's last keys. A sub-view that shows only its one line, such as the
-/// Experts of a model without experts, has no keys of its own. When the row
-/// does not fit, the model's and the view's keys go, from the last one, so
-/// that the chrome's keys stay.
+/// chrome's last keys. A view that shows only its one line, such as the
+/// Experts of a model without experts or a decision model in 4 Models, has no
+/// keys of its own. When the row does not fit, the model's and the view's keys
+/// go, from the last one, so that the chrome's keys stay.
 fn list_keys(screen: &Screen, choices: &Choices, columns: usize) -> Keys {
     let (first, last) = list_chrome_keys(choices);
     let mut own = Vec::new();
     if choices.view == View::Models {
         own.extend(list_model_keys(screen, choices));
     }
+    let is_decision_model = screen
+        .models
+        .get(choices.model)
+        .is_some_and(|model| model.kind == Kind::Decision);
     let shows_one_line = choices.view == View::Models
-        && choices.sub_view == SubView::Experts
-        && screen
-            .statuses
-            .get(choices.model)
-            .is_some_and(has_no_experts);
+        && (is_decision_model
+            || choices.sub_view == SubView::Experts
+                && screen
+                    .statuses
+                    .get(choices.model)
+                    .is_some_and(has_no_experts));
     if !shows_one_line {
         own.extend(list_view_keys(choices));
     }
@@ -160,10 +181,19 @@ mod tests {
 
     /// Draws the screen at `width` x `height` with `choices`.
     fn draw(width: u16, height: u16, choices: &mut Choices) -> Buffer {
-        let models = ["deepseek-v4.1-flash", "qwen3.8-27b"].map(|name| ModelInfo {
-            name: name.into(),
-            kind: Kind::Llm,
-        });
+        draw_models(width, height, choices, [Kind::Llm, Kind::Llm])
+    }
+
+    /// Draws the screen at `width` x `height` with `choices`, with the two
+    /// models of `statuses` of the kinds `kinds`.
+    fn draw_models(width: u16, height: u16, choices: &mut Choices, kinds: [Kind; 2]) -> Buffer {
+        let models =
+            [("deepseek-v4.1-flash", kinds[0]), ("qwen3.8-27b", kinds[1])].map(|(name, kind)| {
+                ModelInfo {
+                    name: name.into(),
+                    kind,
+                }
+            });
         let statuses = statuses();
         let mut samples = Samples::new(WINDOWS);
         samples.add_sample(0.0, &statuses);
@@ -233,6 +263,29 @@ mod tests {
             read_row(&buf, 44).trim_end(),
             " 1–4 views   ←→ model   Tab States or Experts   m mouse: clicks   q stop the server"
         );
+    }
+
+    #[test]
+    fn a_decision_model_shows_one_line_and_no_keys_of_its_own() {
+        for sub_view in [SubView::States, SubView::Experts] {
+            let mut choices = Choices {
+                view: View::Models,
+                model: 1,
+                sub_view,
+                ..Choices::default()
+            };
+            let buf = draw_models(160, 45, &mut choices, [Kind::Llm, Kind::Decision]);
+            assert_eq!(
+                read_row(&buf, 4).trim_end(),
+                " qwen3.8-27b is a decision model: it keeps no sessions and has no experts.",
+                "{sub_view:?}"
+            );
+            assert_eq!(
+                read_row(&buf, 44).trim_end(),
+                " 1–4 views   ←→ model   m mouse: clicks   q stop the server",
+                "{sub_view:?}"
+            );
+        }
     }
 
     #[test]
