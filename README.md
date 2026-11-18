@@ -48,8 +48,8 @@ model memory, state memory included. `build/eremite` alone lists the options.
 ## Serve
 
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
-Completions and Responses APIs at `http://HOST:PORT/v1`, and Codex's model
-catalog at `/v1/codex/models`.
+Completions and Responses APIs at `http://HOST:PORT/v1`, Codex's model catalog
+at `/v1/codex/models`, and standalone web search at `POST /v1/alpha/search`.
 
 Its settings are in a JSON file: `build/eremite-server --config FILE`, or
 `~/.config/eremite/server.json` without `--config`. For example:
@@ -140,7 +140,15 @@ Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
 at high effort.
 
-Codex's web tool searches through eremite's own SearXNG.
-`scripts/setup-searxng.sh` sets it up in `~/.local/share/eremite/searxng`, the
-server's default `searxng_dir`. It needs git and Python 3.10 or later, and
-downloads about 100 MB.
+Codex's standalone web tool sends its session `id` and `commands` to the
+search endpoint. The server runs `search_query` through SearXNG. The `output`
+text lists each query's results under the query: title, URL, citation
+reference and snippet. For each result in `output`, `results` holds a
+`text_result` with the same `ref_id`, `url`, `title` and `snippet`, in
+SearXNG's order. A successful query with no result shown gives an empty
+array, and a call without a successful query gives `null`. `encrypted_output`
+is always `null`.
+
+`scripts/setup-searxng.sh` installs SearXNG in
+`~/.local/share/eremite/searxng`, the server's default `searxng_dir`. It needs
+git and Python 3.10 or later, and downloads about 100 MB.

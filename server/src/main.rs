@@ -310,7 +310,7 @@ async fn list_codex_models(State(shared): App) -> Response {
 
 /// Answers POST /v1/alpha/search: runs the commands of Codex's web tool
 /// (codex/search.rs). Each command's result, or why it failed, is text in
-/// `output`.
+/// `output`. A successful query also returns its sources in `results`.
 async fn answer_search(
     State(shared): App,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -330,10 +330,8 @@ async fn answer_search(
             );
         }
     };
-    let output = shared.search.answer_call(request).await;
-    build_json_response(
-        json!({"output": output, "encrypted_output": null, "results": null}).to_string(),
-    )
+    let answer = shared.search.answer_call(request).await;
+    build_json_response(serde_json::to_string(&answer).expect("serialize the search answer"))
 }
 
 /// Answers GET /v1/models/{id} with the model's object and its live status
