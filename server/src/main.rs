@@ -1,6 +1,6 @@
-//! eremite-server: the OpenAI Chat Completions and Responses APIs and Codex's
-//! model catalog, over eremite's engine, for one model or several in one
-//! process.
+//! eremite-server: the OpenAI Chat Completions, Responses and Decisions APIs
+//! and Codex's model catalog, over eremite's engine, for one model or several
+//! in one process.
 //!
 //! - The engine (src/eremite.h, and engine.rs here) runs the models. It owns
 //!   the stop on SIGINT or SIGTERM.
@@ -9,13 +9,15 @@
 //!   requests.
 //! - Each model family's chat format (chat/) renders its requests and reads its
 //!   replies.
+//! - A decision model's prompt (decision/) renders its questions and reads its
+//!   answers.
 //! - With the setting tui, the terminal UI (ui/) shows the server's status, its
 //!   requests, its memory and its log on stderr's terminal instead of the log.
 //!
 //! The configuration file (config.rs) holds every setting. The command line
 //! names only that file.
 
-use eremite_server::{chat, codex, config, control, engine, http, ui, worker};
+use eremite_server::{chat, codex, config, control, decision, engine, http, ui, worker};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -80,9 +82,9 @@ struct Served {
 enum Format {
     /// DeepSeek V4.1's format (chat/deepseek.rs).
     DeepSeek(deepseek::Defaults),
-    /// d1's prompt (decision/d1.rs). A d1 model is a decision model: it
-    /// answers questions and generates no text.
-    D1,
+    /// d1's prompt (decision/d1.rs), with the checkpoint's d1 settings. A d1
+    /// model is a decision model: it answers questions and generates no text.
+    D1(d1::Checkpoint),
 }
 
 /// What the HTTP handlers share.
@@ -315,7 +317,7 @@ async fn list_codex_models(State(shared): App) -> Response {
                 context_window: model.ctx,
                 default_effort: defaults.is_thinking_on.then_some(defaults.effort),
             }),
-            Format::D1 => None,
+            Format::D1(_) => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -396,12 +398,114 @@ fn submit_request(
     ),
     chat::Error,
 > {
-    worker::submit(request).map_err(|error| match error {
+    worker::submit(request).map_err(convert_submit_error)
+}
+
+/// Converts the worker's refusal to queue a request into a 429 error.
+fn convert_submit_error(error: worker::SubmitError) -> chat::Error {
+    match error {
         worker::SubmitError::Busy(message) => chat::Error {
             status: StatusCode::TOO_MANY_REQUESTS,
             message,
         },
+    }
+}
+
+/// Answers POST /v1/decisions: a decision model answers the request's
+/// questions about its input (decision/). It reads the request, plans the
+/// model's passes and runs them on the worker. It answers once the last pass
+/// has run, with each question's answer.
+async fn answer_decisions(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let body = match http::read_body(body, shared.limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
+    let index = match find_model_index(&shared, &body) {
+        Ok(index) => index,
+        Err(message) => {
+            return chat::build_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                &message,
+            );
+        }
+    };
+    // Rendering and tokenization take a while for long inputs.
+    let (from, handlers) = (peer.clone(), shared.clone());
+    let queued = tokio::task::spawn_blocking(move || {
+        let model = &handlers.models[index];
+        let Format::D1(checkpoint) = &model.format else {
+            return Err(chat::Error::new_bad_request(format!(
+                "{} generates text: it makes no decisions",
+                model.id
+            )));
+        };
+        let request = decision::api::read_request(&body)?;
+        let mut plan = d1::plan(
+            checkpoint,
+            model.tokenizer,
+            &request.state,
+            &request.questions,
+        )
+        .map_err(chat::Error::new_bad_request)?;
+        let input_tokens = plan.count_tokens();
+        let passes = std::mem::take(&mut plan.passes);
+        let note = format!(
+            "http {arrival} from {from}: {} questions in {} passes",
+            request.questions.len(),
+            passes.len()
+        );
+        let (cancel, events) = worker::submit_decision(worker::DecisionRequest {
+            model_index: index,
+            passes,
+            note,
+        })
+        .map_err(convert_submit_error)?;
+        Ok((request, plan, input_tokens, cancel, events))
     })
+    .await;
+    // The guard cancels the decision when the client goes away.
+    let (request, plan, input_tokens, _cancel, mut events) = match queued {
+        Ok(Ok(queued)) => queued,
+        Ok(Err(error)) => return refuse_request(&peer, error),
+        Err(error) => {
+            return chat::build_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                &error.to_string(),
+            );
+        }
+    };
+    match events.recv().await {
+        Some(worker::Event::Decided(logits)) => {
+            let answers = request.build_answers(&plan.read_probabilities(&logits));
+            let id = &shared.models[index].id;
+            build_json_response(
+                decision::api::build_response(id, answers, input_tokens).to_string(),
+            )
+        }
+        Some(worker::Event::Refused(message)) => {
+            refuse_request(&peer, chat::Error::new_bad_request(message))
+        }
+        Some(worker::Event::Failed(message)) => {
+            chat::build_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", &message)
+        }
+        _ => chat::build_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the server is stopping",
+        ),
+    }
 }
 
 /// Answers POST /v1/chat/completions.
@@ -479,7 +583,7 @@ async fn answer_generation(
             let (cancel, events) = submit_request(prepared.build_worker_request(index, note)?)?;
             Ok::<_, chat::Error>((Prepared::DeepSeek(prepared), cancel, events))
         }
-        Format::D1 => Err(chat::Error::new_bad_request(format!(
+        Format::D1(_) => Err(chat::Error::new_bad_request(format!(
             "{} is a decision model: it answers questions and generates no text",
             handlers.models[index].id
         ))),
@@ -665,9 +769,13 @@ fn main() {
     let mut served_models = Vec::new();
     for (settings, family) in served.iter().zip(&families) {
         let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
+        let tokenizer = loaded[served_models.len()].1;
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults::new(id.clone())),
-            Family::D1 => Format::D1,
+            Family::D1 => Format::D1(
+                d1::Checkpoint::read(&settings.options.model, tokenizer)
+                    .unwrap_or_else(|error| die(&error)),
+            ),
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
@@ -697,7 +805,7 @@ fn main() {
             id,
             name,
             ctx,
-            tokenizer: loaded[served_models.len()].1,
+            tokenizer,
             format,
         });
     }
@@ -837,6 +945,14 @@ fn main() {
         .route(
             "/responses",
             post(answer_responses).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/decisions",
+            post(answer_decisions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/decisions",
+            post(answer_decisions).fallback(refuse_other_than_post),
         )
         .fallback(refuse_unknown_endpoint)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))

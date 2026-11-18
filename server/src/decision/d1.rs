@@ -123,11 +123,16 @@ pub struct Plan {
 impl Checkpoint {
     /// Reads the d1 settings of the checkpoint in `dir`: config.json's
     /// d1_set_size and d1_codes, tokenizer_config.json's bos_token,
-    /// calibration.json's temperatures, and the special tokens of
-    /// `tokenizer`, which has `vocabulary` tokens.
-    pub fn read(dir: &str, tokenizer: Tokenizer, vocabulary: i32) -> Result<Checkpoint, String> {
+    /// calibration.json's temperatures, and the special tokens of `tokenizer`
+    /// among the text model's vocabulary (config.json's
+    /// text_config.vocab_size).
+    pub fn read(dir: &str, tokenizer: Tokenizer) -> Result<Checkpoint, String> {
         let read = |name: &str| read_json(dir, name);
         let config = read("config.json")?;
+        let vocabulary = config["text_config"]["vocab_size"]
+            .as_i64()
+            .and_then(|tokens| i32::try_from(tokens).ok())
+            .ok_or("config.json: no text_config.vocab_size")?;
         let set_size = config["d1_set_size"]
             .as_u64()
             .filter(|&size| size >= 1)
@@ -798,7 +803,7 @@ mod tests {
             eprintln!("skipped: set EREMITE_D1_CHECKPOINT");
             return;
         };
-        let checkpoint = Checkpoint::read(&dir, tokenizer, 128000).expect("d1's settings");
+        let checkpoint = Checkpoint::read(&dir, tokenizer).expect("d1's settings");
         assert_eq!((checkpoint.set_size, checkpoint.code_scheme), (16, 2));
         let yes_no = |text: &str| Question::YesNo {
             instructions: text.into(),

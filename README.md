@@ -48,8 +48,9 @@ model memory, state memory included. `build/eremite` alone lists the options.
 ## Serve
 
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
-Completions and Responses APIs at `http://HOST:PORT/v1`, Codex's model catalog
-at `/v1/codex/models`, and standalone web search at `POST /v1/alpha/search`.
+Completions and Responses APIs at `http://HOST:PORT/v1`, OpenAI's Decisions API
+at `POST /v1/decisions`, Codex's model catalog at `/v1/codex/models`, and
+standalone web search at `POST /v1/alpha/search`.
 
 Its settings are in a JSON file: `build/eremite-server --config FILE`, or
 `~/.config/eremite/server.json` without `--config`. For example:
@@ -62,6 +63,9 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
     {
       "model": "/path/to/DeepSeek-V4.1-Flash-1017",
       "experts": "/path/to/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf"
+    },
+    {
+      "model": "/path/to/d1-2B"
     }
   ]
 }
@@ -108,9 +112,9 @@ Each entry under `models` holds one model's settings:
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `model` | the checkpoint's folder | required |
-| `id` | the name that requests give in `model` | `deepseek-v4.1-flash` |
+| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
-| `ctx` | the context in tokens, at most 1048576 and the model's own | the most |
+| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's |
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
@@ -139,6 +143,29 @@ macOS keeps as file cache, and the rest as free file cache.
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
 at high effort.
+
+LiquidAI's d1 models, such as d1-2B, are decision models: they answer
+questions about an input and generate no text. A d1 checkpoint serves
+`POST /v1/decisions` only: the chat endpoints refuse it, and Codex's catalog
+leaves it out. Its entry takes `model`, `id`, `ctx`, `memory` and
+`idle_unload`, and refuses the other model settings. A request gives its
+`input` and 1 to 400 `questions`. Each question has `instructions`, an
+optional `name` and a `type`:
+
+- `predicate`: a yes-or-no question.
+- `choice`: 2 to 255 `choices`, each a `value`, a string or a boolean, with an
+  optional `description`.
+- `score`: 2 to 10 `levels`, each a `label` with an optional `description`.
+
+The input is a string, or a list of messages and tool items. A string, or one
+user message whose content is a string or one `input_text` or `input_json`
+part, gives the model that text or JSON. Another list gives the model the list
+as JSON. Images are refused. Each of the model's passes reads the input and up
+to the checkpoint's `d1_set_size` questions (16 for d1-2B). The answers come
+back in the questions' order: a predicate's `probability` of yes; a choice's
+likeliest `choice`, its `confidence` and every option's `probabilities`; a
+score's probability-weighted `score`, its likeliest level's `confidence` and
+every level's `probabilities`. `usage` counts the tokens that the passes read.
 
 Codex's standalone web tool sends its session `id` and `commands` to the
 search endpoint. The server runs `search_query` through SearXNG. The `output`
