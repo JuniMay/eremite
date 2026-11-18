@@ -80,6 +80,31 @@ static void waits_for_gpu(void *looks) {
       .ready = third_look, .context = looks, .kind = PASS_WAIT_GPU});
 }
 
+// The looks after which a lone pass's wait for the GPU is over without a
+// block: enough that a thread that looks again instead of blocking is caught.
+static constexpr int LOOKS_UNTIL_OVER = 1000;
+
+// A lone pass's wait for the GPU: its block ends it.
+typedef struct {
+  int looks, blocked;
+} LoneGpuWait;
+
+static int lone_gpu_wait_over(void *wait) {
+  LoneGpuWait *w = wait;
+  return w->blocked || ++w->looks > LOOKS_UNTIL_OVER;
+}
+
+static void block_lone_gpu_wait(void *wait) {
+  ((LoneGpuWait *)wait)->blocked = 1;
+}
+
+static void waits_for_gpu_alone(void *wait) {
+  pass_wait(&(PassWait){.ready = lone_gpu_wait_over,
+                        .block = block_lone_gpu_wait,
+                        .context = wait,
+                        .kind = PASS_WAIT_GPU});
+}
+
 static int never_ready(void *) { return 0; }
 
 // A wait that only another pass could end, and that no pass ends.
@@ -181,6 +206,14 @@ int main(void) {
         "a wait for any pass returns 0 when the passes wait only for each "
         "other");
   pass_free(pair[0]), pass_free(pair[1]);
+
+  LoneGpuWait alone = {0};
+  p = pass_new(waits_for_gpu_alone, &alone, 1 << 20);
+  pass_resume(p);
+  check(pass_wait_for_any(&p, 1, event) && alone.blocked,
+        "a wait for any pass blocks in the GPU's wait of the only pass");
+  check(pass_resume(p) == 1, "the pass then ends");
+  pass_free(p);
   threads_event_free(event);
 
   p = pass_new(yielding, NULL, 1 << 20);

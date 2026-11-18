@@ -19,7 +19,7 @@ typedef struct {
   void (*block)(void *context);
   void *context;
   // PASS_WAIT_*: what the wait is for. The engine thread's time is measured by
-  // it, and a wait for the GPU is looked at again at once.
+  // it, and a wait for the GPU beside other passes is looked at again at once.
   int kind;
   void (*notify)(void *context, ThreadsEvent *event);
 } PassWait;
@@ -56,10 +56,11 @@ int pass_waiting_for(const Pass *pass);
 void pass_block(const Pass *pass);
 
 // Waits until one of the n passes can continue, or the event is signaled.
-// While one of them waits for the GPU, it looks at them and at the event again
-// at once: a thread that looks notices the GPU's end sooner than a blocked
-// thread wakes. Otherwise it has each wait with a notify signal the event, and
-// blocks on the event.
+// If the only pass waits for the GPU, it blocks in that wait: looking would
+// keep a core busy. While one of several passes waits for the GPU, it looks at
+// them and at the event again at once: a thread that looks notices the GPU's
+// end sooner than a blocked thread wakes. Otherwise it has each wait with a
+// notify signal the event, and blocks on the event.
 // Returns 0 at once if no pass can continue and none waits for the GPU or has
 // a notify: the passes then wait only for each other.
 int pass_wait_for_any(Pass *const *passes, int n, ThreadsEvent *event);

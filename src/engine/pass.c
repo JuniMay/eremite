@@ -169,6 +169,10 @@ int pass_wait_for_any(Pass *const *passes, int n, ThreadsEvent *event) {
       gpu |= pass_waiting_for(passes[k]) == PASS_WAIT_GPU;
       notified |= passes[k]->wait.notify != NULL;
     }
+    if (gpu && n == 1) {  // the only pass blocks in its wait for the GPU
+      pass_block(passes[0]);
+      return 1;
+    }
     if (gpu) {
       if (threads_event_take(event)) return 1;
       __asm__ __volatile__("yield");  // a hint to the core while it looks again

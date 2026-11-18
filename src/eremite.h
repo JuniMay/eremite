@@ -364,8 +364,9 @@ void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
 // wait for each other ends the program.
 int eremite_run_streams(eremite_stream *const *streams, int n);
 // Makes eremite_run_streams return -1 soon: at once if it waits, or else after
-// the call that runs now waits. A wake that comes outside eremite_run_streams
-// ends its next run after one look at the streams. Any thread may call it.
+// the call that runs now waits. If its only call waits for the GPU, it returns
+// after that wait. A wake that comes outside eremite_run_streams ends its next
+// run after one look at the streams. Any thread may call it.
 void eremite_wake(void);
 // A finished call's results. The logits stay valid until the stream's next
 // call. Null logits: the call did not fit in memory.
