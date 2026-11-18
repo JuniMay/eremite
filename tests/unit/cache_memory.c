@@ -17,7 +17,6 @@ static vm_statistics64_data_t vm_fixture;
 static int pressure_fixture = 1;
 static uint64_t compressed_fixture, wakeups_fixture,
     working_set_fixture = 128ull << 30;
-static uint64_t filecache_min_fixture;  // pages; set in main
 
 static kern_return_t fixture_host(host_t host, host_flavor_t flavor,
                                   host_info64_t out,
@@ -39,12 +38,11 @@ static kern_return_t fixture_task(task_name_t task, task_flavor_t flavor,
 static int fixture_sysctl(const char *name, void *out, size_t *n, void *in,
                           size_t len) {
   (void)in, (void)len;
-  uint64_t value =
-      !strcmp(name, "kern.memorystatus_vm_pressure_level")
-          ? (uint64_t)pressure_fixture
-      : !strcmp(name, "vm.compressor.swapper.wakeups.total") ? wakeups_fixture
-      : !strcmp(name, "vm.vm_page_filecache_min") ? filecache_min_fixture
-                                                  : 0;
+  uint64_t value = !strcmp(name, "kern.memorystatus_vm_pressure_level")
+                       ? (uint64_t)pressure_fixture
+                   : !strcmp(name, "vm.compressor.swapper.wakeups.total")
+                       ? wakeups_fixture
+                       : 0;
   if (!out || !n) return -1;
   size_t size = *n < sizeof value ? *n : sizeof value;
   memcpy(out, &value, size), *n = size;
@@ -86,10 +84,10 @@ static void child_case(int kind) {
   st->nslots = st->cap = st->max_slots - 256;
   if (kind == 7) st->nslots = 0;
   if (kind == 8) st->nslots = st->cap = 2 * EXPERTS;
-  if (kind >= 9)
+  if (kind >= 9 && kind <= 12)
     vm_fixture.external_page_count =
-        (8ull << 30) / vm_page_size;  // within the kept share
-  if (kind >= 10)
+        (8ull << 30) / vm_page_size;  // below the 10 GiB kept
+  if (kind >= 10 && kind <= 12)
     vm_fixture.free_count =
         (15ull << 28) /
         vm_page_size;  // 3.75 GiB: 0.25 GiB short of the reserve
@@ -139,7 +137,18 @@ static void child_case(int kind) {
     for (int i = 0; i < 32; i++) resize(st, -1);
     _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
   }
+  if (kind == 3 || kind == 5) {  // no file cache above the one kept counts
+    vm_fixture.free_count = (11ull << 30) / vm_page_size;
+    vm_fixture.external_page_count = (10ull << 30) / vm_page_size;
+  }
   if (kind == 3) vm_fixture.compressions++, compressed_fixture = 128ull << 20;
+  if (kind == 13) {  // compression while the file cache above the one kept
+                     // counts: that file cache counts as kept from then on
+    vm_fixture.compressions++;
+    resize(st, -1);
+    int kept = memory_kept_file_cache(cache_memory) == 20ull << 30;
+    _exit(st->cap < before && kept ? 0 : 1);
+  }
   if (kind == 4) vm_fixture.swapouts++;
   if (kind == 6) wakeups_fixture++;
   if (kind == 7 || kind == 8) vm_fixture.swapouts++;
@@ -218,7 +227,13 @@ int main(void) {
   working_set_fixture = 128ull << 30;
   check(gpu_target(st) == (int64_t)working_set_fixture,
         "an early reading does not freeze the residency target");
-  filecache_min_fixture = (10ull << 30) / vm_page_size;
+  // The memory reads the file cache that the kernel keeps: 10 GiB, the
+  // smallest file cache read.
+  cache_memory = memory_new();
+  memory_set_reserve(cache_memory, 0, system_memory_read_counters, NULL);
+  vm_fixture.external_page_count = (10ull << 30) / vm_page_size;
+  uint64_t available;
+  memory_read_system(cache_memory, &available);
   vm_fixture.free_count = (48ull << 30) / vm_page_size;
   vm_fixture.external_page_count = (30ull << 30) / vm_page_size;
   vm_fixture.speculative_count = (2ull << 30) / vm_page_size;
@@ -232,14 +247,14 @@ int main(void) {
   expert_store_set_reserve(4);
   expert_store_start(st, 56ull << 30, LAYERS);
   check(st->cap == (int)((56ull << 30) / st->SLOT_SIZE),
-        "the initial limit uses the file cache beyond the kept share to fit "
-        "the 56 GiB asked for");
+        "the initial limit uses the file cache above the one kept to fit the "
+        "56 GiB asked for");
   check(st->cap <= st->max_slots,
         "the initial limit stays within the most slots");
   const char *names[] = {
-      "few free pages with file cache beyond the kept share do not shrink the "
+      "few free pages with file cache above the one kept do not shrink the "
       "cache",
-      "calm growth uses the file cache beyond the kept share",
+      "calm growth uses the file cache above the one kept",
       "memory pressure shrinks the cache",
       "compression alone does not shrink the cache",
       "a new swap-out shrinks the cache",
@@ -247,14 +262,16 @@ int main(void) {
       "a swapper wakeup without swap-outs does not shrink the cache",
       "a swap-out cannot take memory back from an empty cache",
       "a cache at its minimum grows again with available memory",
-      "file cache within the kept share does not count, so few free pages "
+      "a file cache smaller than the one kept lowers it, so few free pages "
       "shrink the cache",
       "a shortfall without pressure gives back only the slots that restore the "
       "reserve",
       "two stores give one shortfall back once, and both stores' unwritten "
       "slots count",
-      "a store that starts short of the reserve holds its minimum slots"};
-  for (int kind = 0; kind < 13; kind++) {
+      "a store that starts short of the reserve holds its minimum slots",
+      "compression while the file cache above the one kept counts makes it "
+      "kept, so few free pages shrink the cache"};
+  for (int kind = 0; kind < 14; kind++) {
     fflush(stdout);
     pid_t pid = fork();
     if (!pid) child_case(kind);

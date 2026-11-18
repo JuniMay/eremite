@@ -16,8 +16,8 @@ static double clock_now = 100;
 // The ids of the evicted test slots, in the order they were evicted, and how
 // many there are.
 static int order[16], order_count;
-// The available memory that the system reports to the reserve.
-static uint64_t available_bytes;
+// The free memory and the file cache that the system reports to the reserve.
+static uint64_t available_bytes, file_bytes;
 // Memory that another program released, and the bytes of it that come back to
 // the system's counts at each sleep.
 static uint64_t coming_back, coming_back_step;
@@ -248,7 +248,10 @@ static void state_goes_after_its_model(void) {
   REQUIRE(saved.evicted == 1 && order[0] == 1 && order[1] == 2);
 }
 
-static uint64_t fake_available(void) { return available_bytes; }
+// The kernel's counters as the tests set them.
+static SystemMemoryCounters fake_counters(void) {
+  return (SystemMemoryCounters){.free = available_bytes, .file = file_bytes};
+}
 
 static void state_memory_keeps_the_reserve(void) {
   Memory *memory = memory_new();
@@ -258,7 +261,7 @@ static void state_memory_keeps_the_reserve(void) {
   TestSlot cache, state;
   test_slot(&cache, &model, NULL, 100, 1);
   available_bytes = 150;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   test_state_slot(&state, &model, 100, 2);
   REQUIRE(cache.evicted == 1 && model.state_bytes == 100);
 }
@@ -273,7 +276,7 @@ static void current_limit_keeps_the_reserve(void) {
   TestSlot weights;
   test_slot(&weights, &model, NULL, 100, 1);
   available_bytes = 300;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   // 100 bytes are counted, and 200 more fit above the reserve.
   REQUIRE(memory_current_limit(memory) == 300);
   // The reading is corrected for the 50 bytes added since.
@@ -356,7 +359,7 @@ static void evictions_at_the_minimum_also_lower_the_growth(void) {
   // 100 bytes are counted, and 10 fit above the reserve. So adding 40 bytes is
   // 30 bytes short of the reserve.
   available_bytes = 110;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   REQUIRE(claim(&growing, 40, MEMORY_REQUIRED));
   // Evicting the cache lowered the counted bytes by 20, to the minimum, and
   // the growth by 30.
@@ -413,7 +416,7 @@ static void readings_wait_for_their_interval(void) {
   MemoryAccount model;
   memory_account_init(memory, &model, "model", 0);
   available_bytes = 300;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   REQUIRE(memory_current_limit(memory) == 200);
   // Within the period the reading stays; after it, a new one is taken.
   available_bytes = 150;
@@ -423,6 +426,34 @@ static void readings_wait_for_their_interval(void) {
   REQUIRE(memory_current_limit(memory) == 50);
 }
 
+// The file cache above the smallest file cache read counts as available: the
+// kernel gives that part up for other memory. A file cache that grows into
+// the free pages leaves the available memory as it was. One that shrinks
+// lowers the file cache kept, and memory_keep_file_cache raises it.
+static void the_file_cache_above_the_smallest_counts_as_available(void) {
+  Memory *memory = memory_new();
+  memory_set_reserve(memory, 100, fake_counters, NULL);
+  uint64_t available;
+  REQUIRE(memory_kept_file_cache(memory) == 0);
+  available_bytes = 1000, file_bytes = 500;
+  memory_read_system(memory, &available);
+  REQUIRE(available == 1000 && memory_kept_file_cache(memory) == 500);
+  // The file cache grows by 300 into the free pages.
+  available_bytes = 700, file_bytes = 800;
+  memory_read_system(memory, &available);
+  REQUIRE(available == 1000 && memory_kept_file_cache(memory) == 500);
+  REQUIRE(memory_current_limit(memory) == 900);
+  // The kernel gave file cache up: 200 stay.
+  available_bytes = 1300, file_bytes = 200;
+  memory_read_system(memory, &available);
+  REQUIRE(available == 1300 && memory_kept_file_cache(memory) == 200);
+  // The kernel compressed other memory rather than drop the file cache.
+  available_bytes = 900, file_bytes = 600;
+  memory_keep_file_cache(memory, 600);
+  memory_read_system(memory, &available);
+  REQUIRE(available == 900 && memory_kept_file_cache(memory) == 600);
+}
+
 static void minimum_waits_while_memory_comes_back(void) {
   Memory *memory = memory_new();
   MemoryAccount model;
@@ -430,7 +461,7 @@ static void minimum_waits_while_memory_comes_back(void) {
   // 120 bytes are available and 100 stay for other programs: a minimum of 100
   // fits once 80 more come back, 50 at each sleep.
   available_bytes = 120, coming_back = 80, coming_back_step = 50;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   double started = clock_now;
   REQUIRE(memory_wait_for_minimum(&model, 100));
   REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
@@ -442,7 +473,7 @@ static void minimum_fails_once_no_memory_comes_back(void) {
   memory_account_init(memory, &model, "model", 0);
   // The first sleep brings 30 bytes, too few, and the second none.
   available_bytes = 120, coming_back = 30, coming_back_step = 50;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   double started = clock_now;
   REQUIRE(!memory_wait_for_minimum(&model, 100));
   REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
@@ -458,7 +489,7 @@ static void claim_waits_while_memory_comes_back(void) {
   // 120 bytes are available and 100 stay for other programs: a claim of 100
   // fits once 80 more come back, 50 at each sleep.
   available_bytes = 120, coming_back = 80, coming_back_step = 50;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   double started = clock_now;
   REQUIRE(memory_wait_for_claim(&slot.slot, 100));
   REQUIRE(clock_now - started == 2 * memory_times(memory).freed_memory_delay);
@@ -470,7 +501,7 @@ static void stop_ends_the_wait_for_a_minimum(void) {
   MemoryAccount model;
   memory_account_init(memory, &model, "model", 0);
   available_bytes = 120, coming_back = 80, coming_back_step = 50;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   shutdown_request();
   double started = clock_now;
   REQUIRE(!memory_wait_for_minimum(&model, 100) && clock_now == started);
@@ -557,7 +588,7 @@ static void a_new_state_takes_kept_slots_for_the_reserve(void) {
                    NULL);
   // 80 bytes are counted, and nothing more fits above the reserve.
   available_bytes = 100;
-  memory_set_reserve(memory, 100, fake_available, NULL);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
   REQUIRE(claim(&state, 10, MEMORY_REQUIRED));
   REQUIRE(kept.evicted == 1 && state.slot.payload == 10);
 }
@@ -833,6 +864,9 @@ int main(void) {
        recently_used_weights_stay_for_their_time},
       {"a reading is taken again only after available_memory_reading_interval",
        readings_wait_for_their_interval},
+      {"the file cache above the smallest file cache read counts as "
+       "available",
+       the_file_cache_above_the_smallest_counts_as_available},
       {"a minimum that does not fit waits while memory comes back, and fits "
        "once enough is back",
        minimum_waits_while_memory_comes_back},

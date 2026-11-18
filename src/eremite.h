@@ -465,9 +465,15 @@ typedef struct {
   // The expert cache's slots, and experts on the SSD only.
   int slots, mapped, cap, max_slots, experts, uncached;
   uint64_t slot_bytes, uncached_bytes, cache_bytes, dense_bytes;
+  // This process's footprint, the GPU driver's memory, and the bytes
+  // available to this process: the free pages, and the file cache above the
+  // file cache that the kernel keeps.
   uint64_t footprint, gpu_in_use, available;
   // Metal's working-set recommendation; INT64_MAX before GPU initialization.
   int64_t gpu_limit;
+  // The system's memory. file_kept is the file cache that the kernel keeps
+  // rather than give up for other memory: the smallest file cache read, or
+  // more when the kernel compressed other memory instead.
   uint64_t total, free, file, file_kept, wired, compressor, compressed,
       swap_used, swapouts;
   // 1 normal, 2 warn, 4 critical.

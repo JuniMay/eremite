@@ -694,7 +694,9 @@ int main(int argc, char **argv) {
   ModelCounters final_counts = counters();
   ExpertStoreCounts c2 = final_counts.cache;
   double g2 = gpu_times(model->gpu).busy_seconds;
-  SystemMemoryCounters m2 = system_memory_read_counters();
+  uint64_t available;
+  SystemMemoryCounters m2 =
+      memory_read_system(model->memory.memory, &available);
   fputc('\n', stdout);
   if (cached()) {
     fprintf(stderr,
@@ -728,7 +730,7 @@ int main(int argc, char **argv) {
             g2 - g1, final_counts.cache_slots,
             final_counts.cache_bytes / (1024.0 * 1024 * 1024),
             (unsigned long long)c2.evictions,
-            system_memory_available() / (1024.0 * 1024 * 1024),
+            available / (1024.0 * 1024 * 1024),
             system_memory_footprint() / (1024.0 * 1024 * 1024),
             system_memory_gpu_driver() / (1024.0 * 1024 * 1024),
             (unsigned long long)(m2.swapouts - m0.swapouts),
@@ -752,7 +754,7 @@ int main(int argc, char **argv) {
             "memory:  available %.1f GiB, footprint %.1f GiB, GPU resident "
             "memory (all processes) %.1f GiB\n",
             n, t1 - t0, n / (t1 - t0), g1 - g0, gen, t2 - t1, gen / (t2 - t1),
-            g2 - g1, system_memory_available() / (1024.0 * 1024 * 1024),
+            g2 - g1, available / (1024.0 * 1024 * 1024),
             system_memory_footprint() / (1024.0 * 1024 * 1024),
             system_memory_gpu_driver() / (1024.0 * 1024 * 1024));
   }

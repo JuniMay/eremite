@@ -31,8 +31,8 @@ int main(void) {
   system_memory_read_info(&info);
   uint64_t total = memsize();
   check(total > 0 && info.total == total, "the total is the Mac's RAM");
-  check(info.free <= total && info.file <= total && info.file_kept <= total,
-        "the free pages, the file pages and the kept share fit in the RAM");
+  check(info.free <= total && info.file <= total,
+        "the free pages and the file pages fit in the RAM");
   check(info.wired > 0 && info.wired <= total,
         "the wired pages are some of the RAM");
   check(pressure_level(info.pressure) &&
@@ -40,12 +40,9 @@ int main(void) {
         "the pressure is one of the kernel's levels");
 
   SystemMemoryCounters first = system_memory_read_counters();
-  check(first.free <= total && first.available <= total,
-        "the free and available bytes fit in the RAM");
-  check(first.available >= first.free,
-        "the available bytes include the free pages");
-  check(system_memory_available() <= total,
-        "the available bytes alone fit in the RAM");
+  check(first.free <= total && first.file <= total &&
+            first.free + first.file <= total,
+        "the free pages and the file cache fit in the RAM together");
   SystemMemoryCounters second = system_memory_read_counters();
   check(second.swapouts >= first.swapouts &&
             second.compressions >= first.compressions,

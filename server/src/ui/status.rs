@@ -253,7 +253,8 @@ pub struct SystemMemory {
     pub free: u64,
     /// The file cache.
     pub file: u64,
-    /// The part of the file cache that the system keeps.
+    /// The part of the file cache that the system keeps rather than give up
+    /// for other memory. The rest of the file cache counts as free.
     pub file_kept: u64,
     /// The wired memory.
     pub wired: u64,

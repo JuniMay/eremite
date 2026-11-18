@@ -28,36 +28,21 @@ static uint64_t file_of(vm_statistics64_data_t s) {
   return file * vm_page_size;
 }
 
-// The free pages and the file cache beyond the share that the kernel keeps,
-// vm.vm_page_filecache_min (23.9 GiB of 128 GiB). While the file cache is
-// below that share, the kernel compresses and swaps other programs' memory
-// rather than drop cached files: it compressed 8.6 pages for every file page
-// it dropped. When the share cannot be read, only the free pages count.
-static uint64_t available_of(vm_statistics64_data_t s) {
-  uint64_t keep = sysctl_u64("vm.vm_page_filecache_min"),
-           file = file_of(s) / vm_page_size;
-  return ((uint64_t)s.free_count + (keep && file > keep ? file - keep : 0)) *
-         vm_page_size;
-}
-
 SystemMemoryCounters system_memory_read_counters(void) {
   vm_statistics64_data_t s = vm();
   return (SystemMemoryCounters){(uint64_t)s.free_count * vm_page_size,
-                                available_of(s), s.swapouts, s.compressions};
+                                file_of(s), s.swapouts, s.compressions};
 }
-
-uint64_t system_memory_available(void) { return available_of(vm()); }
 
 void system_memory_read_info(SystemMemoryInfo *m) {
   vm_statistics64_data_t s = vm();
-  uint64_t p = vm_page_size, keep = sysctl_u64("vm.vm_page_filecache_min");
+  uint64_t p = vm_page_size;
   struct xsw_usage sw = {0};
   size_t n = sizeof sw;
   sysctlbyname("vm.swapusage", &sw, &n, 0, 0);
   *m = (SystemMemoryInfo){.total = sysctl_u64("hw.memsize"),
                           .free = s.free_count * p,
                           .file = file_of(s),
-                          .file_kept = keep * p,
                           .wired = s.wire_count * p,
                           .compressor = s.compressor_page_count * p,
                           .compressed =

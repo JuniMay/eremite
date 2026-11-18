@@ -9,8 +9,8 @@
 typedef struct {
   // The free pages. They include the speculative file pages.
   uint64_t free;
-  // The free pages, and the file cache beyond the share that the kernel keeps.
-  uint64_t available;
+  // The file cache: the file pages other than the speculative ones.
+  uint64_t file;
   // The pages swapped out since boot.
   uint64_t swapouts;
   // The pages compressed since boot.
@@ -33,9 +33,8 @@ typedef enum {
 // The system's memory at one moment, for a status display. The fields are
 // bytes, except the page counts since boot and the pressure.
 typedef struct {
-  // The RAM, the free pages, the file pages, and the file cache that the
-  // kernel keeps.
-  uint64_t total, free, file, file_kept;
+  // The RAM, the free pages and the file cache.
+  uint64_t total, free, file;
   // The wired pages, the compressor's pages, and the uncompressed bytes that
   // the compressor holds.
   uint64_t wired, compressor, compressed;
@@ -49,10 +48,6 @@ typedef struct {
 
 // Reads the system's memory into m.
 void system_memory_read_info(SystemMemoryInfo *m);
-
-// Returns the bytes available to this program: the free pages, and the file
-// cache beyond the share that the kernel keeps.
-uint64_t system_memory_available(void);
 
 // Returns the kernel's memory pressure.
 SystemMemoryPressure system_memory_pressure(void);

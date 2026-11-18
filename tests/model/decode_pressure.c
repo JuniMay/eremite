@@ -36,7 +36,9 @@ static const float *decode_step(const ModelOps *ops, ModelState **states,
 
 // Sets the reserve to bytes more than the available memory.
 static void raise_reserve(Memory *memory, uint64_t bytes) {
-  double gib = ((double)system_memory_available() + (double)bytes) / GIB;
+  uint64_t available;
+  memory_read_system(memory, &available);
+  double gib = ((double)available + (double)bytes) / GIB;
   expert_store_set_memory(memory, (MemorySettings){.reserve_gib = gib});
 }
 

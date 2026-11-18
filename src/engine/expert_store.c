@@ -174,7 +174,7 @@ struct ExpertStore {
   unsigned *layer_holds;
   // The resizing's readings and clocks; the clock of the last give-back is
   // shared.
-  uint64_t swapouts;
+  uint64_t swapouts, compressions;
   int calm, init;
   // The last swap-out while the cache could release memory.
   double bad;
@@ -194,6 +194,8 @@ static constexpr int STORES = 8;
 static ExpertStore *stores[STORES];
 static int nstores;
 static double gave;  // when a store last gave slots back
+// The memory that the stores follow, or null before expert_store_set_memory.
+static Memory *cache_memory;
 #define WHERE(l, e) st->where[(size_t)(l) * st->experts + (e)]
 #define SPAN(l, e, k)                                                          \
   st->span[((size_t)(l) * st->experts + (e)) * st->parts + (k)]
@@ -206,13 +208,25 @@ static double gave;  // when a store last gave slots back
 // set, and the slot bytes that reads have not written yet count as in use.
 static uint64_t cache_unwritten(void);
 
+// Reads the kernel's page counters. *available gets the bytes available to
+// this program, as the memory counts them: the free pages, and the file cache
+// above the one that the kernel keeps. Without a memory, the free pages.
+static SystemMemoryCounters read_counters(uint64_t *available) {
+  if (cache_memory) return memory_read_system(cache_memory, available);
+  SystemMemoryCounters c = system_memory_read_counters();
+  *available = c.free;
+  return c;
+}
+
 void expert_store_set_memory(Memory *memory, MemorySettings settings) {
   const MemorySettings d = EXPERT_STORE_DEFAULT_SETTINGS;
+  cache_memory = memory;
   memory_set_limit(memory, settings.model_gib > 0
                                ? (uint64_t)(settings.model_gib * GiB)
                                : UINT64_MAX);
   expert_store_set_reserve(settings.reserve_gib);
-  memory_set_reserve(memory, reserve, system_memory_available, cache_unwritten);
+  memory_set_reserve(memory, reserve, system_memory_read_counters,
+                     cache_unwritten);
   memory_set_times(memory, settings.times);
   cache_settings = (MemorySettings){
       .model_gib = settings.model_gib,
@@ -606,8 +620,9 @@ void expert_store_start(ExpertStore *st, uint64_t budget, int layers) {
   expert_store_minimum_bytes(st, layers);
   memset(st->where, 0xff, WHERE_BYTES);
   uint64_t pin_size = st->pinned_slot_size;
-  SystemMemoryCounters counters = system_memory_read_counters();
-  uint64_t free = counters.free, avail = counters.available,
+  uint64_t avail;
+  SystemMemoryCounters counters = read_counters(&avail);
+  uint64_t free = counters.free,
            gpu_limit = gpu_recommended_working_set(st->gpu), limit = gpu_limit;
   if (!reserve) expert_store_set_reserve(0);
   int fixed = budget > 0;
@@ -1631,16 +1646,26 @@ void expert_store_cancel_read_aheads(ExpertStore *st, int layer,
 // swap-out cannot take back memory from an empty cache. Growth uses a
 // quarter of the headroom above expert_cache_growth_margin_gib after 32 calm
 // calls, and for free_pages_only_after_swapout after a swap-out only free
-// pages.
+// pages. When the kernel compressed memory while the file cache above the one
+// kept counted as available, it keeps that file cache: the memory counts it
+// as kept from then on, and only the free pages as available.
 static void resize(ExpertStore *st, int below) {
-  SystemMemoryCounters counters = system_memory_read_counters();
-  uint64_t free = counters.free, avail = counters.available,
-           slot = st->SLOT_SIZE,
+  uint64_t avail;
+  SystemMemoryCounters counters = read_counters(&avail);
+  uint64_t free = counters.free, slot = st->SLOT_SIZE,
            growth_margin =
                (uint64_t)(cache_settings.expert_cache_growth_margin_gib * GiB);
   double freed_memory_delay = cache_settings.times.freed_memory_delay,
          caution = cache_settings.free_pages_only_after_swapout;
-  if (!st->init) st->swapouts = counters.swapouts, st->init = 1;
+  if (!st->init)
+    st->swapouts = counters.swapouts, st->compressions = counters.compressions,
+    st->init = 1;
+  if (counters.compressions > st->compressions && avail > free &&
+      cache_memory) {
+    memory_keep_file_cache(cache_memory, counters.file);
+    avail = free;
+  }
+  st->compressions = counters.compressions;
   int64_t room = gpu_room(st);
   // The driver still counts a slot taken out of the residency sets for up to
   // freed_memory_delay, so the mapped slots leave this much of the GPU's room

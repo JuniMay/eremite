@@ -1,5 +1,6 @@
 #ifndef EREMITE_ENGINE_MEMORY_H
 #define EREMITE_ENGINE_MEMORY_H
+#include "platform/system_memory.h"
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -156,12 +157,26 @@ MemoryTimes memory_times(const Memory *memory);
 // Sets the limit in bytes. There is none at first.
 void memory_set_limit(Memory *memory, uint64_t bytes);
 
-// Sets the reserve to keep free for other programs. available() reads the
-// available memory. unwritten(), or null, reads the bytes counted but not yet
+// Sets the reserve to keep free for other programs. read() reads the kernel's
+// page counters. unwritten(), or null, reads the bytes counted but not yet
 // written, which count as used.
 void memory_set_reserve(Memory *memory, uint64_t reserve,
-                        uint64_t (*available)(void),
+                        SystemMemoryCounters (*read)(void),
                         uint64_t (*unwritten)(void));
+
+// Reads the kernel's page counters now. *available gets the bytes available
+// to this program: the free pages, and the file cache above the file cache
+// that the kernel keeps. A reading of a smaller file cache lowers the one
+// kept: the kernel gave that part up. Without a reader, the counters are zero.
+SystemMemoryCounters memory_read_system(Memory *memory, uint64_t *available);
+
+// Returns the file cache that the kernel keeps: the smallest file cache read,
+// or more after memory_keep_file_cache. 0 before the first reading.
+uint64_t memory_kept_file_cache(const Memory *memory);
+
+// Counts at least bytes of file cache as kept. The kernel compressed other
+// memory rather than drop the file cache above the one kept.
+void memory_keep_file_cache(Memory *memory, uint64_t bytes);
 
 // The most memory the models may use now, within the limit and the reserve.
 uint64_t memory_current_limit(Memory *memory);

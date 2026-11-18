@@ -32,7 +32,12 @@ struct Memory {
   // The kernel's count of available memory lags behind this program. So each
   // reading is corrected for what this program used since, and bytes counted
   // but not yet written count as used.
-  uint64_t (*read_available)(void), (*read_unwritten)(void), reserve;
+  SystemMemoryCounters (*read_counters)(void);
+  uint64_t (*read_unwritten)(void), reserve;
+  // The file cache that the kernel keeps rather than give up for other
+  // memory: the smallest file cache read, or more after
+  // memory_keep_file_cache. UINT64_MAX before the first reading.
+  uint64_t kept_file_cache;
   // The last reading, what this program used then, and how much of that was
   // not written yet.
   uint64_t read_bytes, read_used, read_pending;
@@ -56,6 +61,14 @@ static constexpr uint64_t LOGGED_EVICTION = 1ull << 30;
 
 static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
 
+// The bytes available to this program in the counters c: the free pages, and
+// the file cache above the one that the kernel keeps. A smaller file cache
+// lowers the one kept.
+static uint64_t available_in(Memory *memory, SystemMemoryCounters c) {
+  if (c.file < memory->kept_file_cache) memory->kept_file_cache = c.file;
+  return c.free + (c.file - memory->kept_file_cache);
+}
+
 // The available memory. A new reading is taken after
 // available_memory_reading_interval, or at once for 1 GiB or more, but not
 // within freed_memory_delay of a release unless the last is
@@ -67,7 +80,7 @@ static uint64_t available(Memory *memory, uint64_t adding) {
        t - memory->read_at >= times->available_memory_reading_max_age) &&
       (adding >= 1ull << 30 ||
        t - memory->read_at >= times->available_memory_reading_interval)) {
-    memory->read_bytes = memory->read_available();
+    memory->read_bytes = available_in(memory, memory->read_counters());
     memory->read_used = in_use(memory);
     memory->read_at = t;
     memory->read_pending =
@@ -89,7 +102,7 @@ static uint64_t available(Memory *memory, uint64_t adding) {
 
 // How far adding bytes would go below the reserve.
 static uint64_t shortage(Memory *memory, uint64_t bytes) {
-  if (!memory->read_available || !bytes) return 0;
+  if (!memory->read_counters || !bytes) return 0;
   uint64_t a = available(memory, bytes),
            room = a > memory->reserve ? a - memory->reserve : 0;
   return bytes > room ? bytes - room : 0;
@@ -121,6 +134,7 @@ Memory *memory_new(void) {
   if (!memory) die("out of memory (%zu bytes)", sizeof *memory);
   memory->usage.limit = UINT64_MAX;
   memory->read_at = memory->released_at = LONG_AGO;
+  memory->kept_file_cache = UINT64_MAX;
   memory_set_times(memory, (MemoryTimes){0});
   pthread_mutex_init(&memory->host_lock, NULL);
   memory_account_init(memory, &memory->shared_account, "shared", 0);
@@ -156,16 +170,36 @@ void memory_set_times(Memory *memory, MemoryTimes times) {
 MemoryTimes memory_times(const Memory *memory) { return memory->times; }
 
 void memory_set_reserve(Memory *memory, uint64_t bytes,
-                        uint64_t (*reader)(void), uint64_t (*unwritten)(void)) {
+                        SystemMemoryCounters (*reader)(void),
+                        uint64_t (*unwritten)(void)) {
   memory->reserve = bytes;
-  memory->read_available = reader;
+  memory->read_counters = reader;
   memory->read_unwritten = unwritten;
   memory->read_at = LONG_AGO;  // the next use takes a new reading
 }
 
+SystemMemoryCounters memory_read_system(Memory *memory, uint64_t *available) {
+  SystemMemoryCounters c = {0};
+  if (memory->read_counters) c = memory->read_counters();
+  *available = memory->read_counters ? available_in(memory, c) : 0;
+  return c;
+}
+
+uint64_t memory_kept_file_cache(const Memory *memory) {
+  return memory->kept_file_cache == UINT64_MAX ? 0 : memory->kept_file_cache;
+}
+
+void memory_keep_file_cache(Memory *memory, uint64_t bytes) {
+  if (memory->kept_file_cache == UINT64_MAX ||
+      bytes > memory->kept_file_cache) {
+    memory->kept_file_cache = bytes;
+    memory->read_at = LONG_AGO;  // the last reading counted more as available
+  }
+}
+
 uint64_t memory_current_limit(Memory *memory) {
   const MemoryUsage *usage = &memory->usage;
-  if (!memory->read_available) return usage->limit;
+  if (!memory->read_counters) return usage->limit;
   uint64_t a = available(memory, 0),
            room = a > memory->reserve ? a - memory->reserve : 0;
   uint64_t limit = UINT64_MAX - usage->committed < room
@@ -611,11 +645,12 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
 static int retry_while_memory_returns(Memory *memory,
                                       int (*attempt)(void *context),
                                       void *context) {
-  uint64_t seen = memory->read_available ? memory->read_available() : 0;
+  uint64_t seen =
+      memory->read_counters ? available_in(memory, memory->read_counters()) : 0;
   while (!attempt(context)) {
-    if (!memory->read_available || shutdown_requested()) return 0;
+    if (!memory->read_counters || shutdown_requested()) return 0;
     sleep_seconds(memory->times.freed_memory_delay);
-    uint64_t now_available = memory->read_available();
+    uint64_t now_available = available_in(memory, memory->read_counters());
     if (now_available <= seen) return 0;
     seen = now_available;
     memory->read_at = LONG_AGO;  // the next try takes a new reading

@@ -128,6 +128,13 @@ the smallest cache that a prompt pass needs. Then the model's least recently
 used idle state goes. It is saved on the SSD first when `state_disk` is on and
 it holds `state_disk_tokens` tokens of its own.
 
+Free memory means the free pages and the file cache above the part that macOS
+keeps. That part is the smallest file cache read since the server started:
+when memory runs short, macOS drops the file cache above it first. If macOS
+compresses other memory instead while that file cache counts as free, the file
+cache at that moment becomes the part that macOS keeps. So a growing file cache
+does not make the models' memory shrink.
+
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
 at high effort.

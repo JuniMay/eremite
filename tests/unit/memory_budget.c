@@ -20,8 +20,7 @@
 
 #define GB (1ull << 30)
 static uint64_t others_growth;  // what other programs took after the start
-static uint64_t base_free = 100 * GB, file_cache,
-                kept_share;  // kept_share 0: unreadable
+static uint64_t base_free = 100 * GB, file_cache;
 static uint64_t
     unwritten;  // counted model memory whose pages are not written yet
 // The case's memory.
@@ -44,10 +43,7 @@ static kern_return_t fixture_host(host_t host, host_flavor_t flavor,
 static int fixture_sysctl(const char *name, void *out, size_t *n, void *in,
                           size_t len) {
   (void)in, (void)len;
-  uint64_t value = !strcmp(name, "kern.memorystatus_vm_pressure_level") ? 1
-                   : !strcmp(name, "vm.vm_page_filecache_min")
-                       ? kept_share / vm_page_size
-                       : 0;
+  uint64_t value = !strcmp(name, "kern.memorystatus_vm_pressure_level") ? 1 : 0;
   if (!out || !n) return -1;
   size_t size = *n < sizeof value ? *n : sizeof value;
   memcpy(out, &value, size), *n = size;
@@ -195,11 +191,15 @@ static int state_growth_takes_its_space_from_the_experts(void) {
   return back >= 1 * GB;
 }
 
-// 10 GiB free and 30 GiB of file cache, of which the kernel keeps 24 GiB: 16
-// GiB is available, so model memory stops at 12 GiB above the 4 GiB reserve.
+// 10 GiB free and 30 GiB of file cache, of which the kernel keeps 24 GiB, the
+// smallest file cache read: 16 GiB is available, so model memory stops at 12
+// GiB above the 4 GiB reserve.
 static int the_kept_file_cache_is_not_room(void) {
-  base_free = 10 * GB, file_cache = 30 * GB, kept_share = 24 * GB;
+  base_free = 10 * GB, file_cache = 24 * GB;
   start(110, 4);
+  uint64_t available;
+  memory_read_system(memory, &available);
+  file_cache = 30 * GB;
   uint64_t most = fill();
   printf("10 GiB free, 30 GiB of file cache, 24 GiB kept: model memory reached "
          "%.0f GiB (at most 12)\n",
@@ -216,7 +216,7 @@ static uint64_t fixture_unwritten(void) { return unwritten; }
 
 static int slots_not_yet_written_are_not_room(void) {
   start(110, 4);
-  memory_set_reserve(memory, 4 * GB, system_memory_available,
+  memory_set_reserve(memory, 4 * GB, system_memory_read_counters,
                      fixture_unwritten);
   MemoryAccount *deepseek = calloc(1, sizeof *deepseek);
   memory_account_init(memory, deepseek, "DeepSeek", 0);

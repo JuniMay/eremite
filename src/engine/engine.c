@@ -876,17 +876,19 @@ static eremite_stats process_stats;
 void eremite_refresh_stats(void) {
   SystemMemoryInfo mi;
   system_memory_read_info(&mi);
+  uint64_t available = 0;
+  if (memory) memory_read_system(memory, &available);
   uint64_t target =
       gpu ? gpu_recommended_working_set(gpu) : 0;  // 0 before the GPU is made
   process_stats =
       (eremite_stats){.footprint = system_memory_footprint(),
                       .gpu_in_use = system_memory_gpu_driver(),
-                      .available = system_memory_available(),
+                      .available = available,
                       .gpu_limit = target ? (int64_t)target : INT64_MAX,
                       .total = mi.total,
                       .free = mi.free,
                       .file = mi.file,
-                      .file_kept = mi.file_kept,
+                      .file_kept = memory ? memory_kept_file_cache(memory) : 0,
                       .wired = mi.wired,
                       .compressor = mi.compressor,
                       .compressed = mi.compressed,

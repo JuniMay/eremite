@@ -218,7 +218,8 @@ pub struct Stats {
     pub footprint: u64,
     /// Bytes that the GPU has in use.
     pub gpu_in_use: u64,
-    /// Bytes available to the process.
+    /// Bytes available to the process: the free memory, and the file cache
+    /// above the part that the system keeps.
     pub available: u64,
     /// Metal's working-set recommendation; i64::MAX before the GPU starts.
     pub gpu_limit: i64,
@@ -228,7 +229,9 @@ pub struct Stats {
     pub free: u64,
     /// File-backed memory.
     pub file: u64,
-    /// File-backed memory that is kept.
+    /// The part of the file cache that the system keeps rather than give up
+    /// for other memory: the smallest file cache read, or more when the
+    /// system compressed other memory instead.
     pub file_kept: u64,
     /// Wired memory.
     pub wired: u64,
