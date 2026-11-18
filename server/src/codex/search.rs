@@ -9,7 +9,8 @@
 //!   It stops SearXNG after [`Times::searxng_idle`] without a search.
 //! - `open` shows a page from a reference or a URL, and `click` follows one
 //!   of its links.
-//! - `find` shows the lines of a page that contain a text.
+//! - `find` shows a short page whole, or the lines that contain a text with
+//!   the lines around them, and says how many lines match.
 //! - The system curl fetches pages.
 //!   Pages on loopback, private, link-local and other non-public addresses are
 //!   refused, at every redirect.
@@ -25,7 +26,7 @@
 //!   The other commands (images, papers, screenshots, finance, weather, sports)
 //!   are not available and say so.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -52,6 +53,9 @@ const RESULT_SEPARATOR: &str =
 /// `[wordlim: N]` label after each citation marker, as in the hosted web
 /// tool's answers. Codex's instructions for the tool take 200 without a label.
 const SOURCE_WORD_LIMIT: usize = 200;
+/// The lines that find shows above and below each match. The reason for this
+/// value is unknown.
+const FIND_CONTEXT_LINES: usize = 2;
 /// The system's curl.
 const CURL_PATH: &str = "/usr/bin/curl";
 /// A page's bytes at most; a longer page is cut there.
@@ -170,7 +174,7 @@ struct SearchQuery {
 }
 
 /// Opens a page.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct OpenCommand {
     /// The page's reference id or URL.
     ref_id: String,
@@ -180,7 +184,7 @@ struct OpenCommand {
 }
 
 /// Follows a link on a page.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ClickCommand {
     /// The page's reference id or URL.
     ref_id: String,
@@ -190,7 +194,7 @@ struct ClickCommand {
 }
 
 /// Finds a text in a page.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct FindCommand {
     /// The page's reference id or URL.
     ref_id: String,
@@ -283,6 +287,8 @@ pub struct Page {
     pub url: String,
     /// The page's title, or its URL when it has none.
     pub title: String,
+    /// The page's media type, without its parameters; empty when unknown.
+    content_type: String,
     /// The page's text in lines.
     pub lines: Vec<String>,
     /// The URL of each link: link n's URL is `links[n]`.
@@ -538,6 +544,7 @@ impl Service {
                 Ok((id, page)) => format_view(
                     &id,
                     &page,
+                    &command_source("open", command),
                     command.first_line.unwrap_or(0) as usize,
                     length,
                     section_budget,
@@ -551,7 +558,14 @@ impl Service {
                 .click_link(&mut call, command, may_fetch, &allowed_domains)
                 .await
             {
-                Ok((id, page)) => format_view(&id, &page, 0, length, section_budget),
+                Ok((id, page)) => format_view(
+                    &id,
+                    &page,
+                    &command_source("click", command),
+                    0,
+                    length,
+                    section_budget,
+                ),
                 Err(e) => format!("click {} {}: {e}", command.ref_id, command.link_number),
             };
             sections.push(text);
@@ -561,9 +575,7 @@ impl Service {
                 .open_page(&mut call, &command.ref_id, may_fetch, &allowed_domains)
                 .await
             {
-                Ok((id, page)) => {
-                    find_in_page(&id, &page, &command.pattern, length, section_budget)
-                }
+                Ok((id, page)) => find_in_page(&id, &page, command, length, section_budget),
                 Err(e) => format!("find in {}: {e}", command.ref_id),
             };
             sections.push(text);
@@ -1369,12 +1381,21 @@ pub async fn fetch_page(
             Page {
                 url: url.to_string(),
                 title: url.to_string(),
+                content_type: String::new(),
                 lines: wrap_lines(text.lines()),
                 links: Vec::new(),
             }
         } else {
             return Err(format!("not a text page ({content_type})"));
         };
+        if !content_type.is_empty() {
+            page.content_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        }
         if response.is_cut {
             page.lines.push(format!(
                 "(The page is longer than {} MB; the rest is not shown.)",
@@ -1581,6 +1602,7 @@ pub fn convert_html_to_page(base_url: &Url, html: &str) -> Page {
         } else {
             title
         },
+        content_type: "text/html".into(),
         lines,
         links,
     }
@@ -1790,80 +1812,181 @@ fn append_result(output: &mut String, entry: &str, budget: usize) -> bool {
     true
 }
 
-/// A page from line `first_line` on, as many lines as the length and budget
-/// allow.
+/// Returns the command that made a view, as the view's head names it: its
+/// name, then its arguments as JSON in parentheses.
+fn command_source(name: &str, command: &impl Serialize) -> String {
+    let args = serde_json::to_string(command).expect("serialize the web command");
+    format!("{name}({args})")
+}
+
+/// Returns the head of a view of `page`: its result head, its content type
+/// when known, the command `source` that made the view, and the page's lines
+/// in all.
+fn page_header(id: &str, page: &Page, source: &str) -> String {
+    let mut header = source_header(id, &page.title, &page.url);
+    if !page.content_type.is_empty() {
+        header.push_str(&format!(" Content type: {};", page.content_type));
+    }
+    header.push_str(&format!(
+        " Source: {source}; Total lines: {}",
+        page.lines.len()
+    ));
+    header
+}
+
+/// Appends the numbered lines of `page` in `range` to `output` while they fit
+/// in `budget`. Returns the first line not appended.
+fn append_page_lines(
+    output: &mut String,
+    page: &Page,
+    range: std::ops::Range<usize>,
+    budget: usize,
+) -> usize {
+    let end = range.end;
+    for index in range {
+        let line = format!("\nL{index}: {}", page.lines[index]);
+        if output.len() + line.len() > budget {
+            return index;
+        }
+        output.push_str(&line);
+    }
+    end
+}
+
+/// Shows `page` from line `first_line` on: whole lines as the length and the
+/// budget allow, then which line to open next. A first line too long for the
+/// budget is cut.
 fn format_view(
     id: &str,
     page: &Page,
+    source: &str,
     first_line: usize,
     length: ResponseLength,
     budget: usize,
 ) -> String {
+    let mut output = page_header(id, page, source);
     let total = page.lines.len();
-    let first_line = first_line.min(total);
-    let mut out = format!("[{id}] {}\n{}\n", page.title, page.url);
-    let mut body = String::new();
-    let mut to = first_line;
-    while to < total && to - first_line < length.max_lines_per_view() {
-        let line = format!("L{to}: {}\n", page.lines[to]);
-        if out.len() + body.len() + line.len() > budget && to > first_line {
-            break;
-        }
-        body.push_str(&line);
-        to += 1;
-    }
     if total == 0 {
-        out.push_str("The page has no text.\n");
-    } else if to < total {
-        out.push_str(&format!(
-            "Lines {first_line} to {} of {total}; open {id} with \"lineno\": {to} to read on. Links are 【n†text】; click one with {{\"ref_id\": \"{id}\", \"id\": n}}.\n",
-            to - 1
-        ));
-    } else {
-        out.push_str(&format!(
-            "Lines {first_line} to {} of {total}. Links are 【n†text】; click one with {{\"ref_id\": \"{id}\", \"id\": n}}.\n",
-            total.saturating_sub(1)
-        ));
+        output.push_str("\nThe page has no text.");
+        return output;
     }
-    out.push_str(&body);
-    out.trim_end().to_string()
+    let start = first_line.min(total);
+    let end = (start + length.max_lines_per_view()).min(total);
+    let mut next = append_page_lines(&mut output, page, start..end, budget);
+    if next == total {
+        return output;
+    }
+    if next == start {
+        let label = format!("\nL{start}: ");
+        if let Some(room) = budget.checked_sub(output.len() + label.len() + '…'.len_utf8()) {
+            let text = &page.lines[start];
+            output.push_str(&label);
+            output.push_str(&text[..text.floor_char_boundary(room)]);
+            output.push('…');
+        }
+        return output;
+    }
+    let continuation = |line| format!("\nOpen {id} with \"lineno\": {line} to read on.");
+    let hint_size = continuation(next).len();
+    while next > start + 1 && output.len() + hint_size > budget {
+        output.truncate(
+            output
+                .rfind('\n')
+                .expect("a numbered line starts with a newline"),
+        );
+        next -= 1;
+    }
+    let hint = continuation(next);
+    if output.len() + hint.len() <= budget {
+        output.push_str(&hint);
+    }
+    output
 }
 
-/// The page's lines containing the pattern, case ignored.
+/// Shows the lines of `page` that contain the pattern, case ignored, and says
+/// how many there are. A short page that fits is shown whole. Otherwise the
+/// matching lines get the room first, then the lines around them, in page
+/// order.
 fn find_in_page(
     id: &str,
     page: &Page,
-    pattern: &str,
+    command: &FindCommand,
     length: ResponseLength,
     budget: usize,
 ) -> String {
-    let needle = pattern.to_lowercase();
-    let mut out = String::new();
-    let mut count = 0;
-    let mut shown = 0;
-    for (line_number, line) in page.lines.iter().enumerate() {
-        if needle.is_empty() || !line.to_lowercase().contains(&needle) {
-            continue;
+    let mut output = page_header(id, page, &command_source("find", command));
+    let needle = command.pattern.to_lowercase();
+    let is_match = |line: &str| !needle.is_empty() && line.to_lowercase().contains(&needle);
+    let all_matches: Vec<usize> = (0..page.lines.len())
+        .filter(|&index| is_match(&page.lines[index]))
+        .collect();
+    if all_matches.is_empty() {
+        output.push_str("\nNo match.");
+        return output;
+    }
+    let count = all_matches.len();
+    output.push_str(&format!("; Matches: {count}"));
+    // Says how many matching lines the answer shows when it shows fewer.
+    let shown_note = |shown: usize| format!(" ({shown} shown)");
+    let note_room = shown_note(count).len();
+    let matches = &all_matches[..count.min(length.max_matches_per_find())];
+    let total = page.lines.len();
+    if total <= length.max_lines_per_view() {
+        let header_len = output.len();
+        if append_page_lines(&mut output, page, 0..total, budget) == total {
+            return output;
         }
-        count += 1;
-        let entry = format!("L{line_number}: {line}\n");
-        if shown < length.max_matches_per_find() && out.len() + entry.len() < budget {
-            out.push_str(&entry);
-            shown += 1;
+        output.truncate(header_len);
+    }
+
+    let mut selected = BTreeMap::new();
+    let mut remaining = budget.saturating_sub(output.len() + note_room);
+    let mut select = |index: usize| {
+        if let std::collections::btree_map::Entry::Vacant(entry) = selected.entry(index) {
+            let line = format!("\nL{index}: {}", page.lines[index]);
+            if line.len() > remaining {
+                return false;
+            }
+            remaining -= line.len();
+            entry.insert(line);
+        }
+        true
+    };
+    let first_match = matches[0];
+    let displayed: Vec<usize> = matches
+        .iter()
+        .copied()
+        .filter(|&index| select(index))
+        .collect();
+    if displayed.is_empty() {
+        output.push_str(&shown_note(0));
+        let location = format!("\nMatch at L{first_match}.");
+        if output.len() + location.len() <= budget {
+            output.push_str(&location);
+        }
+        return output;
+    }
+    for distance in 1..=FIND_CONTEXT_LINES {
+        for &index in &displayed {
+            if let Some(before) = index.checked_sub(distance) {
+                select(before);
+            }
+            if index + distance < total {
+                select(index + distance);
+            }
         }
     }
-    let head = format!(
-        "Find \"{pattern}\" in [{id}] {} ({}):",
-        page.title, page.url
-    );
-    match count {
-        0 => format!("{head} no match."),
-        _ if shown < count => format!(
-            "{head} {count} matches, the first {shown} shown.\n{}",
-            out.trim_end()
-        ),
-        _ => format!("{head} {count} matches.\n{}", out.trim_end()),
+    let shown = selected
+        .keys()
+        .filter(|&&index| is_match(&page.lines[index]))
+        .count();
+    if shown < count {
+        output.push_str(&shown_note(shown));
     }
+    for line in selected.into_values() {
+        output.push_str(&line);
+    }
+    output
 }
 
 /// Returns the seconds since 1970-01-01 UTC, or 0 for a clock before then.
@@ -1937,6 +2060,7 @@ mod tests {
         Page {
             url: "https://example.com/a".into(),
             title: "Example".into(),
+            content_type: "text/html".into(),
             lines: lines.iter().map(|s| s.to_string()).collect(),
             links: links.iter().map(|s| s.to_string()).collect(),
         }
@@ -2176,9 +2300,9 @@ mod tests {
         assert!(answer.results.is_none());
         let out = answer.output;
         assert!(out.starts_with(UNTRUSTED_CONTENT_NOTICE), "{out}");
-        assert!(out.contains("Find \"pattern\" in [turn0view0] Example (https://example.com/a): 1 matches.\nL1: the Pattern here"), "{out}");
+        assert!(out.contains("Source: find({\"ref_id\":\"turn0view0\",\"pattern\":\"pattern\"}); Total lines: 3; Matches: 1\nL0: first line\nL1: the Pattern here\nL2: last"), "{out}");
         assert!(
-            out.contains("[turn0view0] Example\nhttps://example.com/a\nLines 1 to 2 of 3."),
+            out.contains("Source: open({\"ref_id\":\"turn0view0\",\"lineno\":1}); Total lines: 3\nL1: the Pattern here\nL2: last"),
             "{out}"
         );
         assert!(out.contains("L1: the Pattern here\nL2: last"), "{out}");
@@ -2231,14 +2355,36 @@ mod tests {
         let lines: Vec<String> = (0..300).map(|n| format!("line {n}")).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let p = build_test_page(&refs, &[]);
-        let v = format_view("turn0view0", &p, 0, ResponseLength::Short, 100_000);
+        let v = format_view(
+            "turn0view0",
+            &p,
+            "open({})",
+            0,
+            ResponseLength::Short,
+            100_000,
+        );
         assert!(
-            v.contains("Lines 0 to 59 of 300; open turn0view0 with \"lineno\": 60 to read on."),
+            v.contains("L59: line 59\nOpen turn0view0 with \"lineno\": 60 to read on."),
             "{v}"
         );
-        let small = format_view("turn0view0", &p, 100, ResponseLength::Long, 300);
-        assert!(small.contains("Lines 100 to "), "{small}");
-        assert!(small.len() < 600, "{}", small.len());
+        let small = format_view("turn0view0", &p, "open({})", 100, ResponseLength::Long, 300);
+        assert!(
+            small.contains("L100: line 100") && small.contains("Open turn0view0"),
+            "{small}"
+        );
+        assert!(small.len() <= 300, "{}", small.len());
+        let wide = build_test_page(&[&"é".repeat(300), "last"], &[]);
+        let view = format_view(
+            "turn0view0",
+            &wide,
+            "open({})",
+            0,
+            ResponseLength::Short,
+            240,
+        );
+        assert!(view.contains("L0: é") && view.contains('…'), "{view}");
+        assert!(!view.contains("\"lineno\": 0"), "{view}");
+        assert!(view.len() <= 240, "{view}");
     }
 
     #[test]
@@ -2394,7 +2540,82 @@ mod tests {
         let opened = search_answer(&s, serde_json::json!({"open":[{"ref_id":id}]})).await;
         let text = opened["output"].as_str().unwrap();
         assert!(text.contains("L0: Hello 【0†next page】"), "{text}");
-        assert_eq!(opened.get("results"), Some(&Value::Null));
+        let (_, tail) = text.split_once("\u{e200}cite\u{e202}").unwrap();
+        let (view, _) = tail.split_once('\u{e201}').unwrap();
+        let found = search_answer(
+            &s,
+            serde_json::json!({"find":[{"ref_id":view,"pattern":"Hello"}]}),
+        )
+        .await;
+        assert!(
+            found["output"]
+                .as_str()
+                .unwrap()
+                .contains("L0: Hello 【0†next page】")
+        );
+        let clicked =
+            search_answer(&s, serde_json::json!({"click":[{"ref_id":view,"id":0}]})).await;
+        assert!(
+            clicked["output"]
+                .as_str()
+                .unwrap()
+                .contains("L1: second line")
+        );
+        assert_eq!(clicked.get("results"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn find_shows_the_whole_short_page_and_context_on_long_pages() {
+        let short = build_test_page(&["first", "second", "needle", "fourth", "last"], &[]);
+        let command = FindCommand {
+            ref_id: "turn0view0".into(),
+            pattern: "needle".into(),
+        };
+        let found = find_in_page("turn0view0", &short, &command, ResponseLength::Short, 2500);
+        assert!(
+            found.contains("L0: first\nL1: second\nL2: needle\nL3: fourth\nL4: last"),
+            "{found}"
+        );
+        let mut long = build_test_page(&["other"; 100], &[]);
+        long.lines[40] = "first needle".into();
+        long.lines[42] = "second needle".into();
+        long.lines[90] = "last needle".into();
+        let found = find_in_page("turn0view0", &long, &command, ResponseLength::Short, 2500);
+        for line in [39, 40, 41, 42, 43, 89, 90, 91] {
+            assert_eq!(
+                found
+                    .lines()
+                    .filter(|s| s.starts_with(&format!("L{line}:")))
+                    .count(),
+                1,
+                "{found}"
+            );
+        }
+        assert!(!found.contains("L0: other"), "{found}");
+    }
+
+    #[test]
+    fn find_says_how_many_lines_match() {
+        let command = FindCommand {
+            ref_id: "turn0view0".into(),
+            pattern: "needle".into(),
+        };
+        let short = build_test_page(&["first", "needle", "last"], &[]);
+        let found = find_in_page("turn0view0", &short, &command, ResponseLength::Short, 2500);
+        assert!(
+            found.contains("Total lines: 3; Matches: 1\nL0: first"),
+            "{found}"
+        );
+        // Every tenth line matches; a short answer shows the first 10.
+        let lines: Vec<&str> = (0..1000)
+            .map(|n| if n % 10 == 0 { "a needle" } else { "other" })
+            .collect();
+        let long = build_test_page(&lines, &[]);
+        let found = find_in_page("turn0view0", &long, &command, ResponseLength::Short, 2500);
+        assert!(
+            found.contains("Total lines: 1000; Matches: 100 (10 shown)\n"),
+            "{found}"
+        );
     }
 
     #[test]
@@ -2465,7 +2686,7 @@ mod tests {
             .await
             .output;
         assert!(
-            out.contains(&format!("[turn0view0] Page\nhttp://127.0.0.1:{port}/page")),
+            out.contains(&format!("Page (http://127.0.0.1:{port}/page)\n\u{e200}cite\u{e202}turn0view0\u{e201} [wordlim: 200] Content type: text/html;")),
             "{out}"
         );
         assert!(out.contains("L0: Hello 【0†next page】"), "{out}");
@@ -2476,7 +2697,9 @@ mod tests {
             .await
             .output;
         assert!(
-            out.contains("[turn1view0]") && out.contains("L1: second line"),
+            out.contains(
+                "\u{e200}cite\u{e202}turn1view0\u{e201} [wordlim: 200] Content type: text/plain;"
+            ) && out.contains("L1: second line"),
             "{out}"
         );
         let out = s

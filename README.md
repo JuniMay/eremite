@@ -149,6 +149,13 @@ SearXNG's order. A successful query with no result shown gives an empty
 array, and a call without a successful query gives `null`. `encrypted_output`
 is always `null`.
 
+Within a session, `open` accepts a search reference, a page reference or a
+URL. Page views number each line and link. `find` says how many lines match.
+It returns the whole page when the page fits the view's line and output
+limits, and otherwise the matching lines with up to two lines on either side.
+`click` follows a numbered link of the page. These commands do not use the
+model.
+
 `scripts/setup-searxng.sh` installs SearXNG in
 `~/.local/share/eremite/searxng`, the server's default `searxng_dir`. It needs
 git and Python 3.10 or later, and downloads about 100 MB.
