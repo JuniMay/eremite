@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const ModelOps *const families[] = {&deepseek_ops};
+static const ModelOps *const families[] = {&deepseek_ops, &lfm3_ops};
 
 const ModelOps *model_find_family(const char *dir) {
   char path[1024];
