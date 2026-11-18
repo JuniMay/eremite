@@ -261,6 +261,10 @@ Tokenizer *tokenizer_open(const char *dir, const char *image) {
   }
   for (t->mcap = 1; t->mcap < 2ull * m->n; t->mcap *= 2) {}
   t->merges = xmalloc(t->mcap * sizeof *t->merges);
+  // A merge's two parts as raw bytes, back to back: a part's raw bytes are at
+  // most its UTF-8 bytes in the file.
+  char *ab = NULL;
+  int ab_room = 0;
   for (int i = 0; i < m->n; i++) {
     const Json *e = &m->kid[i];
     const char *l, *r;
@@ -274,13 +278,13 @@ Tokenizer *tokenizer_open(const char *dir, const char *image) {
       l = e->kid[0].s, nl = e->kid[0].n, r = e->kid[1].s, nr = e->kid[1].n;
     } else
       die("tokenizer: a merge of an unknown form");
-    char a[256], b[256], ab[512];
-    if (nl > 255 || nr > 255)
-      die("tokenizer: a merge part longer than 255 bytes");
-    int na = raw(l, nl, a), nb = raw(r, nr, b);
-    memcpy(ab, a, na);
-    memcpy(ab + na, b, nb);
-    int ia = lookup(t, a, na), ib = lookup(t, b, nb),
+    if (nl + nr > ab_room) {
+      ab_room = nl + nr;
+      ab = realloc(ab, (size_t)ab_room);
+      if (!ab) die("out of memory");
+    }
+    int na = raw(l, nl, ab), nb = raw(r, nr, ab + na);
+    int ia = lookup(t, ab, na), ib = lookup(t, ab + na, nb),
         id = lookup(t, ab, na + nb);
     if (ia < 0 || ib < 0 || id < 0)
       die("tokenizer: bad merge %.*s %.*s", nl, l, nr, r);
@@ -289,6 +293,7 @@ Tokenizer *tokenizer_open(const char *dir, const char *image) {
     while (t->merges[j].pair) j = (j + 1) & (t->mcap - 1);
     t->merges[j] = (Merge){key + 1, i, id};
   }
+  free(ab);
   for (int b = 0; b < 256; b++)
     if (lookup(t, (char[]){(char)b}, 1) < 0)
       die("%s: no token for byte %d", path, b);
