@@ -1,8 +1,10 @@
 #include "model/lfm3/model.h"
+#include "base/clock.h"
 #include "base/error.h"
 #include "base/file.h"
 #include "base/json.h"
 #include "engine/memory.h"
+#include "engine/pass.h"
 #include "engine/safetensors.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
@@ -10,10 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-// LFM3's language model in a d1 checkpoint (model.language_model.*): its
-// shape, its layers and their weights. A d1 checkpoint's config.json has
-// model_type lfm3_vl and d1_attention "set". The vision tower's weights do
-// not load with the language model.
+// LFM3's language model in a d1 checkpoint (model.language_model.*), and its
+// decision pass. A d1 checkpoint's config.json has model_type lfm3_vl and
+// d1_attention "set": a sequence holds a state, then its questions. On the
+// global attention layers, the state's rows see every row, and a question's
+// rows see the state and their own question, both ways. The sliding
+// attention layers and the short convolutions see only rows before.
+//
+// The pass runs one layer at a time over all of the sequence's rows, in
+// blocks of rows. Each layer's work is one command buffer.
 
 // The RoPE bases (rope_theta) of the global and the sliding layers.
 static constexpr double GLOBAL_THETA = 1e6, SLIDING_THETA = 1e4;
@@ -21,11 +28,49 @@ static constexpr double GLOBAL_THETA = 1e6, SLIDING_THETA = 1e4;
 // layers (partial_rotary_factor 0.5), all of them on the sliding ones.
 static constexpr int GLOBAL_ROTATED = LFM3_HEAD_DIM / 4,
                      SLIDING_ROTATED = LFM3_HEAD_DIM / 2;
+// Rows of a pass's block: each layer takes its rows in blocks of this many,
+// so that a long sequence's temporary buffers stay near 480 MiB, 120 KiB a
+// row. Block boundaries change no result.
+static constexpr int BLOCK_ROWS = 4096;
+// The rows that the attention kernel takes in one threadgroup, and its key
+// blocks: the BF16 attention arrays hold whole tiles of them, and as many
+// zero rows after the sequence's rows.
+static constexpr int ATTEND_ROWS = 64;
+// The threads of a row's RMSNorm threadgroup, and of the other kernels'
+// threadgroups over a row's values.
+static constexpr int ROW_THREADS = 256;
+// The threads of lfm3_heads's threadgroup: one pair of a head's values each.
+static constexpr int HEAD_THREADS = LFM3_HEAD_DIM / 2;
+// The threadgroups of lfm3_heads for one row: the query heads, then the key
+// heads, then the value heads.
+static constexpr int HEAD_GROUPS = LFM3_HEADS + 2 * LFM3_KV_HEADS;
+// The threads of lfm3_attend's threadgroup: its 4 simdgroups.
+static constexpr int ATTEND_THREADS = 128;
+// The rows of the convolution's filter that reach back before a row.
+static constexpr int CONV_BEFORE = LFM3_CONV_WIDTH - 1;
+// The stack of a pass: it holds little more than one row of FP32 values.
+static constexpr size_t PASS_STACK_BYTES = 1u << 20;
 
 // The GPU that the model runs on.
 static Gpu *gpu;
+// The model's workspace slot, from its loader.
+static MemorySlot *work_slot;
 static TensorIndex *checkpoint;
 static WeightGroup *text_weights;
+// The number of the last command buffer that the running pass committed; 0
+// for none. Each pass has its own.
+static uint64_t last_committed;
+// The running pass's logits from its last decision, and their room. Each pass
+// has its own.
+static float *results;
+static int results_room;
+// The rows of the decisions since the model loaded.
+static uint64_t decision_rows;
+// The least memory that a pass over one full block needs: the weights and
+// the pass's buffers.
+static uint64_t required_bytes;
+static int K_lfm3_embed, K_lfm3_norm, K_lfm3_norm_add, K_lfm3_copy, K_lfm3_conv,
+    K_lfm3_swiglu, K_lfm3_heads, K_lfm3_attend, K_mm_bf16;
 
 // A BF16 matrix of n rows of k values.
 typedef struct {
@@ -63,6 +108,44 @@ static Layer layers[LFM3_LAYERS];
 // The embedding table (BF16, tied to the output head), the final norm, and
 // RoPE's inverse frequencies on the global and the sliding layers.
 static Buf embed, final_norm, global_inv_freq, sliding_inv_freq;
+
+// The parameters of the kernels, as src/kernels/lfm3.metal and mm_bf16 take
+// them.
+typedef struct {
+  uint32_t n;
+  float eps;
+} NormParams;
+
+typedef struct {
+  uint32_t dim, width, before;
+} ConvParams;
+
+typedef struct {
+  uint32_t rows, first, padded, rotated;
+  float eps;
+} HeadsParams;
+
+typedef struct {
+  uint32_t rows, first, block_rows, padded, state, window;
+} AttendParams;
+
+typedef struct {
+  uint32_t m, n, k, round, lda, ldy;
+} ProductParams;
+
+// The buffers of a pass over a sequence: its rows' and one block's.
+typedef struct {
+  // The sequence's rows: the residual stream (FP32), each row's token and
+  // question (0 for the state's rows), the questions' spans, and attention's
+  // BF16 inputs (queries of 16 heads, keys and values of 4) with its gates.
+  Buf x, ids, groups, spans, qh, kh, vh, gates;
+  // A block's rows: normed inputs (after the convolution's rows before the
+  // block), in_proj's outputs, an operator's output and its projection, the
+  // queries, keys and values, and the feed-forward's two halves.
+  Buf normed, bcx, out, projected, q, k, v, up, gated;
+} PassBuffers;
+
+static constexpr int PASS_BUFFERS = sizeof(PassBuffers) / sizeof(Buf);
 
 // ---- weights ----
 
@@ -226,23 +309,392 @@ static void add_text_weights(void) {
                              sizeof(Frequencies));
 }
 
-// ---- loading and counters ----
+// ---- the pass's buffers ----
+
+// Rounds n up to a multiple of unit.
+static int round_up(int n, int unit) { return (n + unit - 1) / unit * unit; }
+
+// The rows of each head in the BF16 attention arrays for n rows.
+static int attention_rows(int n) {
+  return round_up(n, ATTEND_ROWS) + ATTEND_ROWS;
+}
+
+// Writes the bytes of each buffer of a pass over n rows with that many
+// questions, in PassBuffers's order.
+static void count_buffer_bytes(int n, int questions,
+                               size_t bytes[PASS_BUFFERS]) {
+  size_t rows = (size_t)n, block = (size_t)(n < BLOCK_ROWS ? n : BLOCK_ROWS),
+         padded = (size_t)attention_rows(n), wide = block + CONV_BEFORE;
+  size_t sizes[PASS_BUFFERS] = {rows * LFM3_DIM * 4,
+                                rows * 4,
+                                rows * 4,
+                                (size_t)(questions + 1) * 8,
+                                LFM3_HEADS * padded * LFM3_HEAD_DIM * 2,
+                                LFM3_KV_HEADS * padded * LFM3_HEAD_DIM * 2,
+                                LFM3_KV_HEADS * padded * LFM3_HEAD_DIM * 2,
+                                rows * LFM3_HEADS * 4,
+                                wide * LFM3_DIM * 4,
+                                wide * 3 * LFM3_DIM * 4,
+                                block * LFM3_DIM * 4,
+                                block * LFM3_DIM * 4,
+                                block * LFM3_HEADS * LFM3_HEAD_DIM * 4,
+                                block * LFM3_KV_HEADS * LFM3_HEAD_DIM * 4,
+                                block * LFM3_KV_HEADS * LFM3_HEAD_DIM * 4,
+                                block * LFM3_HIDDEN * 4,
+                                block * LFM3_HIDDEN * 4};
+  memcpy(bytes, sizes, sizeof sizes);
+}
+
+// Returns the bytes that the buffers of a pass over n rows with that many
+// questions take.
+static uint64_t count_pass_bytes(int n, int questions) {
+  size_t bytes[PASS_BUFFERS];
+  count_buffer_bytes(n, questions, bytes);
+  uint64_t total = 0;
+  for (int i = 0; i < PASS_BUFFERS; i++)
+    total += gpu_round_up_to_pages(bytes[i]);
+  return total;
+}
+
+// Frees the pass's buffers once the GPU has finished with them.
+static void free_pass_buffers(PassBuffers *b) {
+  Buf *all = &b->x;
+  for (int i = 0; i < PASS_BUFFERS; i++)
+    if (all[i].size) gpu_mark_to_free(&all[i]);
+}
+
+// Allocates the buffers of a pass over n rows with that many questions, in
+// the workspace slot, and zeroes the attention arrays' rows after the
+// sequence's. Returns 0, with none allocated, when they do not fit.
+static int allocate_pass_buffers(PassBuffers *b, int n, int questions) {
+  size_t bytes[PASS_BUFFERS];
+  count_buffer_bytes(n, questions, bytes);
+  *b = (PassBuffers){0};
+  Buf *all = &b->x;
+  for (int i = 0; i < PASS_BUFFERS; i++) {
+    all[i] = gpu_try_alloc_required(gpu, work_slot, bytes[i]);
+    if (!all[i].size) {
+      free_pass_buffers(b);
+      return 0;
+    }
+    gpu_set_resident(&all[i], 1);
+  }
+  gpu_commit_residency(gpu);
+  size_t padded = (size_t)attention_rows(n), row = LFM3_HEAD_DIM * 2,
+         after = (padded - (size_t)n) * row;
+  for (int h = 0; h < LFM3_HEADS; h++) {
+    memset(b->qh.ptr + ((size_t)h * padded + (size_t)n) * row, 0, after);
+    if (h >= LFM3_KV_HEADS) continue;
+    memset(b->kh.ptr + ((size_t)h * padded + (size_t)n) * row, 0, after);
+    memset(b->vh.ptr + ((size_t)h * padded + (size_t)n) * row, 0, after);
+  }
+  return 1;
+}
+
+// ---- the pass's work ----
+
+// Commits the command buffer, and records it as the running pass's last one.
+static void commit_work(GpuCommandBuffer *c) {
+  last_committed = c->number;
+  gpu_commit(c);
+}
+
+static int committed_finished(void *number) {
+  return gpu_has_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+static void committed_wait(void *number) {
+  gpu_wait_until_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+// Waits for the GPU work that the running pass committed: inside a pass, by
+// yielding; outside passes, for all GPU work.
+static void wait_for_work(void) {
+  if (!pass_current()) {
+    gpu_sync(gpu);
+    return;
+  }
+  if (last_committed)
+    pass_wait(&(PassWait){committed_finished, committed_wait,
+                          (void *)(uintptr_t)last_committed, PASS_WAIT_GPU,
+                          NULL});
+  gpu_check_finished(gpu);
+}
+
+// The bytes before row r of rows of LFM3_DIM floats.
+static size_t row_bytes(int r) { return (size_t)r * LFM3_DIM * 4; }
+
+// y = x W^T for m rows of x (row stride lda floats, from byte x_off) into rows
+// of y (row stride ldy floats, from byte y_off).
+static void multiply(GpuCommandBuffer *c, const Lin *w, int m, const Buf *x,
+                     size_t x_off, int lda, const Buf *y, size_t y_off,
+                     int ldy) {
+  ProductParams p = {(uint32_t)m, (uint32_t)w->n, (uint32_t)w->k,
+                     0,           (uint32_t)lda,  (uint32_t)ldy};
+  gpu_select_kernel(c, K_mm_bf16);
+  gpu_bind_buffer(c, 0, &w->w, 0), gpu_bind_buffer(c, 2, x, x_off);
+  gpu_bind_buffer(c, 3, y, y_off), gpu_copy_bytes(c, 4, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)(w->n + 63) / 64, (uint32_t)(m + 63) / 64, 1, 128,
+                 1, 1);
+}
+
+// y = RMSNorm(x) w for m rows of LFM3_DIM values, from bytes x_off and y_off.
+static void normalize(GpuCommandBuffer *c, const Buf *x, size_t x_off,
+                      const Buf *w, const Buf *y, size_t y_off, int m) {
+  NormParams p = {LFM3_DIM, LFM3_NORM_EPS};
+  gpu_select_kernel(c, K_lfm3_norm);
+  gpu_bind_buffer(c, 0, x, x_off), gpu_bind_buffer(c, 1, w, 0);
+  gpu_bind_buffer(c, 2, y, y_off), gpu_copy_bytes(c, 3, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)m, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// x += RMSNorm(y) w for m rows of LFM3_DIM values from byte x_off of x: a
+// sandwich norm's residual.
+static void add_normalized(GpuCommandBuffer *c, const Buf *x, size_t x_off,
+                           const Buf *y, const Buf *w, int m) {
+  NormParams p = {LFM3_DIM, LFM3_NORM_EPS};
+  gpu_select_kernel(c, K_lfm3_norm_add);
+  gpu_bind_buffer(c, 0, x, x_off), gpu_bind_buffer(c, 1, y, 0);
+  gpu_bind_buffer(c, 2, w, 0), gpu_copy_bytes(c, 3, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)m, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// The rows of the block that starts at row first of n.
+static int block_rows(int first, int n) {
+  return n - first < BLOCK_ROWS ? n - first : BLOCK_ROWS;
+}
+
+// Layer y's short convolution over the sequence's n rows, block by block. A
+// block's in_proj also takes the CONV_BEFORE rows before it, normed from the
+// layer's input. Those rows stay in the normed buffer from the block before,
+// a full block, since the residual has changed the stream's rows by then:
+// they move to its front.
+static void run_conv(GpuCommandBuffer *c, const Layer *y, PassBuffers *b,
+                     int n) {
+  int before = 0;
+  for (int first = 0; first < n; first += BLOCK_ROWS) {
+    int m = block_rows(first, n),
+        kept = first < CONV_BEFORE ? first : CONV_BEFORE;
+    if (kept) {
+      uint32_t count = (uint32_t)kept * LFM3_DIM;
+      gpu_select_kernel(c, K_lfm3_copy);
+      gpu_bind_buffer(c, 0, &b->normed, row_bytes(before + BLOCK_ROWS - kept));
+      gpu_bind_buffer(c, 1, &b->normed, 0);
+      gpu_copy_bytes(c, 2, &count, sizeof count);
+      gpu_run_kernel(c, (count + ROW_THREADS - 1) / ROW_THREADS, 1, 1,
+                     ROW_THREADS, 1, 1);
+    }
+    before = kept;
+    normalize(c, &b->x, row_bytes(first), &y->operator_norm, &b->normed,
+              row_bytes(before), m);
+    multiply(c, &y->in_proj, before + m, &b->normed, 0, LFM3_DIM, &b->bcx, 0,
+             3 * LFM3_DIM);
+    ConvParams p = {LFM3_DIM, LFM3_CONV_WIDTH, (uint32_t)before};
+    gpu_select_kernel(c, K_lfm3_conv);
+    gpu_bind_buffer(c, 0, &b->bcx, 0), gpu_bind_buffer(c, 1, &y->conv, 0);
+    gpu_bind_buffer(c, 2, &b->out, 0), gpu_copy_bytes(c, 3, &p, sizeof p);
+    gpu_run_kernel(c, LFM3_DIM / ROW_THREADS, (uint32_t)m, 1, ROW_THREADS, 1,
+                   1);
+    multiply(c, &y->out_proj, m, &b->out, 0, LFM3_DIM, &b->projected, 0,
+             LFM3_DIM);
+    add_normalized(c, &b->x, row_bytes(first), &b->projected,
+                   &y->post_operator_norm, m);
+  }
+}
+
+// Layer y's attention over the sequence's n rows, whose first `state` rows
+// are the state. First each block's queries, keys, values and gates; then,
+// once every row's keys are there, each block's attention, its projection and
+// its residual.
+static void run_attention(GpuCommandBuffer *c, const Layer *y, PassBuffers *b,
+                          int n, int state) {
+  int sliding = y->kind == LAYER_SLIDING;
+  uint32_t padded = (uint32_t)attention_rows(n);
+  for (int first = 0; first < n; first += BLOCK_ROWS) {
+    int m = block_rows(first, n);
+    normalize(c, &b->x, row_bytes(first), &y->operator_norm, &b->normed, 0, m);
+    multiply(c, &y->q, m, &b->normed, 0, LFM3_DIM, &b->q, 0,
+             LFM3_HEADS * LFM3_HEAD_DIM);
+    multiply(c, &y->k, m, &b->normed, 0, LFM3_DIM, &b->k, 0,
+             LFM3_KV_HEADS * LFM3_HEAD_DIM);
+    multiply(c, &y->v, m, &b->normed, 0, LFM3_DIM, &b->v, 0,
+             LFM3_KV_HEADS * LFM3_HEAD_DIM);
+    multiply(c, &y->gate, m, &b->normed, 0, LFM3_DIM, &b->gates,
+             (size_t)first * LFM3_HEADS * 4, LFM3_HEADS);
+    HeadsParams h = {(uint32_t)m, (uint32_t)first, padded,
+                     sliding ? SLIDING_ROTATED : GLOBAL_ROTATED, LFM3_NORM_EPS};
+    gpu_select_kernel(c, K_lfm3_heads);
+    gpu_bind_buffer(c, 0, &b->q, 0), gpu_bind_buffer(c, 1, &b->k, 0);
+    gpu_bind_buffer(c, 2, &b->v, 0), gpu_bind_buffer(c, 3, &y->q_norm, 0);
+    gpu_bind_buffer(c, 4, &y->k_norm, 0);
+    gpu_bind_buffer(c, 5, sliding ? &sliding_inv_freq : &global_inv_freq, 0);
+    gpu_bind_buffer(c, 6, &b->qh, 0), gpu_bind_buffer(c, 7, &b->kh, 0);
+    gpu_bind_buffer(c, 8, &b->vh, 0), gpu_copy_bytes(c, 9, &h, sizeof h);
+    gpu_run_kernel(c, HEAD_GROUPS, (uint32_t)m, 1, HEAD_THREADS, 1, 1);
+  }
+  for (int first = 0; first < n; first += BLOCK_ROWS) {
+    int m = block_rows(first, n);
+    AttendParams a = {(uint32_t)n, (uint32_t)first, (uint32_t)m,
+                      padded,      (uint32_t)state, sliding ? LFM3_WINDOW : 0};
+    gpu_select_kernel(c, K_lfm3_attend);
+    gpu_bind_buffer(c, 0, &b->qh, 0), gpu_bind_buffer(c, 1, &b->kh, 0);
+    gpu_bind_buffer(c, 2, &b->vh, 0);
+    gpu_bind_buffer(c, 3, &b->gates, (size_t)first * LFM3_HEADS * 4);
+    gpu_bind_buffer(c, 4, &b->groups, 0), gpu_bind_buffer(c, 5, &b->spans, 0);
+    gpu_bind_buffer(c, 6, &b->out, 0), gpu_copy_bytes(c, 7, &a, sizeof a);
+    gpu_run_kernel(c, (uint32_t)(m + ATTEND_ROWS - 1) / ATTEND_ROWS, LFM3_HEADS,
+                   1, ATTEND_THREADS, 1, 1);
+    multiply(c, &y->o, m, &b->out, 0, LFM3_DIM, &b->projected, 0, LFM3_DIM);
+    add_normalized(c, &b->x, row_bytes(first), &b->projected,
+                   &y->post_operator_norm, m);
+  }
+}
+
+// Layer y's feed-forward over the sequence's n rows, block by block.
+static void run_feed_forward(GpuCommandBuffer *c, const Layer *y,
+                             PassBuffers *b, int n) {
+  for (int first = 0; first < n; first += BLOCK_ROWS) {
+    int m = block_rows(first, n);
+    normalize(c, &b->x, row_bytes(first), &y->ffn_norm, &b->normed, 0, m);
+    multiply(c, &y->w1, m, &b->normed, 0, LFM3_DIM, &b->gated, 0, LFM3_HIDDEN);
+    multiply(c, &y->w3, m, &b->normed, 0, LFM3_DIM, &b->up, 0, LFM3_HIDDEN);
+    gpu_select_kernel(c, K_lfm3_swiglu);
+    gpu_bind_buffer(c, 0, &b->gated, 0), gpu_bind_buffer(c, 1, &b->up, 0);
+    gpu_bind_buffer(c, 2, &b->gated, 0);
+    gpu_run_kernel(c, (uint32_t)m * LFM3_HIDDEN / ROW_THREADS, 1, 1,
+                   ROW_THREADS, 1, 1);
+    multiply(c, &y->w2, m, &b->gated, 0, LFM3_HIDDEN, &b->projected, 0,
+             LFM3_DIM);
+    add_normalized(c, &b->x, row_bytes(first), &b->projected, &y->post_ffn_norm,
+                   m);
+  }
+}
+
+// Writes the sequence's token ids, each row's question and the questions'
+// spans into the pass's buffers. Returns 0 if the questions do not end in
+// order after the state, the last at the sequence's end, or a token is out of
+// the vocabulary.
+static int write_layout(PassBuffers *b, const int *tokens, int n, int state,
+                        const int *question_ends, int questions) {
+  if (state < 0 || questions < 1 || question_ends[questions - 1] != n) return 0;
+  int32_t *ids = (int32_t *)b->ids.ptr;
+  uint32_t *groups = (uint32_t *)b->groups.ptr,
+           *spans = (uint32_t *)b->spans.ptr;
+  spans[0] = 0, spans[1] = (uint32_t)state;
+  for (int r = 0; r < state && r < n; r++) groups[r] = 0;
+  for (int q = 0, start = state; q < questions; q++) {
+    if (question_ends[q] <= start) return 0;
+    spans[2 * (q + 1)] = (uint32_t)start;
+    spans[2 * (q + 1) + 1] = (uint32_t)question_ends[q];
+    for (int r = start; r < question_ends[q]; r++) groups[r] = (uint32_t)q + 1;
+    start = question_ends[q];
+  }
+  for (int r = 0; r < n; r++) {
+    if (tokens[r] < 0 || tokens[r] >= LFM3_VOCAB) return 0;
+    ids[r] = tokens[r];
+  }
+  return 1;
+}
+
+// Writes the logit of token ids[i] at row rows[i] for each i < count into
+// out: the final norm of the row, times the token's embedding row.
+static void read_logits(const PassBuffers *b, const int *rows, const int *ids,
+                        int count, float *out) {
+  const float *x = (const float *)b->x.ptr, *w = (const float *)final_norm.ptr;
+  // The table's tensor starts off bytes into its buffer.
+  const uint16_t *table =
+      (const uint16_t *)((const uint8_t *)embed.ptr + embed.off);
+  float normed[LFM3_DIM];
+  int normed_row = -1;
+  for (int i = 0; i < count; i++) {
+    if (rows[i] != normed_row) {
+      const float *row = x + (size_t)rows[i] * LFM3_DIM;
+      double squares = 0;
+      for (int d = 0; d < LFM3_DIM; d++) squares += (double)row[d] * row[d];
+      float r = 1.0f / sqrtf((float)(squares / LFM3_DIM) + LFM3_NORM_EPS);
+      for (int d = 0; d < LFM3_DIM; d++) normed[d] = w[d] * (row[d] * r);
+      normed_row = rows[i];
+    }
+    const uint16_t *e = table + (size_t)ids[i] * LFM3_DIM;
+    double sum = 0;
+    for (int d = 0; d < LFM3_DIM; d++) {
+      uint32_t bits = (uint32_t)e[d] << 16;
+      float value;
+      memcpy(&value, &bits, sizeof value);
+      sum += (double)normed[d] * value;
+    }
+    out[i] = (float)sum;
+  }
+}
+
+static const float *lfm3_decide(const int *tokens, int n, int state,
+                                const int *question_ends, int questions,
+                                const int *rows, const int *ids, int count,
+                                const PassWait *wait) {
+  if (n < 1 || n > LFM3_POSITIONS)
+    die("a decision takes 1 to %d rows", LFM3_POSITIONS);
+  for (int i = 0; i < count; i++)
+    if (rows[i] < 0 || rows[i] >= n || ids[i] < 0 || ids[i] >= LFM3_VOCAB)
+      die("a decision's logit at row %d of token %d", rows[i], ids[i]);
+  PassBuffers b;
+  if (!allocate_pass_buffers(&b, n, questions)) return NULL;
+  if (!write_layout(&b, tokens, n, state, question_ends, questions))
+    die("a decision's questions must follow its state in order up to its end, "
+        "with tokens of the vocabulary");
+  GpuCommandBuffer c = gpu_begin(gpu);
+  uint32_t dim = LFM3_DIM;
+  gpu_select_kernel(&c, K_lfm3_embed);
+  gpu_bind_buffer(&c, 0, &embed, 0), gpu_bind_buffer(&c, 1, &b.ids, 0);
+  gpu_bind_buffer(&c, 2, &b.x, 0), gpu_copy_bytes(&c, 3, &dim, sizeof dim);
+  gpu_run_kernel(&c, LFM3_DIM / ROW_THREADS, (uint32_t)n, 1, ROW_THREADS, 1, 1);
+  commit_work(&c);
+  for (int l = 0; l < LFM3_LAYERS; l++) {
+    if (wait) pass_wait(wait);
+    const Layer *y = &layers[l];
+    c = gpu_begin(gpu);
+    if (y->kind == LAYER_CONV)
+      run_conv(&c, y, &b, n);
+    else
+      run_attention(&c, y, &b, n, state);
+    run_feed_forward(&c, y, &b, n);
+    commit_work(&c);
+  }
+  wait_for_work();
+  if (count > results_room) {
+    free(results);
+    results = xmalloc((size_t)count * sizeof *results);
+    results_room = count;
+  }
+  read_logits(&b, rows, ids, count, results);
+  free_pass_buffers(&b);
+  decision_rows += (uint64_t)n;
+  return results;
+}
+
+// ---- loading, counters and passes ----
 
 static int lfm3_load(Gpu *model_gpu, MemorySlot *work, const char *dir,
                      const Options *o) {
   (void)o;
   if (!checkpoint) {
-    gpu = model_gpu;
+    gpu = model_gpu, work_slot = work;
     check_config(dir);
+#define K(name) K_##name = gpu_find_kernel(gpu, #name)
+    K(lfm3_embed), K(lfm3_norm), K(lfm3_norm_add), K(lfm3_copy), K(lfm3_conv),
+        K(lfm3_swiglu), K(lfm3_heads), K(lfm3_attend), K(mm_bf16);
+#undef K
     checkpoint = tensor_index_open(dir);
     text_weights =
         weight_group_new(gpu, work->account, "LFM3 language model weights");
     add_text_weights();
+    required_bytes = weight_group_required_bytes(text_weights) +
+                     count_pass_bytes(BLOCK_ROWS, 1);
   }
   MemorySlot *slot = weight_group_slot(text_weights);
   memory_pin(slot, 1);
   if (!memory_wait_for_minimum(slot->account,
-                               weight_group_required_bytes(text_weights)) ||
+                               weight_group_required_bytes(text_weights) +
+                                   count_pass_bytes(1, 1)) ||
       !weight_group_load(text_weights)) {
     memory_pin(slot, 0);
     return 0;
@@ -255,14 +707,36 @@ static MemorySlot *lfm3_weight_slot(void) {
 }
 
 static void lfm3_read_counters(ModelCounters *c) {
-  *c =
-      (ModelCounters){.layers = LFM3_LAYERS,
-                      .dense_bytes = weight_group_resident_bytes(text_weights)};
+  *c = (ModelCounters){.prefill_rows = decision_rows,
+                       .layers = LFM3_LAYERS,
+                       .dense_bytes = weight_group_resident_bytes(text_weights),
+                       .required_bytes = required_bytes};
 }
 
 static int lfm3_vocab_size(void) { return LFM3_VOCAB; }
 
 static int lfm3_run_idle_work(void) { return 0; }
+
+// A pass's own values: its last command buffer and its logits.
+static Pass *lfm3_pass_new(void (*body)(void *), void *argument) {
+  const PassVariable variables[] = {{&last_committed, sizeof last_committed},
+                                    {&results, sizeof results},
+                                    {&results_room, sizeof results_room}};
+  Pass *pass = pass_new(body, argument, PASS_STACK_BYTES);
+  pass_set_variables(pass, variables, sizeof variables / sizeof *variables);
+  return pass;
+}
+
+static void lfm3_pass_begin(void) {
+  last_committed = 0;
+  results = NULL, results_room = 0;
+}
+
+static void lfm3_pass_end(void) {
+  wait_for_work();
+  free(results);
+  results = NULL, results_room = 0;
+}
 
 static const char *const lfm3_types[] = {"lfm3_vl", 0};
 
@@ -272,4 +746,8 @@ const ModelOps lfm3_ops = {.family = "LFM3 d1",
                            .dense_weight_slot = lfm3_weight_slot,
                            .read_counters = lfm3_read_counters,
                            .vocab_size = lfm3_vocab_size,
-                           .run_idle_work = lfm3_run_idle_work};
+                           .decide = lfm3_decide,
+                           .run_idle_work = lfm3_run_idle_work,
+                           .pass_new = lfm3_pass_new,
+                           .pass_begin = lfm3_pass_begin,
+                           .pass_end = lfm3_pass_end};
