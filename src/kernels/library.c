@@ -10,6 +10,8 @@ static const char source[] = {
 #embed "gguf.metal"
     , '\n',
 #embed "vision.metal"
+    , '\n',
+#embed "lfm3.metal"
 };
 
 const char *kernel_library_source(size_t *length) {
