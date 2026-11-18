@@ -16,6 +16,9 @@
 //! requests run together, at most the model's rows per call. A request that
 //! decodes alone may also run its drafts or its lookup proposals.
 //!
+//! A decision model's step runs its decisions one at a time, one pass per
+//! call, and returns each pass's logits at the decision's end.
+//!
 //! Calls run on streams. The calls of all models run at the same time. After
 //! the steps, the loop advances the streams until a call ends. It then finishes
 //! that call. A prompt resumes from a state in the state cache. The worker also
@@ -35,6 +38,7 @@ use tokio::sync::mpsc;
 
 use crate::calls::CallChooser;
 use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
+use crate::decision::d1;
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
     self, CacheCounts, DraftChoice, ExpandError, Logits, Lookup, Media, Model, PrefillInfo,
@@ -96,6 +100,9 @@ pub enum Event {
     /// the last event. The string says why. The other models still serve
     /// requests.
     Failed(String),
+    /// A decision ended: the logits of each of its passes, in the passes'
+    /// order. This is the last event.
+    Decided(Vec<Vec<f32>>),
 }
 
 /// How a request samples its tokens.
@@ -141,6 +148,23 @@ pub struct Request {
     pub max_tokens: i64,
     /// The log shows "req ID NOTE" with this note when the request is queued.
     pub note: String,
+}
+
+/// A decision model's request: passes that it runs one after another.
+pub struct DecisionRequest {
+    /// The index of the request's model, in the configured order.
+    pub model_index: usize,
+    /// The passes, each a state and questions after it (decision/d1.rs).
+    pub passes: Vec<d1::Pass>,
+    /// The log shows "req ID NOTE" with this note when the request is queued.
+    pub note: String,
+}
+
+impl DecisionRequest {
+    /// Counts the tokens of all its passes.
+    fn count_tokens(&self) -> usize {
+        self.passes.iter().map(|pass| pass.tokens.len()).sum()
+    }
 }
 
 /// Why the worker did not queue a request.
@@ -197,12 +221,13 @@ impl Drop for CancelGuard {
     }
 }
 
-/// A submitted request, as the worker holds it.
-struct Job {
+/// A submitted request, as the worker holds it: a Request, or a
+/// DecisionRequest.
+struct Job<R = Request> {
     /// The request's id: its number in the log.
     id: u64,
     /// The request itself.
-    request: Request,
+    request: R,
     /// Sends the request's events to its handler.
     events: mpsc::UnboundedSender<Event>,
     /// The flags it shares with its cancel guard.
@@ -211,7 +236,7 @@ struct Job {
     queued_at: Instant,
 }
 
-impl Job {
+impl<R> Job<R> {
     /// Sends `event` as the request's last event.
     fn send_last_event(&self, event: Event) {
         let _ = self.events.send(event);
@@ -262,6 +287,8 @@ impl ViewOptions {
 struct Queue {
     /// Each model's waiting requests, the oldest first.
     waiting: Vec<VecDeque<Job>>,
+    /// Each model's waiting decisions, the oldest first.
+    decisions: Vec<VecDeque<Job<DecisionRequest>>>,
     /// Set at the stop. No request is queued after it.
     closed: bool,
     /// The id of the last queued request. The first request gets 1.
@@ -364,6 +391,20 @@ struct Route {
 }
 
 impl RequestStatus {
+    /// Returns the status of the decision `job`, which does `status`: "waiting"
+    /// or "prefill".
+    fn for_decision(job: &Job<DecisionRequest>, status: &'static str) -> RequestStatus {
+        RequestStatus {
+            id: job.id,
+            status,
+            session: None,
+            prompt_tokens: job.request.count_tokens(),
+            reused_tokens: 0,
+            generated_tokens: 0,
+            routes: Vec::new(),
+        }
+    }
+
     /// Returns the status of `job`, a request that waits for its prefill.
     fn for_waiting_job(job: &Job) -> RequestStatus {
         RequestStatus {
@@ -653,6 +694,7 @@ pub fn start(
             let shared = Arc::new(Shared {
                 queue: Mutex::new(Queue {
                     waiting: (0..model_count).map(|_| VecDeque::new()).collect(),
+                    decisions: (0..model_count).map(|_| VecDeque::new()).collect(),
                     control: Control::new(engine::read_memory().limit),
                     ..Queue::default()
                 }),
@@ -763,12 +805,48 @@ pub fn stop() {
 pub fn submit(
     request: Request,
 ) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
+    let counts = format!(
+        "prompt_tokens={}, max_new={}",
+        request.prompt.len(),
+        request.max_tokens
+    );
+    let (model_index, note) = (request.model_index, request.note.clone());
+    queue_job(request, model_index, &note, &counts, |queue| {
+        &mut queue.waiting
+    })
+}
+
+/// Submits the decision `request` to its model's queue, as submit does.
+pub fn submit_decision(
+    request: DecisionRequest,
+) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
+    let counts = format!(
+        "tokens={}, passes={}",
+        request.count_tokens(),
+        request.passes.len()
+    );
+    let (model_index, note) = (request.model_index, request.note.clone());
+    queue_job(request, model_index, &note, &counts, |queue| {
+        &mut queue.decisions
+    })
+}
+
+/// Queues `request` for the model at `model_index` in the queues that
+/// `waiting` picks. The log shows its `note` and its `counts`. Returns the
+/// guard and the receiver of its events, or Busy when too many requests wait
+/// or the server is stopping.
+fn queue_job<R>(
+    request: R,
+    model_index: usize,
+    note: &str,
+    counts: &str,
+    waiting: fn(&mut Queue) -> &mut Vec<VecDeque<Job<R>>>,
+) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
     let shared = clone_shared();
     let (events, receiver) = mpsc::unbounded_channel();
     let flags = Arc::new(RequestFlags::default());
     let mut queue = lock(&shared.queue);
-    if queue.closed
-        || queue.waiting[request.model_index].len() >= shared.budgets.max_waiting_requests
+    if queue.closed || waiting(&mut queue)[model_index].len() >= shared.budgets.max_waiting_requests
     {
         let message = if queue.closed {
             "the server is stopping"
@@ -779,30 +857,28 @@ pub fn submit(
     }
     queue.last_request_id += 1;
     let request_id = queue.last_request_id;
-    if !request.note.is_empty() {
+    if !note.is_empty() {
         // The log shows the note before the worker can take the request.
-        shared.view.write_model_line(
-            request.model_index,
-            &format!("req {request_id} {}", request.note),
-        );
+        shared
+            .view
+            .write_model_line(model_index, &format!("req {request_id} {note}"));
     }
-    let (prompt_tokens, max_tokens, model_index) = (
-        request.prompt.len(),
-        request.max_tokens,
-        request.model_index,
-    );
-    queue.waiting[model_index].push_back(Job {
+    let jobs = &mut waiting(&mut queue)[model_index];
+    jobs.push_back(Job {
         id: request_id,
         request,
         events,
         flags: flags.clone(),
         queued_at: Instant::now(),
     });
-    shared.view.write_model_line(model_index, &format!(
-        "req {request_id}: queued for {}, waiting={}, prompt_tokens={prompt_tokens}, max_new={max_tokens}",
-        shared.models[model_index].settings.id,
-        queue.waiting[model_index].len()
-    ));
+    shared.view.write_model_line(
+        model_index,
+        &format!(
+            "req {request_id}: queued for {}, waiting={}, {counts}",
+            shared.models[model_index].settings.id,
+            jobs.len()
+        ),
+    );
     notify_worker(&shared);
     Ok((
         CancelGuard {
@@ -1210,6 +1286,20 @@ impl Generation {
     }
 }
 
+/// A decision from its first pass to its last.
+struct Decision {
+    /// The submitted request.
+    job: Job<DecisionRequest>,
+    /// The logits that its finished passes read, in the passes' order.
+    logits: Vec<Vec<f32>>,
+    /// Why its last pass failed, if it did.
+    failure: Option<String>,
+    /// Whether a pass of the decision runs on a stream.
+    in_call: bool,
+    /// When the decision's first pass started.
+    started_at: Instant,
+}
+
 /// An engine call that runs on a stream, and what to do when it ends.
 enum Call {
     /// One prefill call of the request. It prefills the prompt up to `end`.
@@ -1233,6 +1323,9 @@ enum Call {
         rows: Vec<i32>,
         proposed_count: usize,
     },
+    /// The next pass of a decision model's request. The request keeps the
+    /// pass's tokens until the call ends.
+    Decide { request_id: u64 },
 }
 
 /// A running call and the stream it runs on.
@@ -1259,6 +1352,13 @@ struct WorkerModel {
     generations: Vec<Generation>,
     /// Admitted requests that wait for their turn to plan their prefill.
     admitted: VecDeque<Job>,
+    /// Whether the model is a decision model: it runs decisions, and generates
+    /// no text.
+    is_decision_model: bool,
+    /// Admitted decisions that wait for their turn.
+    admitted_decisions: VecDeque<Job<DecisionRequest>>,
+    /// The decision that runs its passes.
+    decision: Option<Decision>,
     /// The token that starts a think block, if the model has one.
     think_start_token: Option<i32>,
     /// The token that ends a think block, if the model has one.
@@ -1648,6 +1748,9 @@ impl Worker {
                     ctx: settings.options.ctx as usize,
                     generations: Vec::new(),
                     admitted: VecDeque::new(),
+                    is_decision_model: model.is_decision_model(),
+                    admitted_decisions: VecDeque::new(),
+                    decision: None,
                     think_start_token: model.tokenizer().find_added_token("<think>"),
                     think_end_token: model.tokenizer().find_added_token("</think>"),
                     logged_decoding_count: 0,
@@ -1795,14 +1898,19 @@ impl Worker {
             if queue.control.phase != Phase::Running {
                 return;
             }
-            queue.waiting.iter().map(|jobs| !jobs.is_empty()).collect()
+            queue
+                .waiting
+                .iter()
+                .zip(&queue.decisions)
+                .map(|(jobs, decisions)| !jobs.is_empty() || !decisions.is_empty())
+                .collect()
         };
         let mut drained = false;
         for worker_model in &self.models {
             let after = worker_model.settings.idle_unload;
             if after <= 0.0
-                || !worker_model.generations.is_empty()
-                || !worker_model.admitted.is_empty()
+                || worker_model.runs_requests()
+                || worker_model.has_admitted_requests()
                 || waiting
                     .get(worker_model.model_index)
                     .copied()
@@ -1845,7 +1953,7 @@ impl Worker {
                 let before = worker_model.model.read_stats().cache_bytes;
                 worker_model.model.run_idle_work();
                 freed += before.saturating_sub(worker_model.model.read_stats().cache_bytes);
-            } else if worker_model.generations.is_empty() {
+            } else if !worker_model.runs_requests() {
                 worker_model.model.run_idle_work();
             }
         }
@@ -1913,7 +2021,7 @@ impl Worker {
             .models
             .iter()
             .map(|worker_model| {
-                !worker_model.running_calls.is_empty() || !worker_model.admitted.is_empty()
+                !worker_model.running_calls.is_empty() || worker_model.has_admitted_requests()
             })
             .collect();
         for (i, worker_model) in self.models.iter_mut().enumerate() {
@@ -1956,7 +2064,7 @@ impl Worker {
     /// its requests with the error.
     fn restart_models_with_running_requests(&mut self) {
         for worker_model in &mut self.models {
-            if worker_model.generations.is_empty() {
+            if !worker_model.runs_requests() {
                 continue;
             }
             if !worker_model.model.is_loaded()
@@ -1976,6 +2084,10 @@ impl Worker {
                         vec![(generation.state_id, snapshots)],
                     );
                     generation.job.send_last_event(Event::Failed(error.clone()));
+                }
+                if let Some(mut decision) = worker_model.decision.take() {
+                    decision.failure = Some(error.clone());
+                    worker_model.end_decision(&self.shared, decision);
                 }
                 continue;
             }
@@ -2140,9 +2252,10 @@ impl Worker {
             }
             let idle = |queue: &Queue, models: &[WorkerModel]| {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
+                    && queue.decisions.iter().all(|jobs| jobs.is_empty())
                     && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
-                        worker_model.generations.is_empty() && worker_model.admitted.is_empty()
+                        !worker_model.runs_requests() && !worker_model.has_admitted_requests()
                     })
             };
             while idle(&queue, &self.models) && !engine::is_stopping() {
@@ -2170,32 +2283,50 @@ impl Worker {
             if queue.control.phase != Phase::Running {
                 continue;
             }
-            let mut admitted_by_model: Vec<Vec<Job>> = Vec::new();
+            let mut admitted_by_model: Vec<(Vec<Job>, Vec<Job<DecisionRequest>>)> = Vec::new();
             for worker_model in &self.models {
-                let admitted: Vec<Job> = if engine::is_stopping() {
-                    Vec::new()
-                } else {
-                    queue.waiting[worker_model.model_index].drain(..).collect()
-                };
-                if !admitted.is_empty() {
+                let index = worker_model.model_index;
+                let (admitted, decisions): (Vec<Job>, Vec<Job<DecisionRequest>>) =
+                    if engine::is_stopping() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        (
+                            queue.waiting[index].drain(..).collect(),
+                            queue.decisions[index].drain(..).collect(),
+                        )
+                    };
+                if !admitted.is_empty() || !decisions.is_empty() {
                     worker_model.log_line(&format!(
                         "{}: admitted={}, running={}",
                         worker_model.settings.id,
-                        admitted.len(),
+                        admitted.len() + decisions.len(),
                         worker_model.generations.len()
+                            + usize::from(worker_model.decision.is_some())
                     ));
                 }
-                admitted_by_model.push(admitted);
+                admitted_by_model.push((admitted, decisions));
             }
             drop(queue);
-            for (worker_model, admitted) in self.models.iter_mut().zip(admitted_by_model) {
-                worker_model.run_step(&shared, admitted, &mut self.states);
-                if !worker_model.generations.is_empty() {
+            for (worker_model, (admitted, decisions)) in
+                self.models.iter_mut().zip(admitted_by_model)
+            {
+                if worker_model.is_decision_model {
+                    worker_model.run_decision_step(&shared, admitted, decisions);
+                } else {
+                    for job in decisions {
+                        worker_model.refuse_decision(
+                            job,
+                            "the model generates text: it makes no decisions",
+                        );
+                    }
+                    worker_model.run_step(&shared, admitted, &mut self.states);
+                }
+                if worker_model.runs_requests() {
                     worker_model.last_used_at = Instant::now();
                 }
                 worker_model
                     .model
-                    .set_request_running(!worker_model.generations.is_empty());
+                    .set_request_running(worker_model.runs_requests());
             }
             self.advance_running_calls();
             self.watch_rounds();
@@ -2206,18 +2337,36 @@ impl Worker {
             for generation in std::mem::take(&mut worker_model.generations) {
                 worker_model.end_generation(&shared, generation, true, &mut self.states);
             }
+            if let Some(decision) = worker_model.decision.take() {
+                worker_model.end_decision(&shared, decision);
+            }
         }
-        let mut waiting: Vec<Job> = {
+        let (mut waiting, decisions): (Vec<Job>, Vec<Vec<Job<DecisionRequest>>>) = {
             let mut queue = lock(&shared.queue);
             queue.closed = true;
-            queue
-                .waiting
-                .iter_mut()
-                .flat_map(|jobs| jobs.drain(..))
-                .collect()
+            (
+                queue
+                    .waiting
+                    .iter_mut()
+                    .flat_map(|jobs| jobs.drain(..))
+                    .collect(),
+                queue
+                    .decisions
+                    .iter_mut()
+                    .map(|jobs| jobs.drain(..).collect())
+                    .collect(),
+            )
         };
-        for worker_model in &mut self.models {
+        for (worker_model, decisions) in self.models.iter_mut().zip(decisions) {
             waiting.extend(worker_model.admitted.drain(..));
+            let ended: Vec<Job<DecisionRequest>> = worker_model
+                .admitted_decisions
+                .drain(..)
+                .chain(decisions)
+                .collect();
+            for job in ended {
+                worker_model.end_waiting_decision(job, FinishReason::ServerStop);
+            }
         }
         for job in waiting {
             end_before_prefill(job, FinishReason::ServerStop);
@@ -2269,6 +2418,16 @@ impl WorkerModel {
     /// Writes `line`, a line about the model, to the log.
     fn log_line(&self, line: &str) {
         self.view.write_model_line(self.model_index, line);
+    }
+
+    /// Returns whether the model runs requests: generations, or a decision.
+    fn runs_requests(&self) -> bool {
+        !self.generations.is_empty() || self.decision.is_some()
+    }
+
+    /// Returns whether admitted requests or decisions wait for their turn.
+    fn has_admitted_requests(&self) -> bool {
+        !self.admitted.is_empty() || !self.admitted_decisions.is_empty()
     }
 
     /// Lists the ways `prompt` can resume from this model's states, the
@@ -2537,14 +2696,16 @@ impl WorkerModel {
             status.shown_prompt_tokens,
             status.shown_reused_tokens,
             status.shown_generated_tokens,
-        ) = first.map_or((0, 0, 0, 0), |generation| {
-            (
+        ) = match (first, &self.decision) {
+            (Some(generation), _) => (
                 generation.job.id,
                 generation.prompt_tokens,
                 generation.reused_tokens,
                 generation.generated,
-            )
-        });
+            ),
+            (None, Some(decision)) => (decision.job.id, decision.job.request.count_tokens(), 0, 0),
+            (None, None) => (0, 0, 0, 0),
+        };
         status.requests = self
             .generations
             .iter()
@@ -2561,7 +2722,17 @@ impl WorkerModel {
                 generated_tokens: generation.generated,
                 routes: generation.routes.iter().cloned().collect(),
             })
+            .chain(
+                self.decision
+                    .iter()
+                    .map(|decision| RequestStatus::for_decision(&decision.job, "prefill")),
+            )
             .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
+            .chain(
+                self.admitted_decisions
+                    .iter()
+                    .map(|job| RequestStatus::for_decision(job, "waiting")),
+            )
             .collect();
     }
 
@@ -3245,6 +3416,7 @@ impl WorkerModel {
                 rows,
                 proposed_count,
             } => self.finish_verify_call(stream, request_id, rows, proposed_count, states),
+            Call::Decide { request_id } => self.finish_decide_call(stream, request_id),
         }
     }
 
@@ -3961,6 +4133,250 @@ impl WorkerModel {
         }
         routes.push_back(Route { experts, sources });
     }
+
+    // ---- a decision model's requests ----
+
+    /// Runs one step of a decision model. It refuses `replies`, since the
+    /// model generates no text. The admitted `decisions` wait in order. The
+    /// running decision goes on between its passes. Without one, the next
+    /// admitted decision starts.
+    fn run_decision_step(
+        &mut self,
+        shared: &Shared,
+        replies: Vec<Job>,
+        decisions: Vec<Job<DecisionRequest>>,
+    ) {
+        for job in replies {
+            refuse(job, "the model is a decision model: it generates no text");
+        }
+        self.admitted_decisions.extend(decisions);
+        if let Some(decision) = self.decision.take() {
+            self.continue_decision(shared, decision);
+        }
+        while self.decision.is_none() {
+            let Some(job) = self.admitted_decisions.pop_front() else {
+                break;
+            };
+            self.start_decision(shared, job);
+        }
+        let phase = if self.decision.is_some() {
+            "prefill"
+        } else {
+            "idle"
+        };
+        self.update_status(shared, phase);
+    }
+
+    /// Goes on with the running `decision`. While a pass runs, it waits. After
+    /// a pass, the decision ends when the pass failed, when it has all its
+    /// logits, when its client cancelled it, and at the stop. Otherwise its
+    /// next pass starts.
+    fn continue_decision(&mut self, shared: &Shared, decision: Decision) {
+        if decision.in_call {
+            self.decision = Some(decision);
+        } else if decision.failure.is_some()
+            || decision.logits.len() == decision.job.request.passes.len()
+            || engine::is_stopping()
+            || decision.job.flags.cancelled.load(Ordering::SeqCst)
+        {
+            self.end_decision(shared, decision);
+        } else {
+            self.start_decision_pass(decision);
+        }
+    }
+
+    /// Starts the admitted decision `job`. It ends a cancelled decision, and
+    /// every decision at the stop. It refuses a decision whose passes do not
+    /// fit the model. It loads the model, and the first pass starts.
+    fn start_decision(&mut self, shared: &Shared, job: Job<DecisionRequest>) {
+        if engine::is_stopping() {
+            return self.end_waiting_decision(job, FinishReason::ServerStop);
+        }
+        if job.flags.cancelled.load(Ordering::SeqCst) {
+            return self.end_waiting_decision(job, FinishReason::Cancelled);
+        }
+        let vocab = self.model.vocab_size();
+        if let Some(message) = job
+            .request
+            .passes
+            .iter()
+            .find_map(|pass| check_decision_pass(pass, self.ctx, vocab))
+        {
+            return self.refuse_decision(job, &message);
+        }
+        let was_loaded = self.model.is_loaded();
+        if !was_loaded {
+            self.update_status(shared, "loading");
+        }
+        // No call runs while no decision runs, so the load may resize the
+        // model's buffers.
+        if let Err(error) = load_model(shared, &self.model) {
+            if engine::is_stopping() {
+                // The stop cut the load short.
+                return self.end_waiting_decision(job, FinishReason::ServerStop);
+            }
+            lock(&shared.models[self.model_index].status).load_error = Some(error.clone());
+            self.log_line(&format!("{}: {error}", self.settings.id));
+            job.send_last_event(Event::Failed(error));
+            return;
+        }
+        lock(&shared.models[self.model_index].status).load_error = None;
+        if !was_loaded {
+            self.log_line(&format!("{}: loaded", self.settings.id));
+        }
+        self.last_used_at = Instant::now();
+        let decision = Decision {
+            job,
+            logits: Vec::new(),
+            failure: None,
+            in_call: false,
+            started_at: Instant::now(),
+        };
+        if decision.job.request.passes.is_empty() {
+            // A decision without passes has all its logits.
+            return self.end_decision(shared, decision);
+        }
+        self.start_decision_pass(decision);
+    }
+
+    /// Posts the next pass of `decision` on a new stream, and keeps the
+    /// decision as the running one.
+    fn start_decision_pass(&mut self, mut decision: Decision) {
+        let pass = &decision.job.request.passes[decision.logits.len()];
+        let stream = Stream::new(&self.model);
+        stream.decide(
+            &pass.tokens,
+            pass.state_tokens,
+            &pass.question_ends,
+            &pass.rows,
+            &pass.ids,
+        );
+        decision.in_call = true;
+        self.running_calls.push(RunningCall {
+            stream,
+            call: Call::Decide {
+                request_id: decision.job.id,
+            },
+        });
+        self.decision = Some(decision);
+    }
+
+    /// Finishes a pass of the decision `request_id` that ended on `stream`. It
+    /// keeps the pass's logits, or why the pass failed when it did not fit in
+    /// memory. The model's next step goes on with the decision: a request ends
+    /// only in a step, which then marks whether the model still runs
+    /// requests.
+    fn finish_decide_call(&mut self, stream: Stream, request_id: u64) {
+        let Some(decision) = self
+            .decision
+            .as_mut()
+            .filter(|decision| decision.job.id == request_id)
+        else {
+            return;
+        };
+        decision.in_call = false;
+        let count = decision.job.request.passes[decision.logits.len()].ids.len();
+        match stream.copy_decision_logits(count) {
+            Some(logits) => decision.logits.push(logits),
+            None => {
+                decision.failure = Some("a decision's pass does not fit: memory is short".into())
+            }
+        }
+    }
+
+    /// Ends `decision`: with why its last pass failed, when it did; with its
+    /// logits after its last pass; else at its client's cancellation or the
+    /// stop. It logs the end and counts the passes that ran in the model's
+    /// totals.
+    fn end_decision(&mut self, shared: &Shared, decision: Decision) {
+        let passes = &decision.job.request.passes;
+        let ran = decision.logits.len();
+        let ran_tokens: usize = passes[..ran].iter().map(|pass| pass.tokens.len()).sum();
+        let (count, tokens) = (passes.len(), decision.job.request.count_tokens());
+        let seconds = decision.started_at.elapsed().as_secs_f64();
+        let (how, event) = if let Some(message) = decision.failure {
+            (format!("failed: {message}"), Event::Failed(message))
+        } else if ran == count {
+            ("decided".to_string(), Event::Decided(decision.logits))
+        } else if decision.job.flags.cancelled.load(Ordering::SeqCst) {
+            (
+                "client gone".to_string(),
+                Event::Done {
+                    reason: FinishReason::Cancelled,
+                },
+            )
+        } else {
+            (
+                "stopped by the server's stop".to_string(),
+                Event::Done {
+                    reason: FinishReason::ServerStop,
+                },
+            )
+        };
+        self.log_line(&format!(
+            "req {}: {how}: {ran} of {count} passes, {ran_tokens} of {tokens} tokens in {seconds:.2} s",
+            decision.job.id
+        ));
+        let mut status = lock(&shared.models[self.model_index].status);
+        status.total_requests += 1;
+        status.total_prompt_tokens += tokens as u64;
+        status.total_prefilled_tokens += ran_tokens as u64;
+        status.total_prefill_seconds += seconds;
+        drop(status);
+        decision.job.send_last_event(event);
+    }
+
+    /// Ends the decision `job` before its first pass with `reason`. It logs the
+    /// end and sends Done as the last event.
+    fn end_waiting_decision(&self, job: Job<DecisionRequest>, reason: FinishReason) {
+        self.log_line(&format!(
+            "req {}: ended before its first pass ({}), waited {:.3} s",
+            job.id,
+            if reason == FinishReason::Cancelled {
+                "cancelled"
+            } else {
+                "shutdown"
+            },
+            job.queued_at.elapsed().as_secs_f64()
+        ));
+        job.send_last_event(Event::Done { reason });
+    }
+
+    /// Refuses the decision `job` with `message`. It logs the refusal and sends
+    /// it as the last event.
+    fn refuse_decision(&self, job: Job<DecisionRequest>, message: &str) {
+        self.log_line(&format!("req {}: refused: {message}", job.id));
+        job.send_last_event(Event::Refused(message.into()));
+    }
+}
+
+/// Returns why the engine cannot run the decision pass `pass` with a context
+/// of `ctx` tokens and a vocabulary of `vocab` tokens, or None when it can:
+/// the pass fits the context, its questions follow its state up to its last
+/// token, and it reads the logits of tokens of the vocabulary at its own
+/// rows.
+fn check_decision_pass(pass: &d1::Pass, ctx: usize, vocab: usize) -> Option<String> {
+    let rows = pass.tokens.len();
+    if rows > ctx {
+        return Some(format!("a pass has {rows} tokens; the context holds {ctx}"));
+    }
+    let is_token = |id: &i32| usize::try_from(*id).is_ok_and(|id| id < vocab);
+    let questions_follow = pass.question_ends.last() == Some(&(rows as i32))
+        && pass
+            .question_ends
+            .iter()
+            .try_fold(pass.state_tokens as i32, |start, &end| {
+                (end > start).then_some(end)
+            })
+            .is_some();
+    let reads_fit = pass.rows.len() == pass.ids.len()
+        && pass
+            .rows
+            .iter()
+            .all(|row| usize::try_from(*row).is_ok_and(|row| row < rows))
+        && pass.ids.iter().all(is_token);
+    (!(questions_follow && reads_fit && pass.tokens.iter().all(is_token)))
+        .then(|| "a pass's questions, rows or tokens do not fit the model".to_string())
 }
 
 #[cfg(test)]
@@ -4014,6 +4430,46 @@ mod tests {
             }
         }
         assert_eq!(calls_run, [CALLS * ROWS / REQUESTS; REQUESTS]);
+    }
+
+    /// A pass runs when it fits the context, its questions follow its state up
+    /// to its last token, and it reads tokens of the vocabulary at its rows.
+    #[test]
+    fn a_decision_pass_is_checked_before_the_engine_runs_it() {
+        let pass = || d1::Pass {
+            tokens: vec![5, 6, 7, 8, 9, 10],
+            state_tokens: 2,
+            question_ends: vec![4, 6],
+            rows: vec![3, 5, 5],
+            ids: vec![11, 12, 13],
+        };
+        assert_eq!(check_decision_pass(&pass(), 6, 16), None);
+        assert_eq!(
+            check_decision_pass(&pass(), 5, 16).as_deref(),
+            Some("a pass has 6 tokens; the context holds 5")
+        );
+        let changes: [fn(&mut d1::Pass); 7] = [
+            |pass| pass.question_ends = vec![4, 5],
+            |pass| pass.question_ends = vec![2, 6],
+            |pass| pass.question_ends = vec![5, 4, 6],
+            |pass| pass.question_ends.clear(),
+            |pass| pass.rows[0] = 6,
+            |pass| pass.ids[2] = 16,
+            |pass| pass.tokens[0] = -1,
+        ];
+        for change in changes {
+            let mut wrong = pass();
+            change(&mut wrong);
+            assert_eq!(
+                check_decision_pass(&wrong, 6, 16).as_deref(),
+                Some("a pass's questions, rows or tokens do not fit the model"),
+                "{:?} {:?} {:?} {:?}",
+                wrong.tokens,
+                wrong.question_ends,
+                wrong.rows,
+                wrong.ids
+            );
+        }
     }
 
     /// A request that waits shows no session yet. The running ones show what
