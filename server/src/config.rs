@@ -45,7 +45,20 @@ pub struct ModelConfig {
     pub idle_unload: Option<f64>,
     /// The most states of the model that the state cache keeps.
     pub max_cached_states: usize,
+    /// The keys that the model's entry gives, in the file's order.
+    pub keys: Vec<String>,
 }
+
+/// The keys of a model's entry that only a model that generates text takes.
+const GENERATING_KEYS: [&str; 7] = [
+    "experts",
+    "ced",
+    "prefill_prune",
+    "packed_state_rows",
+    "draft",
+    "lookup",
+    "max_cached_states",
+];
 
 impl ModelConfig {
     /// Creates the settings of the model in the directory `model`. The context
@@ -63,7 +76,36 @@ impl ModelConfig {
             },
             idle_unload: None,
             max_cached_states: 256,
+            keys: Vec::new(),
         }
+    }
+
+    /// Fits the settings to a decision model whose checkpoint holds `context`
+    /// tokens in one pass. A decision model generates no text, so its entry
+    /// takes none of the keys that only such a model takes, and it looks up
+    /// no proposals. Its context is `context`, or the entry's smaller ctx.
+    /// Returns the message about the first setting that does not fit.
+    pub fn fit_decision_model(&mut self, context: i32) -> Result<(), String> {
+        let model = &self.engine.model;
+        if let Some(key) = self
+            .keys
+            .iter()
+            .find(|key| GENERATING_KEYS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "{model}: {key} is not a setting of a decision model"
+            ));
+        }
+        if !self.keys.iter().any(|key| key == "ctx") {
+            self.engine.ctx = context;
+        } else if self.engine.ctx > context {
+            return Err(format!(
+                "{model}: ctx {} is more than the model's context of {context} tokens",
+                self.engine.ctx
+            ));
+        }
+        self.engine.lookup = 0;
+        Ok(())
     }
 
     /// Sets the option `name`, a key of the model's entry in the configuration
@@ -596,6 +638,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             model
                 .set(name, value)
                 .map_err(|error| format!("models[{i}]: {error}"))?;
+            model.keys.push(name.clone());
         }
         if let Some(deepseek) = model.engine.deepseek()
             && deepseek.prefill_prune == Some(true)
@@ -998,5 +1041,43 @@ mod tests {
         assert_eq!(lookup(json!({"model": "/m"})), 15);
         assert_eq!(lookup(json!({"model": "/m", "lookup": "off"})), 0);
         assert_eq!(lookup(json!({"model": "/m", "lookup": 4})), 4);
+    }
+
+    #[test]
+    fn a_decision_model_takes_its_checkpoints_context_and_no_generating_keys() {
+        let fit = |model: Value| {
+            let mut model = parse(&json!({"models": [model]})).unwrap().models[0].clone();
+            model.fit_decision_model(128000).map(|()| model)
+        };
+        let model = fit(json!({"model": "/m/d1", "idle_unload": 60, "memory": 8})).unwrap();
+        assert_eq!(
+            (model.engine.ctx, model.engine.lookup, model.engine.draft),
+            (128000, 0, 0)
+        );
+        assert_eq!(
+            fit(json!({"model": "/m/d1", "ctx": 4096}))
+                .unwrap()
+                .engine
+                .ctx,
+            4096
+        );
+        let error = fit(json!({"model": "/m/d1", "ctx": 128001})).unwrap_err();
+        assert_eq!(
+            error,
+            "/m/d1: ctx 128001 is more than the model's context of 128000 tokens"
+        );
+        for key in GENERATING_KEYS {
+            let value = match key {
+                "experts" => json!("/m/experts.gguf"),
+                "prefill_prune" | "packed_state_rows" => json!(false),
+                "ced" | "lookup" => json!("off"),
+                _ => json!(1),
+            };
+            let error = fit(json!({"model": "/m/d1", key: value})).unwrap_err();
+            assert_eq!(
+                error,
+                format!("/m/d1: {key} is not a setting of a decision model")
+            );
+        }
     }
 }

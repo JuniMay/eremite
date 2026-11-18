@@ -126,12 +126,7 @@ impl Checkpoint {
     /// calibration.json's temperatures, and the special tokens of
     /// `tokenizer`, which has `vocabulary` tokens.
     pub fn read(dir: &str, tokenizer: Tokenizer, vocabulary: i32) -> Result<Checkpoint, String> {
-        let read = |name: &str| -> Result<Value, String> {
-            let path = std::path::Path::new(dir).join(name);
-            let text =
-                std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))
-        };
+        let read = |name: &str| read_json(dir, name);
         let config = read("config.json")?;
         let set_size = config["d1_set_size"]
             .as_u64()
@@ -220,6 +215,40 @@ impl Checkpoint {
             .copied()
             .unwrap_or(self.default_temperature)
     }
+}
+
+/// Reads the JSON file `name` of the checkpoint in `dir`.
+fn read_json(dir: &str, name: &str) -> Result<Value, String> {
+    let path = std::path::Path::new(dir).join(name);
+    let text = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Reads the most tokens that one pass of the d1 checkpoint in `dir` holds:
+/// config.json's text_config.max_position_embeddings.
+pub fn read_context(dir: &str) -> Result<i32, String> {
+    read_json(dir, "config.json")?["text_config"]["max_position_embeddings"]
+        .as_i64()
+        .and_then(|tokens| i32::try_from(tokens).ok())
+        .filter(|&tokens| tokens >= 1)
+        .ok_or(format!(
+            "{dir}: config.json has no text_config.max_position_embeddings"
+        ))
+}
+
+/// Derives the names of the d1 checkpoint in the folder `dir` from the
+/// folder's name: the id that requests give when the model's entry gives none,
+/// in lower case, and the name that the model lists show.
+pub fn derive_model_names(dir: &str) -> (String, String) {
+    // A folder without a name, such as /, takes the family's name.
+    let folder = std::path::Path::new(dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("d1");
+    (
+        folder.to_lowercase(),
+        format!("LiquidAI {folder} (eremite)"),
+    )
 }
 
 /// Returns `x` as Python's repr writes a float: its shortest digits, whole
@@ -616,6 +645,33 @@ mod tests {
             default_temperature: 1.0,
             temperatures: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn the_context_and_the_names_come_from_the_checkpoints_folder() {
+        let dir = std::env::temp_dir().join(format!("D1-Test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"text_config": {"max_position_embeddings": 128000}}"#,
+        )
+        .unwrap();
+        let path = dir.to_str().unwrap();
+        assert_eq!(read_context(path), Ok(128000));
+        let names = derive_model_names(&format!("{path}/"));
+        assert_eq!(
+            names,
+            (
+                format!("d1-test-{}", std::process::id()),
+                format!("LiquidAI D1-Test-{} (eremite)", std::process::id())
+            )
+        );
+        std::fs::write(&config, r#"{"text_config": {}}"#).unwrap();
+        assert!(read_context(path).is_err(), "a config without the context");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(read_context(path).is_err(), "a folder without a config");
+        assert_eq!(derive_model_names("/").0, "d1");
     }
 
     #[test]
