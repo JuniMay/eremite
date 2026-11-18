@@ -345,6 +345,7 @@ unsafe extern "C" {
     fn eremite_max_verify(m: *const RawModel) -> c_int;
     fn eremite_vocab_size(m: *const RawModel) -> c_int;
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
+    fn eremite_is_decision_model(m: *const RawModel) -> c_int;
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
     fn eremite_state_bytes(m: *const RawModel, s: *const RawState, positions: c_int) -> usize;
@@ -418,6 +419,17 @@ unsafe extern "C" {
         proposed: c_int,
         pos: c_int,
         sampler: *mut RawSampler,
+    );
+    fn eremite_stream_decide(
+        x: *mut RawStream,
+        tokens: *const i32,
+        n: c_int,
+        state_tokens: c_int,
+        question_ends: *const i32,
+        questions: c_int,
+        rows: *const i32,
+        ids: *const i32,
+        count: c_int,
     );
     fn eremite_stream_next_token(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
@@ -1004,6 +1016,12 @@ impl Model {
         unsafe { eremite_is_stop_token(self.raw, token) != 0 }
     }
 
+    /// Returns whether the model is a decision model: it answers questions in
+    /// one pass each, and keeps no states.
+    pub fn is_decision_model(&self) -> bool {
+        unsafe { eremite_is_decision_model(self.raw) != 0 }
+    }
+
     /// Makes a new state, or returns None when its memory does not fit.
     pub fn state_new(&self) -> Option<StateHandle> {
         let s = unsafe { eremite_state_new(self.raw) };
@@ -1534,6 +1552,41 @@ impl Stream {
                 sampler.0,
             )
         }
+    }
+
+    /// Posts one pass of a decision model: `tokens`, a state's first
+    /// `state_tokens` tokens and questions after it that end at
+    /// `question_ends`. The pass reads the logit of token `ids[i]` at row
+    /// `rows[i]` for each i.
+    pub fn decide(
+        &self,
+        tokens: &[i32],
+        state_tokens: usize,
+        question_ends: &[i32],
+        rows: &[i32],
+        ids: &[i32],
+    ) {
+        assert_eq!(rows.len(), ids.len(), "a pass reads one token at each row");
+        unsafe {
+            eremite_stream_decide(
+                self.0,
+                tokens.as_ptr(),
+                tokens.len() as c_int,
+                state_tokens as c_int,
+                question_ends.as_ptr(),
+                question_ends.len() as c_int,
+                rows.as_ptr(),
+                ids.as_ptr(),
+                ids.len() as c_int,
+            )
+        }
+    }
+
+    /// Returns a copy of the finished decision pass's `count` logits, or None
+    /// when the pass did not fit in memory.
+    pub fn copy_decision_logits(&self, count: usize) -> Option<Vec<f32>> {
+        let logits = self.logits()?;
+        Some(unsafe { std::slice::from_raw_parts(logits.0.as_ptr(), count) }.to_vec())
     }
 
     /// Returns the finished verify call's next token, and how many of its

@@ -31,6 +31,7 @@ fn an_opened_checkpoint_gives_its_limits_and_its_tokenizer() {
             );
             options.ctx = 4096;
             let model = engine::Model::open(&options).expect("the checkpoint opens");
+            assert!(!model.is_decision_model(), "it generates text");
             assert!(model.max_rows() >= 1, "{} rows", model.max_rows());
             assert_eq!(
                 model.prefill_rows(),
