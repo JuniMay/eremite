@@ -310,6 +310,9 @@ const TOKENIZE_ADDED_TOKENS: c_int = 1;
 /// eremite_tokenize's mode for a rendered prompt: as TOKENIZE_ADDED_TOKENS,
 /// with the byte 0xFF for an image's place.
 const TOKENIZE_PROMPT: c_int = 2;
+/// eremite_token_kind's answer for an added token that tokenizer.json marks
+/// special.
+const TOKEN_SPECIAL: c_int = 2;
 
 unsafe extern "C" {
     fn eremite_init(p: *const RawProcess) -> c_int;
@@ -1221,6 +1224,12 @@ impl Tokenizer {
     /// Returns whether a token is one of the tokenizer's added tokens.
     pub fn is_added(&self, id: i32) -> bool {
         unsafe { eremite_token_kind(self.0, id) != 0 }
+    }
+
+    /// Returns whether a token is one of the tokenizer's added tokens that
+    /// tokenizer.json marks special.
+    pub fn is_special(&self, id: i32) -> bool {
+        unsafe { eremite_token_kind(self.0, id) == TOKEN_SPECIAL }
     }
 
     /// Returns a token's bytes, or none for an unknown id.
