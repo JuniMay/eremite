@@ -133,7 +133,8 @@ keeps. That part is the smallest file cache read since the server started:
 when memory runs short, macOS drops the file cache above it first. If macOS
 compresses other memory instead while that file cache counts as free, the file
 cache at that moment becomes the part that macOS keeps. So a growing file cache
-does not make the models' memory shrink.
+does not make the models' memory shrink. The memory view shows the part that
+macOS keeps as file cache, and the rest as free file cache.
 
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks

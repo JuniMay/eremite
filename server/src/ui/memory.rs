@@ -1,8 +1,9 @@
 //! The view 2 Memory: the Mac's installed memory as a map of tiles. Each
 //! tile's area follows its bytes. Each model is a tile under its name, with
 //! its weights, experts, workspace and states inside it. Beside the models
-//! are the server's other memory, other programs, the file cache, the
-//! reserve and the free memory.
+//! are the server's other memory, other programs, the file cache that the
+//! system keeps, the free file cache (the rest of the file cache, which counts
+//! as free), the reserve and the free memory.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -22,6 +23,9 @@ const ROWS_ABOVE_MAP: u16 = 2;
 const ROWS_UNDER_MAP: u16 = 2;
 /// The fewest columns and rows in which the view draws the map.
 const LEAST_MAP_AREA: (u16, u16) = (20, 8);
+/// The share of the free memory's color in the free file cache's color:
+/// halfway, as the free file cache is both.
+const FREE_FILE_CACHE_TONE_SHARE: f64 = 0.5;
 
 /// Draws 2 Memory in `area`: the line of the figures that the map does not
 /// show, the map, the colors, and the tiles too small for a label. The model
@@ -112,6 +116,7 @@ pub fn draw_memory(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
         .saturating_sub(memory.free.saturating_add(memory.file));
     let others = in_use.saturating_sub(memory.footprint.max(tracked));
     let reserve = memory.free.min((first.reserve_gib * GIB) as u64);
+    let kept_file_cache = memory.file_kept.min(memory.file);
     let rest = [
         (
             "other server memory",
@@ -119,7 +124,12 @@ pub fn draw_memory(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
             theme.brown,
         ),
         ("other programs", others, theme.label),
-        ("file cache", memory.file, theme.rule),
+        ("file cache", kept_file_cache, theme.rule),
+        (
+            "free file cache",
+            memory.file - kept_file_cache,
+            mix(theme.rule, theme.faint, FREE_FILE_CACHE_TONE_SHARE),
+        ),
         ("reserve", reserve, theme.green),
         ("free", memory.free - reserve, theme.faint),
     ];
@@ -216,7 +226,7 @@ mod tests {
                   "workspace": {}, "states": {}}}],
             "model_memory_budget": {{"limit": {}}},
             "engine_counters": {{"memory": {{"total": {}, "free": {}, "file": {},
-                "footprint": {}, "wired": {}, "swap_used": 0}}}}
+                "file_kept": {}, "footprint": {}, "wired": {}, "swap_used": 0}}}}
             }}"#,
             bytes(7.2),
             bytes(44.1),
@@ -228,7 +238,8 @@ mod tests {
             bytes(68.0),
             bytes(128.0),
             bytes(11.1),
-            bytes(7.3),
+            bytes(30.0),
+            bytes(15.0),
             bytes(69.2),
             bytes(73.7),
         );
@@ -277,8 +288,9 @@ mod tests {
             "qwen3.8-27b 15.6 GiB",
             "experts 44.1 GiB",
             "weights 15.2 GiB",
-            "other programs 40.4 GiB",
-            "file cache 7.3 GiB",
+            "other programs 17.7 GiB",
+            "file cache 15.0 GiB",
+            "free file cache 15.0 GiB",
             "reserve 10.0 GiB",
         ] {
             assert!(screen.contains(name), "{name}:\n{screen}");
@@ -301,7 +313,7 @@ mod tests {
         assert!(
             key.starts_with(
                 " ■ weights   ■ experts   ■ workspace   ■ states   ■ other server memory   \
-                 ■ other programs   ■ file cache   ■ reserve   □ free"
+                 ■ other programs   ■ file cache   ■ free file cache   ■ reserve   □ free"
             ),
             "{key}"
         );
