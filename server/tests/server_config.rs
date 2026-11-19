@@ -1,5 +1,6 @@
-//! Startup settings without model loading. A missing port, an empty key or an
-//! occupied listener stops startup before the engine opens a checkpoint.
+//! Startup settings without model loading. A missing port, an empty key, an
+//! occupied listener or a search ranking model that is not a served decision
+//! model stops startup before the engine opens a checkpoint.
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -127,4 +128,36 @@ fn the_command_line_takes_only_the_config_file() {
     );
     assert!(error.contains("unexpected argument '-m'"), "{error}");
     assert!(error.contains("Usage: eremite-server"), "{error}");
+}
+
+#[test]
+fn the_search_ranking_model_must_be_a_served_decision_model() {
+    // A checkpoint folder that holds only DeepSeek's model type: the server
+    // reads its family before it loads a model.
+    let checkpoint =
+        std::env::temp_dir().join(format!("eremite-ranking-model-{}", std::process::id()));
+    std::fs::create_dir_all(&checkpoint).unwrap();
+    std::fs::write(
+        checkpoint.join("config.json"),
+        json!({"model_type": "deepseek_v41"}).to_string(),
+    )
+    .unwrap();
+    for (ranking_model, refusal) in [
+        ("d1-2b", "search_ranking_model: no model is named d1-2b"),
+        (
+            "deepseek-v4.1-flash",
+            "search_ranking_model: deepseek-v4.1-flash generates text: it makes no decisions",
+        ),
+    ] {
+        let config = json!({"port": 0, "host": "127.0.0.1",
+                            "search_ranking_model": ranking_model,
+                            "models": [{"model": checkpoint}]});
+        let error = run(
+            "ranking-model",
+            &["--config".into(), "/dev/stdin".into()],
+            Some(config),
+        );
+        assert!(error.contains(refusal), "{error}");
+    }
+    std::fs::remove_dir_all(&checkpoint).unwrap();
 }

@@ -52,6 +52,7 @@ const PLAIN_FLOAT_EXPONENTS: std::ops::Range<i32> = -4..16;
 
 /// What a d1 checkpoint's files set: its question layout, its option codes,
 /// its special tokens and its temperatures.
+#[derive(Clone)]
 pub struct Checkpoint {
     /// The most questions that one pass holds after its state (d1_set_size).
     pub set_size: usize,

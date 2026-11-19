@@ -742,6 +742,24 @@ fn main() {
         });
         families.push(family);
     }
+    // The model that ranks the web tool's search results, if one is set: a
+    // served decision model.
+    let ranking_model = configuration
+        .server
+        .search_ranking_model
+        .as_ref()
+        .map(|id| {
+            let index = served
+                .iter()
+                .position(|settings| settings.id.eq_ignore_ascii_case(id))
+                .unwrap_or_else(|| die(&format!("search_ranking_model: no model is named {id}")));
+            if families[index] != Family::D1 {
+                die(&format!(
+                    "search_ranking_model: {id} generates text: it makes no decisions"
+                ));
+            }
+            index
+        });
     // The folder of the saved states. There is none without a folder, or with
     // state_disk 0.
     let state_dir = (configuration.budgets.state_disk_gb > 0.0)
@@ -832,6 +850,21 @@ fn main() {
             format,
         });
     }
+    // The ranking model's prompts take its checkpoint and its tokenizer.
+    let ranker = ranking_model.and_then(|index| match &served_models[index] {
+        Served {
+            id,
+            tokenizer,
+            format: Format::D1(checkpoint),
+            ..
+        } => Some(codex::search::Ranker {
+            id: id.clone(),
+            model_index: index,
+            checkpoint: checkpoint.clone(),
+            tokenizer: *tokenizer,
+        }),
+        _ => None,
+    });
     let view = opened.map(|opened| {
         let models = served_models
             .iter()
@@ -886,7 +919,7 @@ fn main() {
                 .searxng_socket
                 .as_deref()
                 .map_or_else(|| dir.join("eremite.sock"), PathBuf::from);
-            codex::search::Service::new(
+            let service = codex::search::Service::new(
                 dir,
                 socket,
                 codex::search::AddressPolicy::Public,
@@ -897,7 +930,11 @@ fn main() {
                         configuration.server.search_session_idle_s,
                     ),
                 },
-            )
+            );
+            match ranker {
+                Some(ranker) => service.with_ranker(ranker),
+                None => service,
+            }
         },
         limits: http::Limits {
             timeout: Duration::from_secs_f64(configuration.server.http_timeout_s),

@@ -101,6 +101,7 @@ The file's root holds the server-wide settings:
 | `search_timeout` | seconds that each fetch, search and health check of the web tool may take, and SearXNG's start | 30 |
 | `searxng_idle` | seconds without a search before SearXNG stops | 600 |
 | `search_session_idle` | seconds without a call before the web tool forgets a session's references | 7200 |
+| `search_ranking_model` | the `id` of a served decision model that ranks each search query's results | none: SearXNG's order |
 | `tui` | `true` shows the terminal UI on stderr's terminal instead of the log: the server's status, its requests, its memory and its log; `q` stops the server, and the log prints on exit | `false` |
 | `tui_theme` | the terminal UI's colors: `auto` (by the terminal's background), `light` or `dark` | `auto` |
 | `tui_background_answer_wait` | seconds that the terminal UI waits for the terminal to tell its background color | 1 |
@@ -180,13 +181,22 @@ choice's likeliest `choice`, its `confidence` and every option's
 the passes read, each image's tokens included.
 
 Codex's standalone web tool sends its session `id` and `commands` to the
-search endpoint. The server runs `search_query` through SearXNG. The `output`
-text lists each query's results under the query: title, URL, citation
-reference and snippet. For each result in `output`, `results` holds a
-`text_result` with the same `ref_id`, `url`, `title` and `snippet`, in
-SearXNG's order. A successful query with no result shown gives an empty
-array, and a call without a successful query gives `null`. `encrypted_output`
-is always `null`.
+search endpoint. The server runs `search_query` through SearXNG. Each query
+shows up to 5, 8 or 12 results, by Codex's `response_length`. With
+`search_ranking_model` set, that decision model ranks the query's first 20
+results from SearXNG, one decision each. A decision's input is `Query:` and
+the query, a blank line, then `Passage:` and the result's title, with its
+snippet on the next line. Its one predicate is "Is this passage relevant to
+answering the query?", Liquid AI's prompt for reranking. The results with the
+highest probability of yes show, ties in SearXNG's order. Without the
+setting, or when the decision is refused, fails, cannot be queued or takes
+longer than `search_timeout`, the query's first results show in SearXNG's
+order, and the log says why. The `output` text lists each query's results
+under the query: title, URL, citation reference and snippet. For each result
+in `output`, `results` holds a `text_result` with the same `ref_id`, `url`,
+`title` and `snippet`, in the same order. A successful query with no result
+shown gives an empty array, and a call without a successful query gives
+`null`. `encrypted_output` is always `null`.
 
 Within a session, `open` accepts a search reference, a page reference or a
 URL. Page views number each line and link. `find` says how many lines match.

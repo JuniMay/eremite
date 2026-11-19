@@ -7,6 +7,10 @@
 //!   SearXNG listens on a Unix socket, so it occupies no TCP port.
 //!   The server starts SearXNG on demand.
 //!   It stops SearXNG after [`Times::searxng_idle`] without a search.
+//! - A ranking model, a served decision model, may rank each query's results:
+//!   one decision for each of SearXNG's first results, and the likeliest to
+//!   be relevant show. Without one, or when its decision fails or comes too
+//!   late, the results keep SearXNG's order.
 //! - `open` shows a page from a reference or a URL, and `click` follows one
 //!   of its links.
 //! - `find` shows a short page whole, or the lines that contain a text with
@@ -73,6 +77,8 @@ const MAX_SNIPPET_CHARS: usize = 400;
 /// The question that a ranking model answers about each search result, in
 /// Liquid AI's words for reranking (the Decision Model Guide).
 const RANKING_QUESTION: &str = "Is this passage relevant to answering the query?";
+/// The most of SearXNG's results that a ranking model reads for each query.
+const RANKING_CANDIDATES: usize = 20;
 /// The User-Agent header that curl sends: Safari's on macOS.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
@@ -364,6 +370,8 @@ pub struct Service {
     address_policy: AddressPolicy,
     /// The time limit and lifetimes.
     times: Times,
+    /// The model that ranks each query's results, if any.
+    ranker: Option<Arc<Ranker>>,
 }
 
 /// What one call keeps while it runs: its turn and its references.
@@ -409,7 +417,14 @@ impl Service {
             searxng: Searxng::new(searxng_dir, searxng_socket, times),
             address_policy,
             times,
+            ranker: None,
         }
+    }
+
+    /// Returns the service with `ranker` ranking each query's results.
+    pub fn with_ranker(mut self, ranker: Ranker) -> Self {
+        self.ranker = Some(Arc::new(ranker));
+        self
     }
 
     /// Stops SearXNG if this server started it.
@@ -620,13 +635,31 @@ impl Service {
     ) -> String {
         let mut tasks = Vec::new();
         for query in queries {
-            let (searxng, query, allowed_domains) = (
+            let (searxng, query, allowed_domains, ranker, timeout) = (
                 self.searxng.clone_handle(),
                 query.clone(),
                 allowed_domains.to_vec(),
+                self.ranker.clone(),
+                self.times.timeout,
             );
             tasks.push(tokio::spawn(async move {
-                searxng.search(&query, &allowed_domains, length).await
+                let shown = length.max_results_per_query();
+                let Some(ranker) = ranker else {
+                    return searxng.search(&query, &allowed_domains, shown).await;
+                };
+                let found = searxng
+                    .search(&query, &allowed_domains, RANKING_CANDIDATES.max(shown))
+                    .await?;
+                let passages = found
+                    .iter()
+                    .map(|result| Passage {
+                        title: result.title.clone(),
+                        snippet: result.snippet.clone(),
+                    })
+                    .collect();
+                let order = ranker.rank(&query.text, passages, shown, timeout).await;
+                let mut found: Vec<Option<SearxngResult>> = found.into_iter().map(Some).collect();
+                Ok(order.into_iter().filter_map(|i| found[i].take()).collect())
             }));
         }
         let mut out = String::new();
@@ -986,13 +1019,13 @@ impl Searxng {
         }
     }
 
-    /// Runs one query on SearXNG and returns its results.
-    /// It starts SearXNG first unless SearXNG answers.
+    /// Runs one query on SearXNG and returns up to `max_results` of its
+    /// results. It starts SearXNG first unless SearXNG answers.
     async fn search(
         &self,
         query: &SearchQuery,
         allowed_domains: &[String],
-        length: ResponseLength,
+        max_results: usize,
     ) -> Result<Vec<SearxngResult>, String> {
         self.start_unless_answering().await?;
         let domains: Vec<String> = query
@@ -1037,7 +1070,7 @@ impl Searxng {
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
-        parse_searxng_results(&output.stdout, &domains, length.max_results_per_query())
+        parse_searxng_results(&output.stdout, &domains, max_results)
     }
 }
 

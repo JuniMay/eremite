@@ -174,7 +174,8 @@ impl ModelConfig {
             | "keepalive"
             | "search_timeout"
             | "searxng_idle"
-            | "search_session_idle" => {
+            | "search_session_idle"
+            | "search_ranking_model" => {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
@@ -223,6 +224,9 @@ pub struct Server {
     /// The seconds without a call after which the web tool forgets a session's
     /// references.
     pub search_session_idle_s: f64,
+    /// The id of the served decision model that ranks each query's search
+    /// results (codex/search.rs); None: the results keep SearXNG's order.
+    pub search_ranking_model: Option<String>,
     /// Whether the terminal UI (ui/) shows on stderr's terminal instead of the
     /// log.
     pub tui: bool,
@@ -257,6 +261,7 @@ impl Default for Server {
             search_timeout_s: 30.0,
             searxng_idle_s: 600.0,
             search_session_idle_s: 7200.0,
+            search_ranking_model: None,
             tui: false,
             tui_theme: ThemeChoice::Auto,
             tui_background_answer_wait_s: 1.0,
@@ -315,6 +320,7 @@ impl Server {
             "state_dir" => self.state_dir = Some(text()?.into()),
             "searxng_dir" => self.searxng_dir = Some(text()?.into()),
             "searxng_socket" => self.searxng_socket = Some(text()?.into()),
+            "search_ranking_model" => self.search_ranking_model = Some(text()?.into()),
             "tui" => self.tui = value.as_bool().ok_or("tui takes true or false")?,
             "tui_theme" => {
                 self.tui_theme = match value.as_str() {
@@ -566,6 +572,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "search_timeout",
             "searxng_idle",
             "search_session_idle",
+            "search_ranking_model",
             "tui",
             "tui_theme",
             "tui_background_answer_wait",
@@ -607,6 +614,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "search_timeout",
         "searxng_idle",
         "search_session_idle",
+        "search_ranking_model",
         "tui",
         "tui_theme",
         "tui_background_answer_wait",
@@ -761,6 +769,7 @@ mod tests {
             "search_timeout",
             "searxng_idle",
             "search_session_idle",
+            "search_ranking_model",
         ] {
             let mut model = json!({"model": "/models/second"});
             model[setting] = json!(8);
@@ -808,6 +817,12 @@ mod tests {
         );
         config.server.set("searxng_idle", &json!(60)).unwrap();
         assert_eq!(config.server.searxng_idle_s, 60.0);
+        assert_eq!(config.server.search_ranking_model, None);
+        config
+            .server
+            .set("search_ranking_model", &json!("d1-2b"))
+            .unwrap();
+        assert_eq!(config.server.search_ranking_model.as_deref(), Some("d1-2b"));
         for (name, value) in [
             ("port", json!(-1)),
             ("port", json!(65536)),
@@ -820,6 +835,8 @@ mod tests {
             ("keepalive", json!("15")),
             ("search_timeout", json!(0)),
             ("search_session_idle", json!(2e6)),
+            ("search_ranking_model", json!("")),
+            ("search_ranking_model", json!(1)),
             ("tui", json!("yes")),
             ("tui_theme", json!("blue")),
             ("tui_now_window", json!(0)),
