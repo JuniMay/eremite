@@ -6,12 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-// d1's pixel budget (config.json's d1_vision_max_pixels), the fewest and the
-// most pixels of the processor's resize (processor_config.json's
-// size.shortest_edge and size.longest_edge), and the largest ratio of an
-// image's sides that smart_resize takes.
-static constexpr int BUDGET_PIXELS = 1638400, RESIZE_MIN_PIXELS = 65536,
-                     RESIZE_MAX_PIXELS = 16777216, MOST_SIDE_RATIO = 200;
+// The fewest and the most pixels of the processor's resize
+// (processor_config.json's size.shortest_edge and size.longest_edge), and the
+// largest ratio of an image's sides that smart_resize takes.
+static constexpr int RESIZE_MIN_PIXELS = 65536, RESIZE_MAX_PIXELS = 16777216,
+                     MOST_SIDE_RATIO = 200;
 
 // The side in pixels of a token's square of patches: the processor's sides
 // are multiples of it.
@@ -29,11 +28,12 @@ typedef struct {
   uint8_t *p;
 } Rgb;  // rows of w RGB pixels
 
-// media.cap_pixels: an image of more than BUDGET_PIXELS pixels shrinks to fit,
-// keeping its shape, with Pillow's bicubic resize. It frees s's pixels then.
+// media.cap_pixels: an image of more than LFM3_IMAGE_MAX_PIXELS pixels shrinks
+// to fit, keeping its shape, with Pillow's bicubic resize. It frees s's pixels
+// then.
 static Rgb cap_pixels(Rgb s) {
-  if ((double)s.w * s.h <= BUDGET_PIXELS) return s;
-  double scale = sqrt(BUDGET_PIXELS / ((double)s.w * s.h));
+  if ((double)s.w * s.h <= LFM3_IMAGE_MAX_PIXELS) return s;
+  double scale = sqrt(LFM3_IMAGE_MAX_PIXELS / ((double)s.w * s.h));
   int w = (int)(s.w * scale), h = (int)(s.h * scale);
   w = w < 1 ? 1 : w, h = h < 1 ? 1 : h;
   Rgb o = {w, h, image_resize_rgb(s.p, s.w, s.h, w, h)};

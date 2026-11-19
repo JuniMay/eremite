@@ -2,10 +2,11 @@
 #define EREMITE_MODEL_LFM3_MODEL_H
 #include "model/model.h"
 
-// LFM3's language model, as LiquidAI's d1 decision models hold it, and its
-// decision pass: one sequence holds a state and the questions after it, and
-// the pass returns the logits of chosen tokens at chosen rows. Also the shape
-// of the patches that its vision tower reads.
+// LFM3-VL as LiquidAI's d1 decision models hold it: its language model and its
+// decision pass, where one sequence holds a state and the questions after it
+// and the pass returns the logits of chosen tokens at chosen rows; and its
+// vision tower and projector, which turn an image's patches into the
+// language model's input rows.
 
 // The language model's shape (text_config in d1-2B's config.json).
 static constexpr int LFM3_DIM = 2048, LFM3_LAYERS = 24, LFM3_VOCAB = 128000,
@@ -25,5 +26,19 @@ static constexpr int LFM3_PATCH = 16, LFM3_MERGE = 2, LFM3_FRAMES = 2;
 // LFM3_PATCH pixels.
 static constexpr int LFM3_PATCH_VALUES =
     3 * LFM3_FRAMES * LFM3_PATCH * LFM3_PATCH;
+
+// d1's pixel budget: an image of more pixels shrinks to it
+// (d1_vision_max_pixels).
+static constexpr int LFM3_IMAGE_MAX_PIXELS = 1638400;
+
+// The vision tower's shape (vision_config): rows of LFM3_VISION_WIDTH values,
+// its layers, its feed-forwards' width, and its attention's query heads that
+// share key heads of LFM3_VISION_HEAD_DIM values. The projector joins each
+// square of patches into LFM3_PROJECTOR_HIDDEN values before it gives a row of
+// LFM3_DIM (projector_hidden_size).
+static constexpr int LFM3_VISION_WIDTH = 1024, LFM3_VISION_LAYERS = 14,
+                     LFM3_VISION_HIDDEN = 2560, LFM3_VISION_HEADS = 16,
+                     LFM3_VISION_KV_HEADS = 8, LFM3_VISION_HEAD_DIM = 64,
+                     LFM3_PROJECTOR_HIDDEN = 4096;
 
 #endif

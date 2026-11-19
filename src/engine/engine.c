@@ -929,7 +929,7 @@ int eremite_media_encode(eremite_media *x, int from) {
 
 void eremite_media_close(eremite_media *x) {
   if (!x) return;
-  x->m->ops->set_prefill_media(0, 0);
+  if (x->m->ops->set_prefill_media) x->m->ops->set_prefill_media(0, 0);
   for (int i = 0; i < x->n; i++) media_free(&x->items[i]);
   free(x->items), free(x);
 }

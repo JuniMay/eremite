@@ -1,4 +1,5 @@
 #include "check.h"
+#include "bmp.h"
 #include "model/lfm3/image.h"
 #include "model/lfm3/model.h"
 #include <math.h>
@@ -14,9 +15,6 @@
 // (Pillow 13, torchvision 0.29), each square of patches together, each frame
 // the same picture. Sides that differ more than 200 times, and bytes that
 // hold no image, are refused.
-
-// The BMP file's header and its information header, in bytes.
-static constexpr int BMP_HEADER = 14, BMP_INFO = 40;
 
 // FNV-1a's 64-bit offset basis and prime.
 static constexpr uint64_t FNV_OFFSET = 14695981039346656037ull,
@@ -37,39 +35,6 @@ static const struct {
     // 12.5 and 6.5 squares of 32 pixels: rounded to 12 and 6
     {400, 208, 24, 12, 5321428952103445155ull},
 };
-
-// Writes v to p in little-endian order, in bytes bytes.
-static void put_le(uint8_t *p, uint32_t v, int bytes) {
-  for (int i = 0; i < bytes; i++) p[i] = (uint8_t)(v >> (8 * i));
-}
-
-// Returns a 24-bit BMP file of width x height pixels and sets *len: red rises
-// from left to right, green from top to bottom, and blue is a texture of
-// sharp edges.
-static uint8_t *make_bmp(int width, int height, size_t *len) {
-  int row = (width * 3 + 3) / 4 * 4;
-  size_t data = (size_t)row * height, start = BMP_HEADER + BMP_INFO;
-  *len = start + data;
-  uint8_t *f = calloc(*len, 1);
-  f[0] = 'B', f[1] = 'M';
-  put_le(f + 2, (uint32_t)*len, 4), put_le(f + 10, (uint32_t)start, 4);
-  uint8_t *info = f + BMP_HEADER;
-  put_le(info, BMP_INFO, 4), put_le(info + 4, (uint32_t)width, 4);
-  put_le(info + 8, (uint32_t)height, 4), put_le(info + 12, 1, 2);
-  put_le(info + 14, 24, 2), put_le(info + 20, (uint32_t)data, 4);
-  // 2835 pixels per meter: 72 per inch.
-  put_le(info + 24, 2835, 4), put_le(info + 28, 2835, 4);
-  for (int y = 0; y < height; y++) {
-    // The rows go from the bottom up, each pixel blue, green, red.
-    uint8_t *line = f + start + (size_t)(height - 1 - y) * row;
-    for (int x = 0; x < width; x++) {
-      line[3 * x] = (uint8_t)((x / 7) * 37 + (y / 5) * 91 + (x * y) % 13 * 11);
-      line[3 * x + 1] = (uint8_t)(y * 255 / (height - 1));
-      line[3 * x + 2] = (uint8_t)(x * 255 / (width - 1));
-    }
-  }
-  return f;
-}
 
 // Returns the pixel level that a patch's BF16 value holds.
 static uint8_t level_of(uint16_t value) {
@@ -108,7 +73,7 @@ static uint64_t hash_pixels(const Media *im, int *frames_agree) {
 // Opens a BMP image of width x height pixels in im.
 static int open_bmp(Media *im, int width, int height) {
   size_t len;
-  uint8_t *bmp = make_bmp(width, height, &len);
+  uint8_t *bmp = make_test_bmp(width, height, &len);
   const char *error = 0;
   int opened = lfm3_image_open(im, bmp, len, &error);
   free(bmp);
