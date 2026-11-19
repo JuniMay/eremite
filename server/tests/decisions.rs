@@ -2,7 +2,8 @@
 //! generates no text. The model lists show it with its checkpoint's context,
 //! Codex's catalog leaves it out, and the chat endpoints refuse it; the server
 //! loads no weights for these. POST /v1/decisions answers questions about a
-//! text or JSON input with the probabilities of LiquidAI's own code.
+//! text or JSON input, and about images, with the probabilities of
+//! LiquidAI's own code.
 //!
 //! Set EREMITE_D1_CHECKPOINT to the d1 checkpoint directory. EREMITE_SERVER
 //! picks the server binary (default build/eremite-server). The tests run one
@@ -17,13 +18,15 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 mod common;
-use common::{Server, build_config, http, one_model, root};
+use common::{Server, build_config, encode_base64, http, make_test_bmp, one_model, root};
 
 /// The tokens that one pass of d1-2B holds.
 const CONTEXT: u64 = 128000;
 /// The largest difference in probability of LiquidAI's own BF16 run from its
-/// FP32 run, over four short requests.
+/// FP32 run, over four short requests of text, and over four requests about
+/// images.
 const PROBABILITY_BOUND: f64 = 0.0067;
+const IMAGE_PROBABILITY_BOUND: f64 = 0.0112;
 
 /// Starts a server of the d1 checkpoint `checkpoint`. It writes no saved
 /// states.
@@ -87,9 +90,16 @@ fn a_decision_model_is_listed_with_its_context_and_refuses_chat() {
     server.stop();
 }
 
-/// Checks that `answer`'s probabilities, option by option, are within
-/// PROBABILITY_BOUND of `expected`.
-fn check_probabilities(answer: &Value, expected: &[f64]) {
+/// Returns an input_image part of the test pattern at width x height pixels,
+/// as a BMP file in a base64 data URL.
+fn image_part(width: usize, height: usize) -> Value {
+    let data = encode_base64(&make_test_bmp(width, height));
+    json!({"type": "input_image", "image_url": format!("data:image/bmp;base64,{data}")})
+}
+
+/// Checks that `answer`'s probabilities, option by option, are within `bound`
+/// of `expected`.
+fn check_probabilities_within(answer: &Value, expected: &[f64], bound: f64) {
     let probabilities: Vec<f64> = answer["probabilities"]
         .as_array()
         .expect("the answer's probabilities")
@@ -99,10 +109,16 @@ fn check_probabilities(answer: &Value, expected: &[f64]) {
     assert_eq!(probabilities.len(), expected.len(), "{answer}");
     for (probability, expected) in probabilities.iter().zip(expected) {
         assert!(
-            (probability - expected).abs() <= PROBABILITY_BOUND,
+            (probability - expected).abs() <= bound,
             "{answer}: {expected} in LiquidAI's FP32 run"
         );
     }
+}
+
+/// Checks that `answer`'s probabilities, option by option, are within
+/// PROBABILITY_BOUND of `expected`.
+fn check_probabilities(answer: &Value, expected: &[f64]) {
+    check_probabilities_within(answer, expected, PROBABILITY_BOUND);
 }
 
 #[test]
@@ -182,5 +198,88 @@ fn a_decision_model_answers_as_liquidais_code_answers() {
     // The status counts the two decisions.
     let status = server.settled(2);
     assert_eq!(status["totals"]["prompt_tokens"], 123 + 89);
+    server.stop();
+}
+
+#[test]
+fn a_decision_model_answers_about_images_as_liquidais_code_answers() {
+    let Ok(checkpoint) = std::env::var("EREMITE_D1_CHECKPOINT") else {
+        eprintln!("skipped: set EREMITE_D1_CHECKPOINT");
+        return;
+    };
+    let _one = one_model();
+    let server = start_server(&checkpoint);
+    // A text state after a 400 x 208 image, with a predicate, a choice and a
+    // score. The expected probabilities are those of LiquidAI's own code in
+    // FP32.
+    let card = json!({
+        "input": [{"role": "user", "content": [
+            image_part(400, 208),
+            {"type": "input_text", "text": "A test card: color ramps and a striped blue texture."}]}],
+        "questions": [
+            {"type": "predicate", "instructions": "Is the picture mostly blue?"},
+            {"type": "choice", "instructions": "Which color is strongest at the right edge?",
+             "choices": [{"value": "red"}, {"value": "green"}, {"value": "blue"}]},
+            {"type": "score", "instructions": "How colorful is the picture?",
+             "levels": [{"label": "dull"}, {"label": "plain"}, {"label": "bright"}]}
+        ]
+    });
+    let (code, decision) = ask(&server, "POST", "/v1/decisions", Some(&card));
+    assert_eq!(code, 200, "{decision}");
+    println!("{decision}");
+    let answers = &decision["answers"];
+    let blue = answers[0]["probability"].as_f64().expect("a probability");
+    assert!(
+        (blue - 0.08439659339814178).abs() <= IMAGE_PROBABILITY_BOUND,
+        "{blue}"
+    );
+    assert_eq!(answers[1]["choice"], "red");
+    check_probabilities_within(
+        &answers[1],
+        &[
+            0.9709278128599893,
+            0.010602843523026886,
+            0.018469343616983654,
+        ],
+        IMAGE_PROBABILITY_BOUND,
+    );
+    check_probabilities_within(
+        &answers[2],
+        &[
+            0.009501194952973599,
+            0.027155231986241753,
+            0.9633435730607847,
+        ],
+        IMAGE_PROBABILITY_BOUND,
+    );
+    assert_eq!(
+        decision["usage"]["input_tokens"], 185,
+        "the image's span counts whole"
+    );
+
+    // A 200 x 150 image alone: the question follows it.
+    let alone = json!({
+        "input": [{"role": "user", "content": [image_part(200, 150)]}],
+        "questions": [{"type": "predicate", "instructions": "Does the picture show a person?"}]
+    });
+    let (code, decision) = ask(&server, "POST", "/v1/decisions", Some(&alone));
+    assert_eq!(code, 200, "{decision}");
+    let person = decision["answers"][0]["probability"]
+        .as_f64()
+        .expect("a probability");
+    assert!(
+        (person - 0.01885821318423426).abs() <= IMAGE_PROBABILITY_BOUND,
+        "{person}"
+    );
+    assert_eq!(decision["usage"]["input_tokens"], 97);
+
+    // An image that does not decode gets 400.
+    let broken = json!({
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,aGk="}]}],
+        "questions": [{"type": "predicate", "instructions": "?"}]
+    });
+    let (code, refused) = ask(&server, "POST", "/v1/decisions", Some(&broken));
+    assert_eq!(code, 400, "{refused}");
     server.stop();
 }

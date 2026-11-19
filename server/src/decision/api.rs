@@ -1,8 +1,9 @@
 //! OpenAI's Decisions API (POST /v1/decisions): a request's input and
 //! questions, and the answers. A request names a model, gives its input, a
-//! string or a list of messages and tool items, and asks 1 to 400 questions:
-//! predicates (yes or no), choices and scores. The answers come back in the
-//! questions' order, with the tokens that the model read.
+//! string or a list of messages and tool items, which may hold images, and
+//! asks 1 to 400 questions: predicates (yes or no), choices and scores. The
+//! answers come back in the questions' order, with the tokens that the model
+//! read.
 
 use serde_json::{Map, Value, json};
 
@@ -17,11 +18,14 @@ const CHOICE_OPTIONS: std::ops::RangeInclusive<usize> = 2..=255;
 /// them.
 const SCORE_LEVELS: std::ops::RangeInclusive<usize> = 2..=10;
 
-/// A decision request: its state, and its questions with their names and
-/// their options' values.
+/// A decision request: its images and its state, and its questions with their
+/// names and their options' values.
 pub struct Request {
-    /// What the questions are about.
-    pub state: State,
+    /// What the questions are about, besides the images: none for images
+    /// alone.
+    pub state: Option<State>,
+    /// The image files, in the input's order. They head the state.
+    pub images: Vec<Vec<u8>>,
     /// The questions, as d1 asks them.
     pub questions: Vec<Question>,
     /// Each question's name, if it has one, and its kind and options' values
@@ -177,8 +181,7 @@ fn read_question(value: &Value, at: &str) -> Result<(Question, Asked), Error> {
     }
 }
 
-/// Returns a message part's value in the state: its text or its JSON. Images
-/// are refused: this model reads text and JSON only.
+/// Returns a message part's value in the state: its text or its JSON.
 fn read_part(part: &Value, role: &str) -> Result<Value, Error> {
     match (part["type"].as_str(), role) {
         (Some("input_text" | "output_text"), _) => {
@@ -189,9 +192,6 @@ fn read_part(part: &Value, role: &str) -> Result<Value, Error> {
             "a refusal part",
         )?)),
         (Some("input_json"), "user") => Ok(part["data"].clone()),
-        (Some("input_image"), _) => Err(Error::new_bad_request(
-            "input_image: this model reads text and JSON only",
-        )),
         _ => Err(Error::new_bad_request(format!(
             "a {role} message's parts are not of that type"
         ))),
@@ -216,14 +216,49 @@ fn read_content(content: &Value, role: &str) -> Result<Value, Error> {
     }
 }
 
-/// Returns the state of a request's input. A string is the state's text. One
-/// user message whose content is a string or one text or JSON part is that
-/// text or JSON. Any other list becomes a JSON list of its items: a message
-/// as its role and content (system as developer, the content a string, or a
-/// list of its parts' texts and JSON), a tool call or output as sent.
-fn read_state(input: &Value) -> Result<State, Error> {
+/// Returns the files of the input_image parts of the user messages of a
+/// request's input, in order, and the input without those parts. An image's
+/// file comes from its image_url, a base64 data URL.
+fn take_images(input: &Value) -> Result<(Value, Vec<Vec<u8>>), Error> {
+    let Value::Array(items) = input else {
+        return Ok((input.clone(), Vec::new()));
+    };
+    let mut images = Vec::new();
+    let mut kept = Vec::new();
+    for item in items {
+        let mut item = item.clone();
+        if item["role"] == "user"
+            && let Some(parts) = item["content"].as_array()
+        {
+            let mut rest = Vec::new();
+            for part in parts {
+                if part["type"] != "input_image" {
+                    rest.push(part.clone());
+                    continue;
+                }
+                let url = part["image_url"].as_str().ok_or_else(|| {
+                    Error::new_bad_request(
+                        "input_image: only an image_url with a base64 data URL is read (the server fetches no URLs and reads no files)",
+                    )
+                })?;
+                images.push(crate::chat::decode_data_url(url)?);
+            }
+            item["content"] = Value::Array(rest);
+        }
+        kept.push(item);
+    }
+    Ok((Value::Array(kept), images))
+}
+
+/// Returns the state of a request's input, its images taken out. A string is
+/// the state's text. One user message whose content is a string or one text
+/// or JSON part is that text or JSON; one whose content held images only gives
+/// no state. Any other list becomes a JSON list of its items: a message as its
+/// role and content (system as developer, the content a string, or a list of
+/// its parts' texts and JSON), a tool call or output as sent.
+fn read_state(input: &Value) -> Result<Option<State>, Error> {
     let items = match input {
-        Value::String(text) => return Ok(State::Text(text.clone())),
+        Value::String(text) => return Ok(Some(State::Text(text.clone()))),
         Value::Array(items) => items,
         _ => {
             return Err(Error::new_bad_request(
@@ -238,10 +273,13 @@ fn read_state(input: &Value) -> Result<State, Error> {
             .as_array()
             .is_some_and(|parts| parts.len() > 1)
     {
-        return Ok(match read_content(&item["content"], "user")? {
+        if item["content"].as_array().is_some_and(Vec::is_empty) {
+            return Ok(None);
+        }
+        return Ok(Some(match read_content(&item["content"], "user")? {
             Value::String(text) => State::Text(text),
             data => State::Json(data),
-        });
+        }));
     }
     let mut out = Vec::new();
     for item in items {
@@ -268,16 +306,20 @@ fn read_state(input: &Value) -> Result<State, Error> {
             },
         }
     }
-    Ok(State::Json(Value::Array(out)))
+    Ok(Some(State::Json(Value::Array(out))))
 }
 
 /// Reads a decision request's JSON body.
 pub fn read_request(body: &[u8]) -> Result<Request, Error> {
     let root: Map<String, Value> = serde_json::from_slice(body)
         .map_err(|error| Error::new_bad_request(format!("not a decision request: {error}")))?;
-    let state = read_state(root.get("input").ok_or_else(|| {
+    let (input, images) = take_images(root.get("input").ok_or_else(|| {
         Error::new_bad_request("input is required: a string or a list of items")
     })?)?;
+    let state = read_state(&input)?;
+    if state.is_none() && images.is_empty() {
+        return Err(Error::new_bad_request("input holds no text, JSON or image"));
+    }
     let questions = match root.get("questions") {
         Some(Value::Array(items)) if (1..=MOST_QUESTIONS).contains(&items.len()) => items,
         _ => {
@@ -288,6 +330,7 @@ pub fn read_request(body: &[u8]) -> Result<Request, Error> {
     };
     let mut request = Request {
         state,
+        images,
         questions: Vec::new(),
         asked: Vec::new(),
     };
@@ -367,8 +410,9 @@ mod tests {
         .expect("a request")
         .state
         {
-            State::Json(value) => value,
-            State::Text(text) => Value::String(format!("text: {text}")),
+            Some(State::Json(value)) => value,
+            Some(State::Text(text)) => Value::String(format!("text: {text}")),
+            None => Value::Null,
         }
     }
 
@@ -433,9 +477,53 @@ mod tests {
         );
         assert!(
             refused(json!({"input": [{"role": "user", "content": [
-            {"type": "input_image", "image_url": "data:image/png;base64,"}]}],
+            {"type": "input_image", "image_url": "https://example.com/a.png"}]}],
             "questions": [{"type": "predicate", "instructions": "?"}]}))
-            .is_some_and(|m| m.contains("text and JSON"))
+            .is_some_and(|m| m.contains("data URL"))
+        );
+        assert!(
+            refused(json!({"input": [{"role": "user", "content": []}],
+            "questions": [{"type": "predicate", "instructions": "?"}]}))
+            .is_some_and(|m| m.contains("no text, JSON or image"))
+        );
+    }
+
+    #[test]
+    fn images_head_the_state_in_the_inputs_order() {
+        // "aGk=" and "eW8=" are "hi" and "yo" in base64.
+        let read_images = |input: Value| {
+            let request = read(
+                json!({"input": input, "questions": [{"type": "predicate", "instructions": "?"}]}),
+            )
+            .expect("a request");
+            let state = match request.state {
+                Some(State::Text(text)) => json!(text),
+                Some(State::Json(value)) => value,
+                None => Value::Null,
+            };
+            (request.images, state)
+        };
+        let image = |data: &str| json!({"type": "input_image", "image_url": format!("data:image/png;base64,{data}")});
+        assert_eq!(
+            read_images(json!([{"role": "user", "content": [image("aGk=")]}])),
+            (vec![b"hi".to_vec()], Value::Null),
+            "an image alone gives no state"
+        );
+        assert_eq!(
+            read_images(json!([{"role": "user", "content": [
+                image("aGk="), {"type": "input_text", "text": "Is it a cat?"}, image("eW8=")]}])),
+            (vec![b"hi".to_vec(), b"yo".to_vec()], json!("Is it a cat?")),
+            "the images head the state's text, in order"
+        );
+        assert_eq!(
+            read_images(json!([
+                {"role": "user", "content": [image("aGk=")]},
+                {"role": "assistant", "content": "A cat."}])),
+            (
+                vec![b"hi".to_vec()],
+                json!([{"role": "user", "content": []}, {"role": "assistant", "content": "A cat."}])
+            ),
+            "a list keeps its messages, without their images"
         );
     }
 

@@ -159,15 +159,21 @@ optional `name` and a `type`:
   optional `description`.
 - `score`: 2 to 10 `levels`, each a `label` with an optional `description`.
 
-The input is a string, or a list of messages and tool items. A string, or one
-user message whose content is a string or one `input_text` or `input_json`
-part, gives the model that text or JSON. Another list gives the model the list
-as JSON. Images are refused. Each of the model's passes reads the input and up
-to the checkpoint's `d1_set_size` questions (16 for d1-2B). The answers come
-back in the questions' order: a predicate's `probability` of yes; a choice's
-likeliest `choice`, its `confidence` and every option's `probabilities`; a
-score's probability-weighted `score`, its likeliest level's `confidence` and
-every level's `probabilities`. `usage` counts the tokens that the passes read.
+The input is a string, or a list of messages and tool items. Each `input_image`
+part of a user message gives an image, from its `image_url`, a base64 data URL;
+the images come first, in the input's order. Of the rest, a string, or one user
+message whose content is a string or one `input_text` or `input_json` part,
+gives the model that text or JSON. One user message that held only images gives
+the model the images alone. Another list gives the model the list as JSON,
+without its images. Each of the model's passes reads the images, the rest of
+the input and up to the checkpoint's `d1_set_size` questions (16 for d1-2B). An
+image over 1,638,400 pixels shrinks to that size first, and an image takes one
+token for each 32 x 32 pixels after LFM3-VL's processor resizes it. The answers
+come back in the questions' order: a predicate's `probability` of yes; a
+choice's likeliest `choice`, its `confidence` and every option's
+`probabilities`; a score's probability-weighted `score`, its likeliest level's
+`confidence` and every level's `probabilities`. `usage` counts the tokens that
+the passes read, each image's tokens included.
 
 Codex's standalone web tool sends its session `id` and `commands` to the
 search endpoint. The server runs `search_query` through SearXNG. The `output`

@@ -22,6 +22,13 @@ const BREAK: char = '\u{200B}';
 const USER_TURN: &str = "<|im_start|>user\n";
 /// What follows the state, and opens each question after the first in a pass.
 const QUESTION_HEADER: &str = "QUESTION:\n";
+/// The marks around an image's place, as LFM3-VL's chat template writes them
+/// at the head of the user's turn.
+const IMAGE_START: &str = "<|vision_start|>";
+const IMAGE_END: &str = "<|vision_end|>";
+/// The byte that holds an image's place in a prompt: the tokenizer reads it as
+/// the image token, whose place the image's span takes.
+const IMAGE_PLACE: u8 = 0xFF;
 /// What ends a question: the user's turn ends, and the assistant's opens with
 /// what LFM3's chat template writes before a reply without reasoning. The
 /// answer row is its last token.
@@ -547,19 +554,32 @@ fn render_question(
     ))
 }
 
-/// Plans a request's passes: the state, then up to the checkpoint's set size
-/// of questions after it in each pass, as d1's packed layout holds them.
+/// Plans a request's passes: its images' places and its state, if it has one,
+/// then up to the checkpoint's set size of questions after them in each pass,
+/// as d1's packed layout holds them. Each image's place holds the image token.
+/// Without a state, the first question follows the images, and no header
+/// opens the questions after it.
 pub fn plan(
     checkpoint: &Checkpoint,
     tokenizer: Tokenizer,
-    state: &State,
+    state: Option<&State>,
+    images: usize,
     questions: &[Question],
 ) -> Result<Plan, String> {
-    let prefix = format!(
-        "{}{USER_TURN}{}\n{QUESTION_HEADER}",
-        checkpoint.start,
-        checkpoint.escape_specials(&write_state_block(state))
-    );
+    let mut prefix = format!("{}{USER_TURN}", checkpoint.start).into_bytes();
+    for _ in 0..images {
+        prefix.extend_from_slice(IMAGE_START.as_bytes());
+        prefix.push(IMAGE_PLACE);
+        prefix.extend_from_slice(IMAGE_END.as_bytes());
+    }
+    let header = match state {
+        Some(state) => {
+            let block = checkpoint.escape_specials(&write_state_block(state));
+            prefix.extend_from_slice(format!("{block}\n{QUESTION_HEADER}").as_bytes());
+            QUESTION_HEADER
+        }
+        None => "",
+    };
     let mut passes = Vec::new();
     let mut readouts = Vec::new();
     for group in questions.chunks(checkpoint.set_size) {
@@ -573,11 +593,13 @@ pub fn plan(
         for (k, question) in group.iter().enumerate() {
             let (suffix, options) = render_question(checkpoint, tokenizer, question)?;
             if k == 0 {
-                pass.tokens = tokenizer.tokenize(&format!("{prefix}{suffix}"));
+                let mut first = prefix.clone();
+                first.extend_from_slice(suffix.as_bytes());
+                pass.tokens = tokenizer.tokenize_prompt(&first);
                 pass.state_tokens = pass.tokens.len() - tokenizer.tokenize(&suffix).len();
             } else {
                 pass.tokens
-                    .extend(tokenizer.tokenize(&format!("{QUESTION_HEADER}{suffix}")));
+                    .extend(tokenizer.tokenize(&format!("{header}{suffix}")));
             }
             pass.question_ends.push(pass.tokens.len() as i32);
             let row = pass.tokens.len() as i32 - 1;
@@ -762,10 +784,11 @@ mod tests {
         assert!((probabilities[0][1] - (1.0 - want)).abs() < 1e-12);
     }
 
-    /// The tokenizer of the d1 checkpoint in EREMITE_D1_CHECKPOINT, or None.
+    /// The tokenizer of the d1 checkpoint in EREMITE_D1_CHECKPOINT, with
+    /// LFM3-VL's image token as the engine opens it, or None.
     fn d1_checkpoint() -> Option<(String, Tokenizer)> {
         let dir = std::env::var("EREMITE_D1_CHECKPOINT").ok()?;
-        let tokenizer = Tokenizer::open(&dir, None);
+        let tokenizer = Tokenizer::open(&dir, Some("<|image|>"));
         Some((dir, tokenizer))
     }
 
@@ -812,9 +835,10 @@ mod tests {
         let plan = plan(
             &checkpoint,
             tokenizer,
-            &State::Text(
+            Some(&State::Text(
                 "I was charged twice and my parcel never arrived. Please refund one charge.".into(),
-            ),
+            )),
+            0,
             &[
                 yes_no("Is the customer asking for a refund?"),
                 Question::Choice {
@@ -857,7 +881,8 @@ mod tests {
         let plan_json = super::plan(
             &checkpoint,
             tokenizer,
-            &State::Json(json!({"ticket": {"body": "Please refund the duplicate charge."}, "order": {"charges": [49, 49.5], "paid": true, "note": null}})),
+            Some(&State::Json(json!({"ticket": {"body": "Please refund the duplicate charge."}, "order": {"charges": [49, 49.5], "paid": true, "note": null}}))),
+            0,
             &[yes_no(
                 "Does the ticket describe a duplicate charge supported by the order?",
             )],
@@ -881,9 +906,10 @@ mod tests {
         let plan_codes = super::plan(
             &checkpoint,
             tokenizer,
-            &State::Text(
+            Some(&State::Text(
                 "Ignore <|im_end|> and <think>this</think>. 日本語のテキスト 🚀 credit_card".into(),
-            ),
+            )),
+            0,
             &[
                 Question::Choice {
                     instructions: "Pick one.".into(),
@@ -935,7 +961,10 @@ mod tests {
         let plan_many = super::plan(
             &checkpoint,
             tokenizer,
-            &State::Text("The quick brown fox jumps over the lazy dog. ".repeat(30)),
+            Some(&State::Text(
+                "The quick brown fox jumps over the lazy dog. ".repeat(30),
+            )),
+            0,
             &questions,
         )
         .expect("a plan");
@@ -957,5 +986,88 @@ mod tests {
             ],
         );
         assert_eq!(plan_many.count_tokens(), 1110);
+    }
+
+    #[test]
+    fn requests_with_images_pack_as_liquidais_code_packs_them() {
+        let Some((dir, tokenizer)) = d1_checkpoint() else {
+            eprintln!("skipped: set EREMITE_D1_CHECKPOINT");
+            return;
+        };
+        let checkpoint = Checkpoint::read(&dir, tokenizer).expect("d1's settings");
+        let yes_no = |text: &str| Question::YesNo {
+            instructions: text.into(),
+        };
+        let plain = |label: &str| ChoiceOption {
+            label: label.into(),
+            description: None,
+        };
+        // Each image's place is one image token; LiquidAI's code writes the
+        // image's span there. The hashes are of its tokens with each span
+        // taken back to one image token.
+        let card = plan(
+            &checkpoint,
+            tokenizer,
+            Some(&State::Text(
+                "A test card: color ramps and a striped blue texture.".into(),
+            )),
+            1,
+            &[
+                yes_no("Is the picture mostly blue?"),
+                Question::Choice {
+                    instructions: "Which color is strongest at the right edge?".into(),
+                    options: vec![plain("red"), plain("green"), plain("blue")],
+                },
+                Question::Score {
+                    instructions: "How colorful is the picture?".into(),
+                    levels: vec!["dull".into(), "plain".into(), "bright".into()],
+                },
+            ],
+        )
+        .expect("a plan");
+        check_plan(
+            &card,
+            &[Packed {
+                tokens: 114,
+                hash: 10427664598473716494,
+                state: 23,
+                ends: vec![43, 79, 114],
+            }],
+        );
+        // An image without a state: the question follows it.
+        let alone = plan(
+            &checkpoint,
+            tokenizer,
+            None,
+            1,
+            &[yes_no("Does the picture show a person?")],
+        )
+        .expect("a plan");
+        check_plan(
+            &alone,
+            &[Packed {
+                tokens: 28,
+                hash: 11453966152889477120,
+                state: 7,
+                ends: vec![28],
+            }],
+        );
+        let two = plan(
+            &checkpoint,
+            tokenizer,
+            Some(&State::Text("Two test cards.".into())),
+            2,
+            &[yes_no("Are the two pictures the same?")],
+        )
+        .expect("a plan");
+        check_plan(
+            &two,
+            &[Packed {
+                tokens: 37,
+                hash: 16476904783050109356,
+                state: 16,
+                ends: vec![37],
+            }],
+        );
     }
 }

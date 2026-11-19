@@ -450,24 +450,27 @@ async fn answer_decisions(
                 model.id
             )));
         };
-        let request = decision::api::read_request(&body)?;
+        let mut request = decision::api::read_request(&body)?;
         let mut plan = d1::plan(
             checkpoint,
             model.tokenizer,
-            &request.state,
+            request.state.as_ref(),
+            request.images.len(),
             &request.questions,
         )
         .map_err(chat::Error::new_bad_request)?;
         let passes = std::mem::take(&mut plan.passes);
+        let media = std::mem::take(&mut request.images);
         let note = format!(
-            "http {arrival} from {from}: {} questions in {} passes",
+            "http {arrival} from {from}: {} questions in {} passes, {} images",
             request.questions.len(),
-            passes.len()
+            passes.len(),
+            media.len()
         );
         let (cancel, events) = worker::submit_decision(worker::DecisionRequest {
             model_index: index,
             passes,
-            media: Vec::new(),
+            media,
             note,
         })
         .map_err(convert_submit_error)?;

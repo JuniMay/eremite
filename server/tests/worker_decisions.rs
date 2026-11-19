@@ -17,6 +17,9 @@ use eremite_server::{config, engine, worker};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+mod common;
+use common::make_test_bmp;
+
 /// The tokens in the test model's context.
 const CTX: usize = 4096;
 /// The seconds without requests before the model unloads: it unloads when
@@ -123,40 +126,6 @@ fn long_pass(rows: usize) -> d1::Pass {
         rows: vec![rows as i32 - 1; IDS.len()],
         ids: IDS.to_vec(),
     }
-}
-
-/// Returns a BMP file of the test pattern at width x height pixels: 24-bit
-/// pixels, red rising from left to right, green from top to bottom, and blue
-/// a texture of sharp edges, as the engine's tests make it.
-fn make_test_bmp(width: usize, height: usize) -> Vec<u8> {
-    let row = (width * 3).div_ceil(4) * 4;
-    let data = row * height;
-    let mut f = vec![0u8; 54 + data];
-    let mut put = |at: usize, value: u32, bytes: usize| {
-        f[at..at + bytes].copy_from_slice(&value.to_le_bytes()[..bytes]);
-    };
-    put(0, u32::from_le_bytes(*b"BM\0\0"), 2);
-    put(2, (54 + data) as u32, 4);
-    put(10, 54, 4);
-    put(14, 40, 4);
-    put(18, width as u32, 4);
-    put(22, height as u32, 4);
-    put(26, 1, 2);
-    put(28, 24, 2);
-    put(34, data as u32, 4);
-    // 2835 pixels per meter: 72 per inch.
-    put(38, 2835, 4);
-    put(42, 2835, 4);
-    for y in 0..height {
-        // The rows go from the bottom up, each pixel blue, green, red.
-        let line = 54 + (height - 1 - y) * row;
-        for x in 0..width {
-            f[line + 3 * x] = ((x / 7) * 37 + (y / 5) * 91 + (x * y) % 13 * 11) as u8;
-            f[line + 3 * x + 1] = (y * 255 / (height - 1)) as u8;
-            f[line + 3 * x + 2] = (x * 255 / (width - 1)) as u8;
-        }
-    }
-    f
 }
 
 /// The pass of CARD, with its image's place.
