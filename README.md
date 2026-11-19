@@ -5,6 +5,21 @@ weights of mixture-of-experts models from the SSD into an expert cache that
 grows and shrinks with free memory, schedules the requests of several models
 on one GPU, and serves an OpenAI- and Codex-compatible API.
 
+## Performance
+
+DeepSeek V4.1 Flash on an Apple M5 Max with 128 GiB, with 64 GiB of its own
+memory, the default settings and one request at a time. Prefill reads a prompt
+of 8,921 tokens. Decoding speed depends on the text, so it is a range.
+
+| Experts | Prefill | Decoding |
+|---|---|---|
+| UD-IQ1_M | 688 token/s | 23~27 token/s |
+| UD-IQ2_XXS | 664 token/s | 21~25 token/s |
+| MXFP4 | 448 token/s | 10~15 token/s |
+
+`docs/performance/deepseek-v4.1-flash.md` gives the setup and the measured
+runs.
+
 ## Build
 
 Requirements: macOS 27 with Xcode 27, and `pkgconf`, `yyjson` and
@@ -83,3 +98,21 @@ requests, memory, decision models and Codex's web search.
 `scripts/setup-searxng.sh` installs SearXNG in
 `~/.local/share/eremite/searxng`, the server's default `searxng_dir`. It needs
 git and Python 3.10 or later, and downloads about 100 MB.
+
+## Credits
+
+eremite was inspired by [ds4](https://github.com/antirez/ds4), antirez's
+local inference engine for DeepSeek 4 Flash and Pro. It also builds on:
+
+- [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash and
+  [Liquid AI](https://www.liquid.ai)'s d1 decision models, with Liquid AI's
+  prompt for reranking.
+- The ggml library of [llama.cpp](https://github.com/ggml-org/llama.cpp): the
+  GGUF format and the codebooks of its i-quants. Their MIT license is in
+  `src/kernels/gguf_grids.metal`.
+- [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)'s
+  GGUF expert files.
+- [deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe), which
+  renders DeepSeek's prompts and reads its output.
+- [SearXNG](https://github.com/searxng/searxng), the search engine behind
+  Codex's web tool.
