@@ -53,5 +53,5 @@ Metal engine and a Rust server. README.md covers building, testing and use,
 
 - Docs change in the same commit as the code they describe.
 - Bug fixes: a test that fails first, then the fix.
-- Messages: `feat(scope): subject`, then the problem, the change, results,
-  tests and limits.
+- Messages: `type(scope): subject`, with a type such as feat, fix or docs,
+  then the problem, the change, results, tests and limits.
