@@ -30,10 +30,12 @@ against the reference tokenizer's ids.
 
 ## Models
 
-`scripts/download-models.sh FOLDER` downloads DeepSeek V4.1 Flash from Hugging
-Face: its checkpoint (510 GB) into `FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017`,
-and the routed experts of the UD-IQ2_XXS GGUF quantization (165 GB) into
-`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`. Other
+`scripts/download-models.sh FOLDER` downloads the models from Hugging Face:
+DeepSeek V4.1 Flash's checkpoint (510 GB) into
+`FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017`, the routed experts of its
+UD-IQ2_XXS GGUF quantization (165 GB) into
+`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, and LiquidAI's
+d1-2B decision model (3.9 GB) into `FOLDER/LiquidAI/d1-2B`. Other
 quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists the
 files without downloading them. It needs Python 3.10 or later, and runs again
 from where an interrupted download stopped.

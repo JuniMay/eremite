@@ -1,8 +1,9 @@
 #!/bin/sh
-# Downloads DeepSeek V4.1 Flash's files for eremite from Hugging Face: its
-# checkpoint, and the routed experts of GGUF quantizations. The last shard of
-# each GGUF set holds the Engram tables, which eremite reads from the
-# checkpoint, so the script leaves that shard out. It installs Hugging Face's
+# Downloads the models that eremite serves from Hugging Face: DeepSeek V4.1
+# Flash's checkpoint, the routed experts of GGUF quantizations, and LiquidAI's
+# d1-2B decision model. The last shard of each GGUF set holds the Engram
+# tables, which eremite reads from the checkpoint, so the script leaves that
+# shard out. It installs Hugging Face's
 # download command, hf, in a Python environment of its own, and deletes that
 # environment at the end. Running the script again goes on where an
 # interrupted download stopped.
@@ -11,6 +12,7 @@
 #   FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017 gets the checkpoint (510 GB).
 #   FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/QUANT gets each QUANT's
 #   experts: UD-IQ2_XXS (165 GB, the default) or UD-IQ1_M (140 GB).
+#   FOLDER/LiquidAI/d1-2B gets d1-2B (3.9 GB).
 #   --dry-run lists the files that the download would fetch, and fetches none.
 #
 # HF_TOKEN gives a Hugging Face token to repositories that need one. It needs
@@ -21,6 +23,7 @@ set -eu
 HUB_VERSION=2.4.0
 CHECKPOINT=deepseek-ai/DeepSeek-V4.1-Flash-1017
 EXPERTS=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+DECISIONS=LiquidAI/d1-2B
 
 fail() {
   echo "download-models: $*" >&2
@@ -63,3 +66,4 @@ for quant in "$@"; do
     --local-dir "$folder/$EXPERTS" $dry_run
   set +f
 done
+"$hf" download "$DECISIONS" --local-dir "$folder/$DECISIONS" $dry_run
