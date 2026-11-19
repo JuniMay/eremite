@@ -364,6 +364,10 @@ int main(int argc, char **argv) {
     die("--dump-fd and --check-prefill require --ced off; they inspect every "
         "prompt row");
   const ModelOps *ops = model_find_family(dir);
+  if (ops->decide)
+    die("%s: a decision model generates no text; eremite-server serves its "
+        "decisions",
+        dir);
   if (o.draft > BLOCK) die("this model accepts at most %d proposals", BLOCK);
   if (nmedia && !ops->encode_media) die("this model does not encode images");
   if (bench && !ops->run_bench)
