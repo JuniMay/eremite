@@ -167,6 +167,7 @@ impl ModelConfig {
             | "max_waiting_requests"
             | "snapshot_interval"
             | "state_dir"
+            | "search_dir"
             | "port"
             | "host"
             | "api_key_file"
@@ -204,6 +205,8 @@ pub struct Server {
     /// The folder of the states saved on the SSD (disk.rs); None:
     /// [`default_state_dir`].
     pub state_dir: Option<String>,
+    /// The folder for the web tool's turn counters. None uses the default.
+    pub search_dir: Option<String>,
     /// The SearXNG for Codex's web tool (codex/search.rs), as
     /// scripts/setup-searxng.sh sets it up; None: [`default_searxng_dir`].
     pub searxng_dir: Option<String>,
@@ -254,6 +257,7 @@ impl Default for Server {
             host: "127.0.0.1".into(),
             api_key_file: None,
             state_dir: None,
+            search_dir: None,
             searxng_dir: None,
             searxng_socket: None,
             http_timeout_s: 60.0,
@@ -291,6 +295,14 @@ pub fn default_searxng_dir() -> Option<PathBuf> {
 }
 
 impl Server {
+    /// Returns the configured search folder or its default under HOME.
+    pub fn search_folder(&self, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        self.search_dir.as_ref().map(PathBuf::from).or_else(|| {
+            let home = home.filter(|home| !home.is_empty())?;
+            Some(PathBuf::from(home).join(".local/share/eremite/web-search"))
+        })
+    }
+
     /// Sets the server setting `name` to `value`. Returns the setting's message
     /// when either is invalid.
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
@@ -318,6 +330,7 @@ impl Server {
             }
             "api_key_file" => self.api_key_file = Some(text()?.into()),
             "state_dir" => self.state_dir = Some(text()?.into()),
+            "search_dir" => self.search_dir = Some(text()?.into()),
             "searxng_dir" => self.searxng_dir = Some(text()?.into()),
             "searxng_socket" => self.searxng_socket = Some(text()?.into()),
             "search_ranking_model" => self.search_ranking_model = Some(text()?.into()),
@@ -561,6 +574,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "max_waiting_requests",
             "snapshot_interval",
             "state_dir",
+            "search_dir",
             "idle_unload",
             "port",
             "host",
@@ -607,6 +621,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "host",
         "api_key_file",
         "state_dir",
+        "search_dir",
         "searxng_dir",
         "searxng_socket",
         "http_timeout",
@@ -670,7 +685,13 @@ mod tests {
 
     #[test]
     fn the_default_folders_are_eremite_s_own_under_home() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let settings = Server::default();
+        assert_eq!(settings.search_folder(None), None);
+        assert_eq!(settings.search_folder(Some("".into())), None);
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let home = PathBuf::from(home);
         assert_eq!(
             default_state_dir(),
             Some(home.join(".cache/eremite/states"))
@@ -678,6 +699,10 @@ mod tests {
         assert_eq!(
             default_searxng_dir(),
             Some(home.join(".local/share/eremite/searxng"))
+        );
+        assert_eq!(
+            settings.search_folder(Some(home.clone().into())),
+            Some(home.join(".local/share/eremite/web-search"))
         );
     }
 
@@ -769,6 +794,7 @@ mod tests {
             "search_timeout",
             "searxng_idle",
             "search_session_idle",
+            "search_dir",
             "search_ranking_model",
         ] {
             let mut model = json!({"model": "/models/second"});
@@ -783,10 +809,14 @@ mod tests {
     #[test]
     fn server_settings_take_values_in_their_range_only() {
         let mut config = parse(
-            &json!({"port": 8008, "host": "localhost", "api_key_file": "key-file",
+            &json!({"port": 8008, "host": "localhost", "api_key_file": "key-file", "search_dir": "search-data",
                     "models": [{"model": "/models/deepseek"}]}),
         )
         .unwrap();
+        assert_eq!(
+            config.server.search_folder(None),
+            Some(PathBuf::from("search-data"))
+        );
         assert_eq!(
             (
                 config.server.port,

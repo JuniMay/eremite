@@ -22,13 +22,15 @@
 //! - Each session keeps its results under reference ids.
 //!   A search result gets `turnNsearchM`.
 //!   An opened page gets `turnNviewM`.
-//!   N is the call's turn: its number in the session, from 0.
+//!   N is the call's turn in the session. A fork starts past inherited turns.
 //!   Later calls name these ids in their commands.
-//!   Sessions live in memory: after a restart the model is told to open a URL
-//!   instead of an unknown reference.
+//!   A search folder preserves turn counters across restarts. Idle sessions
+//!   and restarts discard references. The model can reopen their URLs.
 //! - `time` is answered.
 //!   The other commands (images, papers, screenshots, finance, weather, sports)
 //!   are not available and say so.
+
+mod turns;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -37,16 +39,19 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use url::{Host, Url};
 
+use crate::chat::Error;
 use crate::decision::d1;
 use crate::engine;
 use crate::http::{KIB, MIB};
 use crate::worker;
+use turns::TurnCounters;
 
 /// The notice that begins every answer, before the web content.
 const UNTRUSTED_CONTENT_NOTICE: &str =
@@ -90,6 +95,9 @@ pub struct SearchRequest {
     /// The id of Codex's session.
     #[serde(default, rename = "id")]
     pub session_id: String,
+    /// The thread whose history Codex copied, from its HTTP turn metadata.
+    #[serde(skip)]
+    forked_from: Option<String>,
     /// The model's commands.
     #[serde(default)]
     pub commands: Commands,
@@ -99,6 +107,18 @@ pub struct SearchRequest {
     /// The tokens of output that Codex keeps; it cuts longer output.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+}
+
+impl SearchRequest {
+    /// Reads the search request and its fork parent from the HTTP request.
+    pub fn from_http(body: &[u8], headers: &HeaderMap) -> serde_json::Result<Self> {
+        let mut request: Self = serde_json::from_slice(body)?;
+        request.forked_from = headers.get("x-codex-turn-metadata").and_then(|header| {
+            let fields: Value = serde_json::from_slice(header.as_bytes()).ok()?;
+            Some(fields.get("forked_from_thread_id")?.as_str()?.to_owned())
+        });
+        Ok(request)
+    }
 }
 
 /// The answer to one call. Codex gives the text to the model and the sources
@@ -320,10 +340,8 @@ enum Reference {
     Page(Arc<Page>),
 }
 
-/// A Codex session: its turns and the references of its calls.
+/// The references kept in memory for one Codex session.
 struct Session {
-    /// The next call's number.
-    next_turn: u32,
     /// The references by id.
     references: HashMap<String, Reference>,
     /// The reference ids, oldest first.
@@ -356,14 +374,16 @@ pub struct Times {
     pub timeout: Duration,
     /// SearXNG stops after this long without a search.
     pub searxng_idle: Duration,
-    /// A session without calls for this long is forgotten.
+    /// The time without a call before the session's references expire.
     pub session_idle: Duration,
 }
 
 /// Answers the web tool's calls and keeps their sessions.
 pub struct Service {
-    /// The sessions by id.
+    /// The cached references by session id.
     sessions: Mutex<HashMap<String, Session>>,
+    /// The next web turn for each session.
+    turns: Arc<tokio::sync::Mutex<TurnCounters>>,
     /// The SearXNG that runs the searches.
     searxng: Searxng,
     /// Which addresses pages may be fetched from.
@@ -377,7 +397,7 @@ pub struct Service {
 /// What one call keeps while it runs: its turn and its references.
 struct Call {
     /// The call's number in its session.
-    turn: u32,
+    turn: u64,
     /// How many pages the call has opened.
     view_count: u32,
     /// The references that the call adds to its session.
@@ -414,11 +434,18 @@ impl Service {
     ) -> Self {
         Service {
             sessions: Mutex::new(HashMap::new()),
+            turns: Arc::default(),
             searxng: Searxng::new(searxng_dir, searxng_socket, times),
             address_policy,
             times,
             ranker: None,
         }
+    }
+
+    /// Sets the folder for the durable turn counters before serving requests.
+    pub fn with_search_dir(mut self, folder: PathBuf) -> Self {
+        self.turns = Arc::new(tokio::sync::Mutex::new(TurnCounters::in_folder(folder)));
+        self
     }
 
     /// Returns the service with `ranker` ranking each query's results.
@@ -438,26 +465,30 @@ impl Service {
         self.searxng.stop_when_idle().await;
     }
 
-    /// Returns the call's number in its session and a copy of the session's
-    /// references. It first forgets the sessions without calls for
-    /// [`Times::session_idle`]. The call works on the copy, so no fetch holds
-    /// the lock.
-    fn begin_call(&self, session_id: &str) -> (u32, HashMap<String, Reference>) {
+    /// Reserves a turn and copies the session's live references.
+    async fn begin_call(
+        &self,
+        session_id: &str,
+        parent: Option<&str>,
+    ) -> std::io::Result<(u64, HashMap<String, Reference>)> {
+        let mut counters = Arc::clone(&self.turns).lock_owned().await;
+        let id = session_id.to_owned();
+        let parent = parent.map(str::to_owned);
+        let turn = tokio::task::spawn_blocking(move || counters.reserve(&id, parent.as_deref()))
+            .await
+            .map_err(std::io::Error::other)??;
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sessions.retain(|_, s| now.duration_since(s.last_used) < self.times.session_idle);
         let session = sessions
             .entry(session_id.to_string())
             .or_insert_with(|| Session {
-                next_turn: 0,
                 references: HashMap::new(),
                 reference_order: VecDeque::new(),
                 last_used: now,
             });
         session.last_used = now;
-        let turn = session.next_turn;
-        session.next_turn += 1;
-        (turn, session.references.clone())
+        Ok((turn, session.references.clone()))
     }
 
     /// Adds a call's new references to its session.
@@ -471,7 +502,7 @@ impl Service {
     }
 
     /// Runs the commands and returns their output and any search sources.
-    pub async fn answer_call(&self, request: SearchRequest) -> SearchAnswer {
+    pub async fn answer_call(&self, request: SearchRequest) -> Result<SearchAnswer, Error> {
         let started = Instant::now();
         let commands = &request.commands;
         let length = ResponseLength::parse(commands.response_length.as_deref());
@@ -487,7 +518,13 @@ impl Service {
             .as_ref()
             .and_then(|f| f.allowed_domains.clone())
             .unwrap_or_default();
-        let (turn, known) = self.begin_call(&request.session_id);
+        let (turn, known) = self
+            .begin_call(&request.session_id, request.forked_from.as_deref())
+            .await
+            .map_err(|e| Error {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("cannot reserve a web turn: {e}"),
+            })?;
         let mut call = Call {
             turn,
             view_count: 0,
@@ -615,11 +652,11 @@ impl Service {
             output.len(),
             started.elapsed().as_secs_f64()
         ));
-        SearchAnswer {
+        Ok(SearchAnswer {
             output,
             encrypted_output: None,
             results: call.results,
-        }
+        })
     }
 
     /// Runs the queries on SearXNG at the same time and lists their results,
@@ -2220,6 +2257,24 @@ fn format_time_at_offset(utc_offset: &str, unix_time: i64) -> String {
 mod tests {
     use super::*;
 
+    /// A valid web request works with unreadable metadata.
+    #[test]
+    fn optional_metadata_keeps_valid_web_requests() {
+        let mut headers = HeaderMap::new();
+        for value in [
+            "{",
+            r#"["parent"]"#,
+            r#"{"forked_from_thread_id":42}"#,
+            "{}",
+        ] {
+            headers.insert("x-codex-turn-metadata", value.parse().unwrap());
+            let request = SearchRequest::from_http(br#"{"id":"child"}"#, &headers).unwrap();
+            assert_eq!(request.session_id, "child");
+            assert!(request.forked_from.is_none());
+        }
+        assert!(SearchRequest::from_http(br#"{"commands":5}"#, &headers).is_err());
+    }
+
     /// What each fetch may take in the tests: the setting's default.
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
     /// The web tool's times in the tests: the settings' defaults.
@@ -2422,25 +2477,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn references_stay_in_their_session_between_calls() {
+    /// Live references belong to the session that created them.
+    #[tokio::test]
+    async fn references_stay_in_their_session_between_calls() {
         let s = Service::new(
             "/nonexistent".into(),
             "/nonexistent.sock".into(),
             AddressPolicy::Public,
             TEST_TIMES,
         );
-        let (turn, _) = s.begin_call("session");
+        let (turn, _) = s.begin_call("session", None).await.unwrap();
         assert_eq!(turn, 0);
         let p = Arc::new(build_test_page(
             &["first line", "the Pattern here", "last"],
             &["https://example.com/b"],
         ));
         s.add_references("session", vec![("turn0view0".into(), Reference::Page(p))]);
-        let (turn, known) = s.begin_call("session");
+        let (turn, known) = s.begin_call("session", None).await.unwrap();
         assert_eq!(turn, 1);
         assert!(matches!(known.get("turn0view0"), Some(Reference::Page(_))));
-        assert_eq!(s.begin_call("other").0, 0, "sessions are separate");
+        let (turn, _) = s.begin_call("other", None).await.unwrap();
+        assert_eq!(turn, 0, "sessions are separate");
+
+        let mut headers = HeaderMap::new();
+        let parent = r#"{"thread_id":"child","forked_from_thread_id":"session"}"#;
+        headers.insert("x-codex-turn-metadata", parent.parse().unwrap());
+        let body = br#"{"id":"child","commands":{"open":[{"ref_id":"turn0view0"}]}}"#;
+        let child = SearchRequest::from_http(body, &headers).unwrap();
+        let answer = s.answer_call(child).await.unwrap();
+        assert!(answer.output.contains("is not known here"));
+        assert_eq!(s.begin_call("child", None).await.unwrap().0, 3);
     }
 
     #[tokio::test]
@@ -2455,7 +2521,7 @@ mod tests {
             &["first line", "the Pattern here", "last"],
             &[],
         ));
-        s.begin_call("s");
+        s.begin_call("s", None).await.unwrap();
         s.add_references("s", vec![("turn0view0".into(), Reference::Page(p))]);
         let request: SearchRequest = serde_json::from_value(serde_json::json!({
             "id": "s",
@@ -2470,7 +2536,7 @@ mod tests {
             "max_output_tokens": 2500,
         }))
         .unwrap();
-        let answer = s.answer_call(request).await;
+        let answer = s.answer_call(request).await.unwrap();
         assert!(answer.results.is_none());
         let out = answer.output;
         assert!(out.starts_with(UNTRUSTED_CONTENT_NOTICE), "{out}");
@@ -2511,7 +2577,7 @@ mod tests {
             "settings": {"external_web_access": "cached"},
         }))
         .unwrap();
-        let answer = s.answer_call(request).await;
+        let answer = s.answer_call(request).await.unwrap();
         assert!(answer.results.is_none());
         let out = answer.output;
         assert!(
@@ -2623,7 +2689,7 @@ mod tests {
     async fn search_answer(service: &Service, commands: Value) -> Value {
         let request =
             serde_json::from_value(serde_json::json!({"id":"s", "commands":commands})).unwrap();
-        serde_json::to_value(service.answer_call(request).await).unwrap()
+        serde_json::to_value(service.answer_call(request).await.unwrap()).unwrap()
     }
 
     /// A fixed search result opens a local page and its numbered link.
@@ -2631,9 +2697,8 @@ mod tests {
     async fn search_results_get_references() {
         let port = serve_test_pages().await;
         let page_url = format!("http://127.0.0.1:{port}/page");
-        let socket =
-            std::env::temp_dir().join(format!("eremite-search-test-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
+        let folder = crate::engine::TestDir::new("search-results");
+        let socket = folder.0.join("search.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let body = serde_json::json!({"results": [
             {"url": page_url, "title": "Page", "content": "A sample page.", "publishedDate": "2026-09-27"},
@@ -2652,12 +2717,15 @@ mod tests {
                 let _ = stream.write_all(reply.as_bytes()).await;
             }
         });
-        let s = Service::new(
-            "/nonexistent".into(),
-            socket.clone(),
-            AddressPolicy::Any,
-            TEST_TIMES,
-        );
+        let new_service = || {
+            Service::new(
+                folder.0.clone(),
+                socket.clone(),
+                AddressPolicy::Any,
+                TEST_TIMES,
+            )
+        };
+        let s = new_service();
         let answer = search_answer(
             &s,
             serde_json::json!({
@@ -2680,7 +2748,8 @@ mod tests {
                 }))
                 .unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
         let labeled = search_answer(
             &s,
             serde_json::json!({"search_query": [
@@ -2689,7 +2758,6 @@ mod tests {
             ]}),
         )
         .await;
-        let _ = std::fs::remove_file(&socket);
         // Each query's hits come under that query.
         let text = labeled["output"].as_str().unwrap();
         let order = [
@@ -2762,6 +2830,45 @@ mod tests {
                 .contains("L1: second line")
         );
         assert_eq!(clicked.get("results"), Some(&Value::Null));
+        let next_page = format!("http://127.0.0.1:{port}/next");
+        for loss in ["idle", "restart"] {
+            let counters = folder.0.join(loss);
+            let start = || new_service().with_search_dir(counters.clone());
+            let mut s = start();
+            std::fs::File::create_new(&counters).unwrap();
+            let failure = s.answer_call(SearchRequest::default()).await.err().unwrap();
+            assert_eq!(failure.status, StatusCode::INTERNAL_SERVER_ERROR);
+            std::fs::remove_file(&counters).unwrap();
+            let first = serde_json::json!({"search_query":[{"q":"other","domains":["example.com"]}],"open":[{"ref_id":page_url}]});
+            let old = search_answer(&s, first).await;
+            let hit = &old["results"][0];
+            assert_eq!(hit["ref_id"], "turn0search0");
+            assert_eq!(hit["url"], "https://example.com/x");
+            assert!(old["output"].as_str().unwrap().contains("turn0view0"));
+            if loss == "idle" {
+                s.times.session_idle = Duration::ZERO;
+            } else {
+                drop(s);
+                s = start();
+            }
+            let body = serde_json::json!({"id":"s","settings":{"filters":{"allowed_domains":["127.0.0.1"]}},"commands":{
+                "search_query":[{"q":"sample"}], "open":[{"ref_id":next_page},{"ref_id":"turn0search0"}],
+                "click":[{"ref_id":"turn0view0","id":0}], "find":[{"ref_id":"turn0view0","pattern":"plain"}]
+            }});
+            let fresh = s
+                .answer_call(serde_json::from_value(body).unwrap())
+                .await
+                .unwrap();
+            let hit = &fresh.results.unwrap()[0];
+            assert_eq!(hit.ref_id, "turn1search0", "{loss}");
+            assert_eq!(hit.url, page_url);
+            let out = fresh.output;
+            assert!(
+                out.contains("turn1view0") && out.contains("L1: second line"),
+                "{out}"
+            );
+            assert_eq!(out.matches("is not known here").count(), 3, "{loss}: {out}");
+        }
     }
 
     #[test]
@@ -2884,6 +2991,7 @@ mod tests {
                 serde_json::json!({"open": [{"ref_id": format!("http://127.0.0.1:{port}/old")}]}),
             ))
             .await
+            .unwrap()
             .output;
         assert!(
             out.contains(&format!("Page (http://127.0.0.1:{port}/page)\n\u{e200}cite\u{e202}turn0view0\u{e201} [wordlim: 200] Content type: text/html;")),
@@ -2895,6 +3003,7 @@ mod tests {
                 serde_json::json!({"click": [{"ref_id": "turn0view0", "id": 0}]}),
             ))
             .await
+            .unwrap()
             .output;
         assert!(
             out.contains(
@@ -2907,9 +3016,10 @@ mod tests {
                 serde_json::json!({"find": [{"ref_id": "turn1view0", "pattern": "PLAIN"}]}),
             ))
             .await
+            .unwrap()
             .output;
         assert!(out.contains("L0: plain text"), "{out}");
-        let out = s.answer_call(request(serde_json::json!({"open": [{"ref_id": format!("http://127.0.0.1:{port}/missing")}]}))).await.output;
+        let out = s.answer_call(request(serde_json::json!({"open": [{"ref_id": format!("http://127.0.0.1:{port}/missing")}]}))).await.unwrap().output;
         assert!(out.contains("HTTP 404"), "{out}");
     }
 }

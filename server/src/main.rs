@@ -350,6 +350,7 @@ async fn list_codex_models(State(shared): App) -> Response {
 async fn answer_search(
     State(shared): App,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     let peer = peer.ip().to_string();
@@ -357,7 +358,7 @@ async fn answer_search(
         Ok(body) => body,
         Err(error) => return refuse_request(&peer, error),
     };
-    let request: codex::search::SearchRequest = match serde_json::from_slice(&body) {
+    let request = match codex::search::SearchRequest::from_http(&body, &headers) {
         Ok(request) => request,
         Err(error) => {
             return refuse_request(
@@ -366,7 +367,10 @@ async fn answer_search(
             );
         }
     };
-    let answer = shared.search.answer_call(request).await;
+    let answer = match shared.search.answer_call(request).await {
+        Ok(answer) => answer,
+        Err(error) => return refuse_request(&peer, error),
+    };
     build_json_response(serde_json::to_string(&answer).expect("serialize the search answer"))
 }
 
@@ -919,7 +923,7 @@ fn main() {
                 .searxng_socket
                 .as_deref()
                 .map_or_else(|| dir.join("eremite.sock"), PathBuf::from);
-            let service = codex::search::Service::new(
+            let mut service = codex::search::Service::new(
                 dir,
                 socket,
                 codex::search::AddressPolicy::Public,
@@ -931,6 +935,9 @@ fn main() {
                     ),
                 },
             );
+            if let Some(folder) = settings.search_folder(std::env::var_os("HOME")) {
+                service = service.with_search_dir(folder);
+            }
             match ranker {
                 Some(ranker) => service.with_ranker(ranker),
                 None => service,

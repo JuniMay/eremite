@@ -159,6 +159,8 @@ impl Server {
         let mut child = Command::new(program)
             .arg("--config")
             .arg(&file.0)
+            // Keep test servers out of the user's default search folder.
+            .env_remove("HOME")
             .env("EREMITE_API_KEY", key)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

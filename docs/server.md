@@ -27,9 +27,10 @@ The file's root holds the server-wide settings:
 | `keepalive` | seconds between the comment lines of a streamed response that waits for its first token | 15 |
 | `searxng_dir` | the folder of eremite's SearXNG, for Codex's web tool | `~/.local/share/eremite/searxng` |
 | `searxng_socket` | the Unix socket that SearXNG runs on | `eremite.sock` in `searxng_dir` |
+| `search_dir` | the folder of the web tool's turn counters | `~/.local/share/eremite/web-search` when `HOME` is set, otherwise memory only |
 | `search_timeout` | seconds that each fetch, search and health check of the web tool may take, and SearXNG's start | 30 |
 | `searxng_idle` | seconds without a search before SearXNG stops | 600 |
-| `search_session_idle` | seconds without a call before the web tool forgets a session's references | 7200 |
+| `search_session_idle` | seconds without a web call before the server discards the session's cached references | 7200 |
 | `search_ranking_model` | the `id` of a served decision model that ranks each search query's results | none: SearXNG's order |
 | `tui` | `true` shows the terminal UI on stderr's terminal instead of the log: the server's status, its requests, its memory and its log; `q` stops the server, and the log prints on exit | `false` |
 | `tui_theme` | the terminal UI's colors: `auto` (by the terminal's background), `light` or `dark` | `auto` |
@@ -121,9 +122,39 @@ the passes read, each image's tokens included.
 
 ## Codex's web search
 
-Codex's standalone web tool sends its session `id` and `commands` to the
-search endpoint. The server runs `search_query` through SearXNG. Each query
-shows up to 5, 8 or 12 results, by Codex's `response_length`. With
+Codex's web tool sends each call to `POST /v1/alpha/search`, with its session
+`id` and the model's `commands`. Each call takes the next turn number N of its
+session. The call's references carry N: a search result is `turnNsearchM`,
+and an opened page is `turnNviewM`. So no two calls of a session share a
+reference.
+
+A session `id` that the server has not seen starts at turn 0, unless it is a
+fork. For a new `id`, the server reads the string `forked_from_thread_id` from
+the JSON object in the `x-codex-turn-metadata` header. The fork then starts at
+its parent's next turn. When the server does not know the parent, the fork
+starts after the highest turn that any session has used. A fork whose header
+names no readable parent starts at 0, and can reuse references from the
+history it copied.
+
+The server keeps each session's next turn in `turns.json` in `search_dir`. The
+file holds one entry per session and keeps it forever. Each call saves the
+file before the call issues references: the server syncs a new copy, puts it
+in place of the old one, and syncs the folder. Only one server at a time can
+use the folder. When the file cannot be saved, the call fails with HTTP 500,
+and its turn number stays unused. Without `search_dir` and without a nonempty
+`HOME`, the counters stay in memory, so a restart can give a resumed chat
+references that it already holds.
+
+To move `search_dir`, stop the server and copy `turns.json` along. A lost or
+older copy of the file can also give a chat references that it already holds.
+
+The pages and search results behind the references stay in memory, per
+session. The server drops them after `search_session_idle` without a call,
+and at a restart. A call that names a dropped reference tells the model to
+open its URL instead.
+
+The server runs `search_query` through SearXNG. Each query shows up to 5, 8
+or 12 results, by Codex's `response_length`. With
 `search_ranking_model` set, that decision model ranks the query's first 20
 results from SearXNG, one decision each. A decision's input is `Query:` and
 the query, a blank line, then `Passage:` and the result's title, with its

@@ -558,11 +558,11 @@ impl Store {
     /// Creates file `name` under its temporary name, `name.tmp`. It first
     /// deletes an old file of that temporary name. Returns the open file, its
     /// temporary path and its final path.
-    fn create_temporary_file(&self, name: &str) -> Result<(File, PathBuf, PathBuf), String> {
-        let (final_path, temporary_path) = (
-            self.folder.join(name),
-            self.folder.join(format!("{name}.tmp")),
-        );
+    pub(crate) fn create_temporary_file(
+        folder: &Path,
+        name: &str,
+    ) -> Result<(File, PathBuf, PathBuf), String> {
+        let (final_path, temporary_path) = (folder.join(name), folder.join(format!("{name}.tmp")));
         let _ = fs::remove_file(&temporary_path);
         let file = fs::OpenOptions::new()
             .read(true)
@@ -591,7 +591,7 @@ impl Store {
         name: &str,
         write_contents: impl FnOnce(c_int) -> Option<u64>,
     ) -> Result<u64, String> {
-        let (file, temporary_path, final_path) = self.create_temporary_file(name)?;
+        let (file, temporary_path, final_path) = Self::create_temporary_file(&self.folder, name)?;
         let Some(bytes) = write_contents(file.as_raw_fd()) else {
             drop(file);
             let _ = fs::remove_file(&temporary_path);
@@ -614,16 +614,25 @@ impl Store {
         identity: &[u8; IDENTITY_BYTES],
         saved_state: &SavedState,
     ) -> Result<(), String> {
-        let (mut file, temporary_path, final_path) =
-            self.create_temporary_file(&format_index_file_name(id))?;
-        let written = std::io::Write::write_all(&mut file, &encode_index(identity, saved_state))
+        let temporary = Self::create_temporary_file(&self.folder, &format_index_file_name(id))?;
+        let written = Self::replace_file(temporary, &encode_index(identity, saved_state));
+        if let Ok(folder) = File::open(&self.folder) {
+            unsafe { libc::fsync(folder.as_raw_fd()) };
+        }
+        written
+    }
+
+    /// Replaces the destination with a synced copy of the bytes.
+    pub(crate) fn replace_file(
+        temporary: (File, PathBuf, PathBuf),
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let (mut file, temporary_path, final_path) = temporary;
+        let written = std::io::Write::write_all(&mut file, bytes)
             .map_err(|e| format!("cannot write {}: {e}", temporary_path.display()))
             .and_then(|_| Self::sync_and_rename(file, &temporary_path, &final_path));
         if written.is_err() {
             let _ = fs::remove_file(&temporary_path);
-        }
-        if let Ok(folder) = File::open(&self.folder) {
-            unsafe { libc::fsync(folder.as_raw_fd()) };
         }
         written
     }

@@ -1638,15 +1638,21 @@ pub fn run_streams(streams: &[&Stream]) -> Option<usize> {
 }
 
 #[cfg(test)]
+pub(crate) use tests::TestDir;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// A folder for one test. It is removed when the test ends.
-    struct TestDir(std::path::PathBuf);
+    pub(crate) struct TestDir(
+        /// The path owned by this test.
+        pub(crate) std::path::PathBuf,
+    );
 
     impl TestDir {
         /// Makes an empty folder named after `name` and the process.
-        fn new(name: &str) -> TestDir {
+        pub(crate) fn new(name: &str) -> TestDir {
             let dir =
                 std::env::temp_dir().join(format!("eremite-engine-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
