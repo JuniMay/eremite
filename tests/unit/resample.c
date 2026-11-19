@@ -3,10 +3,24 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Tests the bicubic resize of RGB pixels. A resize to the same size copies the
-// pixels. One color stays that color at any size. A resize along one axis
+// Tests the bicubic resizes of RGB pixels. A resize to the same size copies
+// the pixels. One color stays that color at any size. A resize along one axis
 // keeps the lines that do not change along that axis. Near an edge, the
-// filter's overshoot is clipped to 0 and 255, never wrapped around.
+// filter's overshoot is clipped to 0 and 255, never wrapped around. Pillow's
+// resize and torchvision's give their own libraries' pixels, which differ
+// where their weights' precisions round differently.
+
+// Pixels that differ everywhere: 7 x 5, and the same shrunk to 5 x 3 by
+// Pillow 13 and by torchvision 0.29's antialiased resize of uint8 tensors.
+static constexpr int MIXED_W = 7, MIXED_H = 5, SMALL_W = 5, SMALL_H = 3;
+static const uint8_t pillow_small[SMALL_H * SMALL_W * 3] = {
+    40, 91,  128, 198, 79,  121, 142, 130, 116, 135, 182, 63,  128, 165, 222,
+    58, 106, 143, 176, 95,  136, 145, 133, 131, 151, 160, 86,  143, 183, 87,
+    84, 121, 158, 67,  114, 151, 119, 107, 146, 170, 51,  103, 158, 209, 58};
+static const uint8_t torchvision_small[SMALL_H * SMALL_W * 3] = {
+    40, 91,  128, 198, 79,  121, 143, 130, 116, 135, 182, 63,  128, 165, 222,
+    58, 106, 143, 176, 95,  136, 146, 133, 131, 151, 160, 85,  143, 183, 87,
+    84, 121, 158, 67,  114, 151, 119, 107, 146, 170, 51,  102, 158, 209, 58};
 
 // Returns whether all count pixels at p are the color c.
 static int all_color(const uint8_t *p, int count, const uint8_t c[3]) {
@@ -17,13 +31,25 @@ static int all_color(const uint8_t *p, int count, const uint8_t c[3]) {
 
 int main(void) {
   // Pixels that differ everywhere.
-  constexpr int MIXED_W = 7, MIXED_H = 5;
   uint8_t mixed[MIXED_H * MIXED_W * 3];
   for (size_t i = 0; i < sizeof mixed; i++) mixed[i] = (uint8_t)(i * 37 + 11);
-  uint8_t *same = image_resize_rgb(mixed, MIXED_W, MIXED_H, MIXED_W, MIXED_H);
-  check(same != mixed && !memcmp(same, mixed, sizeof mixed),
+  uint8_t *same = image_resize_rgb(mixed, MIXED_W, MIXED_H, MIXED_W, MIXED_H),
+          *same_torchvision = image_resize_rgb_torchvision(
+              mixed, MIXED_W, MIXED_H, MIXED_W, MIXED_H);
+  check(same != mixed && !memcmp(same, mixed, sizeof mixed) &&
+            same_torchvision != mixed &&
+            !memcmp(same_torchvision, mixed, sizeof mixed),
         "a resize to the same size copies the pixels into a new buffer");
-  free(same);
+  free(same), free(same_torchvision);
+  uint8_t *small = image_resize_rgb(mixed, MIXED_W, MIXED_H, SMALL_W, SMALL_H),
+          *small_torchvision = image_resize_rgb_torchvision(
+              mixed, MIXED_W, MIXED_H, SMALL_W, SMALL_H);
+  check(!memcmp(small, pillow_small, sizeof pillow_small),
+        "Pillow's resize gives Pillow's pixels");
+  check(!memcmp(small_torchvision, torchvision_small, sizeof torchvision_small),
+        "torchvision's resize gives torchvision's pixels, 1 apart from "
+        "Pillow's at 4 of them");
+  free(small), free(small_torchvision);
 
   // One color.
   const uint8_t color[3] = {200, 30, 90};
@@ -72,10 +98,10 @@ int main(void) {
   uint8_t narrow[NARROW_H * NARROW_W * 3];
   for (int i = 0; i < NARROW_W * NARROW_H; i++)
     memcpy(narrow + 3 * i, color, 3);
-  uint8_t *small = image_resize_rgb(narrow, NARROW_W, NARROW_H, 1, 10);
-  check(all_color(small, 10, color),
+  uint8_t *line = image_resize_rgb(narrow, NARROW_W, NARROW_H, 1, 10);
+  check(all_color(line, 10, color),
         "a very tall image of one color keeps its color as it shrinks");
-  free(small);
+  free(line);
 
   // A black-to-white edge, resized to four times its width.
   constexpr int EDGE_W = 8, SCALE = 4;
