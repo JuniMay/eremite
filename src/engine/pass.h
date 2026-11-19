@@ -52,6 +52,10 @@ int pass_ready(const Pass *pass);
 // The kind of the pass's wait, PASS_WAIT_OTHER when it waits for nothing.
 int pass_waiting_for(const Pass *pass);
 
+// Sets the kind of the pass's wait until the wait ends: a wait's ready function
+// calls it when the wait turns to something else.
+void pass_set_wait_kind(Pass *pass, int kind);
+
 // Blocks until the pass can continue.
 void pass_block(const Pass *pass);
 

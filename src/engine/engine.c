@@ -559,8 +559,9 @@ struct eremite_stream {
   PassWait wait_for_decoding;
   uint64_t calls_at_first_look;
   // What the stream's decision waits for in each layer: its turn
-  // (decision_may_go_on). The number of the last command buffer committed at
-  // the wait's first look, and when it was seen finished, or 0 between waits.
+  // (decision_may_go_on), first its GPU work and then decoding calls. The
+  // number of the last command buffer committed at the wait's first look, and
+  // when it was seen finished, or 0 between waits.
   PassWait wait_for_turn;
   uint64_t work_at_first_look;
   double work_finished_at;
@@ -601,11 +602,13 @@ static int decoding_calls_finished(void *context) {
   return 1;
 }
 
-// Ends the stream's decision's wait in a layer.
+// Ends the stream's decision's wait in a layer. The next one starts with the
+// decision's GPU work.
 static void end_turn_wait(eremite_stream *x) {
   x->calls_at_first_look = 0;
   x->work_at_first_look = 0;
   x->work_finished_at = 0;
+  x->wait_for_turn.kind = PASS_WAIT_GPU;
 }
 
 // Whether the stream's decision may run its next layer. Without decoding calls
@@ -614,6 +617,8 @@ static void end_turn_wait(eremite_stream *x) {
 // GPU's time. Its turn goes on while it has run for less time than the
 // decoding calls before the turn took. Then those calls go first, and the next
 // turn may run as long as they took after the decision's GPU work finished.
+// While it waits for them, its wait is for something other than the GPU, so
+// that the engine thread sleeps while they wait for reads.
 static int decision_may_go_on(void *context) {
   eremite_stream *x = context;
   eremite_model *m = x->m;
@@ -628,6 +633,8 @@ static int decision_may_go_on(void *context) {
     if (at - m->turn_start < m->turn_length) return end_turn_wait(x), 1;
     m->turn_length = 0;
     x->work_finished_at = at;
+    x->wait_for_turn.kind = PASS_WAIT_OTHER;
+    pass_set_wait_kind(x->pass, PASS_WAIT_OTHER);
   }
   if (decoding_calls_remain(x)) return 0;
   m->turn_start = now();

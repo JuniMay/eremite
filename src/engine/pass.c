@@ -153,6 +153,8 @@ int pass_waiting_for(const Pass *p) {
   return p->wait.ready ? p->wait.kind : PASS_WAIT_OTHER;
 }
 
+void pass_set_wait_kind(Pass *p, int kind) { p->wait.kind = kind; }
+
 void pass_block(const Pass *p) {
   if (p->wait.block) p->wait.block(p->wait.context);
 }

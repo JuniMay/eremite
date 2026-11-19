@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Tests how a decision takes turns with decoding calls, on DeepSeek V4.1 Flash
 // and d1-2B in one process: one stream decodes without stopping while another
@@ -15,7 +16,10 @@
 // those after a first turn that ended early because the decoding call before
 // it was nearly done. A long decision, which takes the time of several
 // decoding calls alone, lets decoding calls finish between its layers. Both
-// give the logits of the same decision made directly.
+// give the logits of the same decision made directly. While the long decision
+// waits for decoding calls that read experts, the engine thread sleeps until
+// the reads end: its time waiting for reads grows. The memory limit leaves
+// room for part of the experts only, so that decoding calls read some.
 //
 // usage: model-decision_turns CHECKPOINT D1_CHECKPOINT [GGUF]
 
@@ -30,6 +34,10 @@ static constexpr int TIMED_DECODES = 8, TIMED_RUNS = 3;
 // The rows of the long decision: its state fills them up to its question. It
 // then takes longer alone than two decoding calls, as the test checks.
 static constexpr int LONG_ROWS = 16384;
+
+// The engine thread's state while it waits for reads, as the engine numbers
+// it.
+static constexpr int THREAD_WAIT_READ = 3;
 
 // The prompt that the decoding stream decodes after.
 static const char prompt[] = "Write a short story about a lighthouse keeper.";
@@ -71,6 +79,22 @@ typedef struct {
   eremite_state *state;
   int32_t token, pos;
 } Decoding;
+
+// Returns the calling thread's CPU seconds: the engine thread's, since the
+// test runs the streams.
+static double read_thread_cpu_seconds(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+  return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+// Reads the process's statistics.
+static eremite_stats read_stats(const eremite_model *m) {
+  eremite_stats s;
+  eremite_refresh_stats();
+  eremite_read_stats(m, &s);
+  return s;
+}
 
 // The token with the highest logit.
 static int32_t best(const float *logits, int vocab) {
@@ -220,10 +244,21 @@ int main(int argc, char **argv) {
 
   post_decode(&decoding);
   int during_short = run_beside_decoding(x, &short_decision, &decoding, vocab);
+  eremite_stats before = read_stats(deepseek);
+  double cpu_start = read_thread_cpu_seconds(), start = now();
   int during_long = run_beside_decoding(x, &long_decision, &decoding, vocab);
+  double cpu = read_thread_cpu_seconds() - cpu_start, took = now() - start;
+  eremite_stats after = read_stats(deepseek);
+  double expert_reads = after.demand_read_s - before.demand_read_s,
+         read_waits = after.thread_s[THREAD_WAIT_READ] -
+                      before.thread_s[THREAD_WAIT_READ];
   printf("decoding calls that finished while a decision ran: %d during the "
          "short one, %d during the long one\n",
          during_short, during_long);
+  printf("while the long decision ran: %.2f s, the engine thread's CPU time "
+         "%.2f s, expert reads %.2f s, the engine thread's waits for reads "
+         "%.2f s\n",
+         took, cpu, expert_reads, read_waits);
   check(short_decision.alone < fastest,
         "the short decision takes less time alone than a decoding call");
   check(during_short <= 2,
@@ -232,6 +267,11 @@ int main(int argc, char **argv) {
         "the long decision takes more time alone than two decoding calls");
   check(during_long >= 2,
         "decoding calls finish between the long decision's layers");
+  check(expert_reads > 0,
+        "decoding calls read experts while the long decision runs");
+  check(read_waits > 0,
+        "while the long decision waits for decoding calls that read experts, "
+        "the engine thread sleeps until the reads end");
 
   eremite_run_streams(&decoding.stream, 1);
   eremite_stream_free(decoding.stream);
