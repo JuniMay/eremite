@@ -39,8 +39,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use url::{Host, Url};
 
+use crate::decision::d1;
 use crate::engine;
 use crate::http::{KIB, MIB};
+use crate::worker;
 
 /// The notice that begins every answer, before the web content.
 const UNTRUSTED_CONTENT_NOTICE: &str =
@@ -68,6 +70,9 @@ const MAX_SESSION_REFERENCES: usize = 400;
 const MAX_LINE_CHARS: usize = 200;
 /// The characters of a search result's text at most; longer text is cut.
 const MAX_SNIPPET_CHARS: usize = 400;
+/// The question that a ranking model answers about each search result, in
+/// Liquid AI's words for reranking (the Decision Model Guide).
+const RANKING_QUESTION: &str = "Is this passage relevant to answering the query?";
 /// The User-Agent header that curl sends: Safari's on macOS.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
@@ -1077,6 +1082,142 @@ fn parse_searxng_results(
         }
     }
     Ok(results)
+}
+
+// ---- ranking ----
+
+/// A search result as a ranking model reads it.
+pub struct Passage {
+    /// The result's title.
+    pub title: String,
+    /// SearXNG's text about the result.
+    pub snippet: String,
+}
+
+/// A served decision model that ranks each query's search results, and what
+/// its prompts need.
+pub struct Ranker {
+    /// The model's id, as the log names it.
+    pub id: String,
+    /// The model's index in the configured order.
+    pub model_index: usize,
+    /// What the model's checkpoint sets for its prompts.
+    pub checkpoint: d1::Checkpoint,
+    /// The model's tokenizer.
+    pub tokenizer: engine::Tokenizer,
+}
+
+impl Ranker {
+    /// Returns the indices of the query's results that show, best first: the
+    /// `shown` results that the model finds likeliest to be relevant, ties in
+    /// their given order. When its decision cannot be queued, is refused, fails
+    /// or takes longer than `timeout`, the first `shown` show in their given
+    /// order, and the log says why.
+    pub async fn rank(
+        self: &Arc<Self>,
+        query: &str,
+        passages: Vec<Passage>,
+        shown: usize,
+        timeout: Duration,
+    ) -> Vec<usize> {
+        let count = passages.len();
+        let scores = tokio::time::timeout(timeout, self.score(query, passages))
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "it took longer than search_timeout, {} s",
+                    timeout.as_secs_f64()
+                ))
+            });
+        if let Err(why) = &scores {
+            engine::log(&format!(
+                "search: {} did not rank {count} results, which keep SearXNG's order: {why}",
+                self.id
+            ));
+        }
+        order_by_scores(count, scores.ok().as_deref(), shown)
+    }
+
+    /// Returns each passage's probability that the model answers yes to
+    /// RANKING_QUESTION about it and the query. Each passage is a decision of
+    /// one pass, and the passes go to the worker as one request.
+    async fn score(
+        self: &Arc<Self>,
+        query: &str,
+        passages: Vec<Passage>,
+    ) -> Result<Vec<f64>, String> {
+        if passages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (ranker, query) = (self.clone(), query.to_string());
+        // Tokenizing the passages takes a while.
+        let (plans, passes) = tokio::task::spawn_blocking(move || {
+            let question = [d1::Question::YesNo {
+                instructions: RANKING_QUESTION.into(),
+            }];
+            let mut plans = Vec::new();
+            let mut passes = Vec::new();
+            for passage in &passages {
+                let state = d1::State::Text(write_ranking_state(&query, passage));
+                let mut plan = d1::plan(
+                    &ranker.checkpoint,
+                    ranker.tokenizer,
+                    Some(&state),
+                    0,
+                    &question,
+                )?;
+                passes.append(&mut plan.passes);
+                plans.push(plan);
+            }
+            Ok::<_, String>((plans, passes))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        // The guard cancels the decision when the ranking is dropped.
+        let (_cancel, mut events) = worker::submit_decision(worker::DecisionRequest {
+            model_index: self.model_index,
+            note: format!("ranks {} search results", plans.len()),
+            passes,
+            media: Vec::new(),
+        })
+        .map_err(|worker::SubmitError::Busy(why)| why)?;
+        match events.recv().await {
+            Some(worker::Event::Decided { logits, .. }) if logits.len() == plans.len() => Ok(plans
+                .iter()
+                .zip(&logits)
+                .map(|(plan, pass)| plan.read_probabilities(std::slice::from_ref(pass))[0][0])
+                .collect()),
+            Some(worker::Event::Decided { logits, .. }) => Err(format!(
+                "the decision returned the logits of {} passes for {}",
+                logits.len(),
+                plans.len()
+            )),
+            Some(worker::Event::Refused(why) | worker::Event::Failed(why)) => Err(why),
+            _ => Err("the server is stopping".into()),
+        }
+    }
+}
+
+/// Returns the state of a result's decision: the query, and the result's title
+/// and snippet as the passage, with Liquid AI's labels for reranking.
+fn write_ranking_state(query: &str, passage: &Passage) -> String {
+    let text = if passage.snippet.is_empty() {
+        passage.title.clone()
+    } else {
+        format!("{}\n{}", passage.title, passage.snippet)
+    };
+    format!("Query: {query}\n\nPassage: {text}")
+}
+
+/// Returns the indices of the first `shown` of `count` results: by descending
+/// score, ties in their given order, or in their given order without scores.
+fn order_by_scores(count: usize, scores: Option<&[f64]>, shown: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..count).collect();
+    if let Some(scores) = scores {
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    }
+    order.truncate(shown);
+    order
 }
 
 // ---- fetching ----
@@ -2417,6 +2558,32 @@ mod tests {
         );
         let docs = parse_searxng_results(body.as_bytes(), &["docs.rs".into()], 5).unwrap();
         assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn a_ranking_state_holds_the_query_and_the_passage_with_liquid_ais_labels() {
+        let passage = |title: &str, snippet: &str| Passage {
+            title: title.into(),
+            snippet: snippet.into(),
+        };
+        assert_eq!(
+            write_ranking_state("tokio spawn_blocking", &passage("Docs", "Runs a closure.")),
+            "Query: tokio spawn_blocking\n\nPassage: Docs\nRuns a closure."
+        );
+        assert_eq!(
+            write_ranking_state("tokio spawn_blocking", &passage("Docs", "")),
+            "Query: tokio spawn_blocking\n\nPassage: Docs"
+        );
+    }
+
+    #[test]
+    fn ranked_results_show_by_score_and_ties_keep_their_order() {
+        let scores = [0.2, 0.9, 0.5, 0.9, 0.1];
+        assert_eq!(order_by_scores(5, Some(&scores), 3), [1, 3, 2]);
+        assert_eq!(order_by_scores(5, Some(&scores), 8), [1, 3, 2, 0, 4]);
+        // Without scores, the first results show in their order.
+        assert_eq!(order_by_scores(5, None, 3), [0, 1, 2]);
+        assert_eq!(order_by_scores(0, Some(&[]), 3), Vec::<usize>::new());
     }
 
     /// Serializes the service's answer to commands in one test session.
