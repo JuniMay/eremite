@@ -160,6 +160,9 @@ pub struct Choices {
     /// The session chosen in States, by its number. None takes the session
     /// used last.
     pub session: Option<u64>,
+    /// The session whose state the d key asked to delete, by its number. A
+    /// second d deletes it. Any other key, and a click, ask no more.
+    pub delete_asked: Option<u64>,
     /// The lines of the session's text that the panel scrolled past.
     pub text_scroll: usize,
     /// The rows of the text panel, in the frame drawn last.
@@ -186,6 +189,7 @@ impl Default for Choices {
             log_back: 0,
             log_page: 0,
             session: None,
+            delete_asked: None,
             text_scroll: 0,
             text_page: 0,
             request: None,

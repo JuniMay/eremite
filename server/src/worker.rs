@@ -302,6 +302,9 @@ struct Queue {
     last_request_id: u64,
     /// The yield and resume control.
     control: Control,
+    /// The sessions whose states the terminal UI asked to delete from memory,
+    /// each as its model's index and its number, the oldest first.
+    states_to_delete: Vec<(usize, u64)>,
 }
 
 /// What a model is doing and has done, for its status.
@@ -632,6 +635,23 @@ pub fn read_session_tokens(model_index: usize, session: u64) -> Option<Vec<i32>>
         }
         _ => None,
     }
+}
+
+/// Asks the worker to delete the state of session `session` of the model at
+/// `model_index` from memory, without saving it to the SSD. The worker deletes
+/// it between engine calls and logs what it did. It deletes no state that a
+/// request runs in. Once the server stops, it deletes no more states.
+pub fn ask_to_delete_session_state(model_index: usize, session: u64) {
+    let shared = clone_shared();
+    let mut queue = lock(&shared.queue);
+    if queue.closed || engine::is_stopping() {
+        drop(queue);
+        let line = format!("states: session {session} not deleted: the server stops");
+        shared.view.write_model_line(model_index, &line);
+        return;
+    }
+    queue.states_to_delete.push((model_index, session));
+    notify_worker(&shared);
 }
 
 /// Lists the models the worker serves, in their configured order: each one's
@@ -1607,6 +1627,38 @@ impl States {
         }
     }
 
+    /// Deletes the state of session `number` of the model at `model_index` from
+    /// memory, with its snapshots, without saving it to the SSD. It deletes
+    /// nothing when the state cache keeps no such session, or when a request
+    /// runs in it. Returns the line for the log: what it deleted, or why it
+    /// deleted nothing.
+    fn delete_session_state(&mut self, model_index: usize, number: u64) -> String {
+        let found = self
+            .cache
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.model == model_index && entry.number == number);
+        let Some((&state_id, entry)) = found else {
+            return format!("session {number} not deleted: it is no longer in memory");
+        };
+        if entry.busy {
+            return format!("session {number} not deleted: a request runs in it");
+        }
+        let tokens = entry.tokens.len();
+        let bytes = entry.bytes
+            + entry
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.bytes)
+                .sum::<u64>();
+        let snapshots = self.cache.remove_state(state_id);
+        self.free_snapshots_and_states(Vec::new(), vec![(state_id, snapshots)]);
+        format!(
+            "session {number} deleted from memory, not saved to the SSD: {tokens} tokens, {:.2} GiB",
+            bytes as f64 / GIB
+        )
+    }
+
     /// Frees the snapshots in `snapshots` and the states in `states`.
     fn free_snapshots_and_states(
         &mut self,
@@ -1852,6 +1904,18 @@ impl Worker {
             for saved_id in to_delete {
                 store.delete_saved_state(&mut states.cache, saved_id);
             }
+        }
+    }
+
+    /// Deletes the states of the sessions in `asked` from memory, without
+    /// saving them to the SSD, and logs what it did. Each session comes as its
+    /// model's index and its number.
+    fn delete_session_states(&mut self, asked: Vec<(usize, u64)>) {
+        for (model_index, number) in asked {
+            let line = self.states.delete_session_state(model_index, number);
+            self.shared
+                .view
+                .write_model_line(model_index, &format!("states: {line}"));
         }
     }
 
@@ -2247,6 +2311,12 @@ impl Worker {
                 self.run_control_action(action);
                 continue;
             }
+            if !queue.states_to_delete.is_empty() {
+                let asked = std::mem::take(&mut queue.states_to_delete);
+                drop(queue);
+                self.delete_session_states(asked);
+                continue;
+            }
             if queue.control.phase != Phase::Running {
                 // A status reader's request is published at the loop's start,
                 // and so is the reserve's keeping once its interval has passed.
@@ -2262,6 +2332,7 @@ impl Worker {
             let idle = |queue: &Queue, models: &[WorkerModel]| {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
                     && queue.decisions.iter().all(|jobs| jobs.is_empty())
+                    && queue.states_to_delete.is_empty()
                     && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
                         !worker_model.runs_requests() && !worker_model.has_admitted_requests()
@@ -2289,7 +2360,8 @@ impl Worker {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 queue = guard;
             }
-            if queue.control.phase != Phase::Running {
+            // A deletion runs at the loop's start.
+            if queue.control.phase != Phase::Running || !queue.states_to_delete.is_empty() {
                 continue;
             }
             let mut admitted_by_model: Vec<(Vec<Job>, Vec<Job<DecisionRequest>>)> = Vec::new();
@@ -2366,6 +2438,10 @@ impl Worker {
                     .collect(),
             )
         };
+        // The deletions asked before the stop run before the stop saves the
+        // states. No request runs now, and the closed queue takes no more.
+        let states_to_delete = std::mem::take(&mut lock(&shared.queue).states_to_delete);
+        self.delete_session_states(states_to_delete);
         for (worker_model, decisions) in self.models.iter_mut().zip(decisions) {
             waiting.extend(worker_model.admitted.drain(..));
             let ended: Vec<Job<DecisionRequest>> = worker_model
@@ -4675,5 +4751,39 @@ mod tests {
             None,
             "a session of another model"
         );
+    }
+
+    /// The terminal UI's d key deletes an idle session's state from memory.
+    /// A session that a request runs in keeps its state. A session of another
+    /// model is not found.
+    #[test]
+    fn a_deletion_frees_an_idle_sessions_state_and_keeps_a_busy_one() {
+        let limits = ModelLimits {
+            bytes: 1 << 30,
+            states: 8,
+        };
+        // The test takes no snapshots, so any snapshot interval works.
+        let mut states = States::new(vec![limits; 2], 1);
+        // One idle state of 3 tokens and 512 MiB, without engine handles.
+        let idle = states.cache.add_state(0, 0);
+        states.cache.entries.get_mut(&idle).unwrap().tokens = vec![4, 5, 6];
+        states.cache.set_idle(idle, 1 << 29);
+        let busy = states.cache.add_state(0, 0);
+        let other_model = states.cache.add_state(1, 0);
+        assert_eq!(
+            states.delete_session_state(0, busy),
+            format!("session {busy} not deleted: a request runs in it")
+        );
+        assert_eq!(
+            states.delete_session_state(0, other_model),
+            format!("session {other_model} not deleted: it is no longer in memory")
+        );
+        assert_eq!(
+            states.delete_session_state(0, idle),
+            format!("session {idle} deleted from memory, not saved to the SSD: 3 tokens, 0.50 GiB")
+        );
+        assert!(!states.cache.entries.contains_key(&idle));
+        assert!(states.cache.entries.contains_key(&busy));
+        assert!(states.cache.entries.contains_key(&other_model));
     }
 }

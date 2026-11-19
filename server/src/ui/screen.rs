@@ -12,7 +12,7 @@ use super::frame::{
     list_model_keys,
 };
 use super::history::draw_history;
-use super::input::list_view_keys;
+use super::input::{find_delete_question, list_view_keys};
 use super::llm::experts::{draw_experts, has_no_experts};
 use super::llm::states::draw_states;
 use super::log::LogLine;
@@ -70,9 +70,14 @@ fn draw_decision_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
 /// chrome's last keys. A view that shows only its one line, such as the
 /// Experts of a model without experts or a decision model in 4 Models, has no
 /// keys of its own. When the row does not fit, the model's and the view's keys
-/// go, from the last one, so that the chrome's keys stay.
+/// go, from the last one, so that the chrome's keys stay. While d asks to
+/// delete a state, its question takes the place of the model's and the view's
+/// keys, so that even a narrow row shows it.
 fn list_keys(screen: &Screen, choices: &Choices, columns: usize) -> Keys {
     let (first, last) = list_chrome_keys(choices);
+    if let Some(question) = find_delete_question(screen, choices) {
+        return first.into_iter().chain([question]).chain(last).collect();
+    }
     let mut own = Vec::new();
     if choices.view == View::Models {
         own.extend(list_model_keys(screen, choices));
@@ -89,7 +94,7 @@ fn list_keys(screen: &Screen, choices: &Choices, columns: usize) -> Keys {
                     .get(choices.model)
                     .is_some_and(has_no_experts));
     if !shows_one_line {
-        own.extend(list_view_keys(choices));
+        own.extend(list_view_keys(screen, choices));
     }
     loop {
         let row: Keys = first.iter().chain(&own).chain(&last).cloned().collect();
@@ -150,7 +155,7 @@ mod tests {
             SubView::States,
             " 1 session",
             " 1–4 views   ←→ model   Tab States or Experts   ↑↓ or click session   PgUp PgDn \
-             text   m mouse: clicks   q stop the server",
+             text   d session 5 is in use   m mouse: clicks   q stop the server",
             " 1–4 views   ←→ model   Tab States or Experts   m mouse: clicks   q stop the server",
         ),
         (
@@ -187,6 +192,18 @@ mod tests {
     /// Draws the screen at `width` x `height` with `choices`, with the two
     /// models of `statuses` of the kinds `kinds`.
     fn draw_models(width: u16, height: u16, choices: &mut Choices, kinds: [Kind; 2]) -> Buffer {
+        draw_statuses(width, height, choices, kinds, &statuses())
+    }
+
+    /// Draws the screen at `width` x `height` with `choices`, with two models
+    /// of the kinds `kinds` and the statuses `statuses`.
+    fn draw_statuses(
+        width: u16,
+        height: u16,
+        choices: &mut Choices,
+        kinds: [Kind; 2],
+        statuses: &[ModelStatus],
+    ) -> Buffer {
         let models =
             [("deepseek-v4.1-flash", kinds[0]), ("qwen3.8-27b", kinds[1])].map(|(name, kind)| {
                 ModelInfo {
@@ -194,15 +211,14 @@ mod tests {
                     kind,
                 }
             });
-        let statuses = statuses();
         let mut samples = Samples::new(WINDOWS);
-        samples.add_sample(0.0, &statuses);
+        samples.add_sample(0.0, statuses);
         let screen = Screen {
             theme: &DARK,
             address: "127.0.0.1:52878",
             uptime_seconds: 57.0,
             models: &models,
-            statuses: &statuses,
+            statuses,
             samples: &samples,
             home: "",
             session_text: None,
@@ -244,6 +260,29 @@ mod tests {
                 assert!(read_row(&buf, 0).starts_with(&title));
             }
         }
+    }
+
+    #[test]
+    fn the_question_of_the_d_key_shows_in_a_narrow_keys_row() {
+        let mut statuses = statuses();
+        // deepseek-v4.1-flash's session 5 is idle.
+        statuses[0].requests.clear();
+        statuses[0].sessions[0].busy = false;
+        let mut choices = Choices {
+            view: View::Models,
+            delete_asked: Some(5),
+            ..Choices::default()
+        };
+        let question =
+            " 1–4 views   d again deletes session 5   m mouse: clicks   q stop the server";
+        for (width, height) in [(160, 45), (100, 30)] {
+            let buf = draw_statuses(width, height, &mut choices, [Kind::Llm; 2], &statuses);
+            assert_eq!(read_row(&buf, height - 1).trim_end(), question, "{width}");
+        }
+        // a row narrower than the question's row still shows the question
+        let buf = draw_statuses(60, 20, &mut choices, [Kind::Llm; 2], &statuses);
+        let row = read_row(&buf, 19);
+        assert!(row.contains("d again deletes session 5"), "{row}");
     }
 
     #[test]

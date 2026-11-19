@@ -352,6 +352,13 @@ fn run_view(
                     worker::request_stop();
                     false
                 }
+                Asked::DeleteSessionState {
+                    model_index,
+                    session,
+                } => {
+                    worker::ask_to_delete_session_state(model_index, session);
+                    true
+                }
                 Asked::Nothing => false,
             },
             Ok(Wake::Stop) | Err(_) => return,

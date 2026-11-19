@@ -76,6 +76,10 @@ the smallest cache that a prompt pass needs. Then the model's least recently
 used idle state goes. It is saved on the SSD first when `state_disk` is on and
 it holds `state_disk_tokens` tokens of its own.
 
+In the terminal UI, 4 Models: States deletes the chosen session's state from
+memory when `d` is pressed twice. The state is not saved on the SSD. A session
+that a request runs in keeps its state.
+
 Free memory means the free pages and the file cache above the part that macOS
 keeps. That part is the smallest file cache read since the server started:
 when memory runs short, macOS drops the file cache above it first. If macOS

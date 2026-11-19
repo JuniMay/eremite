@@ -20,6 +20,14 @@ pub enum Asked {
     Mouse(bool),
     /// Stop the server.
     Quit,
+    /// Delete the state of session `session` of the model at `model_index`
+    /// from memory, without saving it to the SSD.
+    DeleteSessionState {
+        /// The model's index.
+        model_index: usize,
+        /// The session's number.
+        session: u64,
+    },
     /// Nothing changed.
     Nothing,
 }
@@ -54,8 +62,10 @@ pub fn handle_event(event: &Event, choices: &mut Choices, screen: &Screen) -> As
     }
 }
 
-/// Chooses what a click on `target` chooses.
+/// Chooses what a click on `target` chooses. A click also asks no more to
+/// delete a state.
 fn choose_target(target: Target, choices: &mut Choices, screen: &Screen) -> Asked {
+    choices.delete_asked = None;
     match target {
         Target::View(view) => choices.view = view,
         Target::Model(index) => choose_model(choices, screen, index),
@@ -89,8 +99,10 @@ fn choose_model(choices: &mut Choices, screen: &Screen, index: usize) {
     }
 }
 
-/// Handles the key `code` in the view that `choices` shows.
+/// Handles the key `code` in the view that `choices` shows. Any key but a
+/// second d asks no more to delete a state.
 fn handle_key(code: KeyCode, choices: &mut Choices, screen: &Screen) -> Asked {
+    let delete_asked = choices.delete_asked.take();
     let view = choices.view;
     let sub_view = choices.sub_view;
     let models = screen.models.len();
@@ -129,6 +141,9 @@ fn handle_key(code: KeyCode, choices: &mut Choices, screen: &Screen) -> Asked {
         KeyCode::End if view == View::Overview => choices.log_back = 0,
         KeyCode::Up if in_models(SubView::States) => choose_next_session(choices, screen, -1),
         KeyCode::Down if in_models(SubView::States) => choose_next_session(choices, screen, 1),
+        KeyCode::Char('d' | 'D') if in_models(SubView::States) => {
+            return handle_delete_key(choices, screen, delete_asked);
+        }
         KeyCode::Up if in_models(SubView::Experts) => return scroll(choices, -1),
         KeyCode::Down if in_models(SubView::Experts) => return scroll(choices, 1),
         KeyCode::Char(bracket @ ('[' | ']')) if in_models(SubView::Experts) => {
@@ -151,8 +166,40 @@ fn handle_key(code: KeyCode, choices: &mut Choices, screen: &Screen) -> Asked {
             let page = page_of(choices) as isize;
             return scroll(choices, page);
         }
+        // The keys row asks no more.
+        _ if delete_asked.is_some() => {}
         _ => return Asked::Nothing,
     }
+    Asked::Redraw
+}
+
+/// Handles the d key in States. The first press asks to delete the state of
+/// the chosen session, and the keys row shows the question. A second press,
+/// while `asked` is that session, asks the worker to delete it. A session
+/// that a request runs in is neither asked about nor deleted.
+fn handle_delete_key(choices: &mut Choices, screen: &Screen, asked: Option<u64>) -> Asked {
+    let Some(status) = screen.statuses.get(choices.model) else {
+        return Asked::Nothing;
+    };
+    let Some(index) = find_chosen_session(status, choices) else {
+        return Asked::Nothing;
+    };
+    let session = &status.sessions[index];
+    if session.busy {
+        return Asked::Redraw;
+    }
+    if asked == Some(session.number) {
+        choices.session = None;
+        choices.text_scroll = 0;
+        return Asked::DeleteSessionState {
+            model_index: choices.model,
+            session: session.number,
+        };
+    }
+    // The question names this session, so a status that changes the
+    // session used last does not change it.
+    choices.session = Some(session.number);
+    choices.delete_asked = Some(session.number);
     Asked::Redraw
 }
 
@@ -205,15 +252,16 @@ fn choose_next_session(choices: &mut Choices, screen: &Screen, step: isize) {
     choices.text_scroll = 0;
 }
 
-/// Returns the keys of the view that `choices` shows, for the keys row.
-pub fn list_view_keys(choices: &Choices) -> Keys {
+/// Returns the keys of the view that `choices` shows in `screen`, for the
+/// keys row. In States, d says what it does for the chosen session.
+pub fn list_view_keys(screen: &Screen, choices: &Choices) -> Keys {
     let keys: &[(&'static str, &str)] = match (choices.view, choices.sub_view) {
         (View::Overview, _) => &[
             ("↑↓ PgUp PgDn", "scroll"),
             ("Home End", "oldest, newest"),
             ("f", "filter"),
         ],
-        (View::Models, SubView::States) => &[("↑↓ or click", "session"), ("PgUp PgDn", "text")],
+        (View::Models, SubView::States) => return list_states_keys(screen, choices),
         (View::Models, SubView::Experts) => &[
             ("[ ] or click", "request"),
             ("↑↓ or wheel", "scroll layers"),
@@ -223,6 +271,41 @@ pub fn list_view_keys(choices: &Choices) -> Keys {
     keys.iter()
         .map(|&(key, what)| (key, what.to_string()))
         .collect()
+}
+
+/// Returns the keys of States in `screen` for `choices`. d deletes the
+/// chosen session's state, unless a request runs in the session.
+fn list_states_keys(screen: &Screen, choices: &Choices) -> Keys {
+    let mut keys = vec![
+        ("↑↓ or click", "session".to_string()),
+        ("PgUp PgDn", "text".to_string()),
+    ];
+    let Some(status) = screen.statuses.get(choices.model) else {
+        return keys;
+    };
+    let Some(index) = find_chosen_session(status, choices) else {
+        return keys;
+    };
+    let session = &status.sessions[index];
+    if session.busy {
+        keys.push(("d", format!("session {} is in use", session.number)));
+    } else {
+        keys.push(("d", "delete state".to_string()));
+    }
+    keys
+}
+
+/// Returns the question of the keys row while d asks to delete the state of
+/// the session chosen in States, such as "d again deletes session 3". Returns
+/// None when d asks nothing, and for a session that a request runs in.
+pub fn find_delete_question(screen: &Screen, choices: &Choices) -> Option<(&'static str, String)> {
+    if (choices.view, choices.sub_view) != (View::Models, SubView::States) {
+        return None;
+    }
+    let status = screen.statuses.get(choices.model)?;
+    let session = &status.sessions[find_chosen_session(status, choices)?];
+    (!session.busy && choices.delete_asked == Some(session.number))
+        .then(|| ("d", format!("again deletes session {}", session.number)))
 }
 
 #[cfg(test)]
@@ -243,8 +326,10 @@ mod tests {
             "requests": [{"request": 5, "status": "decoding", "session": 5},
                          {"request": 6, "status": "decoding", "session": 2}],
             "sessions": [
-                {"session": 5, "tokens": 604, "idle_seconds": 0, "shared_with_next": 2},
-                {"session": 2, "tokens": 550, "idle_seconds": 23, "shared_with_next": 7},
+                {"session": 5, "tokens": 604, "idle_seconds": 0, "busy": true,
+                 "shared_with_next": 2},
+                {"session": 2, "tokens": 550, "idle_seconds": 23, "busy": true,
+                 "shared_with_next": 7},
                 {"session": 3, "tokens": 469, "idle_seconds": 30, "shared_with_next": 0}]}"#;
         vec![
             serde_json::from_str(deepseek).unwrap(),
@@ -252,8 +337,9 @@ mod tests {
         ]
     }
 
-    /// Hands `key` to `handle_event` with `choices`.
-    fn press(code: KeyCode, choices: &mut Choices) -> Asked {
+    /// Returns what `use_screen` returns from the screen of the two models of
+    /// `statuses`.
+    fn with_screen<T>(use_screen: impl FnOnce(&Screen) -> T) -> T {
         let models = ["deepseek-v4.1-flash", "qwen3.8-27b"].map(|name| ModelInfo {
             name: name.into(),
             kind: Kind::Llm,
@@ -270,8 +356,18 @@ mod tests {
             home: "",
             session_text: None,
         };
+        use_screen(&screen)
+    }
+
+    /// Hands `key` to `handle_event` with `choices`.
+    fn press(code: KeyCode, choices: &mut Choices) -> Asked {
         let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
-        handle_event(&event, choices, &screen)
+        with_screen(|screen| handle_event(&event, choices, screen))
+    }
+
+    /// Returns the keys of the view that `choices` shows.
+    fn view_keys(choices: &Choices) -> Keys {
+        with_screen(|screen| list_view_keys(screen, choices))
     }
 
     #[test]
@@ -321,7 +417,7 @@ mod tests {
         assert_eq!(choices.log_back, 0);
         press(KeyCode::Char('f'), &mut choices);
         assert_eq!(choices.log_filter, LogFilter::Model(0));
-        assert_eq!(list_view_keys(&choices)[2], ("f", "filter".to_string()));
+        assert_eq!(view_keys(&choices)[2], ("f", "filter".to_string()));
     }
 
     #[test]
@@ -348,11 +444,63 @@ mod tests {
         assert_eq!(choices.request, Some(5), "the requests go round");
         press(KeyCode::Down, &mut choices);
         assert_eq!(choices.layer_scroll, 1);
-        assert_eq!(list_view_keys(&choices)[0].0, "[ ] or click");
+        assert_eq!(view_keys(&choices)[0].0, "[ ] or click");
         // a model of the same kind keeps the sub-view
         press(KeyCode::Right, &mut choices);
         assert_eq!((choices.model, choices.sub_view), (1, SubView::Experts));
         assert_eq!((choices.request, choices.layer_scroll), (None, 0));
+    }
+
+    #[test]
+    fn the_d_key_asks_then_deletes_an_idle_sessions_state() {
+        let mut choices = Choices {
+            view: View::Models,
+            ..Choices::default()
+        };
+        let delete_key = |choices: &Choices| view_keys(choices).last().cloned();
+        // the session used last, 5, runs request 5
+        assert_eq!(
+            delete_key(&choices),
+            Some(("d", "session 5 is in use".to_string()))
+        );
+        press(KeyCode::Char('d'), &mut choices);
+        assert_eq!(choices.delete_asked, None, "d does nothing for it");
+        press(KeyCode::Down, &mut choices);
+        press(KeyCode::Down, &mut choices);
+        assert_eq!(choices.session, Some(3));
+        assert_eq!(
+            delete_key(&choices),
+            Some(("d", "delete state".to_string()))
+        );
+        assert_eq!(press(KeyCode::Char('d'), &mut choices), Asked::Redraw);
+        assert_eq!(choices.delete_asked, Some(3));
+        assert_eq!(
+            with_screen(|screen| find_delete_question(screen, &choices)),
+            Some(("d", "again deletes session 3".to_string())),
+            "the keys row asks"
+        );
+        // another key asks no more
+        assert_eq!(press(KeyCode::Char('x'), &mut choices), Asked::Redraw);
+        assert_eq!(choices.delete_asked, None);
+        press(KeyCode::Char('d'), &mut choices);
+        assert_eq!(
+            press(KeyCode::Char('d'), &mut choices),
+            Asked::DeleteSessionState {
+                model_index: 0,
+                session: 3
+            }
+        );
+        assert_eq!((choices.delete_asked, choices.session), (None, None));
+        // a click asks no more
+        press(KeyCode::Down, &mut choices);
+        press(KeyCode::Down, &mut choices);
+        press(KeyCode::Char('d'), &mut choices);
+        let target = Target::View(View::Models);
+        with_screen(|screen| choose_target(target, &mut choices, screen));
+        assert_eq!(choices.delete_asked, None);
+        // d does nothing outside States
+        choices.sub_view = SubView::Experts;
+        assert_eq!(press(KeyCode::Char('d'), &mut choices), Asked::Nothing);
     }
 
     #[test]
