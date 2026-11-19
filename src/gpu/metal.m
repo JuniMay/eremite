@@ -135,8 +135,9 @@ struct Gpu {
   // The buffers marked to be freed, which wait for command buffers to finish.
   MarkedBuffer *marked;
   int nmarked, marked_cap;
-  // The last committed command buffer.
+  // The last committed command buffer, and its number.
   id<MTLCommandBuffer> last;
+  uint64_t last_number;
   // The autorelease pool.
   void *pool;
   // The residency sets. Buffers are spread over several sets, since one very
@@ -452,6 +453,7 @@ static void move_to_done(Gpu *gpu, id<MTLCommandBuffer> c, uint64_t number) {
                                 sizeof *gpu->done);
   gpu->done[gpu->ndone++] = (Committed){[c retain], number};
   gpu->last = c;
+  gpu->last_number = number;
 }
 
 void gpu_commit(GpuCommandBuffer *c) {
@@ -769,6 +771,8 @@ static int committed_at(const Gpu *gpu, uint64_t number) {
     if (gpu->done[i].number == number) return i;
   return -1;
 }
+
+uint64_t gpu_last_committed(Gpu *gpu) { return gpu->last_number; }
 
 int gpu_has_finished(Gpu *gpu, uint64_t number) {
   int at = committed_at(gpu, number);

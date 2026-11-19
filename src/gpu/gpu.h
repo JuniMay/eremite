@@ -217,6 +217,10 @@ void gpu_sync(Gpu *gpu);
 // command buffers have now all finished.
 void gpu_check_finished(Gpu *gpu);
 
+// Returns the number of the last committed command buffer, or 0 before the
+// first commit.
+uint64_t gpu_last_committed(Gpu *gpu);
+
 // Returns whether the command buffer numbered number has finished, without
 // waiting. Ends the program if it was never begun, if it is not committed
 // yet, or if it failed.

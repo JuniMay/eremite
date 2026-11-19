@@ -1,4 +1,5 @@
 #include "eremite.h"
+#include "base/clock.h"
 #include "base/error.h"
 #include "base/log.h"
 #include "base/shutdown.h"
@@ -41,6 +42,10 @@ struct eremite_model {
   // eremite_state_identity's, once known.
   uint8_t identity[32];
   int identified;
+  // A decision model's turn beside decoding calls: when its decisions' latest
+  // turn began, and how long it may run, which is how long the decoding calls
+  // before it took. Decoding calls that have not started wait while it runs.
+  double turn_start, turn_length;
 };
 
 struct eremite_media {
@@ -525,6 +530,8 @@ struct eremite_stream {
   // The call posted and not finished, and its number among all posted calls.
   StreamCall call;
   uint64_t call_number;
+  // Its pass has started the posted call.
+  int started;
   // It finished, and eremite_run_streams has not reported that yet.
   int finished;
   // the call's arguments
@@ -551,6 +558,12 @@ struct eremite_stream {
   // call posted then, or 0 between waits.
   PassWait wait_for_decoding;
   uint64_t calls_at_first_look;
+  // What the stream's decision waits for in each layer: its turn
+  // (decision_may_go_on). The number of the last command buffer committed at
+  // the wait's first look, and when it was seen finished, or 0 between waits.
+  PassWait wait_for_turn;
+  uint64_t work_at_first_look;
+  double work_finished_at;
   // The run that advances the stream, while one does.
   const StreamRun *run;
 };
@@ -564,21 +577,90 @@ static int has_decoding_call(const eremite_stream *x) {
   return x->call == STREAM_DECODE || x->call == STREAM_VERIFY;
 }
 
-// Whether the decoding calls that the stream's prefill waits for have
-// finished. The prefill waits for those in its run that were posted at the
-// wait's first look.
-static int decoding_calls_finished(void *context) {
-  eremite_stream *x = context;
-  if (!x->run) die("a stream's prefill ran outside eremite_run_streams");
+// Whether decoding calls in the stream's run that were posted at its wait's
+// first look have not finished. The first look is the wait's first question.
+static int decoding_calls_remain(eremite_stream *x) {
+  if (!x->run) die("a stream's pass waited outside eremite_run_streams");
   if (!x->calls_at_first_look) x->calls_at_first_look = calls_posted;
   for (int k = 0; k < x->run->count; k++) {
     const eremite_stream *other = x->run->streams[k];
     if (has_decoding_call(other) &&
         other->call_number <= x->calls_at_first_look)
-      return 0;
+      return 1;
   }
+  return 0;
+}
+
+// Whether the decoding calls that the stream's prefill waits for have
+// finished. The prefill waits for those in its run that were posted at the
+// wait's first look.
+static int decoding_calls_finished(void *context) {
+  eremite_stream *x = context;
+  if (decoding_calls_remain(x)) return 0;
   x->calls_at_first_look = 0;
   return 1;
+}
+
+// Ends the stream's decision's wait in a layer.
+static void end_turn_wait(eremite_stream *x) {
+  x->calls_at_first_look = 0;
+  x->work_at_first_look = 0;
+  x->work_finished_at = 0;
+}
+
+// Whether the stream's decision may run its next layer. Without decoding calls
+// in its run posted at the wait's first look, it goes on at once. Beside them,
+// its GPU work committed by then finishes first, so that its turn counts the
+// GPU's time. Its turn goes on while it has run for less time than the
+// decoding calls before the turn took. Then those calls go first, and the next
+// turn may run as long as they took after the decision's GPU work finished.
+static int decision_may_go_on(void *context) {
+  eremite_stream *x = context;
+  eremite_model *m = x->m;
+  if (!x->calls_at_first_look) {
+    x->work_at_first_look = gpu_last_committed(gpu);
+    if (!decoding_calls_remain(x)) return end_turn_wait(x), 1;
+  }
+  if (!x->work_finished_at) {
+    if (x->work_at_first_look && !gpu_has_finished(gpu, x->work_at_first_look))
+      return 0;
+    double at = now();
+    if (at - m->turn_start < m->turn_length) return end_turn_wait(x), 1;
+    m->turn_length = 0;
+    x->work_finished_at = at;
+  }
+  if (decoding_calls_remain(x)) return 0;
+  m->turn_start = now();
+  m->turn_length = m->turn_start - x->work_finished_at;
+  return end_turn_wait(x), 1;
+}
+
+// Waits until the GPU work that the stream's decision committed by its wait's
+// first look has finished. Its pass blocks the engine thread only as the one
+// pass in its run that may go on: in its turn, while the decoding calls that
+// have not started wait.
+static void wait_for_decision_work(void *context) {
+  eremite_stream *x = context;
+  if (x->work_at_first_look)
+    gpu_wait_until_finished(gpu, x->work_at_first_look);
+}
+
+// Whether a decision's turn runs among the streams.
+static int decision_turn_runs(eremite_stream *const *streams, int n) {
+  for (int k = 0; k < n; k++) {
+    const eremite_model *m = streams[k]->m;
+    if (streams[k]->call == STREAM_DECIDE && m->turn_length > 0 &&
+        now() - m->turn_start < m->turn_length)
+      return 1;
+  }
+  return 0;
+}
+
+// Whether the stream's call waits while a decision's turn runs among the
+// streams: a decoding call that has not started.
+static int waits_for_turn(eremite_stream *x, eremite_stream *const *streams,
+                          int n) {
+  return has_decoding_call(x) && !x->started && decision_turn_runs(streams, n);
 }
 
 static void stream_run(eremite_stream *x) {
@@ -595,10 +677,9 @@ static void stream_run(eremite_stream *x) {
         eremite_decode_rows(m, x->states, x->row_tokens, x->row_pos, x->count);
     break;
   case STREAM_DECIDE:
-    x->logits =
-        run_decide(m, x->tokens, x->n, x->state_tokens, x->question_ends,
-                   x->questions, x->logit_rows, x->logit_ids, x->count,
-                   x->images, &x->wait_for_decoding);
+    x->logits = run_decide(
+        m, x->tokens, x->n, x->state_tokens, x->question_ends, x->questions,
+        x->logit_rows, x->logit_ids, x->count, x->images, &x->wait_for_turn);
     break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
@@ -626,9 +707,11 @@ static void stream_body(void *argument) {
   for (;;) {
     pass_wait(&(PassWait){stream_has_call, NULL, x, PASS_WAIT_OTHER, NULL});
     if (x->call == STREAM_QUIT) break;
+    x->started = 1;
     stream_run(x);
     if (x->m->ops->pass_release) x->m->ops->pass_release();
     x->call = STREAM_NONE;
+    x->started = 0;
     x->finished = 1;
   }
   x->m->ops->pass_end();
@@ -639,6 +722,8 @@ eremite_stream *eremite_stream_new(eremite_model *m) {
   x->m = m;
   x->wait_for_decoding =
       (PassWait){decoding_calls_finished, NULL, x, PASS_WAIT_OTHER, NULL};
+  x->wait_for_turn = (PassWait){decision_may_go_on, wait_for_decision_work, x,
+                                PASS_WAIT_GPU, NULL};
   x->pass = m->ops->pass_new(stream_body, x);
   return x;
 }
@@ -741,6 +826,7 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
     for (int k = 0; k < n && finished < 0; k++) {
       int i = (int)(((unsigned)first + (unsigned)k) % (unsigned)n);
       eremite_stream *x = streams[i];
+      if (waits_for_turn(x, streams, n)) continue;
       if (pass_ready(x->pass))
         set_thread_state(THREAD_PASS), pass_resume(x->pass), ran = 1;
       if (x->finished) x->finished = 0, first = (unsigned)i + 1, finished = i;
@@ -749,7 +835,9 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
     if (ran) continue;
     int count = 0;
     for (int k = 0; k < n; k++)
-      if (streams[k]->call != STREAM_NONE) waiting[count++] = streams[k]->pass;
+      if (streams[k]->call != STREAM_NONE &&
+          !waits_for_turn(streams[k], streams, n))
+        waiting[count++] = streams[k]->pass;
     if (!count) break;
     set_thread_state(streams_wait_for(streams, n));
     if (!pass_wait_for_any(waiting, count, wake))

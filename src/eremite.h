@@ -390,9 +390,11 @@ void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
                            const eremite_media *images);
 // Advances the streams until a call finishes, and returns that stream's index.
 // It returns -1 when no stream has a call posted, and when eremite_wake asks it
-// to. Only this function runs the streams. A prefill or a decision lets
-// decoding calls (decodes and verifies) go first: in each layer, it waits
-// until those posted to the streams before its wait have finished. A run whose
+// to. Only this function runs the streams. A prefill lets decoding calls
+// (decodes and verifies) go first: in each layer, it waits until those posted
+// to the streams before its wait have finished. A decision takes turns with
+// them: it lets those posted before its wait go first, then runs for as long
+// as they took, while decoding calls that have not started wait. A run whose
 // calls can only wait for each other ends the program.
 int eremite_run_streams(eremite_stream *const *streams, int n);
 // Makes eremite_run_streams return -1 soon: at once if it waits, or else after
