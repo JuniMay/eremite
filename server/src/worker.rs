@@ -4250,6 +4250,7 @@ impl WorkerModel {
             &pass.question_ends,
             &pass.rows,
             &pass.ids,
+            None,
         );
         decision.in_call = true;
         self.running_calls.push(RunningCall {

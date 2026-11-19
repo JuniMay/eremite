@@ -26,7 +26,7 @@ const BOUND: f32 = 0.0619;
 /// Runs the pass of TOKENS on `stream` to its end, and returns its logits.
 fn decide(stream: &Stream) -> Vec<f32> {
     let rows = [TOKENS.len() as i32 - 1; IDS.len()];
-    stream.decide(&TOKENS, STATE, &[TOKENS.len() as i32], &rows, &IDS);
+    stream.decide(&TOKENS, STATE, &[TOKENS.len() as i32], &rows, &IDS, None);
     assert_eq!(engine::run_streams(&[stream]), Some(0), "the pass finishes");
     stream
         .copy_decision_logits(IDS.len())

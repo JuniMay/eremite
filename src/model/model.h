@@ -231,13 +231,15 @@ typedef struct {
                               const int *pos, int m);
   // Runs a decision model's pass over one sequence of n tokens: the state's
   // first state_tokens, then the questions, question q's ending before
-  // question_ends[q]. Returns count logits: logit i is token ids[i]'s at row
-  // rows[i]. Returns null when the pass's memory does not fit. A non-null wait
-  // is waited for in each layer. Null for a model that runs no decisions.
+  // question_ends[q]. The rows whose tokens are negative are the media's: they
+  // take the encoded rows of the nmedia media in turn, every row of each.
+  // Returns count logits: logit i is token ids[i]'s at row rows[i]. Returns
+  // null when the pass's memory does not fit. A non-null wait is waited for in
+  // each layer. Null for a model that runs no decisions.
   const float *(*decide)(const int *tokens, int n, int state_tokens,
                          const int *question_ends, int questions,
                          const int *rows, const int *ids, int count,
-                         const PassWait *wait);
+                         const Media *media, int nmedia, const PassWait *wait);
   // Drafts. propose_drafts writes up to drafts_per_pass() drafts after token
   // at pos, once every position before it has run. It returns the sampled
   // proposals' probabilities, n vocabulary rows, or null for proposals without

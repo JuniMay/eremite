@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 4;
+const ABI: c_int = 5;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -430,6 +430,7 @@ unsafe extern "C" {
         rows: *const i32,
         ids: *const i32,
         count: c_int,
+        images: *const RawMedia,
     );
     fn eremite_stream_next_token(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
@@ -1557,7 +1558,8 @@ impl Stream {
     /// Posts one pass of a decision model: `tokens`, a state's first
     /// `state_tokens` tokens and questions after it that end at
     /// `question_ends`. The pass reads the logit of token `ids[i]` at row
-    /// `rows[i]` for each i.
+    /// `rows[i]` for each i. `media` gives its encoded images, whose spans
+    /// the tokens hold.
     pub fn decide(
         &self,
         tokens: &[i32],
@@ -1565,6 +1567,7 @@ impl Stream {
         question_ends: &[i32],
         rows: &[i32],
         ids: &[i32],
+        media: Option<&Media>,
     ) {
         assert_eq!(rows.len(), ids.len(), "a pass reads one token at each row");
         unsafe {
@@ -1578,6 +1581,7 @@ impl Stream {
                 rows.as_ptr(),
                 ids.as_ptr(),
                 ids.len() as c_int,
+                media.map_or(ptr::null(), |media| media.0),
             )
         }
     }

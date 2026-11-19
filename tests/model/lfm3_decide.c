@@ -142,7 +142,7 @@ static double read_temperature(const char *dir) {
 static void run_case(const Model *m, const Case *c, double temperature) {
   const float *got =
       m->ops->decide(c->tokens, c->n, c->state, c->ends, c->questions, c->rows,
-                     c->ids, c->count, NULL);
+                     c->ids, c->count, NULL, 0, NULL);
   if (!got) die("%s: the pass did not fit in memory", c->what);
   double logit_difference = 0, probability_difference = 0;
   for (int i = 0; i < c->count; i++)

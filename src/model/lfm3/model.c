@@ -731,11 +731,14 @@ static void run_feed_forward(GpuCommandBuffer *c, const Layer *y,
 }
 
 // Writes the sequence's token ids, each row's question and the questions'
-// spans into the pass's buffers. Returns 0 if the questions do not end in
-// order after the state, the last at the sequence's end, or a token is out of
-// the vocabulary.
+// spans into the pass's buffers. A row whose token is negative is a medium's:
+// its id is -1, and its row of the residual stream is the next of the media's
+// rows. Returns 0 if the questions do not end in order after the state, the
+// last at the sequence's end, a token is out of the vocabulary, or the
+// media's rows do not fill those rows, every row of each medium once.
 static int write_layout(PassBuffers *b, const int *tokens, int n, int state,
-                        const int *question_ends, int questions) {
+                        const int *question_ends, int questions,
+                        const Media *media, int nmedia) {
   if (state < 0 || questions < 1 || question_ends[questions - 1] != n) return 0;
   int32_t *ids = (int32_t *)b->ids.ptr;
   uint32_t *groups = (uint32_t *)b->groups.ptr,
@@ -749,11 +752,21 @@ static int write_layout(PassBuffers *b, const int *tokens, int n, int state,
     for (int r = start; r < question_ends[q]; r++) groups[r] = (uint32_t)q + 1;
     start = question_ends[q];
   }
+  float *x = (float *)b->x.ptr;
+  int medium = 0, row = 0;
   for (int r = 0; r < n; r++) {
-    if (tokens[r] < 0 || tokens[r] >= LFM3_VOCAB) return 0;
-    ids[r] = tokens[r];
+    if (tokens[r] >= LFM3_VOCAB) return 0;
+    ids[r] = tokens[r] < 0 ? -1 : tokens[r];
+    if (tokens[r] >= 0) continue;
+    if (medium == nmedia) return 0;
+    const uint16_t *from = media[medium].rows + (size_t)row * LFM3_DIM;
+    for (int i = 0; i < LFM3_DIM; i++) {
+      uint32_t bits = (uint32_t)from[i] << 16;
+      memcpy(&x[(size_t)r * LFM3_DIM + i], &bits, sizeof bits);
+    }
+    if (++row == media[medium].th * media[medium].tw) medium++, row = 0;
   }
-  return 1;
+  return medium == nmedia;
 }
 
 // Writes the logit of token ids[i] at row rows[i] for each i < count into
@@ -790,6 +803,7 @@ static void read_logits(const PassBuffers *b, const int *rows, const int *ids,
 static const float *lfm3_decide(const int *tokens, int n, int state,
                                 const int *question_ends, int questions,
                                 const int *rows, const int *ids, int count,
+                                const Media *media, int nmedia,
                                 const PassWait *wait) {
   if (n < 1 || n > LFM3_POSITIONS)
     die("a decision takes 1 to %d rows", LFM3_POSITIONS);
@@ -798,9 +812,11 @@ static const float *lfm3_decide(const int *tokens, int n, int state,
       die("a decision's logit at row %d of token %d", rows[i], ids[i]);
   PassBuffers b;
   if (!allocate_pass_buffers(&b, n, questions)) return NULL;
-  if (!write_layout(&b, tokens, n, state, question_ends, questions))
+  if (!write_layout(&b, tokens, n, state, question_ends, questions, media,
+                    nmedia))
     die("a decision's questions must follow its state in order up to its end, "
-        "with tokens of the vocabulary");
+        "with tokens of the vocabulary, and its media's rows must fill its "
+        "rows of negative tokens");
   GpuCommandBuffer c = gpu_begin(gpu);
   uint32_t dim = LFM3_DIM;
   gpu_select_kernel(&c, K_lfm3_embed);

@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 4
+#define EREMITE_ABI 5
 
 // ---- the process ----
 
@@ -192,13 +192,16 @@ int eremite_is_stop_token(const eremite_model *m, int32_t token);
 int eremite_is_decision_model(const eremite_model *m);
 // Runs a decision model's pass over n tokens: the first state_tokens are the
 // state, and question q's tokens end before question_ends[q], the last
-// question's at n. Returns count logits, valid until the next call that runs
-// the model: logit i is token ids[i]'s at row rows[i]. Returns null when the
+// question's at n. Its images, or null for none, are encoded
+// (eremite_media_encode), and each one's span (eremite_media_expand) holds
+// its rows. Returns count logits, valid until the next call that runs the
+// model: logit i is token ids[i]'s at row rows[i]. Returns null when the
 // pass's memory does not fit.
 const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
                             int state_tokens, const int32_t *question_ends,
                             int questions, const int32_t *rows,
-                            const int32_t *ids, int count);
+                            const int32_t *ids, int count,
+                            const eremite_media *images);
 
 // ---- attention states and snapshots ----
 
@@ -383,7 +386,8 @@ void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
 void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
                            int state_tokens, const int32_t *question_ends,
                            int questions, const int32_t *rows,
-                           const int32_t *ids, int count);
+                           const int32_t *ids, int count,
+                           const eremite_media *images);
 // Advances the streams until a call finishes, and returns that stream's index.
 // It returns -1 when no stream has a call posted, and when eremite_wake asks it
 // to. Only this function runs the streams. A prefill or a decision lets

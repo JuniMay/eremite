@@ -317,23 +317,30 @@ int eremite_is_decision_model(const eremite_model *m) {
   return m->ops->decide != NULL;
 }
 
-// Runs a decision model's pass. A non-null wait is waited for in each layer.
+// Runs a decision model's pass with its images, if any. A non-null wait is
+// waited for in each layer.
 static const float *run_decide(eremite_model *m, const int32_t *tokens, int n,
                                int state_tokens, const int32_t *question_ends,
                                int questions, const int32_t *rows,
                                const int32_t *ids, int count,
+                               const eremite_media *images,
                                const PassWait *wait) {
   if (!m->ops->decide) die("%s: not a decision model", m->dir);
+  for (int i = 0; images && i < images->n; i++)
+    if (!images->items[i].rows)
+      die("%s: a decision's images must be encoded first", m->dir);
   return m->ops->decide(tokens, n, state_tokens, question_ends, questions, rows,
-                        ids, count, wait);
+                        ids, count, images ? images->items : NULL,
+                        images ? images->n : 0, wait);
 }
 
 const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
                             int state_tokens, const int32_t *question_ends,
                             int questions, const int32_t *rows,
-                            const int32_t *ids, int count) {
+                            const int32_t *ids, int count,
+                            const eremite_media *images) {
   return run_decide(m, tokens, n, state_tokens, question_ends, questions, rows,
-                    ids, count, NULL);
+                    ids, count, images, NULL);
 }
 
 // Ends the program for a decision model: it keeps no states and runs no
@@ -588,9 +595,10 @@ static void stream_run(eremite_stream *x) {
         eremite_decode_rows(m, x->states, x->row_tokens, x->row_pos, x->count);
     break;
   case STREAM_DECIDE:
-    x->logits = run_decide(m, x->tokens, x->n, x->state_tokens,
-                           x->question_ends, x->questions, x->logit_rows,
-                           x->logit_ids, x->count, &x->wait_for_decoding);
+    x->logits =
+        run_decide(m, x->tokens, x->n, x->state_tokens, x->question_ends,
+                   x->questions, x->logit_rows, x->logit_ids, x->count,
+                   x->images, &x->wait_for_decoding);
     break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
@@ -685,11 +693,13 @@ void eremite_stream_verify(eremite_stream *x, eremite_state *s, int32_t *rows,
 void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
                            int state_tokens, const int32_t *question_ends,
                            int questions, const int32_t *rows,
-                           const int32_t *ids, int count) {
+                           const int32_t *ids, int count,
+                           const eremite_media *images) {
   if (!x->m->ops->decide) die("%s: not a decision model", x->m->dir);
   x->tokens = tokens, x->n = n, x->state_tokens = state_tokens;
   x->question_ends = question_ends, x->questions = questions;
   x->logit_rows = rows, x->logit_ids = ids, x->count = count;
+  x->images = images;
   post_call(x, STREAM_DECIDE);
 }
 
