@@ -126,6 +126,10 @@ Each entry under `models` holds one model's settings:
 | `max_cached_states` | the most states of the model kept in memory | 256 |
 | `idle_unload` | the model's own `idle_unload` | the server-wide one |
 
+A request names its model by its `id` in `model`. A request that names no
+served model goes to the only model that answers its endpoint: a chat request
+to the model that generates text, a decision to the decision model.
+
 A model's states take an adaptive part of its memory: all that its weights and
 a full-speed prompt pass leave of its own `memory`, or else of the root
 `memory` and the free memory above `reserve`. Its expert cache grows into what

@@ -107,11 +107,27 @@ struct Shared {
     keepalive: Duration,
 }
 
+/// Returns whether `model` generates text: whether it answers the chat
+/// endpoints.
+fn generates_text(model: &Served) -> bool {
+    matches!(model.format, Format::DeepSeek(_))
+}
+
+/// Returns whether `model` is a decision model: whether it answers POST
+/// /v1/decisions.
+fn makes_decisions(model: &Served) -> bool {
+    matches!(model.format, Format::D1(_))
+}
+
 /// Finds the index of the model that the request's `body` names, in any case.
-/// With one model served, it returns that model for any name. Among several
-/// models, it returns an error message when the body names an unknown model, or
-/// none.
-fn find_model_index(shared: &Shared, body: &[u8]) -> Result<usize, String> {
+/// For an unknown name, or none, it returns the only model that `answers`
+/// accepts, those that answer the request's endpoint, or else the only model
+/// served. Otherwise it returns an error message.
+fn find_model_index(
+    shared: &Shared,
+    body: &[u8],
+    answers: fn(&Served) -> bool,
+) -> Result<usize, String> {
     /// The part of a request's body that names its model.
     #[derive(serde::Deserialize)]
     struct Named {
@@ -127,6 +143,12 @@ fn find_model_index(shared: &Shared, body: &[u8]) -> Result<usize, String> {
             .iter()
             .position(|model| name.eq_ignore_ascii_case(&model.id))
     {
+        return Ok(index);
+    }
+    let answering: Vec<usize> = (0..shared.models.len())
+        .filter(|&index| answers(&shared.models[index]))
+        .collect();
+    if let [index] = answering[..] {
         return Ok(index);
     }
     if shared.models.len() == 1 {
@@ -430,7 +452,7 @@ async fn answer_decisions(
         "http {arrival}: arrived from {peer}, {} body bytes",
         body.len()
     ));
-    let index = match find_model_index(&shared, &body) {
+    let index = match find_model_index(&shared, &body, makes_decisions) {
         Ok(index) => index,
         Err(message) => {
             return chat::build_error_response(
@@ -546,7 +568,7 @@ async fn answer_generation(
         "http {arrival}: arrived from {peer}, {} body bytes",
         body.len()
     ));
-    let index = match find_model_index(&shared, &body) {
+    let index = match find_model_index(&shared, &body, generates_text) {
         Ok(index) => index,
         Err(message) => {
             return chat::build_error_response(

@@ -3,11 +3,14 @@
 //! Codex's catalog leaves it out, and the chat endpoints refuse it; the server
 //! loads no weights for these. POST /v1/decisions answers questions about a
 //! text or JSON input, and about images, with the probabilities of
-//! LiquidAI's own code.
+//! LiquidAI's own code. Beside a model that generates text, a request without
+//! a known model's name goes to the only model that answers its endpoint.
 //!
-//! Set EREMITE_D1_CHECKPOINT to the d1 checkpoint directory. EREMITE_SERVER
-//! picks the server binary (default build/eremite-server). The tests run one
-//! model process at a time (they share a lock):
+//! Set EREMITE_D1_CHECKPOINT to the d1 checkpoint directory, and for the test
+//! beside DeepSeek also EREMITE_CHECKPOINT to DeepSeek V4.1's and optionally
+//! EREMITE_EXPERTS to its GGUF experts. EREMITE_SERVER picks the server binary
+//! (default build/eremite-server). The tests run one model process at a time
+//! (they share a lock):
 //!
 //!     EREMITE_D1_CHECKPOINT=DIR cargo test --release \
 //!       --manifest-path server/Cargo.toml --test decisions -- --nocapture
@@ -281,5 +284,85 @@ fn a_decision_model_answers_about_images_as_liquidais_code_answers() {
     });
     let (code, refused) = ask(&server, "POST", "/v1/decisions", Some(&broken));
     assert_eq!(code, 400, "{refused}");
+    server.stop();
+}
+
+#[test]
+fn requests_without_a_known_name_go_to_the_model_of_their_endpoint() {
+    let (Ok(d1), Ok(deepseek)) = (
+        std::env::var("EREMITE_D1_CHECKPOINT"),
+        std::env::var("EREMITE_CHECKPOINT"),
+    ) else {
+        eprintln!("skipped: set EREMITE_D1_CHECKPOINT and EREMITE_CHECKPOINT");
+        return;
+    };
+    let _one = one_model();
+    let program = std::env::var("EREMITE_SERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root().join("build/eremite-server"));
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let key = format!("decisions-test-{}-{port}-key", std::process::id());
+    let mut generating = json!({"model": deepseek, "ctx": 4096});
+    if let Ok(experts) = std::env::var("EREMITE_EXPERTS") {
+        generating["experts"] = experts.into();
+    }
+    let mut config = build_config(
+        port,
+        json!({"memory": 64, "state_disk": 0}),
+        &d1,
+        None,
+        json!({}),
+    );
+    config["models"] = json!([generating, {"model": d1}]);
+    let server = Server::start(&program, &config, &key, port);
+    let (code, models) = ask(&server, "GET", "/v1/models", None);
+    assert_eq!(code, 200, "{models}");
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .expect("the models")
+        .iter()
+        .map(|model| model["id"].as_str().unwrap_or(""))
+        .collect();
+    println!("serving {ids:?}");
+    let (decision_model, chat_model) = (ids[1].to_string(), ids[0].to_string());
+    let question = json!([{"type": "predicate", "instructions": "Is this a greeting?"}]);
+    for name in [None, Some("gpt-6-luna")] {
+        let mut body = json!({"input": "Hello there!", "questions": question});
+        if let Some(name) = name {
+            body["model"] = name.into();
+        }
+        let (code, decision) = ask(&server, "POST", "/v1/decisions", Some(&body));
+        assert_eq!(code, 200, "{name:?}: {decision}");
+        assert_eq!(decision["model"], decision_model.as_str(), "{name:?}");
+    }
+    let chat = json!({"messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 4});
+    let (code, reply) = ask(&server, "POST", "/v1/chat/completions", Some(&chat));
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply["model"], chat_model.as_str());
+    // A decision while the other model writes a long reply: it waits for
+    // nothing but the GPU's turns.
+    let (port, key) = (server.port, server.key.clone());
+    let long = json!({"messages": [{"role": "user", "content": "Count to 300, one number a line."}],
+                      "max_tokens": 600});
+    let writer =
+        std::thread::spawn(move || http(port, &key, "POST", "/v1/chat/completions", Some(&long)).0);
+    // Each status read waits for the worker to publish.
+    while !writer.is_finished()
+        && !server.status()["requests"]
+            .as_array()
+            .is_some_and(|requests| requests.iter().any(|r| r["status"] == "decoding"))
+    {}
+    let body = json!({"input": "Hello there!", "questions": question});
+    let asked = std::time::Instant::now();
+    let (code, decision) = ask(&server, "POST", "/v1/decisions", Some(&body));
+    println!(
+        "a decision beside the other model's reply took {:.3} s",
+        asked.elapsed().as_secs_f64()
+    );
+    assert_eq!(code, 200, "{decision}");
+    assert_eq!(writer.join().expect("the reply's thread"), 200);
     server.stop();
 }
