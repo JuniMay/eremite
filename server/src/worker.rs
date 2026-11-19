@@ -101,8 +101,12 @@ pub enum Event {
     /// requests.
     Failed(String),
     /// A decision ended: the logits of each of its passes, in the passes'
-    /// order. This is the last event.
-    Decided(Vec<Vec<f32>>),
+    /// order, and the tokens that the passes read, each image's span counted
+    /// whole. This is the last event.
+    Decided {
+        logits: Vec<Vec<f32>>,
+        tokens: usize,
+    },
 }
 
 /// How a request samples its tokens.
@@ -156,6 +160,9 @@ pub struct DecisionRequest {
     pub model_index: usize,
     /// The passes, each a state and questions after it (decision/d1.rs).
     pub passes: Vec<d1::Pass>,
+    /// The bytes of each image file, in the order of the image places in each
+    /// pass's state.
+    pub media: Vec<Vec<u8>>,
     /// The log shows "req ID NOTE" with this note when the request is queued.
     pub note: String,
 }
@@ -1288,8 +1295,10 @@ impl Generation {
 
 /// A decision from its first pass to its last.
 struct Decision {
-    /// The submitted request.
+    /// The submitted request. Its passes hold their images' spans.
     job: Job<DecisionRequest>,
+    /// Its images, encoded, if it has any.
+    media: Option<Media>,
     /// The logits that its finished passes read, in the passes' order.
     logits: Vec<Vec<f32>>,
     /// Why its last pass failed, if it did.
@@ -4186,23 +4195,16 @@ impl WorkerModel {
     }
 
     /// Starts the admitted decision `job`. It ends a cancelled decision, and
-    /// every decision at the stop. It refuses a decision whose passes do not
-    /// fit the model. It loads the model, and the first pass starts.
-    fn start_decision(&mut self, shared: &Shared, job: Job<DecisionRequest>) {
+    /// every decision at the stop. It loads the model. It opens the decision's
+    /// images and puts their spans in place of their places in each pass. It
+    /// refuses a decision whose images or passes do not fit the model. It
+    /// encodes the images, and the first pass starts.
+    fn start_decision(&mut self, shared: &Shared, mut job: Job<DecisionRequest>) {
         if engine::is_stopping() {
             return self.end_waiting_decision(job, FinishReason::ServerStop);
         }
         if job.flags.cancelled.load(Ordering::SeqCst) {
             return self.end_waiting_decision(job, FinishReason::Cancelled);
-        }
-        let vocab = self.model.vocab_size();
-        if let Some(message) = job
-            .request
-            .passes
-            .iter()
-            .find_map(|pass| check_decision_pass(pass, self.ctx, vocab))
-        {
-            return self.refuse_decision(job, &message);
         }
         let was_loaded = self.model.is_loaded();
         if !was_loaded {
@@ -4225,13 +4227,51 @@ impl WorkerModel {
             self.log_line(&format!("{}: loaded", self.settings.id));
         }
         self.last_used_at = Instant::now();
+        let mut media = None;
+        if !job.request.media.is_empty() {
+            let mut opened = match self.model.open_media(&job.request.media) {
+                Ok(opened) => opened,
+                Err(message) => return self.refuse_decision(job, &message),
+            };
+            for pass in &mut job.request.passes {
+                if let Err(message) = place_spans(&mut opened, pass, self.ctx) {
+                    return self.refuse_decision(job, &message);
+                }
+            }
+            media = Some(opened);
+        }
+        let vocab = self.model.vocab_size();
+        if let Some(message) = job
+            .request
+            .passes
+            .iter()
+            .find_map(|pass| check_decision_pass(pass, self.ctx, vocab, media.is_some()))
+        {
+            return self.refuse_decision(job, &message);
+        }
+        let started_at = Instant::now();
+        let mut failure = None;
+        if let Some(media) = media.as_mut() {
+            match media.encode(0) {
+                Ok(count) => self.log_line(&format!(
+                    "req {}: {count} images encoded in {:.2} s",
+                    job.id,
+                    started_at.elapsed().as_secs_f64()
+                )),
+                Err(message) => failure = Some(message),
+            }
+        }
         let decision = Decision {
             job,
+            media,
             logits: Vec::new(),
-            failure: None,
+            failure,
             in_call: false,
-            started_at: Instant::now(),
+            started_at,
         };
+        if decision.failure.is_some() {
+            return self.end_decision(shared, decision);
+        }
         if decision.job.request.passes.is_empty() {
             // A decision without passes has all its logits.
             return self.end_decision(shared, decision);
@@ -4250,7 +4290,7 @@ impl WorkerModel {
             &pass.question_ends,
             &pass.rows,
             &pass.ids,
-            None,
+            decision.media.as_ref(),
         );
         decision.in_call = true;
         self.running_calls.push(RunningCall {
@@ -4298,7 +4338,13 @@ impl WorkerModel {
         let (how, event) = if let Some(message) = decision.failure {
             (format!("failed: {message}"), Event::Failed(message))
         } else if ran == count {
-            ("decided".to_string(), Event::Decided(decision.logits))
+            (
+                "decided".to_string(),
+                Event::Decided {
+                    logits: decision.logits,
+                    tokens,
+                },
+            )
         } else if decision.job.flags.cancelled.load(Ordering::SeqCst) {
             (
                 "client gone".to_string(),
@@ -4351,17 +4397,53 @@ impl WorkerModel {
     }
 }
 
+/// Puts the spans of the images of `media` in place of their places in the
+/// state of `pass`, at most `ctx` tokens with them, and moves the pass's
+/// state, question ends and rows after them. Returns why it cannot: the pass
+/// does not fit, or its places in the state and the images differ.
+fn place_spans(media: &mut Media, pass: &mut d1::Pass, ctx: usize) -> Result<(), String> {
+    let tokens = media
+        .expand(&pass.tokens, ctx)
+        .map_err(|error| match error {
+            ExpandError::TooLong(rows) => {
+                format!("a pass has {rows} tokens; the context holds {ctx}")
+            }
+            ExpandError::PlacesAndMediaDiffer => {
+                "a pass's image places and its images differ".to_string()
+            }
+        })?;
+    let added = tokens.len() - pass.tokens.len();
+    let state = pass.state_tokens + added;
+    // A span's tokens are negative: every one must be in the state.
+    if tokens[state..].iter().any(|&token| token < 0) {
+        return Err("a pass's image places must be in its state".into());
+    }
+    pass.tokens = tokens;
+    pass.state_tokens = state;
+    for at in pass.question_ends.iter_mut().chain(&mut pass.rows) {
+        *at += added as i32;
+    }
+    Ok(())
+}
+
 /// Returns why the engine cannot run the decision pass `pass` with a context
 /// of `ctx` tokens and a vocabulary of `vocab` tokens, or None when it can:
 /// the pass fits the context, its questions follow its state up to its last
 /// token, and it reads the logits of tokens of the vocabulary at its own
-/// rows.
-fn check_decision_pass(pass: &d1::Pass, ctx: usize, vocab: usize) -> Option<String> {
+/// rows. Its tokens are of the vocabulary, or negative in its images' spans
+/// when `reads_images`.
+fn check_decision_pass(
+    pass: &d1::Pass,
+    ctx: usize,
+    vocab: usize,
+    reads_images: bool,
+) -> Option<String> {
     let rows = pass.tokens.len();
     if rows > ctx {
         return Some(format!("a pass has {rows} tokens; the context holds {ctx}"));
     }
     let is_token = |id: &i32| usize::try_from(*id).is_ok_and(|id| id < vocab);
+    let is_row = |id: &i32| is_token(id) || (reads_images && *id < 0);
     let questions_follow = pass.question_ends.last() == Some(&(rows as i32))
         && pass
             .question_ends
@@ -4376,7 +4458,7 @@ fn check_decision_pass(pass: &d1::Pass, ctx: usize, vocab: usize) -> Option<Stri
             .iter()
             .all(|row| usize::try_from(*row).is_ok_and(|row| row < rows))
         && pass.ids.iter().all(is_token);
-    (!(questions_follow && reads_fit && pass.tokens.iter().all(is_token)))
+    (!(questions_follow && reads_fit && pass.tokens.iter().all(is_row)))
         .then(|| "a pass's questions, rows or tokens do not fit the model".to_string())
 }
 
@@ -4444,11 +4526,19 @@ mod tests {
             rows: vec![3, 5, 5],
             ids: vec![11, 12, 13],
         };
-        assert_eq!(check_decision_pass(&pass(), 6, 16), None);
+        assert_eq!(check_decision_pass(&pass(), 6, 16, false), None);
         assert_eq!(
-            check_decision_pass(&pass(), 5, 16).as_deref(),
+            check_decision_pass(&pass(), 5, 16, false).as_deref(),
             Some("a pass has 6 tokens; the context holds 5")
         );
+        let mut with_image = pass();
+        with_image.tokens[1] = -7;
+        assert_eq!(
+            check_decision_pass(&with_image, 6, 16, true),
+            None,
+            "an image's span holds negative tokens"
+        );
+        assert!(check_decision_pass(&with_image, 6, 16, false).is_some());
         let changes: [fn(&mut d1::Pass); 7] = [
             |pass| pass.question_ends = vec![4, 5],
             |pass| pass.question_ends = vec![2, 6],
@@ -4462,7 +4552,7 @@ mod tests {
             let mut wrong = pass();
             change(&mut wrong);
             assert_eq!(
-                check_decision_pass(&wrong, 6, 16).as_deref(),
+                check_decision_pass(&wrong, 6, 16, false).as_deref(),
                 Some("a pass's questions, rows or tokens do not fit the model"),
                 "{:?} {:?} {:?} {:?}",
                 wrong.tokens,

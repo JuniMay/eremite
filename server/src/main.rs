@@ -458,7 +458,6 @@ async fn answer_decisions(
             &request.questions,
         )
         .map_err(chat::Error::new_bad_request)?;
-        let input_tokens = plan.count_tokens();
         let passes = std::mem::take(&mut plan.passes);
         let note = format!(
             "http {arrival} from {from}: {} questions in {} passes",
@@ -468,14 +467,15 @@ async fn answer_decisions(
         let (cancel, events) = worker::submit_decision(worker::DecisionRequest {
             model_index: index,
             passes,
+            media: Vec::new(),
             note,
         })
         .map_err(convert_submit_error)?;
-        Ok((request, plan, input_tokens, cancel, events))
+        Ok((request, plan, cancel, events))
     })
     .await;
     // The guard cancels the decision when the client goes away.
-    let (request, plan, input_tokens, _cancel, mut events) = match queued {
+    let (request, plan, _cancel, mut events) = match queued {
         Ok(Ok(queued)) => queued,
         Ok(Err(error)) => return refuse_request(&peer, error),
         Err(error) => {
@@ -487,12 +487,10 @@ async fn answer_decisions(
         }
     };
     match events.recv().await {
-        Some(worker::Event::Decided(logits)) => {
+        Some(worker::Event::Decided { logits, tokens }) => {
             let answers = request.build_answers(&plan.read_probabilities(&logits));
             let id = &shared.models[index].id;
-            build_json_response(
-                decision::api::build_response(id, answers, input_tokens).to_string(),
-            )
+            build_json_response(decision::api::build_response(id, answers, tokens).to_string())
         }
         Some(worker::Event::Refused(message)) => {
             refuse_request(&peer, chat::Error::new_bad_request(message))

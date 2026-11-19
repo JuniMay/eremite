@@ -1,7 +1,9 @@
 //! The worker runs a decision model's decisions and reports their events. A
 //! decision runs its passes one after another, and its last event holds each
-//! pass's logits. The model unloads when idle and loads again for the next
-//! decision. The worker refuses a reply request for a decision model, and a
+//! pass's logits and the tokens they read. A decision about an image puts
+//! the image's span in place of its place in each pass. The model unloads
+//! when idle and loads again for the next decision, its vision weights
+//! too. The worker refuses a reply request for a decision model, and a
 //! pass longer than the context. A dropped guard cancels a decision, and the
 //! stop ends one: a running decision before its next pass, a waiting one
 //! before its first. The log shows each decision's note when it is queued,
@@ -44,6 +46,35 @@ const LONG_PASSES: usize = 6;
 const QUESTION_TOKENS: usize = 8;
 /// The note of every decision that the test submits.
 const NOTE: &str = "from the decision test";
+/// A text state after a 400 x 208 image's place (the image token), and three
+/// questions: yes or no, a choice of three, and a score of three levels.
+const CARD: [i32; 114] = [
+    124894, 124899, 5922, 207, 125009, 125030, 125010, 41, 1426, 4559, 34, 3599, 376, 11775, 309,
+    267, 5322, 10590, 6542, 20242, 64673, 63509, 833, 4439, 278, 7628, 8286, 6542, 64929, 57922,
+    415, 18171, 432, 794, 1049, 22, 124900, 207, 124899, 63514, 207, 124901, 124902, 63509, 833,
+    28327, 3599, 355, 31211, 462, 278, 1583, 8527, 64929, 13314, 833, 41, 2959, 207, 42, 4752, 207,
+    43, 6542, 8, 57922, 415, 278, 7331, 4713, 1049, 22, 124900, 207, 124899, 63514, 207, 124901,
+    124902, 63509, 833, 3522, 34880, 355, 278, 7628, 64929, 24, 37787, 207, 25, 15175, 207, 26,
+    9398, 8, 57922, 415, 267, 2936, 19763, 229, 24, 21, 26, 1049, 22, 124900, 207, 124899, 63514,
+    207, 124901, 124902,
+];
+/// CARD's state, its questions' ends and the rows of its answers, before the
+/// image's span takes its place; the tokens with the span; the tokens that
+/// its questions read; their logits in LiquidAI's own code in FP32; and the
+/// largest difference of its BF16 run from them.
+const CARD_STATE: usize = 23;
+const CARD_ENDS: [i32; 3] = [43, 79, 114];
+const CARD_EXPANDED: usize = 185;
+const CARD_IDS: [(i32, [i32; 6]); 3] = [
+    (42, [11683, 12447, 2243, 4547, 19598, -1]),
+    (78, [41, 334, 42, 378, 43, 340]),
+    (113, [24, 25, 26, -1, -1, -1]),
+];
+const CARD_LOGITS: [f32; 14] = [
+    2.908662, 7.315761, 5.76309, 10.504194, 3.416532, 13.300821, 8.844008, 7.259619, 2.441981,
+    8.001862, 3.481334, 6.407514, 7.811986, 12.584948,
+];
+const CARD_BOUND: f32 = 0.0583;
 
 /// The lines that the log hook received, and the condition that each new line
 /// notifies.
@@ -94,11 +125,82 @@ fn long_pass(rows: usize) -> d1::Pass {
     }
 }
 
+/// Returns a BMP file of the test pattern at width x height pixels: 24-bit
+/// pixels, red rising from left to right, green from top to bottom, and blue
+/// a texture of sharp edges, as the engine's tests make it.
+fn make_test_bmp(width: usize, height: usize) -> Vec<u8> {
+    let row = (width * 3).div_ceil(4) * 4;
+    let data = row * height;
+    let mut f = vec![0u8; 54 + data];
+    let mut put = |at: usize, value: u32, bytes: usize| {
+        f[at..at + bytes].copy_from_slice(&value.to_le_bytes()[..bytes]);
+    };
+    put(0, u32::from_le_bytes(*b"BM\0\0"), 2);
+    put(2, (54 + data) as u32, 4);
+    put(10, 54, 4);
+    put(14, 40, 4);
+    put(18, width as u32, 4);
+    put(22, height as u32, 4);
+    put(26, 1, 2);
+    put(28, 24, 2);
+    put(34, data as u32, 4);
+    // 2835 pixels per meter: 72 per inch.
+    put(38, 2835, 4);
+    put(42, 2835, 4);
+    for y in 0..height {
+        // The rows go from the bottom up, each pixel blue, green, red.
+        let line = 54 + (height - 1 - y) * row;
+        for x in 0..width {
+            f[line + 3 * x] = ((x / 7) * 37 + (y / 5) * 91 + (x * y) % 13 * 11) as u8;
+            f[line + 3 * x + 1] = (y * 255 / (height - 1)) as u8;
+            f[line + 3 * x + 2] = (x * 255 / (width - 1)) as u8;
+        }
+    }
+    f
+}
+
+/// The pass of CARD, with its image's place.
+fn card_pass() -> d1::Pass {
+    let (mut rows, mut ids) = (Vec::new(), Vec::new());
+    for (row, tokens) in CARD_IDS {
+        for id in tokens.into_iter().filter(|&id| id >= 0) {
+            rows.push(row);
+            ids.push(id);
+        }
+    }
+    d1::Pass {
+        tokens: CARD.to_vec(),
+        state_tokens: CARD_STATE,
+        question_ends: CARD_ENDS.to_vec(),
+        rows,
+        ids,
+    }
+}
+
+/// Runs the decision of CARD about the 400 x 208 test image, and returns its
+/// logits and the tokens that it read.
+fn decide_card() -> (Vec<f32>, usize) {
+    let request = worker::DecisionRequest {
+        model_index: 0,
+        passes: vec![card_pass()],
+        media: vec![make_test_bmp(400, 208)],
+        note: NOTE.into(),
+    };
+    let Ok((_guard, mut events)) = worker::submit_decision(request) else {
+        panic!("the worker is busy");
+    };
+    match read_last(&mut events) {
+        worker::Event::Decided { mut logits, tokens } => (logits.remove(0), tokens),
+        other => panic!("the decision ended with {other:?}"),
+    }
+}
+
 /// Submits a decision of `passes` to the first model.
 fn submit(passes: Vec<d1::Pass>) -> (worker::CancelGuard, UnboundedReceiver<worker::Event>) {
     let request = worker::DecisionRequest {
         model_index: 0,
         passes,
+        media: Vec::new(),
         note: NOTE.into(),
     };
     match worker::submit_decision(request) {
@@ -148,7 +250,7 @@ fn check_done(events: &mut UnboundedReceiver<worker::Event>, reason: worker::Fin
 fn decide(passes: Vec<d1::Pass>) -> Vec<Vec<f32>> {
     let (_guard, mut events) = submit(passes);
     match read_last(&mut events) {
-        worker::Event::Decided(logits) => logits,
+        worker::Event::Decided { logits, .. } => logits,
         other => panic!("the decision ended with {other:?}"),
     }
 }
@@ -196,6 +298,22 @@ fn decisions_run_their_passes_and_return_their_logits() {
     // which gives the same bits.
     let unloaded = wait_for_line(0, "d1: unloaded after");
     assert_eq!(decide(vec![json_pass()]), first);
+    let loaded = wait_for_line(unloaded, "d1: loaded");
+
+    // A decision about an image reads the image's span in place of its place,
+    // as close to FP32 as LiquidAI's BF16 run. After the model unloads, its
+    // vision weights load again, and the same decision gives the same bits.
+    let (card, tokens) = decide_card();
+    assert_eq!(tokens, CARD_EXPANDED, "the image's span counts whole");
+    let difference = card
+        .iter()
+        .zip(CARD_LOGITS)
+        .map(|(logit, reference)| (logit - reference).abs())
+        .fold(0.0, f32::max);
+    println!("the image decision's logits differ from FP32 by {difference:.4}");
+    assert!(difference <= CARD_BOUND, "{card:?}");
+    let unloaded = wait_for_line(loaded, "d1: unloaded after");
+    assert_eq!(decide_card(), (card, tokens));
     wait_for_line(unloaded, "d1: loaded");
 
     // A reply request, and a pass longer than the context, are refused.
@@ -266,6 +384,7 @@ fn decisions_run_their_passes_and_return_their_logits() {
     let refused = worker::submit_decision(worker::DecisionRequest {
         model_index: 0,
         passes: vec![json_pass()],
+        media: Vec::new(),
         note: NOTE.into(),
     })
     .err();
