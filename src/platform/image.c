@@ -199,9 +199,107 @@ static Rgb decode(const void *bytes, size_t len, const char **err) {
   return r;
 }
 
+// Number of 8-bit channels in an RGB pixel, and bits per channel.
+static constexpr size_t RGB_CHANNELS = 3, RGB_CHANNEL_BITS = 8;
+
 uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height,
                           const char **err) {
   Rgb image = decode(data, len, err);
   *width = image.w, *height = image.h;
   return image.p;
+}
+
+// Validates dimensions and pixel pointer for encoding. Returns 0 with *err set
+// if invalid.
+static int check_encode_input(const uint8_t *pixels, int width, int height,
+                              const char **err) {
+  if (!pixels || width <= 0 || height <= 0) {
+    *err = "the image is empty";
+    return 0;
+  }
+  if ((double)width * height > BOMB) {
+    *err = "the image has more than 178,956,970 pixels";
+    return 0;
+  }
+  return 1;
+}
+
+uint8_t *image_encode_png(const uint8_t *pixels, int width, int height,
+                          size_t *length, const char **err) {
+  *length = 0;
+  *err = 0;
+  if (!check_encode_input(pixels, width, height, err)) return 0;
+  size_t row = (size_t)width * RGB_CHANNELS;
+  CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGDataProviderRef provider =
+      CGDataProviderCreateWithData(0, pixels, row * (size_t)height, 0);
+  CGImageRef image =
+      space && provider
+          ? CGImageCreate((size_t)width, (size_t)height, RGB_CHANNEL_BITS,
+                          RGB_CHANNEL_BITS * RGB_CHANNELS, row, space,
+                          (CGBitmapInfo)kCGImageAlphaNone, provider, 0, false,
+                          kCGRenderingIntentDefault)
+          : 0;
+  CFMutableDataRef file = image ? CFDataCreateMutable(0, 0) : 0;
+  CGImageDestinationRef dest =
+      file ? CGImageDestinationCreateWithData(file, CFSTR("public.png"), 1, 0)
+           : 0;
+  uint8_t *out = 0;
+  if (dest) {
+    CGImageDestinationAddImage(dest, image, 0);
+    if (CGImageDestinationFinalize(dest)) {
+      size_t n = (size_t)CFDataGetLength(file);
+      out = xmalloc(n);
+      memcpy(out, CFDataGetBytePtr(file), n);
+      *length = n;
+    }
+  }
+  if (!out) *err = "the PNG image could not be encoded";
+  if (dest) CFRelease(dest);
+  if (file) CFRelease(file);
+  if (image) CGImageRelease(image);
+  if (provider) CGDataProviderRelease(provider);
+  if (space) CGColorSpaceRelease(space);
+  return out;
+}
+
+uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,
+                           int quality, size_t *length, const char **err) {
+  *length = 0;
+  *err = 0;
+  if (!check_encode_input(pixels, width, height, err)) return 0;
+  if (quality < IMAGE_JPEG_QUALITY_MIN || quality > IMAGE_JPEG_QUALITY_MAX) {
+    *err = "the JPEG quality is out of range";
+    return 0;
+  }
+  struct jpeg_compress_struct c;
+  JpegErr je;
+  unsigned char *volatile file = 0;
+  unsigned long file_length = 0;
+  c.err = jpeg_std_error(&je.mgr);
+  je.mgr.error_exit = jpeg_fail;
+  if (setjmp(je.back)) {
+    jpeg_destroy_compress(&c);
+    free(file);
+    *err = "the JPEG image could not be encoded";
+    return 0;
+  }
+  jpeg_create_compress(&c);
+  jpeg_mem_dest(&c, (unsigned char **)&file, &file_length);
+  c.image_width = (JDIMENSION)width;
+  c.image_height = (JDIMENSION)height;
+  c.input_components = (int)RGB_CHANNELS;
+  c.in_color_space = JCS_RGB;
+  jpeg_set_defaults(&c);
+  jpeg_set_quality(&c, quality, TRUE);
+  jpeg_start_compress(&c, TRUE);
+  while (c.next_scanline < c.image_height) {
+    JSAMPROW row = (JSAMPROW)(pixels + (size_t)c.next_scanline * (size_t)width *
+                                           RGB_CHANNELS);
+    jpeg_write_scanlines(&c, &row, 1);
+  }
+  jpeg_finish_compress(&c);
+  jpeg_destroy_compress(&c);
+  *length = (size_t)file_length;
+  return file;
 }

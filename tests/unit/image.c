@@ -201,6 +201,45 @@ int main(void) {
   check(!pixels && error && !width && !height,
         "a broken JPEG file gives an error and no pixels");
 
+  // Encoding RGB pixels as PNG and JPEG, and rejecting invalid inputs.
+  size_t encoded_length = 0;
+  error = "unset";
+  uint8_t *encoded_png =
+      image_encode_png(&rgb[0][0][0], WIDTH, HEIGHT, &encoded_length, &error);
+  pixels = encoded_png ? decode(encoded_png, encoded_length, WIDTH, HEIGHT) : 0;
+  check(encoded_png && encoded_length > 8 &&
+            !memcmp(encoded_png, "\x89PNG\r\n\x1a\n", 8) && !error && pixels &&
+            !memcmp(pixels, rgb, sizeof rgb),
+        "encoded PNG bytes round-trip to the exact RGB pixels");
+  free(pixels);
+  free(encoded_png);
+
+  error = "unset";
+  uint8_t *encoded_jpeg =
+      image_encode_jpeg(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE,
+                        JPEG_DEFAULT_QUALITY, &encoded_length, &error);
+  jpeg = encode_jpeg(&smooth[0][0][0], JPEG_DEFAULT_QUALITY, 0, &jpeg_length);
+  pixels = encoded_jpeg
+               ? decode(encoded_jpeg, encoded_length, JPEG_SIDE, JPEG_SIDE)
+               : 0;
+  check(encoded_jpeg && !error && encoded_length == jpeg_length &&
+            !memcmp(encoded_jpeg, jpeg, jpeg_length) && pixels != 0,
+        "encoded JPEG bytes match libjpeg defaults and decode back");
+  free(pixels);
+  free(jpeg);
+  free(encoded_jpeg);
+
+  error = 0;
+  encoded_png =
+      image_encode_png(&rgb[0][0][0], 0, HEIGHT, &encoded_length, &error);
+  check(!encoded_png && !encoded_length && error,
+        "encoding an empty PNG gives an error");
+  error = 0;
+  encoded_jpeg = image_encode_jpeg(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE, 0,
+                                   &encoded_length, &error);
+  check(!encoded_jpeg && !encoded_length && error,
+        "encoding a JPEG with quality outside 1 to 100 gives an error");
+
   CGColorSpaceRelease(gray_space);
   CGColorSpaceRelease(srgb);
   return failures != 0;
