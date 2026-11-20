@@ -7,7 +7,8 @@
 #include <stdint.h>
 
 // MiniMax-H3-Image VAE: a 24-channel spatial-16x VAE with a 24-layer FP16 2D
-// ViT decoder and spatial tiling (256 px tiles, minimum 64 px linear overlap).
+// ViT decoder, a 6-level 3D causal CNN encoder (single-frame T=1), and spatial
+// tiling (256 px tiles, minimum 64 px linear overlap).
 
 // Number of channels in MiniMax-H3 image latents.
 static constexpr int MINIMAX_H3_VAE_LATENT_CHANNELS = 24;
@@ -63,6 +64,29 @@ uint64_t minimax_h3_image_vae_resident_bytes(const MinimaxH3ImageVae *vae);
 // Loads the VAE decoder weights into GPU memory if not already resident.
 // Returns 1 on success or 0 if memory did not fit or shutdown interrupted.
 int minimax_h3_image_vae_load(MinimaxH3ImageVae *vae);
+
+// Returns the VAE encoder's weight group.
+WeightGroup *minimax_h3_image_vae_encoder_weights(MinimaxH3ImageVae *vae);
+
+// Returns the GPU bytes required to keep the VAE encoder weights resident.
+uint64_t
+minimax_h3_image_vae_encoder_required_bytes(const MinimaxH3ImageVae *vae);
+
+// Returns the GPU bytes currently resident for the VAE encoder weights.
+uint64_t
+minimax_h3_image_vae_encoder_resident_bytes(const MinimaxH3ImageVae *vae);
+
+// Loads the single-frame VAE encoder weights into GPU memory if not already
+// resident. Returns 1 on success or 0 if memory did not fit or shutdown hit.
+int minimax_h3_image_vae_load_encoder(MinimaxH3ImageVae *vae);
+
+// Encodes interleaved 8-bit sRGB pixels [height, width, 3] (both positive
+// multiples of 16) into normalized channel-first FP32 latents
+// [24, height / 16, width / 16] in out_latents using spatial tiling and
+// deterministic posterior sampling (seed 42).
+// Returns 1 on success or 0 if loading or workspace allocation fails.
+int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
+                                int width, int height, float *out_latents);
 
 // Decodes normalized channel-first FP32 latents [24, h_lat, w_lat] into
 // interleaved 8-bit sRGB pixels [h_lat * 16, w_lat * 16, 3] in out_rgb.

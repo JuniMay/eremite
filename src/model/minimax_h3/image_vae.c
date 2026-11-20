@@ -23,10 +23,30 @@ static constexpr int VAE_TILE_SIZE = 256, VAE_TILE_OVERLAP_MIN = 64;
 static constexpr float VAE_NORM_EPS = 1e-5f;
 static constexpr double VAE_ROPE_THETA = 100.0;
 
+// 3D causal CNN encoder architecture constants (single-frame T=1).
+static constexpr int ENC_LEVELS = 6, ENC_BLOCKS_PER_LEVEL = 2,
+                     ENC_GN_GROUPS = 32,
+                     ENC_MOMENT_CH = 2 * MINIMAX_H3_VAE_LATENT_CHANNELS,
+                     ENC_BASE_CH = 128;
+
+// Encoder GroupNorm epsilon, posterior sampling seed and logvar clamp range.
+static constexpr float ENC_GN_EPS = 1e-6f, ENC_LOGVAR_MIN = -30.0f,
+                       ENC_LOGVAR_MAX = 20.0f;
+static constexpr uint64_t ENC_POSTERIOR_SEED = 42;
+
+// Cap on FP16 im2col staging elements (16384 x 1152 = 36 MiB) per conv strip.
+static constexpr size_t ENC_IM2COL_MAX_HALFS = 16384u * 1152u,
+                        ENC_IM2COL_MIN_HALFS = 256u * 9216u;
+
+// Channel counts and spatial downsampling flags for each encoder level.
+static const int ENC_CH[ENC_LEVELS] = {128, 256, 256, 512, 512, 1024};
+static const int ENC_SPACE_DOWN[ENC_LEVELS] = {2, 2, 2, 2, 1, 1};
+
 // Threadgroup and tile sizes matching src/kernels/minimax_h3_vae.metal.
 static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
                           NORM_THREADS = 256, EMBED_THREADS = 256,
-                          HEADS_THREADS = 32, ELEM_THREADS = 32;
+                          HEADS_THREADS = 32, ELEM_THREADS = 32,
+                          ADD_THREADS = 256;
 
 // Per-channel latent mean and standard deviation from MiniMax-H3-Image
 // vae/config.json.
@@ -116,6 +136,81 @@ typedef struct {
   uint32_t rows, padded;
 } VaeAttendParam;
 
+// Parameters passed to minimax_h3_groupnorm_silu.
+typedef struct {
+  // Spatial pixel count, channel count and group count.
+  uint32_t hw, channels, groups;
+  // GroupNorm epsilon.
+  float eps;
+} GroupNormParam;
+
+// Parameters passed to minimax_h3_im2col_f16.
+typedef struct {
+  // Input spatial height, width and channels.
+  uint32_t in_h, in_w, cin;
+  // Output width, starting output row and strip height.
+  uint32_t out_w, out_y0, strip_h;
+  // Kernel side (1 or 3), spatial stride, top/left pad and padded K width.
+  uint32_t ksize, stride, pad_t, pad_l, k_padded;
+} Im2ColParam;
+
+// Parameters for generating a padded 2D FP16 weight matrix from a 5D Conv3d
+// checkpoint tensor by slicing its last temporal tap (t = kT - 1).
+typedef struct {
+  // Source 5D F16 Conv3d weight tensor [cout, cin, kt, ksize, ksize].
+  Tensor tensor;
+  // Output channels, input channels, temporal kernel size and spatial side.
+  int cout, cin, kt, ksize;
+  // Output channels and inner K padded to multiples of 64.
+  int cout_padded, k_padded;
+} EncConvWeightParam;
+
+// One single-frame 2D convolution extracted from a CausalConv3d / Conv3d layer.
+typedef struct {
+  // Padded FP16 weight matrix [cout_padded, k_padded] in tap-major NHWC layout.
+  Buf w;
+  // FP32 bias vector [cout].
+  Buf bias;
+  // Input channels, output channels, spatial kernel side (1 or 3) and padded K.
+  int cin, cout, ksize, k_padded;
+  // Spatial stride (1 or 2) and top/left reflect padding (0 or 1).
+  int stride, pad;
+} EncConv;
+
+// Weights for one encoder ResnetBlock3D (single-frame T=1).
+typedef struct {
+  // Pre-conv1 GroupNorm weight and bias (FP32, cin).
+  Buf norm1_w, norm1_b;
+  // Pre-conv2 GroupNorm weight and bias (FP32, cout).
+  Buf norm2_w, norm2_b;
+  // First and second 3x3 convolutions.
+  EncConv conv1, conv2;
+  // Optional 1x1 channel-change shortcut convolution.
+  EncConv shortcut;
+  // Non-zero when cin != cout and shortcut is present.
+  int has_shortcut;
+} EncResBlock;
+
+// Weights for one encoder resolution level.
+typedef struct {
+  // Two residual blocks at this resolution.
+  EncResBlock blocks[ENC_BLOCKS_PER_LEVEL];
+  // Optional stride-2 spatial downsampling convolution.
+  EncConv downsample;
+  // Non-zero when this level downsamples spatially by 2x.
+  int has_downsample;
+} EncLevel;
+
+// Transient workspace buffers reused across all tiles of one encode call.
+typedef struct {
+  // Three ping-pong NHWC FP32 activation buffers sized for level 0.
+  Buf a, b, c;
+  // Padded FP16 im2col staging buffer.
+  Buf im2col;
+  // Capacity of im2col in 16-bit half elements.
+  size_t im2col_halfs;
+} EncWorkspace;
+
 // One FP16 linear projection with FP32 bias.
 typedef struct {
   // FP16 weight matrix (n by k), sector-aligned.
@@ -170,6 +265,8 @@ struct MinimaxH3ImageVae {
   TensorIndex *tensors;
   // Full-residence weight group for all 2D ViT decoder weights.
   WeightGroup *weights;
+  // Full-residence weight group for single-frame 3D causal CNN encoder weights.
+  WeightGroup *enc_weights;
   // post_quant_conv (24x24) and x_embedder (1024x24) weights and biases (FP32).
   Buf pqc_w, pqc_b, emb_w, emb_b;
   // Learned register tokens (FP32, 4 by 1024) and 2D RoPE frequencies (FP32,
@@ -179,10 +276,19 @@ struct MinimaxH3ImageVae {
   VaeBlock blocks[VAE_LAYERS];
   // Final LayerNorm (FP32, 1024) and patch output projection (768 by 1024).
   Buf norm_out_w, norm_out_b;
+  // Patch projection from decoder width to 16x16 RGB patch outputs.
   F16Lin proj_out;
-  // Compiled Metal kernel indices.
-  int k_x_f16, k_mm_f16, k_rmsnorm, k_add_scaled, k_swiglu_chunked;
-  int k_layernorm, k_embed, k_heads, k_attend;
+  // Single-frame encoder input conv, 6 levels, final norm/conv and quant_conv.
+  EncConv enc_conv_in;
+  // Six encoder resolution levels.
+  EncLevel enc_levels[ENC_LEVELS];
+  // Encoder output GroupNorm weights and biases (FP32, 1024).
+  Buf enc_norm_out_w, enc_norm_out_b;
+  // Encoder output conv (1024 -> 48) and 1x1 quant_conv (48 -> 48).
+  EncConv enc_conv_out, enc_quant_conv;
+  // Compiled Metal kernel indices for decoder and encoder ops.
+  int k_x_f16, k_mm_f16, k_rmsnorm, k_add_scaled, k_swiglu_chunked, k_layernorm,
+      k_embed, k_heads, k_attend, k_add, k_groupnorm_silu, k_im2col_f16;
 };
 
 // Generates the 8 FP32 per-axis inverse frequencies 100^(-k / 8) for 2D RoPE.
@@ -192,6 +298,79 @@ static void fill_vae_inv_freq(Buf *buffer, const void *context) {
   for (int i = 0; i < VAE_ROPE_FREQS; i++)
     out[i] =
         (float)(1.0 / pow(VAE_ROPE_THETA, (double)i / (double)VAE_ROPE_FREQS));
+}
+
+// Extracts the last temporal slice (t = kt - 1) of a 5D F16 Conv3d weight
+// tensor [cout, cin, kt, ksize, ksize] and writes a padded 2D FP16 matrix
+// [cout_padded, k_padded] in tap-major NHWC order (ky, kx, ci).
+static void fill_enc_conv_weight(Buf *buffer, const void *context) {
+  const EncConvWeightParam *p = context;
+  uint16_t *raw = xmalloc(p->tensor.size);
+  minimax_h3_read_tensor_bytes(p->tensor, raw);
+  size_t out_bytes =
+      (size_t)p->cout_padded * (size_t)p->k_padded * sizeof(uint16_t);
+  memset(buffer->ptr, 0, out_bytes);
+  uint16_t *dst = (uint16_t *)buffer->ptr;
+  int t_last = p->kt - 1;
+  for (int co = 0; co < p->cout; co++) {
+    uint16_t *drow = dst + (size_t)co * (size_t)p->k_padded;
+    for (int ci = 0; ci < p->cin; ci++) {
+      for (int ky = 0; ky < p->ksize; ky++) {
+        for (int kx = 0; kx < p->ksize; kx++) {
+          size_t sidx =
+              (((((size_t)co * (size_t)p->cin + (size_t)ci) * (size_t)p->kt +
+                 (size_t)t_last) *
+                    (size_t)p->ksize +
+                (size_t)ky) *
+                   (size_t)p->ksize +
+               (size_t)kx);
+          size_t didx =
+              (size_t)(ky * p->ksize + kx) * (size_t)p->cin + (size_t)ci;
+          drow[didx] = raw[sidx];
+        }
+      }
+    }
+  }
+  free(raw);
+}
+
+// Registers one single-frame encoder convolution (5D F16 weight + 1D F16 bias)
+// into group.
+static void add_enc_conv(WeightGroup *group, const TensorIndex *tensors,
+                         EncConv *conv, int cin, int cout, int ksize,
+                         int stride, int pad, const char *prefix) {
+  Tensor w = tensor_index_get(tensors, "%s.weight", prefix);
+  Tensor b = tensor_index_get(tensors, "%s.bias", prefix);
+  int kt = ksize;
+  if (w.dtype != 'h' || w.ndim != 5 || w.shape[0] != cout ||
+      w.shape[1] != cin || w.shape[2] != kt || w.shape[3] != ksize ||
+      w.shape[4] != ksize)
+    die("unexpected encoder conv weight shape for %s", prefix);
+  if (b.dtype != 'h' || b.ndim != 1 || b.shape[0] != cout)
+    die("unexpected encoder conv bias shape for %s", prefix);
+  int cout_padded = (cout + (int)TILE_N - 1) / (int)TILE_N * (int)TILE_N;
+  int k_raw = ksize * ksize * cin;
+  int k_padded = (k_raw + (int)TILE_N - 1) / (int)TILE_N * (int)TILE_N;
+  conv->cin = cin;
+  conv->cout = cout;
+  conv->ksize = ksize;
+  conv->k_padded = k_padded;
+  conv->stride = stride;
+  conv->pad = pad;
+  EncConvWeightParam param = {
+      .tensor = w,
+      .cout = cout,
+      .cin = cin,
+      .kt = kt,
+      .ksize = ksize,
+      .cout_padded = cout_padded,
+      .k_padded = k_padded,
+  };
+  weight_group_add_generated(group, &conv->w,
+                             (size_t)cout_padded * (size_t)k_padded *
+                                 sizeof(uint16_t),
+                             fill_enc_conv_weight, &param, sizeof param);
+  weight_group_add_vector(group, &conv->bias, b, 0.0f, 0);
 }
 
 // Registers an FP16 linear projection (weight + bias) into group.
@@ -252,6 +431,8 @@ MinimaxH3ImageVae *minimax_h3_image_vae_open(Gpu *gpu, MemoryAccount *account,
                    "minimax-h3-vae-workspace", NULL, NULL);
   vae->tensors = tensor_index_open_file(weights_path);
   vae->weights = weight_group_new(gpu, account, "minimax-h3-image-vae-decoder");
+  vae->enc_weights =
+      weight_group_new(gpu, account, "minimax-h3-image-vae-encoder");
 
   vae->k_x_f16 = gpu_find_kernel(gpu, "minimax_h3_x_f16");
   vae->k_mm_f16 = gpu_find_kernel(gpu, "minimax_h3_mm_f16");
@@ -262,6 +443,9 @@ MinimaxH3ImageVae *minimax_h3_image_vae_open(Gpu *gpu, MemoryAccount *account,
   vae->k_embed = gpu_find_kernel(gpu, "minimax_h3_vae_embed");
   vae->k_heads = gpu_find_kernel(gpu, "minimax_h3_vae_heads");
   vae->k_attend = gpu_find_kernel(gpu, "minimax_h3_vae_attend");
+  vae->k_add = gpu_find_kernel(gpu, "minimax_h3_add");
+  vae->k_groupnorm_silu = gpu_find_kernel(gpu, "minimax_h3_groupnorm_silu");
+  vae->k_im2col_f16 = gpu_find_kernel(gpu, "minimax_h3_im2col_f16");
 
   // Small embedding matrices and register tokens are stored as FP32 vectors.
   Tensor pqc_w = tensor_index_get(vae->tensors, "post_quant_conv.weight");
@@ -331,11 +515,78 @@ MinimaxH3ImageVae *minimax_h3_image_vae_open(Gpu *gpu, MemoryAccount *account,
       tensor_index_get(vae->tensors, "decoder.norm_out.bias"), 0.0f, 0);
   add_f16_lin(vae->weights, vae->tensors, &vae->proj_out, VAE_PATCH_OUT,
               VAE_DIM, "decoder.proj_out");
+
+  // Single-frame 3D causal CNN encoder weights (loaded on demand for edits).
+  add_enc_conv(vae->enc_weights, vae->tensors, &vae->enc_conv_in, 3,
+               ENC_BASE_CH, 3, 1, 1, "encoder.conv_in");
+  for (int lv = 0; lv < ENC_LEVELS; lv++) {
+    EncLevel *el = &vae->enc_levels[lv];
+    int c_in_lv = lv == 0 ? ENC_CH[0] : ENC_CH[lv - 1];
+    int c_out_lv = ENC_CH[lv];
+    for (int bi = 0; bi < ENC_BLOCKS_PER_LEVEL; bi++) {
+      EncResBlock *rb = &el->blocks[bi];
+      int cin = bi == 0 ? c_in_lv : c_out_lv;
+      int cout = c_out_lv;
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm1_w,
+          tensor_index_get(vae->tensors,
+                           "encoder.down.%d.block.%d.norm1.weight", lv, bi),
+          0.0f, 0);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm1_b,
+          tensor_index_get(vae->tensors, "encoder.down.%d.block.%d.norm1.bias",
+                           lv, bi),
+          0.0f, 0);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm2_w,
+          tensor_index_get(vae->tensors,
+                           "encoder.down.%d.block.%d.norm2.weight", lv, bi),
+          0.0f, 0);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm2_b,
+          tensor_index_get(vae->tensors, "encoder.down.%d.block.%d.norm2.bias",
+                           lv, bi),
+          0.0f, 0);
+      char name[128];
+      snprintf(name, sizeof name, "encoder.down.%d.block.%d.conv1", lv, bi);
+      add_enc_conv(vae->enc_weights, vae->tensors, &rb->conv1, cin, cout, 3, 1,
+                   1, name);
+      snprintf(name, sizeof name, "encoder.down.%d.block.%d.conv2", lv, bi);
+      add_enc_conv(vae->enc_weights, vae->tensors, &rb->conv2, cout, cout, 3, 1,
+                   1, name);
+      rb->has_shortcut = (cin != cout);
+      if (rb->has_shortcut) {
+        snprintf(name, sizeof name, "encoder.down.%d.block.%d.nin_shortcut", lv,
+                 bi);
+        add_enc_conv(vae->enc_weights, vae->tensors, &rb->shortcut, cin, cout,
+                     1, 1, 0, name);
+      }
+    }
+    el->has_downsample = (ENC_SPACE_DOWN[lv] > 1);
+    if (el->has_downsample) {
+      char name[128];
+      snprintf(name, sizeof name, "encoder.down.%d.downsample.conv", lv);
+      add_enc_conv(vae->enc_weights, vae->tensors, &el->downsample, c_out_lv,
+                   c_out_lv, 3, 2, 0, name);
+    }
+  }
+  weight_group_add_vector(
+      vae->enc_weights, &vae->enc_norm_out_w,
+      tensor_index_get(vae->tensors, "encoder.norm_out.weight"), 0.0f, 0);
+  weight_group_add_vector(
+      vae->enc_weights, &vae->enc_norm_out_b,
+      tensor_index_get(vae->tensors, "encoder.norm_out.bias"), 0.0f, 0);
+  add_enc_conv(vae->enc_weights, vae->tensors, &vae->enc_conv_out,
+               ENC_CH[ENC_LEVELS - 1], ENC_MOMENT_CH, 3, 1, 1,
+               "encoder.conv_out");
+  add_enc_conv(vae->enc_weights, vae->tensors, &vae->enc_quant_conv,
+               ENC_MOMENT_CH, ENC_MOMENT_CH, 1, 1, 0, "quant_conv");
   return vae;
 }
 
 void minimax_h3_image_vae_close(MinimaxH3ImageVae *vae) {
   if (!vae) return;
+  weight_group_free(vae->enc_weights);
   weight_group_free(vae->weights);
   memory_slot_remove(&vae->workspace_slot);
   tensor_index_close(vae->tensors);
@@ -362,6 +613,24 @@ uint64_t minimax_h3_image_vae_resident_bytes(const MinimaxH3ImageVae *vae) {
 
 int minimax_h3_image_vae_load(MinimaxH3ImageVae *vae) {
   return weight_group_load(vae->weights);
+}
+
+WeightGroup *minimax_h3_image_vae_encoder_weights(MinimaxH3ImageVae *vae) {
+  return vae->enc_weights;
+}
+
+uint64_t
+minimax_h3_image_vae_encoder_required_bytes(const MinimaxH3ImageVae *vae) {
+  return weight_group_required_bytes(vae->enc_weights);
+}
+
+uint64_t
+minimax_h3_image_vae_encoder_resident_bytes(const MinimaxH3ImageVae *vae) {
+  return weight_group_resident_bytes(vae->enc_weights);
+}
+
+int minimax_h3_image_vae_load_encoder(MinimaxH3ImageVae *vae) {
+  return weight_group_load(vae->enc_weights);
 }
 
 // Frees all transient GPU buffers of a decode workspace.
@@ -766,5 +1035,373 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
     }
   }
   free(canvas);
+  return 1;
+}
+
+// Deterministic SplitMix64 generator for posterior latent sampling.
+static uint64_t enc_splitmix64_next(uint64_t *state) {
+  uint64_t z = (*state += 0x9e3779b97f4a7c15ull);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+
+// Fills count floats with standard normal N(0, 1) draws via Box-Muller.
+static void enc_fill_gaussian(float *out, size_t count, uint64_t seed) {
+  uint64_t state = seed;
+  static constexpr double TWO_PI = 6.28318530717958647692;
+  static constexpr double INV_2_53 = 1.0 / 9007199254740992.0;
+  for (size_t i = 0; i < count; i += 2) {
+    double u1 = ((double)(enc_splitmix64_next(&state) >> 11) + 0.5) * INV_2_53;
+    double u2 = (double)(enc_splitmix64_next(&state) >> 11) * INV_2_53;
+    double r = sqrt(-2.0 * log(u1));
+    double theta = TWO_PI * u2;
+    out[i] = (float)(r * cos(theta));
+    if (i + 1 < count) out[i + 1] = (float)(r * sin(theta));
+  }
+}
+
+// Frees all transient GPU buffers of an encoder workspace.
+static void free_enc_workspace(EncWorkspace *ws) {
+  gpu_free(&ws->im2col);
+  gpu_free(&ws->c);
+  gpu_free(&ws->b);
+  gpu_free(&ws->a);
+}
+
+// Allocates transient GPU buffers for single-frame encoder tiles up to
+// max_tile_h by max_tile_w pixels.
+static int alloc_enc_workspace(MinimaxH3ImageVae *vae, int max_tile_h,
+                               int max_tile_w, EncWorkspace *ws) {
+  memset(ws, 0, sizeof *ws);
+  size_t act_bytes = (size_t)max_tile_h * (size_t)max_tile_w *
+                     (size_t)ENC_BASE_CH * sizeof(float);
+  size_t wanted_halfs =
+      (size_t)max_tile_h * (size_t)max_tile_w * 9u * (size_t)ENC_BASE_CH;
+  if (wanted_halfs < ENC_IM2COL_MIN_HALFS) wanted_halfs = ENC_IM2COL_MIN_HALFS;
+  if (wanted_halfs > ENC_IM2COL_MAX_HALFS) wanted_halfs = ENC_IM2COL_MAX_HALFS;
+  ws->im2col_halfs = wanted_halfs;
+
+  MemorySlot *slot = &vae->workspace_slot;
+  ws->a = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
+  ws->b = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
+  ws->c = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
+  ws->im2col =
+      gpu_try_alloc_required(vae->gpu, slot, wanted_halfs * sizeof(uint16_t));
+  if (!ws->a.obj || !ws->b.obj || !ws->c.obj || !ws->im2col.obj) {
+    free_enc_workspace(ws);
+    return 0;
+  }
+  return 1;
+}
+
+// Encodes fused NHWC GroupNorm(32, channels, eps=1e-6) + SiLU.
+static void run_enc_gn_silu(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
+                            const Buf *x, const Buf *w, const Buf *b,
+                            const Buf *y, int h, int w_px, int channels) {
+  GroupNormParam p = {(uint32_t)(h * w_px), (uint32_t)channels,
+                      (uint32_t)ENC_GN_GROUPS, ENC_GN_EPS};
+  gpu_select_kernel(cmd, vae->k_groupnorm_silu);
+  gpu_bind_buffer(cmd, 0, x, 0);
+  gpu_bind_buffer(cmd, 1, w, 0);
+  gpu_bind_buffer(cmd, 2, b, 0);
+  gpu_bind_buffer(cmd, 3, y, 0);
+  gpu_copy_bytes(cmd, 4, &p, sizeof p);
+  gpu_run_kernel(cmd, (uint32_t)ENC_GN_GROUPS, 1, 1, NORM_THREADS, 1, 1);
+}
+
+// Encodes a single-frame 2D convolution via strip-chunked FP16 im2col + matmul.
+static void run_enc_conv(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
+                         const EncWorkspace *ws, const Buf *x,
+                         const EncConv *conv, const Buf *y, int in_h,
+                         int in_w) {
+  int out_h = in_h / conv->stride, out_w = in_w / conv->stride;
+  size_t max_rows = ws->im2col_halfs / (size_t)conv->k_padded;
+  size_t max_padded_rows = (max_rows / TILE_M) * TILE_M;
+  int strip_h = (int)(max_padded_rows / (size_t)out_w);
+  if (strip_h < 1) strip_h = 1;
+  if (strip_h > out_h) strip_h = out_h;
+
+  for (int y0 = 0; y0 < out_h; y0 += strip_h) {
+    int sh = out_h - y0 < strip_h ? out_h - y0 : strip_h;
+    uint32_t m = (uint32_t)(sh * out_w);
+    uint32_t padded_m = (m + TILE_M - 1) / TILE_M * TILE_M;
+    Im2ColParam ip = {
+        (uint32_t)in_h,
+        (uint32_t)in_w,
+        (uint32_t)conv->cin,
+        (uint32_t)out_w,
+        (uint32_t)y0,
+        (uint32_t)sh,
+        (uint32_t)conv->ksize,
+        (uint32_t)conv->stride,
+        (uint32_t)conv->pad,
+        (uint32_t)conv->pad,
+        (uint32_t)conv->k_padded,
+    };
+    gpu_select_kernel(cmd, vae->k_im2col_f16);
+    gpu_bind_buffer(cmd, 0, x, 0);
+    gpu_bind_buffer(cmd, 1, &ws->im2col, 0);
+    gpu_copy_bytes(cmd, 2, &ip, sizeof ip);
+    gpu_run_kernel(cmd,
+                   ((uint32_t)conv->k_padded + ELEM_THREADS - 1) / ELEM_THREADS,
+                   padded_m, 1, ELEM_THREADS, 1, 1);
+
+    F16MMParam mp = {m, (uint32_t)conv->cout, (uint32_t)conv->k_padded,
+                     (uint32_t)conv->cout, 1};
+    size_t y_off =
+        (size_t)y0 * (size_t)out_w * (size_t)conv->cout * sizeof(float);
+    gpu_select_kernel(cmd, vae->k_mm_f16);
+    gpu_bind_buffer(cmd, 0, &conv->w, 0);
+    gpu_bind_buffer(cmd, 1, &ws->im2col, 0);
+    gpu_bind_buffer(cmd, 2, &conv->bias, 0);
+    gpu_bind_buffer(cmd, 3, y, y_off);
+    gpu_copy_bytes(cmd, 4, &mp, sizeof mp);
+    gpu_run_kernel(cmd, ((uint32_t)conv->cout + TILE_N - 1) / TILE_N,
+                   padded_m / TILE_M, 1, MM_THREADS, 1, 1);
+  }
+}
+
+// Encodes in-place elementwise addition dst[i] += src[i] over count floats.
+static void run_enc_add(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
+                        const Buf *dst, const Buf *src, uint32_t count) {
+  gpu_select_kernel(cmd, vae->k_add);
+  gpu_bind_buffer(cmd, 0, dst, 0);
+  gpu_bind_buffer(cmd, 1, src, 0);
+  gpu_copy_bytes(cmd, 2, &count, sizeof count);
+  gpu_run_kernel(cmd, (count + ADD_THREADS - 1) / ADD_THREADS, 1, 1,
+                 ADD_THREADS, 1, 1);
+}
+
+// Runs the single-frame 3D causal CNN encoder + quant_conv on one RGB tile
+// [tile_h, tile_w, 3] and writes channel-first FP32 moments [48, h_lat, w_lat].
+static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
+                            const uint8_t *rgb, int full_w, int y0, int x0,
+                            int tile_h, int tile_w, float *out_moments) {
+  // Normalize tile RGB pixels into NHWC FP32 in ws->b.
+  float *in_px = (float *)ws->b.ptr;
+  for (int y = 0; y < tile_h; y++) {
+    const uint8_t *srow =
+        rgb + ((size_t)(y0 + y) * (size_t)full_w + (size_t)x0) * 3u;
+    float *drow = in_px + (size_t)y * (size_t)tile_w * 3u;
+    for (int x = 0; x < tile_w; x++) {
+      for (int c = 0; c < 3; c++) {
+        float p = (float)srow[x * 3 + c] * (1.0f / 255.0f);
+        drow[x * 3 + c] = (p - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+      }
+    }
+  }
+
+  const Buf *cur = &ws->a, *alt = &ws->b, *tmp = &ws->c;
+  int h = tile_h, w = tile_w;
+  GpuCommandBuffer cmd = gpu_begin(vae->gpu);
+  run_enc_conv(vae, &cmd, ws, alt, &vae->enc_conv_in, cur, h, w);
+  gpu_commit(&cmd);
+  uint64_t prev_cmd = cmd.number;
+
+  for (int lv = 0; lv < ENC_LEVELS; lv++) {
+    const EncLevel *el = &vae->enc_levels[lv];
+    cmd = gpu_begin(vae->gpu);
+    for (int bi = 0; bi < ENC_BLOCKS_PER_LEVEL; bi++) {
+      const EncResBlock *rb = &el->blocks[bi];
+      run_enc_gn_silu(vae, &cmd, cur, &rb->norm1_w, &rb->norm1_b, tmp, h, w,
+                      rb->conv1.cin);
+      run_enc_conv(vae, &cmd, ws, tmp, &rb->conv1, alt, h, w);
+      if (rb->has_shortcut) {
+        run_enc_conv(vae, &cmd, ws, cur, &rb->shortcut, tmp, h, w);
+        run_enc_gn_silu(vae, &cmd, alt, &rb->norm2_w, &rb->norm2_b, cur, h, w,
+                        rb->conv2.cin);
+        run_enc_conv(vae, &cmd, ws, cur, &rb->conv2, alt, h, w);
+        run_enc_add(vae, &cmd, alt, tmp,
+                    (uint32_t)((size_t)h * (size_t)w * (size_t)rb->conv2.cout));
+      } else {
+        run_enc_gn_silu(vae, &cmd, alt, &rb->norm2_w, &rb->norm2_b, tmp, h, w,
+                        rb->conv2.cin);
+        run_enc_conv(vae, &cmd, ws, tmp, &rb->conv2, alt, h, w);
+        run_enc_add(vae, &cmd, alt, cur,
+                    (uint32_t)((size_t)h * (size_t)w * (size_t)rb->conv2.cout));
+      }
+      const Buf *swap = cur;
+      cur = alt;
+      alt = swap;
+    }
+    if (el->has_downsample) {
+      run_enc_conv(vae, &cmd, ws, cur, &el->downsample, alt, h, w);
+      h /= 2;
+      w /= 2;
+      const Buf *swap = cur;
+      cur = alt;
+      alt = swap;
+    }
+    gpu_commit(&cmd);
+    minimax_h3_gpu_wait(vae->gpu, prev_cmd);
+    prev_cmd = cmd.number;
+  }
+
+  cmd = gpu_begin(vae->gpu);
+  run_enc_gn_silu(vae, &cmd, cur, &vae->enc_norm_out_w, &vae->enc_norm_out_b,
+                  tmp, h, w, ENC_CH[ENC_LEVELS - 1]);
+  run_enc_conv(vae, &cmd, ws, tmp, &vae->enc_conv_out, alt, h, w);
+  run_enc_conv(vae, &cmd, ws, alt, &vae->enc_quant_conv, cur, h, w);
+  gpu_commit(&cmd);
+  minimax_h3_gpu_wait(vae->gpu, prev_cmd);
+  minimax_h3_gpu_wait(vae->gpu, cmd.number);
+
+  // Transpose NHWC [h * w, 48] -> channel-first [48, h, w].
+  const float *src = (const float *)cur->ptr;
+  size_t plane = (size_t)h * (size_t)w;
+  for (size_t p = 0; p < plane; p++) {
+    const float *pix = src + p * (size_t)ENC_MOMENT_CH;
+    for (int c = 0; c < ENC_MOMENT_CH; c++)
+      out_moments[(size_t)c * plane + p] = pix[c];
+  }
+}
+
+int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
+                                int width, int height, float *out_latents) {
+  if (width <= 0 || height <= 0 || width % MINIMAX_H3_VAE_SPATIAL_RATIO != 0 ||
+      height % MINIMAX_H3_VAE_SPATIAL_RATIO != 0 || !rgb || !out_latents)
+    die("invalid VAE encode arguments");
+  if (!minimax_h3_image_vae_load_encoder(vae)) return 0;
+
+  MinimaxH3VaeTilePlan y_plan = minimax_h3_image_vae_split_tiles(height);
+  MinimaxH3VaeTilePlan x_plan = minimax_h3_image_vae_split_tiles(width);
+  int max_tile_h = 0, max_tile_w = 0;
+  for (int i = 0; i < y_plan.count; i++)
+    if (y_plan.len[i] > max_tile_h) max_tile_h = y_plan.len[i];
+  for (int j = 0; j < x_plan.count; j++)
+    if (x_plan.len[j] > max_tile_w) max_tile_w = x_plan.len[j];
+
+  MemorySlot *wslot = weight_group_slot(vae->enc_weights);
+  memory_pin(wslot, 1);
+  EncWorkspace ws;
+  if (!alloc_enc_workspace(vae, max_tile_h, max_tile_w, &ws)) {
+    memory_pin(wslot, 0);
+    return 0;
+  }
+
+  // Encode all tiles into raw [48, th_lat, tw_lat] buffers so blending matches
+  // tiled_encode's raw-neighbor blend order.
+  int total_tiles = y_plan.count * x_plan.count;
+  float **raw_tiles = xmalloc((size_t)total_tiles * sizeof *raw_tiles);
+  for (int i = 0; i < y_plan.count; i++) {
+    int th_lat = y_plan.len[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+    for (int j = 0; j < x_plan.count; j++) {
+      int tw_lat = x_plan.len[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+      size_t floats = (size_t)ENC_MOMENT_CH * (size_t)th_lat * (size_t)tw_lat;
+      float *buf = xmalloc(floats * sizeof(float));
+      encode_one_tile(vae, &ws, rgb, width, y_plan.start[i], x_plan.start[j],
+                      y_plan.len[i], x_plan.len[j], buf);
+      raw_tiles[i * x_plan.count + j] = buf;
+    }
+  }
+
+  free_enc_workspace(&ws);
+  memory_pin(wslot, 0);
+  memory_touch(wslot);
+
+  // Blend tile overlaps along height then width, trim trailing overlaps, and
+  // assemble full moments [48, h_lat, w_lat].
+  int h_lat = height / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int w_lat = width / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  size_t full_plane = (size_t)h_lat * (size_t)w_lat;
+  float *moments = xmalloc((size_t)ENC_MOMENT_CH * full_plane * sizeof(float));
+  size_t max_tile_floats = (size_t)ENC_MOMENT_CH *
+                           (size_t)(max_tile_h / MINIMAX_H3_VAE_SPATIAL_RATIO) *
+                           (size_t)(max_tile_w / MINIMAX_H3_VAE_SPATIAL_RATIO);
+  float *blended = xmalloc(max_tile_floats * sizeof(float));
+
+  int out_y = 0;
+  for (int i = 0; i < y_plan.count; i++) {
+    int th = y_plan.len[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+    int ov_top =
+        i > 0 ? y_plan.overlap[i - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+    int ov_bot = i < y_plan.count - 1
+                     ? y_plan.overlap[i] / MINIMAX_H3_VAE_SPATIAL_RATIO
+                     : 0;
+    int keep_h = th - ov_bot;
+    int out_x = 0;
+    for (int j = 0; j < x_plan.count; j++) {
+      int tw = x_plan.len[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+      int ov_left =
+          j > 0 ? x_plan.overlap[j - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+      int ov_right = j < x_plan.count - 1
+                         ? x_plan.overlap[j] / MINIMAX_H3_VAE_SPATIAL_RATIO
+                         : 0;
+      int keep_w = tw - ov_right;
+      size_t tplane = (size_t)th * (size_t)tw;
+      memcpy(blended, raw_tiles[i * x_plan.count + j],
+             (size_t)ENC_MOMENT_CH * tplane * sizeof(float));
+
+      if (ov_top > 0) {
+        const float *above = raw_tiles[(i - 1) * x_plan.count + j];
+        int ah = y_plan.len[i - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+        size_t aplane = (size_t)ah * (size_t)tw;
+        for (int c = 0; c < ENC_MOMENT_CH; c++) {
+          float *tp = blended + (size_t)c * tplane;
+          const float *ap = above + (size_t)c * aplane;
+          for (int y = 0; y < ov_top; y++) {
+            float wb = (float)y / (float)ov_top, wa = 1.0f - wb;
+            float *trow = tp + (size_t)y * (size_t)tw;
+            const float *arow = ap + (size_t)(ah - ov_top + y) * (size_t)tw;
+            for (int x = 0; x < tw; x++) trow[x] = arow[x] * wa + trow[x] * wb;
+          }
+        }
+      }
+      if (ov_left > 0) {
+        const float *left = raw_tiles[i * x_plan.count + (j - 1)];
+        int lw = x_plan.len[j - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+        size_t lplane = (size_t)th * (size_t)lw;
+        for (int c = 0; c < ENC_MOMENT_CH; c++) {
+          float *tp = blended + (size_t)c * tplane;
+          const float *lp = left + (size_t)c * lplane;
+          for (int y = 0; y < th; y++) {
+            float *trow = tp + (size_t)y * (size_t)tw;
+            const float *lrow = lp + (size_t)y * (size_t)lw + (lw - ov_left);
+            for (int x = 0; x < ov_left; x++) {
+              float wb = (float)x / (float)ov_left, wa = 1.0f - wb;
+              trow[x] = lrow[x] * wa + trow[x] * wb;
+            }
+          }
+        }
+      }
+
+      for (int c = 0; c < ENC_MOMENT_CH; c++) {
+        const float *tp = blended + (size_t)c * tplane;
+        float *mp = moments + (size_t)c * full_plane;
+        for (int y = 0; y < keep_h; y++)
+          memcpy(mp + (size_t)(out_y + y) * (size_t)w_lat + (size_t)out_x,
+                 tp + (size_t)y * (size_t)tw, (size_t)keep_w * sizeof(float));
+      }
+      out_x += keep_w;
+    }
+    out_y += keep_h;
+  }
+
+  for (int t = 0; t < total_tiles; t++) free(raw_tiles[t]);
+  free(raw_tiles);
+  free(blended);
+
+  // Sample posterior with fixed seed 42 and normalize to unit latent scale.
+  size_t lat_floats = (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * full_plane;
+  float *noise = xmalloc(lat_floats * sizeof(float));
+  enc_fill_gaussian(noise, lat_floats, ENC_POSTERIOR_SEED);
+  for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+    const float *mean_c = moments + (size_t)c * full_plane;
+    const float *lv_c =
+        moments + (size_t)(c + MINIMAX_H3_VAE_LATENT_CHANNELS) * full_plane;
+    const float *n_c = noise + (size_t)c * full_plane;
+    float *out_c = out_latents + (size_t)c * full_plane;
+    float lm = LATENTS_MEAN[c], inv_ls = 1.0f / LATENTS_STD[c];
+    for (size_t p = 0; p < full_plane; p++) {
+      float lv = lv_c[p];
+      if (lv < ENC_LOGVAR_MIN) lv = ENC_LOGVAR_MIN;
+      if (lv > ENC_LOGVAR_MAX) lv = ENC_LOGVAR_MAX;
+      float lat = mean_c[p] + expf(0.5f * lv) * n_c[p];
+      out_c[p] = (lat - lm) * inv_ls;
+    }
+  }
+  free(noise);
+  free(moments);
   return 1;
 }

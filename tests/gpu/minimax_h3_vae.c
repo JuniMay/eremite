@@ -13,8 +13,8 @@
 
 // 2D ViT decoder geometry matching src/kernels/minimax_h3_vae.metal.
 static constexpr int LATENT_CH = 24, VAE_DIM = 1024, HEADS = 16, HEAD_DIM = 64,
-                     HALF_HEAD = HEAD_DIM / 2, ROT_PAIRS = 16,
-                     FREQ_PER_AXIS = 8, REGISTERS = 4, SUFFIX = REGISTERS + 1;
+                     ROT_PAIRS = 16, FREQ_PER_AXIS = 8, REGISTERS = 4,
+                     SUFFIX = REGISTERS + 1;
 
 // Tile padding, threadgroup sizes and tolerances.
 static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
@@ -502,6 +502,189 @@ static void test_vae_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&qkv);
 }
 
+// Parameters passed to minimax_h3_groupnorm_silu.
+typedef struct {
+  // Spatial pixel count, channels and group count.
+  uint32_t hw, channels, groups;
+  // Normalization epsilon.
+  float eps;
+} GroupNormParam;
+
+// Parameters passed to minimax_h3_im2col_f16.
+typedef struct {
+  // Input spatial height, width and channels.
+  uint32_t in_h, in_w, cin;
+  // Output width, starting output row and strip height.
+  uint32_t out_w, out_y0, strip_h;
+  // Kernel side, stride, top/left pad and padded K width.
+  uint32_t ksize, stride, pad_t, pad_l, k_padded;
+} Im2ColParam;
+
+// Reflects coordinate c into [0, limit - 1] matching PyTorch reflect padding.
+static int reflect_coord(int c, int limit) {
+  if (limit <= 1) return 0;
+  if (c < 0) c = -c;
+  if (c >= limit) c = 2 * limit - 2 - c;
+  if (c < 0) c = 0;
+  if (c >= limit) c = limit - 1;
+  return c;
+}
+
+// Tests VAE encoder kernels: minimax_h3_groupnorm_silu and
+// minimax_h3_im2col_f16 paired with minimax_h3_mm_f16 (3x3 reflect conv,
+// stride-2 downsample, and 48-channel padded-N 1x1 conv).
+static void test_encoder_kernels(Gpu *gpu, MemorySlot *slot) {
+  int k_gn = gpu_find_kernel(gpu, "minimax_h3_groupnorm_silu");
+  int k_i2c = gpu_find_kernel(gpu, "minimax_h3_im2col_f16");
+  int k_mm = gpu_find_kernel(gpu, "minimax_h3_mm_f16");
+  uint32_t rng = 0x51a2b3c4u;
+
+  // 1. GroupNorm(32, 128, eps=1e-6) + SiLU.
+  int hw = 17 * 13, ch = 128, groups = 32;
+  float gn_eps = 1e-6f;
+  Buf gx = gpu_alloc(gpu, slot, (size_t)hw * (size_t)ch * sizeof(float));
+  Buf gw = gpu_alloc(gpu, slot, (size_t)ch * sizeof(float));
+  Buf gb = gpu_alloc(gpu, slot, (size_t)ch * sizeof(float));
+  Buf gy = gpu_alloc(gpu, slot, (size_t)hw * (size_t)ch * sizeof(float));
+  float *gxp = (float *)gx.ptr, *gwp = (float *)gw.ptr, *gbp = (float *)gb.ptr;
+  for (int i = 0; i < hw * ch; i++) gxp[i] = 2.0f * rng_float(&rng) + 0.3f;
+  for (int c = 0; c < ch; c++) {
+    gwp[c] = 0.5f + rng_float(&rng);
+    gbp[c] = 0.25f * rng_float(&rng);
+  }
+  GroupNormParam gnp = {(uint32_t)hw, (uint32_t)ch, (uint32_t)groups, gn_eps};
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_gn);
+  gpu_bind_buffer(&cmd, 0, &gx, 0);
+  gpu_bind_buffer(&cmd, 1, &gw, 0);
+  gpu_bind_buffer(&cmd, 2, &gb, 0);
+  gpu_bind_buffer(&cmd, 3, &gy, 0);
+  gpu_copy_bytes(&cmd, 4, &gnp, sizeof gnp);
+  gpu_run_kernel(&cmd, (uint32_t)groups, 1, 1, NORM_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  const float *gyp = (const float *)gy.ptr;
+  float worst_gn = 0.0f;
+  int gc = ch / groups;
+  for (int g = 0; g < groups; g++) {
+    double sum = 0.0, sq = 0.0;
+    for (int p = 0; p < hw; p++)
+      for (int k = 0; k < gc; k++) sum += (double)gxp[p * ch + g * gc + k];
+    double mean = sum / (double)(hw * gc);
+    for (int p = 0; p < hw; p++)
+      for (int k = 0; k < gc; k++) {
+        double d = (double)gxp[p * ch + g * gc + k] - mean;
+        sq += d * d;
+      }
+    double inv = 1.0 / sqrt(sq / (double)(hw * gc) + (double)gn_eps);
+    for (int p = 0; p < hw; p++)
+      for (int k = 0; k < gc; k++) {
+        int c = g * gc + k;
+        float v =
+            gwp[c] * (float)(((double)gxp[p * ch + c] - mean) * inv) + gbp[c];
+        float ref = v / (1.0f + expf(-v));
+        float d = fabsf(gyp[p * ch + c] - ref);
+        if (d > worst_gn) worst_gn = d;
+      }
+  }
+  check(worst_gn < FP32_TOL,
+        "minimax_h3_groupnorm_silu matches CPU GroupNorm + SiLU reference");
+  gpu_free(&gy), gpu_free(&gb), gpu_free(&gw), gpu_free(&gx);
+
+  // 2. Reflect-padded 3x3 conv (stride=1, pad=1), stride-2 Downsample3D
+  //    (stride=2, pad=0), and padded-N 48-channel 1x1 conv (quant_conv).
+  struct {
+    int in_h, in_w, cin, cout, ksize, stride, pad;
+    const char *label;
+  } cases[] = {
+      {8, 10, 3, 64, 3, 1, 1,
+       "3x3 reflect-padded conv (cin=3, k padded to 64) matches CPU"},
+      {8, 10, 16, 64, 3, 2, 0,
+       "stride-2 Downsample3D conv (right/bottom reflect pad) matches CPU"},
+      {6, 8, 48, 48, 1, 1, 0,
+       "1x1 quant_conv (48->48 padded to 64) matches CPU"},
+  };
+
+  for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
+    int ih = cases[ci].in_h, iw = cases[ci].in_w;
+    int cin = cases[ci].cin, cout = cases[ci].cout;
+    int ks = cases[ci].ksize, st = cases[ci].stride, pd = cases[ci].pad;
+    int oh = ih / st, ow = iw / st;
+    int k_raw = ks * ks * cin;
+    int k_pad = (k_raw + 63) / 64 * 64;
+    int n_pad = (cout + 63) / 64 * 64;
+    uint32_t m = (uint32_t)(oh * ow);
+    uint32_t m_pad = (m + TILE_M - 1) / TILE_M * TILE_M;
+
+    Buf x = gpu_alloc(gpu, slot, (size_t)ih * (size_t)iw * (size_t)cin * 4);
+    Buf w = gpu_alloc(gpu, slot, (size_t)n_pad * (size_t)k_pad * 2);
+    Buf b = gpu_alloc(gpu, slot, (size_t)cout * 4);
+    Buf im2col = gpu_alloc(gpu, slot, (size_t)m_pad * (size_t)k_pad * 2);
+    Buf y = gpu_alloc(gpu, slot, (size_t)m * (size_t)cout * 4);
+
+    float *xp = (float *)x.ptr, *bp = (float *)b.ptr;
+    _Float16 *wp = (_Float16 *)w.ptr;
+    memset(wp, 0, (size_t)n_pad * (size_t)k_pad * 2);
+    for (int i = 0; i < ih * iw * cin; i++) xp[i] = 0.5f * rng_float(&rng);
+    for (int co = 0; co < cout; co++) {
+      bp[co] = 0.25f * rng_float(&rng);
+      for (int j = 0; j < k_raw; j++)
+        wp[co * k_pad + j] = (_Float16)(0.4f * rng_float(&rng));
+    }
+
+    Im2ColParam ip = {
+        (uint32_t)ih,   (uint32_t)iw, (uint32_t)cin, (uint32_t)ow, 0,
+        (uint32_t)oh,   (uint32_t)ks, (uint32_t)st,  (uint32_t)pd, (uint32_t)pd,
+        (uint32_t)k_pad};
+    F16MMParam mp = {m, (uint32_t)cout, (uint32_t)k_pad, (uint32_t)cout, 1};
+    cmd = gpu_begin(gpu);
+    gpu_select_kernel(&cmd, k_i2c);
+    gpu_bind_buffer(&cmd, 0, &x, 0);
+    gpu_bind_buffer(&cmd, 1, &im2col, 0);
+    gpu_copy_bytes(&cmd, 2, &ip, sizeof ip);
+    gpu_run_kernel(&cmd, ((uint32_t)k_pad + ELEM_THREADS - 1) / ELEM_THREADS,
+                   m_pad, 1, ELEM_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_mm);
+    gpu_bind_buffer(&cmd, 0, &w, 0);
+    gpu_bind_buffer(&cmd, 1, &im2col, 0);
+    gpu_bind_buffer(&cmd, 2, &b, 0);
+    gpu_bind_buffer(&cmd, 3, &y, 0);
+    gpu_copy_bytes(&cmd, 4, &mp, sizeof mp);
+    gpu_run_kernel(&cmd, ((uint32_t)cout + TILE_N - 1) / TILE_N, m_pad / TILE_M,
+                   1, MM_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+
+    const float *yp = (const float *)y.ptr;
+    float worst = 0.0f;
+    for (int oy = 0; oy < oh; oy++) {
+      for (int ox = 0; ox < ow; ox++) {
+        for (int co = 0; co < cout; co++) {
+          float acc = bp[co];
+          for (int ky = 0; ky < ks; ky++) {
+            int iy = reflect_coord(oy * st + ky - pd, ih);
+            for (int kx = 0; kx < ks; kx++) {
+              int ix = reflect_coord(ox * st + kx - pd, iw);
+              int tap = ky * ks + kx;
+              for (int c = 0; c < cin; c++) {
+                float xv = (float)(_Float16)xp[(iy * iw + ix) * cin + c];
+                float wv = (float)wp[co * k_pad + tap * cin + c];
+                acc += xv * wv;
+              }
+            }
+          }
+          float d = fabsf(yp[(oy * ow + ox) * cout + co] - acc);
+          if (d > worst) worst = d;
+        }
+      }
+    }
+    check(worst < FP16_TOL, cases[ci].label);
+    gpu_free(&y), gpu_free(&im2col), gpu_free(&b), gpu_free(&w), gpu_free(&x);
+  }
+}
+
 int main(void) {
   test_split_tiles();
   Memory *memory = memory_new();
@@ -513,5 +696,6 @@ int main(void) {
   test_f16_matmul(gpu, slot);
   test_norms_and_embed(gpu, slot);
   test_vae_heads_and_attention(gpu, slot);
+  test_encoder_kernels(gpu, slot);
   return failures != 0;
 }

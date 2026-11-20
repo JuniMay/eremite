@@ -25,7 +25,16 @@ typedef enum {
   WEIGHTS_TORCH,
 } Weights;
 
-static double cubic(double x) {  // a = -0.5, support 2
+// Resampling kernel and its half-width support radius.
+typedef struct {
+  // Kernel evaluation function at distance x from sample center.
+  double (*eval)(double);
+  // Filter support half-width in output-normalized units.
+  double support;
+} Filter;
+
+// Pillow's bicubic filter (a = -0.5, support 2).
+static double cubic(double x) {
   const double a = -0.5;
   x = fabs(x);
   if (x < 1) return ((a + 2) * x - (a + 3)) * x * x + 1;
@@ -33,13 +42,41 @@ static double cubic(double x) {  // a = -0.5, support 2
   return 0;
 }
 
+// Normalized cardinal sine sin(pi*x)/(pi*x) used by Lanczos-3.
+static double sinc(double x) {
+  static constexpr double PI = 3.14159265358979323846;
+  if (x == 0.0) return 1.0;
+  x *= PI;
+  return sin(x) / x;
+}
+
+// Pillow's Lanczos-3 filter (support 3).
+static double lanczos(double x) {
+  x = fabs(x);
+  if (x < 3.0) return sinc(x) * sinc(x / 3.0);
+  return 0.0;
+}
+
+// Pillow's bilinear triangle filter (support 1).
+static double bilinear(double x) {
+  x = fabs(x);
+  if (x < 1.0) return 1.0 - x;
+  return 0.0;
+}
+
+// Built-in resampling filters matching Pillow's libImaging/Resample.c.
+static const Filter FILTER_BICUBIC = {cubic, 2.0};
+static const Filter FILTER_LANCZOS = {lanczos, 3.0};
+static const Filter FILTER_BILINEAR = {bilinear, 1.0};
+
 // Each output pixel's taps along one axis (precompute_coeffs and
 // normalize_coeffs_8bpc): the first input pixel and their count in bounds,
 // their weights in fixed point in k, ksize per pixel. The weights get the
 // fraction bits that `weights` gives them, returned in *frac.
-static int taps(int in, int out, Weights weights, int **bounds, int32_t **k,
-                int *frac) {
-  double scale = (double)in / out, fs = scale < 1 ? 1 : scale, support = 2 * fs;
+static int taps(int in, int out, Filter filter, Weights weights, int **bounds,
+                int32_t **k, int *frac) {
+  double scale = (double)in / out, fs = scale < 1 ? 1 : scale,
+         support = filter.support * fs;
   int ksize = (int)ceil(support) * 2 + 1;
   double *w = xmalloc((size_t)out * ksize * sizeof *w), largest = 0;
   *bounds = xmalloc((size_t)out * 2 * sizeof **bounds);
@@ -53,7 +90,7 @@ static int taps(int in, int out, Weights weights, int **bounds, int32_t **k,
     if (xmax > in) xmax = in;
     xmax -= xmin;
     for (int x = 0; x < xmax; x++)
-      ww += kx[x] = cubic((x + xmin - center + 0.5) * ss);
+      ww += kx[x] = filter.eval((x + xmin - center + 0.5) * ss);
     for (int x = 0; x < ksize; x++) {
       kx[x] = x >= xmax ? 0 : ww != 0 ? kx[x] / ww : kx[x];
       largest = fmax(largest, kx[x]);
@@ -81,11 +118,11 @@ static uint8_t clip8(int32_t v, int frac) {
 // ImagingResampleInner: along rows first, over the rows the column pass
 // reads, then along columns; each pass rounds to 8 bits. The weights become
 // integers as `weights` says.
-static Rgb resample(Rgb s, int w, int h, Weights weights) {
+static Rgb resample(Rgb s, int w, int h, Filter filter, Weights weights) {
   int *bx = 0, *by, fx = 0, fy;
   int32_t *kx = 0, *ky;
-  int ksx = w != s.w ? taps(s.w, w, weights, &bx, &kx, &fx) : 0,
-      ksy = taps(s.h, h, weights, &by, &ky, &fy);
+  int ksx = w != s.w ? taps(s.w, w, filter, weights, &bx, &kx, &fx) : 0,
+      ksy = taps(s.h, h, filter, weights, &by, &ky, &fy);
   int y0 = by[0], y1 = by[2 * (h - 1)] + by[2 * (h - 1) + 1];
   Rgb t = s;
   if (w != s.w) {
@@ -127,19 +164,34 @@ static Rgb resample(Rgb s, int w, int h, Weights weights) {
 
 // Media.resize: a copy at the same size; an image over 100 times taller
 // than wide shrinks along its height first.
-static Rgb resize(Rgb s, int w, int h) {
+static Rgb resize(Rgb s, int w, int h, Filter filter) {
   if (s.h > s.w * 100 && h < s.h) {
-    Rgb t = resample(s, s.w, h, WEIGHTS_PILLOW),
-        o = resample(t, w, h, WEIGHTS_PILLOW);
+    Rgb t = resample(s, s.w, h, filter, WEIGHTS_PILLOW),
+        o = resample(t, w, h, filter, WEIGHTS_PILLOW);
     free(t.p);
     return o;
   }
-  return resample(s, w, h, WEIGHTS_PILLOW);
+  return resample(s, w, h, filter, WEIGHTS_PILLOW);
 }
 
 uint8_t *image_resize_rgb(const uint8_t *pixels, int width, int height,
                           int out_width, int out_height) {
-  return resize((Rgb){width, height, (uint8_t *)pixels}, out_width, out_height)
+  return resize((Rgb){width, height, (uint8_t *)pixels}, out_width, out_height,
+                FILTER_BICUBIC)
+      .p;
+}
+
+uint8_t *image_resize_rgb_lanczos(const uint8_t *pixels, int width, int height,
+                                  int out_width, int out_height) {
+  return resize((Rgb){width, height, (uint8_t *)pixels}, out_width, out_height,
+                FILTER_LANCZOS)
+      .p;
+}
+
+uint8_t *image_resize_rgb_bilinear(const uint8_t *pixels, int width, int height,
+                                   int out_width, int out_height) {
+  return resize((Rgb){width, height, (uint8_t *)pixels}, out_width, out_height,
+                FILTER_BILINEAR)
       .p;
 }
 
@@ -147,6 +199,6 @@ uint8_t *image_resize_rgb_torchvision(const uint8_t *pixels, int width,
                                       int height, int out_width,
                                       int out_height) {
   return resample((Rgb){width, height, (uint8_t *)pixels}, out_width,
-                  out_height, WEIGHTS_TORCH)
+                  out_height, FILTER_BICUBIC, WEIGHTS_TORCH)
       .p;
 }

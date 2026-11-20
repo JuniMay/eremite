@@ -119,5 +119,43 @@ int main(void) {
   check(dark && bright,
         "near an edge, the overshoot is clipped to 0 and 255, not wrapped");
   free(wide);
+
+  // Lanczos-3 and bilinear preserve flat colors, keep same-size copies exact,
+  // and bilinear keeps a monotone step strictly within [0, 255] with no ring.
+  uint8_t *l_same =
+      image_resize_rgb_lanczos(mixed, MIXED_W, MIXED_H, MIXED_W, MIXED_H);
+  uint8_t *b_same =
+      image_resize_rgb_bilinear(mixed, MIXED_W, MIXED_H, MIXED_W, MIXED_H);
+  check(l_same != mixed && !memcmp(l_same, mixed, sizeof mixed) &&
+            b_same != mixed && !memcmp(b_same, mixed, sizeof mixed),
+        "Lanczos and bilinear same-size resizes copy pixels verbatim");
+  free(l_same), free(b_same);
+
+  int lb_plain_ok = 1;
+  for (size_t s = 0; s < sizeof sizes / sizeof *sizes; s++) {
+    int w = sizes[s][0], h = sizes[s][1];
+    uint8_t *lo = image_resize_rgb_lanczos(plain, PLAIN_W, PLAIN_H, w, h);
+    uint8_t *bo = image_resize_rgb_bilinear(plain, PLAIN_W, PLAIN_H, w, h);
+    lb_plain_ok &= all_color(lo, w * h, color) && all_color(bo, w * h, color);
+    free(lo), free(bo);
+  }
+  check(lb_plain_ok,
+        "Lanczos and bilinear preserve a solid color at every size");
+
+  uint8_t *b_edge =
+      image_resize_rgb_bilinear(edge, EDGE_W, 1, EDGE_W * SCALE, 1);
+  uint8_t *l_edge =
+      image_resize_rgb_lanczos(edge, EDGE_W, 1, EDGE_W * SCALE, 1);
+  int mono = 1, l_ok = 1;
+  for (int x = 1; x < EDGE_W * SCALE; x++)
+    mono &= b_edge[3 * x] >= b_edge[3 * (x - 1)];
+  for (int x = 0; x < EDGE_W * SCALE; x++) {
+    double at = (x + 0.5) / SCALE;
+    if (at < EDGE_W / 2 - 1) l_ok &= l_edge[3 * x] < 64;
+    if (at > EDGE_W / 2 + 1) l_ok &= l_edge[3 * x] > 191;
+  }
+  check(mono && l_ok,
+        "bilinear edge upsample is monotone and Lanczos clips cleanly");
+  free(b_edge), free(l_edge);
   return failures != 0;
 }

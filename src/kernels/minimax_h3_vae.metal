@@ -82,8 +82,9 @@ kernel void minimax_h3_x_f16(device const float4 *x [[buffer(0)]],
 }
 
 // Native FP16 matrix product accumulating in FP32, with optional FP32 bias.
-// xh must have rows padded to a multiple of 64; k and n must be multiples of
-// 64. Each threadgroup of 128 threads computes a 64x64 tile.
+// xh must have rows padded to a multiple of 64; w must have rows padded to a
+// multiple of 64; k must be a multiple of 64. Each threadgroup of 128 threads
+// computes a 64x64 tile.
 kernel void minimax_h3_mm_f16(device const half *w [[buffer(0)]],
                               device const half *xh [[buffer(1)]],
                               device const float *bias [[buffer(2)]],
@@ -96,10 +97,11 @@ kernel void minimax_h3_mm_f16(device const half *w [[buffer(0)]],
   matmul2d<desc, execution_simdgroups<4>> op;
   uint padded_m = (p.m + MINIMAX_H3_VAE_TILE_M - 1u) / MINIMAX_H3_VAE_TILE_M *
                   MINIMAX_H3_VAE_TILE_M;
+  uint padded_n = (p.n + 63u) / 64u * 64u;
   tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(
       (device half *)xh, dextents<int32_t, 2>(p.k, padded_m));
   tensor<device half, dextents<int32_t, 2>, tensor_inline> tw(
-      (device half *)w, dextents<int32_t, 2>(p.k, p.n));
+      (device half *)w, dextents<int32_t, 2>(p.k, padded_n));
   uint m0 = tg.y * 64u, n0 = tg.x * 64u;
   auto a = tx.slice(0, m0);
   auto b = tw.slice(0, n0);
@@ -381,4 +383,99 @@ kernel void minimax_h3_vae_attend(device const half *qh [[buffer(0)]],
         o[out_row * MINIMAX_H3_VAE_DIM + h * MINIMAX_H3_VAE_HEAD_DIM + at[0]] =
             acc[i] / sum[at[1]];
     }
+}
+
+// Parameters for fused NHWC GroupNorm + SiLU over a single-frame feature map.
+struct MinimaxH3GroupNorm {
+  uint hw, channels, groups;
+  float eps;
+};
+
+// Parameters for reflect-padded NHWC 2D im2col (kernel 1x1 or 3x3) into FP16.
+struct MinimaxH3Im2Col {
+  uint in_h, in_w, cin, out_w, out_y0, strip_h, ksize, stride, pad_t, pad_l,
+      k_padded;
+};
+
+// Fused NHWC GroupNorm + SiLU: normalizes each channel group across all spatial
+// pixels hw with two-pass centered variance, applies affine weight/bias, and
+// applies SiLU. One threadgroup of 256 threads per group.
+kernel void minimax_h3_groupnorm_silu(device const float *x [[buffer(0)]],
+                                      device const float *w [[buffer(1)]],
+                                      device const float *b [[buffer(2)]],
+                                      device float *y [[buffer(3)]],
+                                      constant MinimaxH3GroupNorm &p
+                                      [[buffer(4)]],
+                                      uint g [[threadgroup_position_in_grid]],
+                                      uint t [[thread_index_in_threadgroup]],
+                                      uint nt [[threads_per_threadgroup]]) {
+  threadgroup float tmp[32];
+  uint gc = p.channels / p.groups;
+  uint c0 = g * gc;
+  uint count = p.hw * gc;
+
+  float sum = 0.0f;
+  for (uint i = t; i < count; i += nt) {
+    uint pix = i / gc;
+    uint ch = c0 + (i % gc);
+    sum += x[pix * p.channels + ch];
+  }
+  float mean = tg_sum(sum, tmp, t, nt) / float(count);
+
+  float sq = 0.0f;
+  for (uint i = t; i < count; i += nt) {
+    uint pix = i / gc;
+    uint ch = c0 + (i % gc);
+    float d = x[pix * p.channels + ch] - mean;
+    sq += d * d;
+  }
+  float inv = rsqrt(tg_sum(sq, tmp, t, nt) / float(count) + p.eps);
+
+  for (uint i = t; i < count; i += nt) {
+    uint pix = i / gc;
+    uint ch = c0 + (i % gc);
+    uint idx = pix * p.channels + ch;
+    float v = w[ch] * ((x[idx] - mean) * inv) + b[ch];
+    y[idx] = v / (1.0f + exp(-v));
+  }
+}
+
+// Reflects coordinate c into [0, limit - 1] matching PyTorch reflect padding.
+inline uint minimax_h3_reflect(int c, uint limit) {
+  if (limit <= 1u) return 0u;
+  int lim = int(limit);
+  if (c < 0) c = -c;
+  if (c >= lim) c = 2 * lim - 2 - c;
+  return uint(clamp(c, 0, lim - 1));
+}
+
+// Extracts an NHWC spatial strip of strip_h output rows starting at out_y0 into
+// a row-major FP16 matrix [padded_m, k_padded] with reflect spatial padding and
+// zero-padding for columns >= ksize*ksize*cin and rows >= strip_h*out_w.
+kernel void minimax_h3_im2col_f16(device const float *x [[buffer(0)]],
+                                  device half *dst [[buffer(1)]],
+                                  constant MinimaxH3Im2Col &p [[buffer(2)]],
+                                  uint2 i [[thread_position_in_grid]]) {
+  uint col = i.x, row = i.y;
+  if (col >= p.k_padded) return;
+  uint m = p.strip_h * p.out_w;
+  uint k_raw = p.ksize * p.ksize * p.cin;
+  if (row >= m || col >= k_raw) {
+    dst[row * p.k_padded + col] = half(0.0f);
+    return;
+  }
+  uint oy = p.out_y0 + row / p.out_w;
+  uint ox = row % p.out_w;
+  if (p.ksize == 1u) {
+    dst[row * p.k_padded + col] =
+        half(x[(oy * p.in_w + ox) * p.cin + col]);
+    return;
+  }
+  uint tap = col / p.cin;
+  uint c = col % p.cin;
+  uint ky = tap / p.ksize;
+  uint kx = tap % p.ksize;
+  uint iy = minimax_h3_reflect(int(oy * p.stride + ky) - int(p.pad_t), p.in_h);
+  uint ix = minimax_h3_reflect(int(ox * p.stride + kx) - int(p.pad_l), p.in_w);
+  dst[row * p.k_padded + col] = half(x[(iy * p.in_w + ix) * p.cin + c]);
 }
