@@ -118,7 +118,7 @@ int main(void) {
         "eremite_image_model_limits rejects a null model");
   ImageLimits lim = {0};
   minimax_h3_image_ops.read_image_limits(&lim);
-  check(lim.max_prompt_tokens == MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS &&
+  check(lim.max_prompt_tokens == MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS &&
             lim.max_dim == MINIMAX_H3_IMAGE_MAX_DIM &&
             lim.min_generation_area == MINIMAX_H3_IMAGE_MIN_AREA &&
             lim.max_generation_area == MINIMAX_H3_IMAGE_MAX_AREA &&
@@ -142,7 +142,7 @@ int main(void) {
           (MINIMAX_H3_IMAGE_PATCH_PX * MINIMAX_H3_IMAGE_PATCH_PX));
   uint64_t text_small = minimax_h3_text_encoder_workspace_bytes(64, 0);
   uint64_t text_max = minimax_h3_text_encoder_workspace_bytes(
-      MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS, 0);
+      MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS, 0);
   uint64_t vae_tile = minimax_h3_image_vae_workspace_bytes();
   check(dit_small > 0 && dit_default > dit_small && text_small > 0 &&
             text_max > text_small && vae_tile > 0,
@@ -170,16 +170,42 @@ int main(void) {
                             .dit = 15ull << 30,
                             .vae = 2ull << 30,
                             .vae_encoder = 1ull << 30};
-  MinimaxH3RequestMemory mem_default =
-      minimax_h3_image_plan_request_memory(w, 2048, 2048, 64, 0, 0, 0);
-  MinimaxH3RequestMemory mem_huge =
-      minimax_h3_image_plan_request_memory(w, 4896, 4896, 64, 0, 0, 0);
+  MinimaxH3RequestMemory mem_default = minimax_h3_image_plan_request_memory(
+      w, minimax_h3_image_stage_bytes(64, NULL, 0, 2048, 2048), 0);
+  MinimaxH3RequestMemory mem_huge = minimax_h3_image_plan_request_memory(
+      w, minimax_h3_image_stage_bytes(64, NULL, 0, 4896, 4896), 0);
   uint64_t dit_delta = minimax_h3_dit_workspace_bytes(64, 0, 153 * 153) -
                        minimax_h3_dit_workspace_bytes(64, 0, 64 * 64);
   check(mem_huge.full_bytes == mem_default.full_bytes + dit_delta &&
             mem_huge.staged_bytes > mem_default.staged_bytes &&
             mem_huge.full_bytes > mem_huge.staged_bytes,
         "planned request memory scales exactly by DiT workspace growth");
+
+  // An edit's encode stage holds the vision tower's workspace beside the image
+  // outputs, the prompt's buffers beside the text layers' workspace, and the
+  // VAE encoder's workspace beside the hidden rows.
+  MinimaxH3RefSizes ref = minimax_h3_image_ref_sizes(1024, 1024);
+  int edit_seq_len = 64 + ref.vision.tokens;
+  MinimaxH3StageBytes edit =
+      minimax_h3_image_stage_bytes(edit_seq_len, &ref, 1, 2048, 2048);
+  uint64_t row = (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+  uint64_t image_outputs = (uint64_t)(1 + MINIMAX_H3_TEXT_DEEPSTACK_LAYERS) *
+                           (uint64_t)ref.vision.tokens * row;
+  uint64_t prompt_buffers = 2 * (uint64_t)edit_seq_len * row +
+                            (uint64_t)MINIMAX_H3_TEXT_DEEPSTACK_LAYERS *
+                                (uint64_t)ref.vision.tokens * row;
+  check(ref.vision.patches == 4096 && ref.vision.tokens == 1024 &&
+            ref.vae_width == 1024 && ref.vae_height == 1024 &&
+            edit.encode >=
+                minimax_h3_vision_encoder_workspace_bytes(ref.vision.patches) +
+                    image_outputs &&
+            edit.encode >= minimax_h3_text_encoder_workspace_bytes(
+                               edit_seq_len, ref.vision.tokens) +
+                               prompt_buffers &&
+            edit.encode >= minimax_h3_image_vae_encoder_workspace_bytes(
+                               ref.vae_width, ref.vae_height) +
+                               (uint64_t)edit_seq_len * row,
+        "an edit's encode stage counts the vision and VAE encoder workspaces");
 
   Memory *mem = memory_new();
   MemoryAccount acct;

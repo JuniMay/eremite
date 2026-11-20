@@ -41,14 +41,6 @@ static constexpr double BYTES_PER_GIB = (double)(1ull << 30);
 static constexpr int DIT_PATCH_SIDE =
     MINIMAX_H3_IMAGE_PATCH_PX / MINIMAX_H3_VAE_SPATIAL_RATIO;
 
-// Buffer length and token cap for "Picture %d: " labels when sizing prompts.
-static constexpr size_t REF_LABEL_BUF_CAP = 32;
-static constexpr int REF_LABEL_MAX_TOKENS = 16;
-
-// Number of vision delimiter tokens (<|vision_start|> and <|vision_end|>)
-// flanking each reference image in the multimodal prompt.
-static constexpr int REF_VISION_DELIM_TOKENS = 2;
-
 // Shared GPU device for the active MiniMax-H3-Image model.
 static Gpu *model_gpu;
 
@@ -166,38 +158,63 @@ int minimax_h3_image_plan_canvas(int width, int height, int min_area,
 // Returns the larger of two byte counts.
 static uint64_t max_u64(uint64_t a, uint64_t b) { return a > b ? a : b; }
 
-MinimaxH3RequestMemory
-minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights, int canvas_w,
-                                     int canvas_h, int text_len, int vis_tokens,
-                                     int ref_patches, int ref_count) {
-  int h_lat = canvas_h / MINIMAX_H3_VAE_SPATIAL_RATIO;
-  int w_lat = canvas_w / MINIMAX_H3_VAE_SPATIAL_RATIO;
-  int target_patches = ((h_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE) *
-                       ((w_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE);
-  uint64_t text_hidden =
-      (uint64_t)text_len * (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
-  uint64_t vis_outputs =
-      vis_tokens > 0 ? (uint64_t)(1 + MINIMAX_H3_TEXT_DEEPSTACK_LAYERS) *
-                           (uint64_t)vis_tokens *
-                           (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float)
-                     : 0;
-  uint64_t encode_ws =
-      (text_len > 0
-           ? minimax_h3_text_encoder_workspace_bytes(text_len, vis_tokens)
-           : 0) +
-      text_hidden + vis_outputs;
-  uint64_t dit_ws =
-      minimax_h3_dit_workspace_bytes(text_len, ref_patches, target_patches) +
-      text_hidden;
-  uint64_t vae_ws = minimax_h3_image_vae_workspace_bytes();
+// Returns the DiT patches of the latent of a width by height image.
+static int latent_patches(int width, int height) {
+  int h_lat = height / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int w_lat = width / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  return ((h_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE) *
+         ((w_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE);
+}
 
+MinimaxH3RefSizes minimax_h3_image_ref_sizes(int width, int height) {
+  MinimaxH3RefSizes sizes = {.vision =
+                                 minimax_h3_vision_ref_tokens(width, height)};
+  minimax_h3_vae_ref_size(width, height, &sizes.vae_width, &sizes.vae_height);
+  return sizes;
+}
+
+MinimaxH3StageBytes minimax_h3_image_stage_bytes(int seq_len,
+                                                 const MinimaxH3RefSizes *refs,
+                                                 int ref_count, int canvas_w,
+                                                 int canvas_h) {
+  if (ref_count < 0 || ref_count > MINIMAX_H3_IMAGE_MAX_REFS)
+    die("%d reference images is outside 0 to %d", ref_count,
+        MINIMAX_H3_IMAGE_MAX_REFS);
+  uint64_t hidden =
+      (uint64_t)seq_len * (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+  MinimaxH3RefTokens tokens[MINIMAX_H3_IMAGE_MAX_REFS];
+  uint64_t vae_encode = 0;
+  int ref_patches = 0;
+  for (int i = 0; i < ref_count; i++) {
+    tokens[i] = refs[i].vision;
+    vae_encode =
+        max_u64(vae_encode, minimax_h3_image_vae_encoder_workspace_bytes(
+                                refs[i].vae_width, refs[i].vae_height));
+    ref_patches += latent_patches(refs[i].vae_width, refs[i].vae_height);
+  }
+  // The references' VAE encoding runs after the prompt's, beside its hidden
+  // rows.
+  uint64_t encode =
+      minimax_h3_multimodal_prompt_peak_bytes(seq_len, tokens, ref_count);
+  if (ref_count > 0) encode = max_u64(encode, vae_encode + hidden);
+  return (MinimaxH3StageBytes){
+      .encode = encode,
+      .sample = minimax_h3_dit_workspace_bytes(
+                    seq_len, ref_patches, latent_patches(canvas_w, canvas_h)) +
+                hidden,
+      .decode = minimax_h3_image_vae_workspace_bytes()};
+}
+
+MinimaxH3RequestMemory minimax_h3_image_plan_request_memory(
+    MinimaxH3WeightBytes weights, MinimaxH3StageBytes stages, int ref_count) {
   uint64_t core = weights.text + weights.dit + weights.vae;
   uint64_t edit = ref_count > 0 ? weights.vision + weights.vae_encoder : 0;
   uint64_t full =
-      max_u64(max_u64(core + edit + encode_ws, core + dit_ws), core + vae_ws);
-  uint64_t staged =
-      max_u64(max_u64(weights.text + edit + encode_ws, weights.dit + dit_ws),
-              weights.vae + vae_ws);
+      max_u64(max_u64(core + edit + stages.encode, core + stages.sample),
+              core + stages.decode);
+  uint64_t staged = max_u64(
+      max_u64(weights.text + edit + stages.encode, weights.dit + stages.sample),
+      weights.vae + stages.decode);
   return (MinimaxH3RequestMemory){.full_bytes = full, .staged_bytes = staged};
 }
 
@@ -240,58 +257,17 @@ int minimax_h3_image_admit_request(MemoryAccount *account, int full_resident,
   return 0;
 }
 
-// Collects the resident weight byte sizes of all five MiniMax-H3 sub-models.
-static MinimaxH3WeightBytes current_weight_bytes(void) {
+// Returns the weight bytes of the five MiniMax-H3-Image weight groups.
+static MinimaxH3WeightBytes
+read_weight_bytes(const MinimaxH3TextEncoder *text,
+                  const MinimaxH3VisionEncoder *vision, const MinimaxH3Dit *dit,
+                  const MinimaxH3ImageVae *vae) {
   return (MinimaxH3WeightBytes){
-      .text = minimax_h3_text_encoder_required_bytes(text_enc),
-      .vision = minimax_h3_vision_encoder_required_bytes(vision_enc),
+      .text = minimax_h3_text_encoder_required_bytes(text),
+      .vision = minimax_h3_vision_encoder_required_bytes(vision),
       .dit = minimax_h3_dit_required_bytes(dit),
       .vae = minimax_h3_image_vae_required_bytes(vae),
       .vae_encoder = minimax_h3_image_vae_encoder_required_bytes(vae)};
-}
-
-// Counts prompt tokens, reference vision tokens and reference DiT patches
-// before running Stage 1 so request workspace memory can be admitted upfront.
-static int count_request_tokens(const char *prompt,
-                                const MinimaxH3RefImage *refs, int ref_count,
-                                int *out_vis_tokens, int *out_ref_patches) {
-  int *prompt_ids =
-      xmalloc((size_t)MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS * sizeof(int));
-  int prompt_len = 0;
-  if (ref_count == 0 || (prompt && prompt[0] != '\0')) {
-    prompt_len = minimax_h3_text_encoder_tokenize(
-        text_enc, prompt, prompt_ids, MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS);
-  }
-  free(prompt_ids);
-  if (ref_count == 0) {
-    *out_vis_tokens = 0;
-    *out_ref_patches = 0;
-    return prompt_len;
-  }
-  int vis_tokens = 0, ref_patches = 0, seq_len = prompt_len;
-  for (int i = 0; i < ref_count; i++) {
-    int vis_w = 0, vis_h = 0;
-    minimax_h3_vision_ref_size(refs[i].width, refs[i].height, &vis_w, &vis_h);
-    int n_merged = (vis_w / MINIMAX_H3_IMAGE_PATCH_PX) *
-                   (vis_h / MINIMAX_H3_IMAGE_PATCH_PX);
-    vis_tokens += n_merged;
-    char label[REF_LABEL_BUF_CAP];
-    snprintf(label, sizeof label, "Picture %d: ", i + 1);
-    int label_ids[REF_LABEL_MAX_TOKENS];
-    int l_len = minimax_h3_text_encoder_tokenize(text_enc, label, label_ids,
-                                                 REF_LABEL_MAX_TOKENS);
-    seq_len += l_len + n_merged + REF_VISION_DELIM_TOKENS;
-
-    int vw = 0, vh = 0;
-    minimax_h3_vae_ref_size(refs[i].width, refs[i].height, &vw, &vh);
-    int rh_lat = vh / MINIMAX_H3_VAE_SPATIAL_RATIO;
-    int rw_lat = vw / MINIMAX_H3_VAE_SPATIAL_RATIO;
-    ref_patches += ((rh_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE) *
-                   ((rw_lat + DIT_PATCH_SIDE - 1) / DIT_PATCH_SIDE);
-  }
-  *out_vis_tokens = vis_tokens;
-  *out_ref_patches = ref_patches;
-  return seq_len > 0 ? seq_len : 1;
 }
 
 // Resolves the directory containing tokenizer.json under dir into out.
@@ -352,8 +328,8 @@ static int minimax_h3_image_load(Gpu *gpu, MemorySlot *work, const char *dir,
         MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA /
         (MINIMAX_H3_IMAGE_PATCH_PX * MINIMAX_H3_IMAGE_PATCH_PX);
     uint64_t encode_ws = minimax_h3_text_encoder_workspace_bytes(
-                             MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS, 0) +
-                         (uint64_t)MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS *
+                             MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS, 0) +
+                         (uint64_t)MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS *
                              (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
     uint64_t dit_ws =
         minimax_h3_dit_workspace_bytes(0, 0, default_canvas_patches);
@@ -576,13 +552,20 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   // Reserve the GPU memory needed for the planned canvas and reference images
   // before running the text encoder so oversized canvases refuse early (or
   // fall back cleanly from full residence to staged execution).
-  int est_vis_tokens = 0, est_ref_patches = 0;
-  int est_text_len =
-      count_request_tokens(req->prompt, req->ref_count ? ref_images : NULL,
-                           req->ref_count, &est_vis_tokens, &est_ref_patches);
+  MinimaxH3RefSizes ref_sizes[MINIMAX_H3_IMAGE_MAX_REFS] = {0};
+  MinimaxH3RefTokens ref_tokens[MINIMAX_H3_IMAGE_MAX_REFS] = {0};
+  for (int i = 0; i < req->ref_count; i++) {
+    ref_sizes[i] =
+        minimax_h3_image_ref_sizes(ref_images[i].width, ref_images[i].height);
+    ref_tokens[i] = ref_sizes[i].vision;
+  }
+  int planned_seq_len = minimax_h3_multimodal_prompt_tokens(
+      text_enc, req->prompt, ref_tokens, req->ref_count);
   MinimaxH3RequestMemory req_mem = minimax_h3_image_plan_request_memory(
-      current_weight_bytes(), canvas_w, canvas_h, est_text_len, est_vis_tokens,
-      est_ref_patches, req->ref_count);
+      read_weight_bytes(text_enc, vision_enc, dit, vae),
+      minimax_h3_image_stage_bytes(planned_seq_len, ref_sizes, req->ref_count,
+                                   canvas_w, canvas_h),
+      req->ref_count);
   int request_full = full_resident;
   if (!minimax_h3_image_admit_request(
           work_slot->account, full_resident, canvas_w, canvas_h, req_mem,
@@ -625,6 +608,10 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     ok = minimax_h3_encode_multimodal_prompt(
         text_enc, vision_enc, req->prompt, req->ref_count ? ref_images : NULL,
         req->ref_count, work_slot, &text_hidden, &text_len, &text_tags, &hooks);
+    if (ok && text_len != planned_seq_len)
+      die("MiniMax-H3-Image: the prompt has %d tokens, but its memory plan "
+          "counted %d",
+          text_len, planned_seq_len);
   }
   double prefill_s = now() - prefill_start;
 
@@ -755,7 +742,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
 // Writes MiniMax-H3-Image's input and output limits into out.
 static void minimax_h3_image_read_limits(ImageLimits *out) {
   *out = (ImageLimits){
-      .max_prompt_tokens = MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS,
+      .max_prompt_tokens = MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS,
       .max_dim = MINIMAX_H3_IMAGE_MAX_DIM,
       .min_generation_area = MINIMAX_H3_IMAGE_MIN_AREA,
       .max_generation_area = MINIMAX_H3_IMAGE_MAX_AREA,

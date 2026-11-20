@@ -33,6 +33,11 @@ static constexpr int MINIMAX_H3_TEXT_PAD_TOKEN = 151643,
                      MINIMAX_H3_TEXT_VISION_START_TOKEN = 151652,
                      MINIMAX_H3_TEXT_VISION_END_TOKEN = 151653;
 
+// Most tokens kept from a prompt's text; the rest is cut off. MiniMax's
+// MiniMax-H3-Image README, Specifications: content beyond 4,096 tokens is
+// truncated.
+static constexpr int MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS = 4096;
+
 // Loaded MiniMax-H3 Qwen3-VL-32B text encoder handle.
 typedef struct MinimaxH3TextEncoder MinimaxH3TextEncoder;
 

@@ -31,6 +31,36 @@ void minimax_h3_vision_ref_size(int width, int height, int *out_w, int *out_h);
 // edge into [1024, 2048] while keeping aspect ratio, rounded to 32 px.
 void minimax_h3_vae_ref_size(int width, int height, int *out_w, int *out_h);
 
+// The vision tower patches and prompt tokens of one reference image.
+typedef struct {
+  // 16 by 16 pixel patches that the vision tower reads.
+  int patches;
+  // Merged tokens that the image takes in the prompt, one per 2 by 2 patches.
+  int tokens;
+} MinimaxH3RefTokens;
+
+// Returns the patches and tokens of a width by height reference image after
+// its Qwen3-VL resize.
+MinimaxH3RefTokens minimax_h3_vision_ref_tokens(int width, int height);
+
+// Returns the GPU bytes of the vision tower's working buffers for one image of
+// patches patches.
+uint64_t minimax_h3_vision_encoder_workspace_bytes(int patches);
+
+// Returns the token count of the multimodal prompt for prompt and ref_count
+// reference images of refs[i].tokens tokens each: each image's label, vision
+// tokens and two delimiters, then the prompt's text.
+int minimax_h3_multimodal_prompt_tokens(const MinimaxH3TextEncoder *text_enc,
+                                        const char *prompt,
+                                        const MinimaxH3RefTokens *refs,
+                                        int ref_count);
+
+// Returns the most GPU bytes held at once while a multimodal prompt of seq_len
+// tokens with ref_count reference images is encoded, its hidden rows included.
+uint64_t minimax_h3_multimodal_prompt_peak_bytes(int seq_len,
+                                                 const MinimaxH3RefTokens *refs,
+                                                 int ref_count);
+
 // Opens the Qwen3-VL vision tower sharing text_enc's open safetensors file and
 // GPU device, registering its BF16 weights in account under a separate
 // on-demand WeightGroup. Must be closed before text_enc is closed.

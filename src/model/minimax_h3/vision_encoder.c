@@ -24,23 +24,32 @@ static constexpr int VIS_LAYERS = 27, VIS_DIM = 1152, VIS_HEADS = 16,
                      VIS_MERGE_DIM = VIS_DIM * VIS_MERGE_UNIT,
                      VIS_POS_ENTRIES = 2304, VIS_ROPE_FREQS = 18;
 
-// Reference image sizing and prompt truncation constants from Comfy-Org/ComfyUI
+// Reference image sizing constants from Comfy-Org/ComfyUI
 // comfy_extras/nodes_minimax_h3.py:32,41-42 (CANVAS_MULTIPLE 32,
 // IMAGE_REF_SHORT_EDGE 1024, IMAGE_REF_VAE_MAX_SHORT_EDGE 2048) and
 // comfy/text_encoders/minimax.py:43-44 (min_pixels 3136, max_pixels 12845056).
 static constexpr int REF_GRID_MULTIPLE = 32, REF_VISION_SHORT_EDGE = 1024,
                      REF_VAE_MIN_SHORT_EDGE = 1024,
                      REF_VAE_MAX_SHORT_EDGE = 2048, REF_SMART_MIN_PIXELS = 3136,
-                     REF_SMART_MAX_PIXELS = 12845056, PROMPT_MAX_TOKENS = 4096;
+                     REF_SMART_MAX_PIXELS = 12845056;
 
-// Reference prompt template budgets for "Picture %d: " plus flanking
-// <|vision_start|> and <|vision_end|>: "Picture 16: " is 12 ASCII bytes and at
-// most 5 BPE tokens, so 32 bytes / 16 tokens per label and 4 guard tokens
-// comfortably cover up to 16 reference images.
+// Tokens around each reference image's vision tokens: <|vision_start|> and
+// <|vision_end|>.
+static constexpr int REF_VISION_DELIMITERS = 2;
+
+// Reference prompt template budgets for "Picture %d: " plus the delimiters:
+// "Picture 16: " is 12 ASCII bytes and at most 5 BPE tokens, so 32 bytes / 16
+// tokens per label and 4 guard tokens comfortably cover up to 16 reference
+// images.
 static constexpr size_t REF_LABEL_BUF_CAP = 32;
 static constexpr int REF_LABEL_MAX_TOKENS = 16,
-                     REF_TEMPLATE_TOKENS = REF_LABEL_MAX_TOKENS + 2,
+                     REF_TEMPLATE_TOKENS =
+                         REF_LABEL_MAX_TOKENS + REF_VISION_DELIMITERS,
                      REF_SEQ_GUARD_TOKENS = 4;
+
+// Working buffers of one activation's size in the vision tower: h, norm and
+// attn_out.
+static constexpr int VIS_ACTIVATION_BUFFERS = 3;
 
 // DeepStack vision block indices from MiniMaxAI/MiniMax-H3-Image
 // text_encoder/config.json:41-45 ("deepstack_visual_indexes": [8, 16, 24]).
@@ -339,6 +348,15 @@ void minimax_h3_vae_ref_size(int width, int height, int *out_w, int *out_h) {
                   out_w, out_h);
 }
 
+MinimaxH3RefTokens minimax_h3_vision_ref_tokens(int width, int height) {
+  int vis_w = 0, vis_h = 0;
+  minimax_h3_vision_ref_size(width, height, &vis_w, &vis_h);
+  int grid_w = vis_w / VIS_PATCH_SIDE, grid_h = vis_h / VIS_PATCH_SIDE;
+  return (MinimaxH3RefTokens){.patches = grid_w * grid_h,
+                              .tokens = (grid_w / VIS_MERGE_SIDE) *
+                                        (grid_h / VIS_MERGE_SIDE)};
+}
+
 MinimaxH3VisionEncoder *
 minimax_h3_vision_encoder_open(MinimaxH3TextEncoder *text_enc,
                                MemoryAccount *account) {
@@ -453,39 +471,64 @@ static void free_vis_workspace(VisWorkspace *ws) {
   gpu_free(&ws->patch_in);
 }
 
+// Byte sizes of the vision tower's working buffers for one image.
+typedef struct {
+  // Patch pixels, patches by VIS_PATCH_DIM FP32.
+  size_t patch_in;
+  // One activation, patches by VIS_DIM FP32: h, norm and attn_out each.
+  size_t activation;
+  // BF16 matmul input, padded rows by VIS_MERGE_DIM.
+  size_t xb;
+  // Fused query, key and value rows, patches by VIS_QKV_WIDTH FP32.
+  size_t qkv;
+  // One head-major BF16 buffer: qh, kh and vh each.
+  size_t heads;
+  // MLP hidden rows, patches by VIS_MLP_PAD FP32.
+  size_t mlp_mid;
+  // Merger hidden rows, merged tokens by VIS_MERGE_DIM FP32.
+  size_t merge_mid;
+} VisWorkspaceSizes;
+
+// Returns the byte sizes of the working buffers for num_patches patches.
+static VisWorkspaceSizes vis_workspace_sizes(int num_patches) {
+  size_t patches = (size_t)num_patches;
+  size_t padded = (patches + TILE_M - 1) / TILE_M * TILE_M;
+  size_t merged = patches / VIS_MERGE_UNIT;
+  return (VisWorkspaceSizes){
+      .patch_in = patches * VIS_PATCH_DIM * sizeof(float),
+      .activation = patches * VIS_DIM * sizeof(float),
+      .xb = padded * VIS_MERGE_DIM * sizeof(uint16_t),
+      .qkv = patches * VIS_QKV_WIDTH * sizeof(float),
+      .heads = (size_t)VIS_HEADS * padded * VIS_PAD_HEAD * sizeof(uint16_t),
+      .mlp_mid = patches * VIS_MLP_PAD * sizeof(float),
+      .merge_mid = merged * VIS_MERGE_DIM * sizeof(float)};
+}
+
+uint64_t minimax_h3_vision_encoder_workspace_bytes(int patches) {
+  VisWorkspaceSizes sizes = vis_workspace_sizes(patches);
+  return sizes.patch_in + VIS_ACTIVATION_BUFFERS * sizes.activation + sizes.xb +
+         sizes.qkv + MINIMAX_H3_QKV_PARTS * sizes.heads + sizes.mlp_mid +
+         sizes.merge_mid;
+}
+
 // Allocates transient GPU buffers for num_patches (multiple of 4) tokens.
 static int alloc_vis_workspace(MinimaxH3VisionEncoder *vis, int num_patches,
                                VisWorkspace *ws) {
   memset(ws, 0, sizeof *ws);
-  int n_merged = num_patches / VIS_MERGE_UNIT;
-  uint32_t padded = ((uint32_t)num_patches + TILE_M - 1) / TILE_M * TILE_M;
+  VisWorkspaceSizes sizes = vis_workspace_sizes(num_patches);
   MemorySlot *slot = &vis->workspace_slot;
 
-  ws->patch_in = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)num_patches * VIS_PATCH_DIM * sizeof(float));
-  ws->h = gpu_try_alloc_required(vis->gpu, slot,
-                                 (size_t)num_patches * VIS_DIM * sizeof(float));
-  ws->norm = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)num_patches * VIS_DIM * sizeof(float));
-  ws->xb = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)padded * VIS_MERGE_DIM * sizeof(uint16_t));
-  ws->qkv = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)num_patches * VIS_QKV_WIDTH * sizeof(float));
-  ws->attn_out = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)num_patches * VIS_DIM * sizeof(float));
-  ws->qh = gpu_try_alloc_required(vis->gpu, slot,
-                                  (size_t)VIS_HEADS * padded * VIS_PAD_HEAD *
-                                      sizeof(uint16_t));
-  ws->kh = gpu_try_alloc_required(vis->gpu, slot,
-                                  (size_t)VIS_HEADS * padded * VIS_PAD_HEAD *
-                                      sizeof(uint16_t));
-  ws->vh = gpu_try_alloc_required(vis->gpu, slot,
-                                  (size_t)VIS_HEADS * padded * VIS_PAD_HEAD *
-                                      sizeof(uint16_t));
-  ws->mlp_mid = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)num_patches * VIS_MLP_PAD * sizeof(float));
-  ws->merge_mid = gpu_try_alloc_required(
-      vis->gpu, slot, (size_t)n_merged * VIS_MERGE_DIM * sizeof(float));
+  ws->patch_in = gpu_try_alloc_required(vis->gpu, slot, sizes.patch_in);
+  ws->h = gpu_try_alloc_required(vis->gpu, slot, sizes.activation);
+  ws->norm = gpu_try_alloc_required(vis->gpu, slot, sizes.activation);
+  ws->xb = gpu_try_alloc_required(vis->gpu, slot, sizes.xb);
+  ws->qkv = gpu_try_alloc_required(vis->gpu, slot, sizes.qkv);
+  ws->attn_out = gpu_try_alloc_required(vis->gpu, slot, sizes.activation);
+  ws->qh = gpu_try_alloc_required(vis->gpu, slot, sizes.heads);
+  ws->kh = gpu_try_alloc_required(vis->gpu, slot, sizes.heads);
+  ws->vh = gpu_try_alloc_required(vis->gpu, slot, sizes.heads);
+  ws->mlp_mid = gpu_try_alloc_required(vis->gpu, slot, sizes.mlp_mid);
+  ws->merge_mid = gpu_try_alloc_required(vis->gpu, slot, sizes.merge_mid);
 
   if (!ws->patch_in.obj || !ws->h.obj || !ws->norm.obj || !ws->xb.obj ||
       !ws->qkv.obj || !ws->attn_out.obj || !ws->qh.obj || !ws->kh.obj ||
@@ -786,6 +829,83 @@ typedef struct {
   int start_idx;
 } EncodedRefVis;
 
+// Tokenizes the label "Picture N: " of the reference image at index (from 0)
+// into ids and returns its length; Comfy-Org/ComfyUI
+// comfy/text_encoders/minimax.py:8,233 and
+// comfy_extras/nodes_minimax_h3.py:768.
+static int tokenize_ref_label(const MinimaxH3TextEncoder *text_enc, int index,
+                              int ids[REF_LABEL_MAX_TOKENS]) {
+  char label[REF_LABEL_BUF_CAP];
+  snprintf(label, sizeof label, "Picture %d: ", index + 1);
+  return minimax_h3_text_encoder_tokenize(text_enc, label, ids,
+                                          REF_LABEL_MAX_TOKENS);
+}
+
+// Tokenizes the text of an edit's prompt into ids, which holds
+// MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS, and returns its length: 0 for an empty
+// prompt, which takes no pad token beside its images.
+static int tokenize_edit_prompt(const MinimaxH3TextEncoder *text_enc,
+                                const char *prompt, int *ids) {
+  if (!prompt || prompt[0] == '\0') return 0;
+  return minimax_h3_text_encoder_tokenize(text_enc, prompt, ids,
+                                          MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS);
+}
+
+int minimax_h3_multimodal_prompt_tokens(const MinimaxH3TextEncoder *text_enc,
+                                        const char *prompt,
+                                        const MinimaxH3RefTokens *refs,
+                                        int ref_count) {
+  int *ids = xmalloc((size_t)MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS * sizeof(int));
+  int tokens = 0;
+  if (ref_count == 0) {
+    tokens = minimax_h3_text_encoder_tokenize(
+        text_enc, prompt ? prompt : "", ids, MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS);
+  } else {
+    tokens = tokenize_edit_prompt(text_enc, prompt, ids);
+    for (int i = 0; i < ref_count; i++) {
+      int label_ids[REF_LABEL_MAX_TOKENS];
+      tokens += tokenize_ref_label(text_enc, i, label_ids) + refs[i].tokens +
+                REF_VISION_DELIMITERS;
+    }
+  }
+  free(ids);
+  return tokens;
+}
+
+uint64_t minimax_h3_multimodal_prompt_peak_bytes(int seq_len,
+                                                 const MinimaxH3RefTokens *refs,
+                                                 int ref_count) {
+  uint64_t row = (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+  uint64_t hidden = (uint64_t)seq_len * row;
+  if (ref_count == 0)
+    return minimax_h3_text_encoder_workspace_bytes(seq_len, 0) + hidden;
+
+  // Each image's vision tower run holds its workspace beside its outputs and
+  // those of the images before it: merged rows and DeepStack rows.
+  uint64_t outputs = 0, peak = 0;
+  int visual = 0;
+  for (int i = 0; i < ref_count; i++) {
+    outputs += (uint64_t)(1 + MINIMAX_H3_TEXT_DEEPSTACK_LAYERS) *
+               (uint64_t)refs[i].tokens * row;
+    uint64_t run =
+        minimax_h3_vision_encoder_workspace_bytes(refs[i].patches) + outputs;
+    if (run > peak) peak = run;
+    visual += refs[i].tokens;
+  }
+
+  // The embeddings, the concatenated DeepStack rows and the hidden rows are
+  // made while the image outputs still exist. The text layers then run beside
+  // these three.
+  uint64_t embeds = hidden;
+  uint64_t deepstack =
+      (uint64_t)MINIMAX_H3_TEXT_DEEPSTACK_LAYERS * (uint64_t)visual * row;
+  uint64_t prompt_buffers = embeds + deepstack + hidden;
+  if (outputs + prompt_buffers > peak) peak = outputs + prompt_buffers;
+  uint64_t layers =
+      minimax_h3_text_encoder_workspace_bytes(seq_len, visual) + prompt_buffers;
+  return layers > peak ? layers : peak;
+}
+
 int minimax_h3_encode_multimodal_prompt(
     MinimaxH3TextEncoder *text_enc, MinimaxH3VisionEncoder *vis,
     const char *prompt, const MinimaxH3RefImage *refs, int ref_count,
@@ -851,14 +971,10 @@ int minimax_h3_encode_multimodal_prompt(
     total_vis += enc_refs[i].n_merged;
   }
 
-  // Tokenize reference labels ("Picture %d: ", Comfy-Org/ComfyUI
-  // comfy/text_encoders/minimax.py:8,233 and
-  // comfy_extras/nodes_minimax_h3.py:768) and raw prompt text.
-  int *prompt_ids = xmalloc((size_t)PROMPT_MAX_TOKENS * sizeof(int));
-  int prompt_len = 0;
-  if (prompt && prompt[0] != '\0')
-    prompt_len = minimax_h3_text_encoder_tokenize(text_enc, prompt, prompt_ids,
-                                                  PROMPT_MAX_TOKENS);
+  // Tokenize the reference labels and the raw prompt text.
+  int *prompt_ids =
+      xmalloc((size_t)MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS * sizeof(int));
+  int prompt_len = tokenize_edit_prompt(text_enc, prompt, prompt_ids);
 
   int max_seq = total_vis + prompt_len + ref_count * REF_TEMPLATE_TOKENS +
                 REF_SEQ_GUARD_TOKENS;
@@ -868,11 +984,8 @@ int minimax_h3_encode_multimodal_prompt(
   int seq_len = 0, vis_cursor = 0;
 
   for (int i = 0; i < ref_count; i++) {
-    char label[REF_LABEL_BUF_CAP];
-    snprintf(label, sizeof label, "Picture %d: ", i + 1);
     int label_ids[REF_LABEL_MAX_TOKENS];
-    int l_len = minimax_h3_text_encoder_tokenize(text_enc, label, label_ids,
-                                                 REF_LABEL_MAX_TOKENS);
+    int l_len = tokenize_ref_label(text_enc, i, label_ids);
     for (int j = 0; j < l_len; j++) {
       ids[seq_len] = label_ids[j];
       tags[seq_len] = TAG_TEXT;

@@ -1,14 +1,12 @@
 #ifndef EREMITE_MODEL_MINIMAX_H3_MODEL_H
 #define EREMITE_MODEL_MINIMAX_H3_MODEL_H
+#include "model/minimax_h3/vision_encoder.h"
 #include "model/model.h"
 #include <stddef.h>
 
 // MiniMax-H3-Image model integration: wraps the Qwen3-VL-32B NVFP4 text and
 // vision encoders, pruned INT8-ConvRot 50-layer DiT, and FP16 24-channel VAE
 // behind ModelOps for text-to-image generation and multi-reference editing.
-
-// Maximum prompt tokens retained from the text prompt before encoding.
-static constexpr int MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS = 4096;
 
 // Spatial multiple in pixels required by the VAE (16x) and DiT (2x2 patch);
 // Comfy-Org/ComfyUI comfy_extras/nodes_minimax_h3.py:32 (CANVAS_MULTIPLE = 32).
@@ -84,14 +82,40 @@ int minimax_h3_image_plan_canvas(int width, int height, int min_area,
                                  int *out_canvas_w, int *out_canvas_h,
                                  char *error, size_t error_cap);
 
-// Computes full-residence and staged GPU memory peaks for a planned canvas
-// (canvas_w by canvas_h), prompt token length text_len, reference vision token
-// count vis_tokens, reference latent patch count ref_patches and reference
-// count ref_count.
+// Sizes of one reference image of an edit.
+typedef struct {
+  // Vision tower patches and prompt tokens.
+  MinimaxH3RefTokens vision;
+  // VAE encoder input width and height in pixels.
+  int vae_width, vae_height;
+} MinimaxH3RefSizes;
+
+// Returns the vision and VAE sizes of a width by height reference image.
+MinimaxH3RefSizes minimax_h3_image_ref_sizes(int width, int height);
+
+// GPU working bytes of each stage of one request, weights aside.
+typedef struct {
+  // The most that encoding the prompt and the references holds at once.
+  uint64_t encode;
+  // Sampling with the DiT, the prompt's hidden rows included.
+  uint64_t sample;
+  // Decoding the latents with the VAE.
+  uint64_t decode;
+} MinimaxH3StageBytes;
+
+// Returns the working bytes of each stage for a prompt sequence of seq_len
+// tokens, ref_count reference images of sizes refs and a canvas_w by canvas_h
+// canvas.
+MinimaxH3StageBytes minimax_h3_image_stage_bytes(int seq_len,
+                                                 const MinimaxH3RefSizes *refs,
+                                                 int ref_count, int canvas_w,
+                                                 int canvas_h);
+
+// Computes full-residence and staged GPU memory peaks for a request with
+// ref_count reference images whose stages need stages beside the weights.
 MinimaxH3RequestMemory
-minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights, int canvas_w,
-                                     int canvas_h, int text_len, int vis_tokens,
-                                     int ref_patches, int ref_count);
+minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights,
+                                     MinimaxH3StageBytes stages, int ref_count);
 
 // Reserves GPU memory in account for a planned canvas before running the text
 // encoder. Prefers full residence when full_resident is nonzero, falling back

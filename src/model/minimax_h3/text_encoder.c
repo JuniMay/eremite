@@ -23,9 +23,6 @@ static constexpr int QWEN_VOCAB = 151936, QWEN_HEADS = 64, QWEN_KV_HEADS = 8,
 static constexpr float QWEN_RMS_EPS = 1e-6f;
 static constexpr double QWEN_ROPE_THETA = 5000000.0;
 
-// Maximum token count accepted when tokenizing a text prompt.
-static constexpr int QWEN_MAX_PROMPT_TOKENS = 4096;
-
 // Tile and threadgroup sizes matching minimax_h3_quant.metal and
 // minimax_h3_qwen.metal.
 static constexpr uint32_t TILE_M = 128, TILE_N = 64, ATTN_PAD = 64,
@@ -628,9 +625,9 @@ int minimax_h3_text_encoder_encode_prompt(MinimaxH3TextEncoder *enc,
                                           MemorySlot *out_slot, Buf *out_hidden,
                                           int *out_seq_len,
                                           const MinimaxH3RunHooks *hooks) {
-  int ids[QWEN_MAX_PROMPT_TOKENS];
-  int seq_len = minimax_h3_text_encoder_tokenize(enc, prompt, ids,
-                                                 QWEN_MAX_PROMPT_TOKENS);
+  int ids[MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS];
+  int seq_len = minimax_h3_text_encoder_tokenize(
+      enc, prompt, ids, MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS);
   size_t bytes = (size_t)seq_len * (size_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
   Buf hidden = gpu_try_alloc_required(enc->gpu, out_slot, bytes);
   if (!hidden.obj) return 0;

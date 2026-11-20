@@ -46,6 +46,9 @@ static constexpr float ENC_GN_EPS = 1e-6f, ENC_LOGVAR_MIN = -30.0f,
                        ENC_LOGVAR_MAX = 20.0f;
 static constexpr uint64_t ENC_POSTERIOR_SEED = 42;
 
+// Activation buffers of the encoder's working memory: a, b and c.
+static constexpr int ENC_ACTIVATION_BUFFERS = 3;
+
 // Cap on FP16 im2col staging elements (16384 x 1152 = 36 MiB) per conv strip.
 static constexpr size_t ENC_IM2COL_MAX_HALFS = 16384u * 1152u,
                         ENC_IM2COL_MIN_HALFS = 256u * 9216u;
@@ -1102,25 +1105,57 @@ static void free_enc_workspace(EncWorkspace *ws) {
   gpu_free(&ws->a);
 }
 
+// Byte sizes of the VAE encoder's working buffers for one tile size.
+typedef struct {
+  // One NHWC FP32 activation of a tile at ENC_BASE_CH channels: a, b and c
+  // each.
+  size_t activation;
+  // im2col staging capacity in 16-bit half elements.
+  size_t im2col_halfs;
+} EncWorkspaceSizes;
+
+// Returns the byte sizes of the working buffers for tiles up to max_tile_h by
+// max_tile_w pixels.
+static EncWorkspaceSizes enc_workspace_sizes(int max_tile_h, int max_tile_w) {
+  size_t pixels = (size_t)max_tile_h * (size_t)max_tile_w;
+  size_t halfs = pixels * (size_t)ENC_CONV_TAPS_3X3 * (size_t)ENC_BASE_CH;
+  if (halfs < ENC_IM2COL_MIN_HALFS) halfs = ENC_IM2COL_MIN_HALFS;
+  if (halfs > ENC_IM2COL_MAX_HALFS) halfs = ENC_IM2COL_MAX_HALFS;
+  return (EncWorkspaceSizes){.activation =
+                                 pixels * (size_t)ENC_BASE_CH * sizeof(float),
+                             .im2col_halfs = halfs};
+}
+
+// Returns the longest tile of plan.
+static int longest_tile(MinimaxH3VaeTilePlan plan) {
+  int longest = 0;
+  for (int i = 0; i < plan.count; i++)
+    if (plan.len[i] > longest) longest = plan.len[i];
+  return longest;
+}
+
+uint64_t minimax_h3_image_vae_encoder_workspace_bytes(int width, int height) {
+  EncWorkspaceSizes sizes = enc_workspace_sizes(
+      longest_tile(minimax_h3_image_vae_split_tiles(height)),
+      longest_tile(minimax_h3_image_vae_split_tiles(width)));
+  return ENC_ACTIVATION_BUFFERS * sizes.activation +
+         sizes.im2col_halfs * sizeof(uint16_t);
+}
+
 // Allocates transient GPU buffers for single-frame encoder tiles up to
 // max_tile_h by max_tile_w pixels.
 static int alloc_enc_workspace(MinimaxH3ImageVae *vae, int max_tile_h,
                                int max_tile_w, EncWorkspace *ws) {
   memset(ws, 0, sizeof *ws);
-  size_t act_bytes = (size_t)max_tile_h * (size_t)max_tile_w *
-                     (size_t)ENC_BASE_CH * sizeof(float);
-  size_t wanted_halfs = (size_t)max_tile_h * (size_t)max_tile_w *
-                        (size_t)ENC_CONV_TAPS_3X3 * (size_t)ENC_BASE_CH;
-  if (wanted_halfs < ENC_IM2COL_MIN_HALFS) wanted_halfs = ENC_IM2COL_MIN_HALFS;
-  if (wanted_halfs > ENC_IM2COL_MAX_HALFS) wanted_halfs = ENC_IM2COL_MAX_HALFS;
-  ws->im2col_halfs = wanted_halfs;
+  EncWorkspaceSizes sizes = enc_workspace_sizes(max_tile_h, max_tile_w);
+  ws->im2col_halfs = sizes.im2col_halfs;
 
   MemorySlot *slot = &vae->workspace_slot;
-  ws->a = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
-  ws->b = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
-  ws->c = gpu_try_alloc_required(vae->gpu, slot, act_bytes);
-  ws->im2col =
-      gpu_try_alloc_required(vae->gpu, slot, wanted_halfs * sizeof(uint16_t));
+  ws->a = gpu_try_alloc_required(vae->gpu, slot, sizes.activation);
+  ws->b = gpu_try_alloc_required(vae->gpu, slot, sizes.activation);
+  ws->c = gpu_try_alloc_required(vae->gpu, slot, sizes.activation);
+  ws->im2col = gpu_try_alloc_required(vae->gpu, slot,
+                                      sizes.im2col_halfs * sizeof(uint16_t));
   if (!ws->a.obj || !ws->b.obj || !ws->c.obj || !ws->im2col.obj) {
     free_enc_workspace(ws);
     return 0;
@@ -1311,11 +1346,7 @@ int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
 
   MinimaxH3VaeTilePlan y_plan = minimax_h3_image_vae_split_tiles(height);
   MinimaxH3VaeTilePlan x_plan = minimax_h3_image_vae_split_tiles(width);
-  int max_tile_h = 0, max_tile_w = 0;
-  for (int i = 0; i < y_plan.count; i++)
-    if (y_plan.len[i] > max_tile_h) max_tile_h = y_plan.len[i];
-  for (int j = 0; j < x_plan.count; j++)
-    if (x_plan.len[j] > max_tile_w) max_tile_w = x_plan.len[j];
+  int max_tile_h = longest_tile(y_plan), max_tile_w = longest_tile(x_plan);
 
   MemorySlot *wslot = weight_group_slot(vae->enc_weights);
   unsigned was_pinned = wslot->pins;
