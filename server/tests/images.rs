@@ -1,8 +1,8 @@
 //! MiniMax-H3-Image through HTTP: POST /v1/images/generations (JSON) and
-//! POST /v1/images/edits (multipart/form-data). Verifies model listing, Codex
-//! catalog exclusion, chat and decision refusals, HTTP 400 validation errors,
-//! exact requested output dimensions (including non-32 resizing), PNG and JPEG
-//! encoding, and multi-part reference image editing.
+//! POST /v1/images/edits (JSON or multipart/form-data). Verifies model
+//! listing, Codex catalog exclusion, chat and decision refusals, HTTP 400
+//! validation errors, exact and auto output sizes (including non-32
+//! resizing), PNG and JPEG encoding, and reference image editing.
 //!
 //! Set EREMITE_MINIMAX_H3_MODEL_DIR, EREMITE_MINIMAX_H3_TEXT_ENCODER,
 //! EREMITE_MINIMAX_H3_DIT, EREMITE_MINIMAX_H3_VAE, and optionally
@@ -280,13 +280,31 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let auto_edit = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
     assert_eq!(png_dimensions(&auto_edit), Some(ref_size));
 
+    // 5c. A JSON edit gives its image as a base64 data URL, as Codex sends it.
+    let json_edit = json!({
+        "model": "gpt-image-2",
+        "prompt": "Keep <Picture 1> with warm golden sunset lighting.",
+        "images": [{"image_url": format!(
+            "data:image/png;base64,{}",
+            eremite_server::image::encode_base64(&ref_bytes)
+        )}],
+        "size": "auto",
+        "quality": "auto",
+        "background": "opaque",
+        "seed": 1234,
+        "min_generation_area": 1024
+    });
+    let (code, answer) = ask(&server, "POST", "/v1/images/edits", Some(&json_edit));
+    assert_eq!(code, 200, "JSON edit failed: {answer}");
+    assert_eq!(answer["size"], format!("{}x{}", ref_size.0, ref_size.1));
+
     // 6. Status endpoint reports loaded image model with separated counters.
     let (code, status) = ask(&server, "GET", "/v1/models/minimax-h3-image", None);
     assert_eq!(code, 200, "{status}");
     let st = &status["status"];
     assert_eq!(st["loaded"], json!(true));
     assert_eq!(st["phase"], json!("idle"));
-    assert_eq!(st["totals"]["generated_images"], json!(5));
+    assert_eq!(st["totals"]["generated_images"], json!(6));
     assert_eq!(st["totals"]["generated_tokens"], json!(0));
     assert!(
         st["totals"]["prefilled_tokens"].as_u64().unwrap_or(0) > 0,
@@ -300,8 +318,8 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         st["totals"]["image_seconds"].as_f64().unwrap_or(0.0) > 0.0,
         "{st}"
     );
-    assert_eq!(st["engine_counters"]["generated_images"], json!(5));
-    assert_eq!(st["engine_counters"]["image_steps"], json!(30));
+    assert_eq!(st["engine_counters"]["generated_images"], json!(6));
+    assert_eq!(st["engine_counters"]["image_steps"], json!(36));
     assert_eq!(st["engine_counters"]["image_stage"], json!(0));
 
     server.stop();

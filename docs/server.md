@@ -137,7 +137,7 @@ also takes `id`, `ctx` (at most 4096), `memory`, `idle_unload` and
 `default_size`, and refuses text-generation settings.
 
 An image model serves `POST /v1/images/generations` (JSON) and
-`POST /v1/images/edits` (`multipart/form-data`, up to 128 MiB). The chat and
+`POST /v1/images/edits` (JSON or `multipart/form-data`, up to 128 MiB). The chat and
 decision endpoints refuse it, and Codex's catalog leaves it out. Both endpoints
 return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT"}`,
 where `size` is the size of the returned images:
@@ -150,8 +150,13 @@ where `size` is the size of the returned images:
   to the largest size of its shape that fits; an image whose shape fits no
   canvas gets HTTP 400. Total output pixels across all images in one request
   (`width * height * n`) may be at most 33,554,432 (32 Mi pixels).
-- `image` (or `image[]`): `/v1/images/edits` only; 1 to 16 image files in
-  upload order, defining `<Picture 1>`, `<Picture 2>`, and so on in `prompt`.
+- `image` (or `image[]`): `/v1/images/edits` with `multipart/form-data`
+  only; 1 to 16 image files in upload order, defining `<Picture 1>`,
+  `<Picture 2>`, and so on in `prompt`.
+- `images`: `/v1/images/edits` with JSON only; 1 to 16 objects, each with an
+  `image_url` that is a base64 data URL, in the same order. The server
+  fetches no URLs and has no Files API, so `file_id` gets HTTP 400.
+- `mask`: unsupported; it gets HTTP 400.
 - `n`: optional image count, 1 to 16 (default 1); image `i` uses `seed + i`.
 - `seed`: optional nonnegative integer (random when omitted).
 - `generator_device`: accepted and ignored (initial noise always uses the

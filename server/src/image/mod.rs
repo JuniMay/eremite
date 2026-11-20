@@ -165,12 +165,27 @@ pub fn parse_generation_request(
     body: &[u8],
     limits: &engine::ImageLimits,
 ) -> Result<ParsedRequest, chat::Error> {
+    read_json_request(&read_json_object(body)?, limits)
+}
+
+/// Reads a request body that must be one JSON object.
+fn read_json_object(body: &[u8]) -> Result<Map<String, Value>, chat::Error> {
     let root: Value = serde_json::from_slice(body)
         .map_err(|error| chat::Error::new_bad_request(format!("not valid JSON: {error}")))?;
-    let object = root
-        .as_object()
-        .ok_or_else(|| chat::Error::new_bad_request("request body must be a JSON object"))?;
+    match root {
+        Value::Object(object) => Ok(object),
+        _ => Err(chat::Error::new_bad_request(
+            "request body must be a JSON object",
+        )),
+    }
+}
 
+/// Reads and validates the fields of a JSON image request, other than its
+/// reference images, against the target model's `limits`.
+fn read_json_request(
+    object: &Map<String, Value>,
+    limits: &engine::ImageLimits,
+) -> Result<ParsedRequest, chat::Error> {
     let model = read_optional_string(object, "model")?
         .filter(|s| !s.is_empty())
         .map(String::from);
@@ -257,7 +272,7 @@ fn extract_multipart_boundary(content_type: &str) -> Result<String, chat::Error>
     let media_type = parts.next().unwrap_or_default().trim();
     if !media_type.eq_ignore_ascii_case("multipart/form-data") {
         return Err(chat::Error::new_bad_request(
-            "Content-Type must be multipart/form-data",
+            "Content-Type must be application/json or multipart/form-data",
         ));
     }
     for param in parts {
@@ -438,7 +453,7 @@ pub struct EditForm {
 /// attachments before model-specific limit validation.
 pub fn parse_edit_form(content_type: Option<&str>, body: &[u8]) -> Result<EditForm, chat::Error> {
     let content_type = content_type.ok_or_else(|| {
-        chat::Error::new_bad_request("Content-Type: multipart/form-data is required")
+        chat::Error::new_bad_request("Content-Type must be application/json or multipart/form-data")
     })?;
     let boundary = extract_multipart_boundary(content_type)?;
     let parts = parse_multipart(&boundary, body)?;
@@ -446,6 +461,9 @@ pub fn parse_edit_form(content_type: Option<&str>, body: &[u8]) -> Result<EditFo
     let mut fields = HashMap::<String, String>::new();
     let mut references = Vec::<Vec<u8>>::new();
     for part in parts {
+        if part.name == "mask" {
+            return Err(chat::Error::new_bad_request("mask is not supported"));
+        }
         if part.name == "image" || part.name == "image[]" {
             if part.data.is_empty() {
                 return Err(chat::Error::new_bad_request("an image part is empty"));
@@ -478,17 +496,7 @@ impl EditForm {
             fields,
             references,
         } = self;
-        if references.is_empty() {
-            return Err(chat::Error::new_bad_request(
-                "at least one reference image is required",
-            ));
-        }
-        if references.len() > limits.max_references as usize {
-            return Err(chat::Error::new_bad_request(format!(
-                "at most {} reference images are supported",
-                limits.max_references
-            )));
-        }
+        check_reference_count(references.len(), limits)?;
 
         let prompt = fields
             .get("prompt")
@@ -586,15 +594,128 @@ impl EditForm {
     }
 }
 
-/// Parses and validates a multipart/form-data image editing request for POST
-/// /v1/images/edits against `limits`. Reference images are collected from
-/// `image` and `image[]` parts in upload order (`<Picture 1>`, `<Picture 2>`, ...).
+/// Checks that an edit has 1 to the model's most reference images.
+fn check_reference_count(count: usize, limits: &engine::ImageLimits) -> Result<(), chat::Error> {
+    if count == 0 {
+        return Err(chat::Error::new_bad_request(
+            "at least one reference image is required",
+        ));
+    }
+    if count > limits.max_references as usize {
+        return Err(chat::Error::new_bad_request(format!(
+            "at most {} reference images are supported",
+            limits.max_references
+        )));
+    }
+    Ok(())
+}
+
+/// An edit's body before the target model's limits validate it.
+pub enum EditBody {
+    /// A multipart/form-data body.
+    Form(EditForm),
+    /// A JSON body, with the reference images of its `images` decoded.
+    Json {
+        /// The body's object.
+        object: Map<String, Value>,
+        /// The decoded images in the array's order.
+        references: Vec<Vec<u8>>,
+    },
+}
+
+impl EditBody {
+    /// Returns the model that the body names, or None.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            EditBody::Form(form) => form.model.as_deref(),
+            EditBody::Json { object, .. } => object
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty()),
+        }
+    }
+
+    /// Validates the body against the target model's `limits`.
+    pub fn validate(self, limits: &engine::ImageLimits) -> Result<ParsedRequest, chat::Error> {
+        match self {
+            EditBody::Form(form) => form.validate(limits),
+            EditBody::Json { object, references } => {
+                check_reference_count(references.len(), limits)?;
+                let mut parsed = read_json_request(&object, limits)?;
+                parsed.references = references;
+                Ok(parsed)
+            }
+        }
+    }
+}
+
+/// Parses the body of POST /v1/images/edits by its Content-Type: JSON with an
+/// `images` array, or multipart/form-data with `image` parts.
+pub fn parse_edit_body(content_type: Option<&str>, body: &[u8]) -> Result<EditBody, chat::Error> {
+    let media_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return parse_edit_form(content_type, body).map(EditBody::Form);
+    }
+    let object = read_json_object(body)?;
+    if object.get("mask").is_some_and(|mask| !mask.is_null()) {
+        return Err(chat::Error::new_bad_request("mask is not supported"));
+    }
+    let references = read_json_images(&object)?;
+    Ok(EditBody::Json { object, references })
+}
+
+/// Decodes the reference images of a JSON edit's `images` array: objects
+/// whose `image_url` is a base64 data URL.
+fn read_json_images(object: &Map<String, Value>) -> Result<Vec<Vec<u8>>, chat::Error> {
+    let items = match object.get("images") {
+        Some(Value::Array(items)) => items,
+        None | Some(Value::Null) => {
+            return Err(chat::Error::new_bad_request(
+                "images is required: an array of objects with an image_url",
+            ));
+        }
+        Some(_) => return Err(chat::Error::new_bad_request("images must be an array")),
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            if item.get("file_id").is_some_and(|id| !id.is_null()) {
+                return Err(chat::Error::new_bad_request(format!(
+                    "images[{index}].file_id is not supported: this server has no Files API; \
+                     send the image as a base64 data URL in image_url"
+                )));
+            }
+            let url = item.get("image_url").and_then(Value::as_str).ok_or_else(|| {
+                chat::Error::new_bad_request(format!("images[{index}] needs an image_url"))
+            })?;
+            let bytes = chat::decode_data_url(url).map_err(|_| {
+                chat::Error::new_bad_request(format!(
+                    "images[{index}].image_url must be a base64 data URL; the server fetches no URLs"
+                ))
+            })?;
+            if bytes.is_empty() {
+                return Err(chat::Error::new_bad_request(format!(
+                    "images[{index}] is empty"
+                )));
+            }
+            Ok(bytes)
+        })
+        .collect()
+}
+
+/// Parses and validates an image editing request for POST /v1/images/edits
+/// against `limits`. Reference images keep their order (`<Picture 1>`,
+/// `<Picture 2>`, ...).
 pub fn parse_edit_request(
     content_type: Option<&str>,
     body: &[u8],
     limits: &engine::ImageLimits,
 ) -> Result<ParsedRequest, chat::Error> {
-    parse_edit_form(content_type, body)?.validate(limits)
+    parse_edit_body(content_type, body)?.validate(limits)
 }
 
 /// Encodes `bytes` into standard RFC 4648 base64 with `=` padding.
@@ -888,6 +1009,88 @@ mod tests {
              --{boundary}--\r\n"
         );
         assert!(parse_edit_request(Some(&ct), too_many_pixels.as_bytes(), &limits).is_err());
+    }
+
+    #[test]
+    fn edit_request_reads_json_images_from_data_urls() {
+        let limits = test_limits();
+        let url = |bytes: &[u8]| format!("data:image/png;base64,{}", encode_base64(bytes));
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-image-2",
+            "prompt": "Combine <Picture 1> and <Picture 2>.",
+            "images": [{"image_url": url(b"first")}, {"image_url": url(b"second")}],
+            "size": "auto",
+            "quality": "auto",
+            "background": "opaque"
+        }))
+        .unwrap();
+        let edit = parse_edit_body(Some("application/json"), &body).unwrap();
+        assert_eq!(edit.model(), Some("gpt-image-2"));
+        let req = edit.validate(&limits).unwrap();
+        assert_eq!(req.references, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(req.size, ImageSize::Auto);
+        assert_eq!(req.prompt, "Combine <Picture 1> and <Picture 2>.");
+    }
+
+    #[test]
+    fn edit_request_refuses_json_images_it_cannot_read() {
+        let limits = test_limits();
+        let data = format!("data:image/png;base64,{}", encode_base64(b"x"));
+        for (bad, message) in [
+            (json!({"prompt": "p"}), "images is required"),
+            (json!({"prompt": "p", "images": "x"}), "must be an array"),
+            (
+                json!({"prompt": "p", "images": []}),
+                "at least one reference image",
+            ),
+            (
+                json!({"prompt": "p", "images": [{"file_id": "file-1"}]}),
+                "no Files API",
+            ),
+            (
+                json!({"prompt": "p", "images": [{"image_url": "https://example.com/a.png"}]}),
+                "fetches no URLs",
+            ),
+            (json!({"prompt": "p", "images": [{}]}), "needs an image_url"),
+            (
+                json!({"prompt": "p", "images": [{"image_url": data}], "mask": {"image_url": data}}),
+                "mask is not supported",
+            ),
+            (
+                json!({"images": [{"image_url": data}]}),
+                "prompt is required",
+            ),
+        ] {
+            let body = serde_json::to_vec(&bad).unwrap();
+            let error = parse_edit_request(Some("application/json; charset=utf-8"), &body, &limits)
+                .expect_err("refused");
+            assert!(error.message.contains(message), "{bad}: {}", error.message);
+        }
+        let many: Vec<Value> = (0..=limits.max_references)
+            .map(|_| json!({"image_url": data}))
+            .collect();
+        let body = serde_json::to_vec(&json!({"prompt": "p", "images": many})).unwrap();
+        assert!(parse_edit_request(Some("application/json"), &body, &limits).is_err());
+        assert!(parse_edit_request(Some("text/plain"), b"{}", &limits).is_err());
+    }
+
+    #[test]
+    fn edit_form_refuses_a_mask() {
+        let boundary = "b2";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"mask\"\r\n\r\n\u{0}\u{1}\r\n\
+             --{boundary}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let error =
+            parse_edit_request(Some(&ct), body.as_bytes(), &test_limits()).expect_err("refused");
+        assert!(
+            error.message.contains("mask is not supported"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

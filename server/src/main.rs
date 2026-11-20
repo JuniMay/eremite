@@ -733,9 +733,9 @@ async fn answer_image_generations(
     run_image_request(index, arrival, peer, parsed).await
 }
 
-/// Answers POST /v1/images/edits: parses the multipart/form-data body, finds
-/// the target image model, validates the form against that model's limits,
-/// submits it to the worker, and returns `data[i].b64_json`.
+/// Answers POST /v1/images/edits: parses the JSON or multipart/form-data body,
+/// finds the target image model, validates the body against that model's
+/// limits, submits it to the worker, and returns `data[i].b64_json`.
 async fn answer_image_edits(
     State(shared): App,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -759,15 +759,15 @@ async fn answer_image_edits(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let form = match image::parse_edit_form(content_type, &body) {
-        Ok(form) => form,
+    let edit = match image::parse_edit_body(content_type, &body) {
+        Ok(edit) => edit,
         Err(error) => return refuse_request(&peer, error),
     };
-    let (index, limits) = match resolve_image_model(&shared, form.model.as_deref()) {
+    let (index, limits) = match resolve_image_model(&shared, edit.model()) {
         Ok(pair) => pair,
         Err((status, message)) => return refuse_image_model(&peer, status, message),
     };
-    let parsed = match form.validate(&limits) {
+    let parsed = match edit.validate(&limits) {
         Ok(parsed) => parsed,
         Err(error) => return refuse_request(&peer, error),
     };
