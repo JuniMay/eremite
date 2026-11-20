@@ -425,6 +425,7 @@ unsafe extern "C" {
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
     fn eremite_is_decision_model(m: *const RawModel) -> c_int;
     fn eremite_is_image_model(m: *const RawModel) -> c_int;
+    fn eremite_image_model_limits(m: *const RawModel, out: *mut ImageLimits) -> c_int;
     fn eremite_image_result_free(result: *mut RawImageResult);
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
@@ -1689,6 +1690,48 @@ impl Drop for Media {
     fn drop(&mut self) {
         unsafe { eremite_media_close(self.0) }
     }
+}
+
+/// Input and output limits of an image generation model (eremite_image_limits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImageLimits {
+    /// Maximum prompt tokens retained before encoding.
+    pub max_prompt_tokens: c_int,
+    /// Maximum single-axis output or canvas dimension in pixels.
+    pub max_dim: c_int,
+    /// Minimum accepted min_generation_area in pixels.
+    pub min_generation_area: c_int,
+    /// Maximum accepted min_generation_area in pixels.
+    pub max_generation_area: c_int,
+    /// Default min_generation_area in pixels when omitted.
+    pub default_generation_area: c_int,
+    /// Maximum generation canvas area in pixels.
+    pub max_canvas_area: i64,
+    /// Maximum total output pixels across all images of one request.
+    pub max_request_pixels: i64,
+    /// Maximum images returned by one request.
+    pub max_images_per_request: c_int,
+    /// Maximum reference images accepted by one edit request.
+    pub max_references: c_int,
+    /// Smallest JPEG quality value accepted.
+    pub min_jpeg_quality: c_int,
+    /// Largest JPEG quality value accepted.
+    pub max_jpeg_quality: c_int,
+    /// Default JPEG quality when omitted.
+    pub default_jpeg_quality: c_int,
+    /// Required inference step count for distilled checkpoints.
+    pub inference_steps: c_int,
+    /// Required guidance scale for CFG-free checkpoints.
+    pub guidance_scale: f64,
+}
+
+/// Returns the default MiniMax-H3-Image limits defined by the C engine.
+pub fn default_image_limits() -> ImageLimits {
+    let mut out = ImageLimits::default();
+    let ok = unsafe { eremite_image_model_limits(ptr::null(), &mut out) };
+    debug_assert_ne!(ok, 0);
+    out
 }
 
 /// Running stage of an image generation call (EREMITE_IMAGE_STAGE_*).

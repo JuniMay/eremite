@@ -142,7 +142,8 @@ return `{"created": ..., "data": [{"b64_json": "..."}]}`:
 
 - `prompt`: required string, passed verbatim and truncated to 4096 tokens.
 - `size`: required `WIDTHxHEIGHT` (each 1 to 8192). The returned image has
-  exactly this size.
+  exactly this size. Total output pixels across all images in one request
+  (`width * height * n`) may be at most 33,554,432 (32 Mi pixels).
 - `image` (or `image[]`): `/v1/images/edits` only; 1 to 16 image files in
   upload order, defining `<Picture 1>`, `<Picture 2>`, and so on in `prompt`.
 - `n`: optional image count, 1 to 16 (default 1); image `i` uses `seed + i`.

@@ -393,6 +393,30 @@ int eremite_is_image_model(const eremite_model *m) {
   return m->ops->generate_image != NULL;
 }
 
+int eremite_image_model_limits(const eremite_model *m,
+                               eremite_image_limits *out) {
+  const ModelOps *ops = m ? m->ops : &minimax_h3_image_ops;
+  if (!ops->read_image_limits) return 0;
+  ImageLimits lim = {0};
+  ops->read_image_limits(&lim);
+  *out = (eremite_image_limits){
+      .max_prompt_tokens = lim.max_prompt_tokens,
+      .max_dim = lim.max_dim,
+      .min_generation_area = lim.min_generation_area,
+      .max_generation_area = lim.max_generation_area,
+      .default_generation_area = lim.default_generation_area,
+      .max_canvas_area = lim.max_canvas_area,
+      .max_request_pixels = lim.max_request_pixels,
+      .max_images_per_request = lim.max_images_per_request,
+      .max_references = lim.max_references,
+      .min_jpeg_quality = lim.min_jpeg_quality,
+      .max_jpeg_quality = lim.max_jpeg_quality,
+      .default_jpeg_quality = lim.default_jpeg_quality,
+      .inference_steps = lim.inference_steps,
+      .guidance_scale = lim.guidance_scale};
+  return 1;
+}
+
 // Converts an eremite_image_request and runs the image model's generation pass.
 static int run_image_generation(eremite_model *m,
                                 const eremite_image_request *request,

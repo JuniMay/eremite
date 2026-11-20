@@ -1,5 +1,7 @@
+#include "eremite.h"
 #include "model/minimax_h3/model.h"
 #include "model/minimax_h3/quant.h"
+#include "platform/image.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -104,6 +106,25 @@ int main(void) {
   check(!minimax_h3_should_stop(&hooks), "uncancelled hooks do not stop");
   cancelled = 1;
   check(minimax_h3_should_stop(&hooks), "cancelled hooks request stop");
+
+  // Single-source image limits exported through eremite.h match model.h.
+  eremite_image_limits lim = {0};
+  check(eremite_image_model_limits(NULL, &lim) == 1 &&
+            lim.max_prompt_tokens == MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS &&
+            lim.max_dim == MINIMAX_H3_IMAGE_MAX_DIM &&
+            lim.min_generation_area == MINIMAX_H3_IMAGE_MIN_AREA &&
+            lim.max_generation_area == MINIMAX_H3_IMAGE_MAX_AREA &&
+            lim.default_generation_area == MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA &&
+            lim.max_canvas_area == MINIMAX_H3_IMAGE_MAX_CANVAS_AREA &&
+            lim.max_request_pixels == MINIMAX_H3_IMAGE_MAX_REQUEST_PIXELS &&
+            lim.max_images_per_request == MINIMAX_H3_IMAGE_MAX_IMAGES &&
+            lim.max_references == MINIMAX_H3_IMAGE_MAX_REFS &&
+            lim.min_jpeg_quality == IMAGE_JPEG_QUALITY_MIN &&
+            lim.max_jpeg_quality == IMAGE_JPEG_QUALITY_MAX &&
+            lim.default_jpeg_quality == MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY &&
+            lim.inference_steps == MINIMAX_H3_IMAGE_STEPS &&
+            lim.guidance_scale == MINIMAX_H3_IMAGE_GUIDANCE_SCALE,
+        "eremite_image_model_limits exports exact C model limits");
 
   printf("minimax_h3_image unit checks: %d failures\n", failures);
   return failures != 0;

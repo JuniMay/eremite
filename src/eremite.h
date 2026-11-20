@@ -290,8 +290,39 @@ typedef struct {
   double image_seconds;
 } eremite_image_result;
 
+// Input and output limits of an image generation model.
+typedef struct {
+  // Maximum prompt tokens retained before encoding.
+  int max_prompt_tokens;
+  // Maximum single-axis output or canvas dimension in pixels.
+  int max_dim;
+  // Minimum and maximum accepted min_generation_area in pixels.
+  int min_generation_area, max_generation_area;
+  // Default min_generation_area in pixels when omitted.
+  int default_generation_area;
+  // Maximum generation canvas area in pixels.
+  int64_t max_canvas_area;
+  // Maximum total output pixels across all images of one request.
+  int64_t max_request_pixels;
+  // Maximum images returned by one request.
+  int max_images_per_request;
+  // Maximum reference images accepted by one edit request.
+  int max_references;
+  // Minimum, maximum and default JPEG quality values.
+  int min_jpeg_quality, max_jpeg_quality, default_jpeg_quality;
+  // Required inference step count for distilled checkpoints.
+  int inference_steps;
+  // Required guidance scale for CFG-free checkpoints.
+  double guidance_scale;
+} eremite_image_limits;
+
 // Returns whether the model is an image generation model.
 int eremite_is_image_model(const eremite_model *m);
+// Writes the image limits of m into out and returns 1, or returns 0 for a
+// model that generates no images. When m is null, writes the default
+// MiniMax-H3-Image limits and returns 1.
+int eremite_image_model_limits(const eremite_model *m,
+                               eremite_image_limits *out);
 // Runs one image generation or editing call synchronously and writes the
 // result into out. Caller releases out->data with eremite_image_result_free.
 // Returns 1 on success or 0 on failure.

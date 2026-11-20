@@ -15,33 +15,14 @@ use crate::{chat, engine, http};
 pub const DEFAULT_MODEL_ID: &str = "minimax-h3-image";
 /// Display name shown in GET /v1/models for MiniMax-H3-Image.
 pub const DISPLAY_NAME: &str = "MiniMax-H3-Image (eremite)";
-/// Maximum prompt tokens kept before MiniMax-H3-Image text encoding.
-pub const MAX_PROMPT_TOKENS: i32 = 4096;
-/// Minimum accepted value of `min_generation_area` in pixels (one 32x32 patch).
-pub const MIN_GENERATION_AREA_MIN: i32 = 1024;
-/// Maximum accepted value of `min_generation_area` in pixels (4096x4096).
-pub const MIN_GENERATION_AREA_MAX: i32 = 16_777_216;
-/// Default value of `min_generation_area` in pixels (2048x2048).
-pub const MIN_GENERATION_AREA_DEFAULT: i32 = 4_194_304;
-/// Maximum single-axis output dimension in pixels.
-pub const MAX_DIM: i32 = 8192;
-/// Maximum number of images returned by one request (`n`).
-pub const MAX_IMAGES_PER_REQUEST: usize = 16;
-/// Maximum number of reference images accepted by one edit request.
-pub const MAX_REFERENCES: usize = 16;
-/// Default JPEG quality when `output_compression` is omitted.
-pub const DEFAULT_JPEG_QUALITY: i32 = 95;
-/// Smallest JPEG compression quality value accepted.
-pub const MIN_JPEG_QUALITY: i32 = 1;
-/// Largest JPEG compression quality value accepted.
-pub const MAX_JPEG_QUALITY: i32 = 100;
-/// Only inference step count supported by the 6-step distilled PDD checkpoint.
-pub const REQUIRED_INFERENCE_STEPS: i64 = 6;
-/// Only guidance scale supported by the CFG-free checkpoint.
-pub const REQUIRED_GUIDANCE_SCALE: f64 = 1.0;
 /// Maximum body size for multipart image editing uploads (128 MiB for up to 16
 /// multi-megabyte reference images).
 pub const MAX_EDIT_BODY_BYTES: usize = 128 * http::MIB;
+
+/// CRLF blank-line separator between multipart headers and part body.
+const CRLF_HEADER_END: &[u8] = b"\r\n\r\n";
+/// LF blank-line separator between multipart headers and part body.
+const LF_HEADER_END: &[u8] = b"\n\n";
 
 /// RFC 4648 standard base64 alphabet.
 const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -72,7 +53,7 @@ pub struct ParsedRequest {
 }
 
 /// Parses a `WIDTHxHEIGHT` size string into validated pixel dimensions.
-fn parse_size(raw: &str) -> Result<(i32, i32), chat::Error> {
+fn parse_size(raw: &str, limits: &engine::ImageLimits) -> Result<(i32, i32), chat::Error> {
     let trimmed = raw.trim();
     let Some((w_str, h_str)) = trimmed.split_once(['x', 'X']) else {
         return Err(chat::Error::new_bad_request(
@@ -85,12 +66,33 @@ fn parse_size(raw: &str) -> Result<(i32, i32), chat::Error> {
     let height: i32 = h_str
         .parse()
         .map_err(|_| chat::Error::new_bad_request("size height must be a positive integer"))?;
-    if !(1..=MAX_DIM).contains(&width) || !(1..=MAX_DIM).contains(&height) {
+    if !(1..=limits.max_dim).contains(&width) || !(1..=limits.max_dim).contains(&height) {
         return Err(chat::Error::new_bad_request(format!(
-            "size dimensions must be between 1 and {MAX_DIM}"
+            "size dimensions must be between 1 and {}",
+            limits.max_dim
         )));
     }
     Ok((width, height))
+}
+
+/// Checks that total output pixels across all requested images fit within the
+/// response memory bound.
+fn validate_total_pixels(
+    width: i32,
+    height: i32,
+    count: usize,
+    limits: &engine::ImageLimits,
+) -> Result<(), chat::Error> {
+    let total_pixels = (width as i64)
+        .saturating_mul(height as i64)
+        .saturating_mul(count as i64);
+    if total_pixels > limits.max_request_pixels {
+        return Err(chat::Error::new_bad_request(format!(
+            "total output pixels ({width}x{height} x {count} = {total_pixels}) exceed {} pixel limit",
+            limits.max_request_pixels
+        )));
+    }
+    Ok(())
 }
 
 /// Validates and parses the `response_format` value (only `b64_json`).
@@ -157,6 +159,7 @@ fn read_optional_i64(
 /// Parses and validates a JSON text-to-image request for POST
 /// /v1/images/generations.
 pub fn parse_generation_request(body: &[u8]) -> Result<ParsedRequest, chat::Error> {
+    let limits = engine::default_image_limits();
     let root: Value = serde_json::from_slice(body)
         .map_err(|error| chat::Error::new_bad_request(format!("not valid JSON: {error}")))?;
     let object = root
@@ -171,10 +174,11 @@ pub fn parse_generation_request(body: &[u8]) -> Result<ParsedRequest, chat::Erro
         .to_string();
     let size_raw = read_optional_string(object, "size")?
         .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-    let (width, height) = parse_size(size_raw)?;
+    let (width, height) = parse_size(size_raw, &limits)?;
 
-    let count =
-        read_optional_i64(object, "n", 1, MAX_IMAGES_PER_REQUEST as i64)?.unwrap_or(1) as usize;
+    let count = read_optional_i64(object, "n", 1, limits.max_images_per_request as i64)?
+        .unwrap_or(1) as usize;
+    validate_total_pixels(width, height, count, &limits)?;
     let seed = match object.get("seed") {
         None | Some(Value::Null) => rand::random(),
         Some(value) => value
@@ -187,36 +191,38 @@ pub fn parse_generation_request(body: &[u8]) -> Result<ParsedRequest, chat::Erro
     let quality = read_optional_i64(
         object,
         "output_compression",
-        MIN_JPEG_QUALITY as i64,
-        MAX_JPEG_QUALITY as i64,
+        limits.min_jpeg_quality as i64,
+        limits.max_jpeg_quality as i64,
     )?
-    .unwrap_or(DEFAULT_JPEG_QUALITY as i64) as i32;
+    .unwrap_or(limits.default_jpeg_quality as i64) as i32;
     let min_generation_area = read_optional_i64(
         object,
         "min_generation_area",
-        MIN_GENERATION_AREA_MIN as i64,
-        MIN_GENERATION_AREA_MAX as i64,
+        limits.min_generation_area as i64,
+        limits.max_generation_area as i64,
     )?
-    .unwrap_or(MIN_GENERATION_AREA_DEFAULT as i64) as i32;
+    .unwrap_or(limits.default_generation_area as i64) as i32;
 
     if let Some(value) = object.get("num_inference_steps")
         && !value.is_null()
-        && value.as_i64() != Some(REQUIRED_INFERENCE_STEPS)
+        && value.as_i64() != Some(limits.inference_steps as i64)
     {
         return Err(chat::Error::new_bad_request(format!(
-            "num_inference_steps must be omitted or {REQUIRED_INFERENCE_STEPS}"
+            "num_inference_steps must be omitted or {}",
+            limits.inference_steps
         )));
     }
     if let Some(value) = object.get("guidance_scale")
         && !value.is_null()
     {
-        let ok = value.as_f64().is_some_and(|scale| {
-            scale.is_finite() && (scale - REQUIRED_GUIDANCE_SCALE).abs() == 0.0
-        });
+        let ok = value
+            .as_f64()
+            .is_some_and(|scale| scale.is_finite() && (scale - limits.guidance_scale).abs() == 0.0);
         if !ok {
-            return Err(chat::Error::new_bad_request(
-                "guidance_scale must be omitted or 1",
-            ));
+            return Err(chat::Error::new_bad_request(format!(
+                "guidance_scale must be omitted or {}",
+                limits.guidance_scale
+            )));
         }
     }
     if let Some(neg) = read_optional_string(object, "negative_prompt")?
@@ -333,10 +339,11 @@ fn parse_multipart<'a>(
         }
         // Locate end of part headers (\r\n\r\n or \n\n).
         let part_slice = &body[cursor..];
-        let (header_end, body_start) = if let Some(pos) = find_subslice(part_slice, b"\r\n\r\n") {
-            (pos, pos + 4)
-        } else if let Some(pos) = find_subslice(part_slice, b"\n\n") {
-            (pos, pos + 2)
+        let (header_end, body_start) = if let Some(pos) = find_subslice(part_slice, CRLF_HEADER_END)
+        {
+            (pos, pos + CRLF_HEADER_END.len())
+        } else if let Some(pos) = find_subslice(part_slice, LF_HEADER_END) {
+            (pos, pos + LF_HEADER_END.len())
         } else {
             return Err(chat::Error::new_bad_request(
                 "multipart part is missing header terminator",
@@ -420,6 +427,7 @@ pub fn parse_edit_request(
     content_type: Option<&str>,
     body: &[u8],
 ) -> Result<ParsedRequest, chat::Error> {
+    let limits = engine::default_image_limits();
     let content_type = content_type.ok_or_else(|| {
         chat::Error::new_bad_request("Content-Type: multipart/form-data is required")
     })?;
@@ -446,9 +454,10 @@ pub fn parse_edit_request(
             "at least one reference image is required",
         ));
     }
-    if references.len() > MAX_REFERENCES {
+    if references.len() > limits.max_references as usize {
         return Err(chat::Error::new_bad_request(format!(
-            "at most {MAX_REFERENCES} reference images are supported"
+            "at most {} reference images are supported",
+            limits.max_references
         )));
     }
 
@@ -464,10 +473,11 @@ pub fn parse_edit_request(
     let size_raw = fields
         .get("size")
         .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-    let (width, height) = parse_size(size_raw)?;
+    let (width, height) = parse_size(size_raw, &limits)?;
 
-    let count =
-        parse_form_i64(&fields, "n", 1, MAX_IMAGES_PER_REQUEST as i64)?.unwrap_or(1) as usize;
+    let count = parse_form_i64(&fields, "n", 1, limits.max_images_per_request as i64)?.unwrap_or(1)
+        as usize;
+    validate_total_pixels(width, height, count, &limits)?;
     let seed = match fields
         .get("seed")
         .map(|s| s.trim())
@@ -493,26 +503,27 @@ pub fn parse_edit_request(
     let quality = parse_form_i64(
         &fields,
         "output_compression",
-        MIN_JPEG_QUALITY as i64,
-        MAX_JPEG_QUALITY as i64,
+        limits.min_jpeg_quality as i64,
+        limits.max_jpeg_quality as i64,
     )?
-    .unwrap_or(DEFAULT_JPEG_QUALITY as i64) as i32;
+    .unwrap_or(limits.default_jpeg_quality as i64) as i32;
     let min_generation_area = parse_form_i64(
         &fields,
         "min_generation_area",
-        MIN_GENERATION_AREA_MIN as i64,
-        MIN_GENERATION_AREA_MAX as i64,
+        limits.min_generation_area as i64,
+        limits.max_generation_area as i64,
     )?
-    .unwrap_or(MIN_GENERATION_AREA_DEFAULT as i64) as i32;
+    .unwrap_or(limits.default_generation_area as i64) as i32;
 
     if let Some(raw) = fields
         .get("num_inference_steps")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        && raw.parse::<i64>().ok() != Some(REQUIRED_INFERENCE_STEPS)
+        && raw.parse::<i64>().ok() != Some(limits.inference_steps as i64)
     {
         return Err(chat::Error::new_bad_request(format!(
-            "num_inference_steps must be omitted or {REQUIRED_INFERENCE_STEPS}"
+            "num_inference_steps must be omitted or {}",
+            limits.inference_steps
         )));
     }
     if let Some(raw) = fields
@@ -520,13 +531,15 @@ pub fn parse_edit_request(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        let ok = raw.parse::<f64>().ok().is_some_and(|scale| {
-            scale.is_finite() && (scale - REQUIRED_GUIDANCE_SCALE).abs() == 0.0
-        });
+        let ok = raw
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|scale| scale.is_finite() && (scale - limits.guidance_scale).abs() == 0.0);
         if !ok {
-            return Err(chat::Error::new_bad_request(
-                "guidance_scale must be omitted or 1",
-            ));
+            return Err(chat::Error::new_bad_request(format!(
+                "guidance_scale must be omitted or {}",
+                limits.guidance_scale
+            )));
         }
     }
     if let Some(neg) = fields.get("negative_prompt")
@@ -629,9 +642,10 @@ mod tests {
         assert_eq!((req.width, req.height), (4736, 3552));
         assert_eq!(req.count, 1);
         assert_eq!(req.seed, 42);
-        assert_eq!(req.min_generation_area, MIN_GENERATION_AREA_DEFAULT);
+        let limits = engine::default_image_limits();
+        assert_eq!(req.min_generation_area, limits.default_generation_area);
         assert_eq!(req.format, engine::ImageFormat::Png);
-        assert_eq!(req.quality, DEFAULT_JPEG_QUALITY);
+        assert_eq!(req.quality, limits.default_jpeg_quality);
         assert!(req.references.is_empty());
 
         let jpg_body = serde_json::to_vec(&json!({
@@ -673,6 +687,7 @@ mod tests {
             json!({"prompt": "hi", "size": "512x512", "num_inference_steps": 8}),
             json!({"prompt": "hi", "size": "512x512", "guidance_scale": 7.5}),
             json!({"prompt": "hi", "size": "512x512", "negative_prompt": "blurry"}),
+            json!({"prompt": "hi", "size": "4096x4096", "n": 16}),
         ] {
             let bytes = serde_json::to_vec(&bad).unwrap();
             assert!(
@@ -751,6 +766,15 @@ mod tests {
              --{boundary}--\r\n"
         );
         assert!(parse_edit_request(Some(&ct), bad_steps.as_bytes()).is_err());
+
+        let too_many_pixels = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n4096x4096\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n3\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
+             --{boundary}--\r\n"
+        );
+        assert!(parse_edit_request(Some(&ct), too_many_pixels.as_bytes()).is_err());
     }
 
     #[test]

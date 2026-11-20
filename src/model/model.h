@@ -220,6 +220,32 @@ typedef struct {
   double image_seconds;
 } ImageResult;
 
+// Input and output limits of an image generation model.
+typedef struct {
+  // Maximum prompt tokens retained before encoding.
+  int max_prompt_tokens;
+  // Maximum single-axis output or canvas dimension in pixels.
+  int max_dim;
+  // Minimum and maximum accepted min_generation_area in pixels.
+  int min_generation_area, max_generation_area;
+  // Default min_generation_area in pixels when omitted.
+  int default_generation_area;
+  // Maximum generation canvas area in pixels.
+  int64_t max_canvas_area;
+  // Maximum total output pixels across all images of one request.
+  int64_t max_request_pixels;
+  // Maximum images returned by one request.
+  int max_images_per_request;
+  // Maximum reference images accepted by one edit request.
+  int max_references;
+  // Minimum, maximum and default JPEG quality values.
+  int min_jpeg_quality, max_jpeg_quality, default_jpeg_quality;
+  // Required inference step count for distilled checkpoints.
+  int inference_steps;
+  // Required guidance scale for CFG-free checkpoints.
+  double guidance_scale;
+} ImageLimits;
+
 typedef struct {
   // The family's name, for the log.
   const char *family;
@@ -336,6 +362,9 @@ typedef struct {
   // on success or 0 on failure. Null for a model that generates no images.
   int (*generate_image)(const ImageRequest *request, const PassWait *wait,
                         const int *cancelled, ImageResult *out);
+  // Writes the image model's request and output limits into out. Null for a
+  // model that generates no images.
+  void (*read_image_limits)(ImageLimits *out);
   // Drafts. propose_drafts writes up to drafts_per_pass() drafts after token
   // at pos, once every position before it has run. It returns the sampled
   // proposals' probabilities, n vocabulary rows, or null for proposals without

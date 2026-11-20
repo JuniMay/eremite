@@ -546,6 +546,25 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   return 1;
 }
 
+// Writes MiniMax-H3-Image's input and output limits into out.
+static void minimax_h3_image_read_limits(ImageLimits *out) {
+  *out = (ImageLimits){
+      .max_prompt_tokens = MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS,
+      .max_dim = MINIMAX_H3_IMAGE_MAX_DIM,
+      .min_generation_area = MINIMAX_H3_IMAGE_MIN_AREA,
+      .max_generation_area = MINIMAX_H3_IMAGE_MAX_AREA,
+      .default_generation_area = MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA,
+      .max_canvas_area = MINIMAX_H3_IMAGE_MAX_CANVAS_AREA,
+      .max_request_pixels = MINIMAX_H3_IMAGE_MAX_REQUEST_PIXELS,
+      .max_images_per_request = MINIMAX_H3_IMAGE_MAX_IMAGES,
+      .max_references = MINIMAX_H3_IMAGE_MAX_REFS,
+      .min_jpeg_quality = IMAGE_JPEG_QUALITY_MIN,
+      .max_jpeg_quality = IMAGE_JPEG_QUALITY_MAX,
+      .default_jpeg_quality = MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY,
+      .inference_steps = MINIMAX_H3_IMAGE_STEPS,
+      .guidance_scale = MINIMAX_H3_IMAGE_GUIDANCE_SCALE};
+}
+
 static Pass *minimax_h3_image_pass_new(void (*body)(void *), void *argument) {
   return pass_new(body, argument, PASS_STACK_BYTES);
 }
@@ -567,6 +586,7 @@ const ModelOps minimax_h3_image_ops = {
     .read_counters = minimax_h3_image_read_counters,
     .vocab_size = minimax_h3_image_vocab_size,
     .generate_image = minimax_h3_image_generate,
+    .read_image_limits = minimax_h3_image_read_limits,
     .run_idle_work = minimax_h3_image_run_idle_work,
     .pass_new = minimax_h3_image_pass_new,
     .pass_begin = minimax_h3_image_pass_begin,

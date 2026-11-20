@@ -26,11 +26,25 @@ static constexpr int MINIMAX_H3_IMAGE_MAX_DIM = 8192;
 // Maximum generation canvas area in pixels (24 megapixels).
 static constexpr int64_t MINIMAX_H3_IMAGE_MAX_CANVAS_AREA = 24ll * 1024 * 1024;
 
+// Maximum total output pixels across all images of one request (32 Mi pixels),
+// bounding peak response PNG and base64 memory to ~224 MiB.
+static constexpr int64_t MINIMAX_H3_IMAGE_MAX_REQUEST_PIXELS =
+    32ll * 1024 * 1024;
+
+// Maximum number of images returned by one request (n).
+static constexpr int MINIMAX_H3_IMAGE_MAX_IMAGES = 16;
+
 // Maximum number of reference images accepted by one edit request.
 static constexpr int MINIMAX_H3_IMAGE_MAX_REFS = 16;
 
 // Default JPEG quality when an image request leaves quality unset.
 static constexpr int MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY = 95;
+
+// Required inference step count of the 6-step distilled PDD checkpoint.
+static constexpr int MINIMAX_H3_IMAGE_STEPS = 6;
+
+// Required guidance scale of the CFG-free distilled checkpoint.
+static constexpr double MINIMAX_H3_IMAGE_GUIDANCE_SCALE = 1.0;
 
 // Vocabulary size of the Qwen3-VL tokenizer used by MiniMax-H3.
 static constexpr int MINIMAX_H3_IMAGE_VOCAB = 151936;

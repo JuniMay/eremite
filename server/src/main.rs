@@ -869,7 +869,7 @@ fn main() {
                 .unwrap_or_else(|error| die(&error));
         } else if family == Family::MinimaxH3Image {
             model
-                .fit_image_model(image::MAX_PROMPT_TOKENS)
+                .fit_image_model(engine::default_image_limits().max_prompt_tokens)
                 .unwrap_or_else(|error| die(&error));
         }
         let mut options = model.engine.clone();
