@@ -228,14 +228,14 @@ static int try_admit_bytes(MemoryAccount *account, uint64_t bytes) {
   return memory_wait_for_minimum(account, bytes);
 }
 
-int minimax_h3_image_admit_request(MemoryAccount *account, int full_resident,
-                                   int canvas_w, int canvas_h,
-                                   MinimaxH3RequestMemory req_mem,
+int minimax_h3_image_admit_request(MemoryAccount *account, int prefer_full,
+                                   uint64_t staged_base, int canvas_w,
+                                   int canvas_h, MinimaxH3RequestMemory req_mem,
                                    int *out_use_full, char *error,
                                    size_t error_cap) {
   if (!account) return 0;
   uint64_t saved_min = account->minimum;
-  if (full_resident) {
+  if (prefer_full) {
     uint64_t full_target = max_u64(req_mem.full_bytes, saved_min);
     if (try_admit_bytes(account, full_target)) {
       if (out_use_full) *out_use_full = 1;
@@ -243,7 +243,7 @@ int minimax_h3_image_admit_request(MemoryAccount *account, int full_resident,
     }
     if (shutdown_requested()) return 0;
   }
-  uint64_t staged_target = req_mem.staged_bytes;
+  uint64_t staged_target = max_u64(req_mem.staged_bytes, staged_base);
   if (try_admit_bytes(account, staged_target)) {
     if (out_use_full) *out_use_full = 0;
     return 1;
@@ -391,19 +391,12 @@ static int minimax_h3_image_is_loaded(void) {
   return text_ready || dit_ready || vae_ready;
 }
 
-// Restores the model account's baseline minimum after a request finishes.
-static void restore_base_minimum(void) {
-  if (!work_slot) return;
-  uint64_t base = full_resident && minimax_h3_image_is_loaded()
-                      ? required_full_bytes
-                      : required_staged_bytes;
-  if (work_slot->account->minimum > base) {
-    memory_set_minimum(work_slot->account, base, MEMORY_REQUIRED);
-  } else if (work_slot->account->minimum < base &&
-             !memory_set_minimum(work_slot->account, base, MEMORY_REQUIRED)) {
-    memory_set_minimum(work_slot->account, required_staged_bytes,
-                       MEMORY_REQUIRED);
-  }
+// Sets account's minimum back to base after a request, or to staged_base when
+// base does not fit.
+static void restore_base_minimum(MemoryAccount *account, uint64_t base,
+                                 uint64_t staged_base) {
+  if (!memory_set_minimum(account, base, MEMORY_REQUIRED))
+    memory_set_minimum(account, staged_base, MEMORY_REQUIRED);
 }
 
 // Pins core weight groups while a request runs and unpins all groups when idle.
@@ -568,8 +561,8 @@ static int minimax_h3_image_generate(const ImageRequest *req,
       req->ref_count);
   int request_full = full_resident;
   if (!minimax_h3_image_admit_request(
-          work_slot->account, full_resident, canvas_w, canvas_h, req_mem,
-          &request_full, out->error, sizeof out->error)) {
+          work_slot->account, full_resident, required_staged_bytes, canvas_w,
+          canvas_h, req_mem, &request_full, out->error, sizeof out->error)) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
     if (minimax_h3_should_stop(&hooks)) set_runtime_error(out, &hooks);
     return 0;
@@ -693,11 +686,17 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   if (!request_full) memory_pin(vae_slot, 0);
   free(out_lat);
   out_lat = NULL;
+  // The GPU work of the request is over: its reservation goes back to the
+  // model's base.
+  restore_base_minimum(work_slot->account,
+                       full_resident && minimax_h3_image_is_loaded()
+                           ? required_full_bytes
+                           : required_staged_bytes,
+                       required_staged_bytes);
 
   if (!ok) {
     if (gen_start > 0.0) total_image_seconds += now() - gen_start;
     clear_active_progress();
-    restore_base_minimum();
     free(canvas_rgb);
     set_runtime_error(out, &hooks);
     return 0;
@@ -725,7 +724,6 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   double gen_s = now() - gen_start;
   total_image_seconds += gen_s;
   clear_active_progress();
-  restore_base_minimum();
 
   if (!out->data) {
     snprintf(out->error, sizeof out->error, "failed to encode output image: %s",

@@ -118,13 +118,14 @@ minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights,
                                      MinimaxH3StageBytes stages, int ref_count);
 
 // Reserves GPU memory in account for a planned canvas before running the text
-// encoder. Prefers full residence when full_resident is nonzero, falling back
-// to staged execution if only staged_bytes fits. On failure writes a message
-// naming the canvas and required GiB into error and leaves account->minimum
-// unchanged. Returns 1 on success and sets *out_use_full, or 0 on failure.
-int minimax_h3_image_admit_request(MemoryAccount *account, int full_resident,
-                                   int canvas_w, int canvas_h,
-                                   MinimaxH3RequestMemory req_mem,
+// encoder. With prefer_full, it tries full residence first: req_mem.full_bytes
+// or the account's minimum, the larger. Staged execution reserves
+// req_mem.staged_bytes or staged_base, the larger. On failure it writes a
+// message naming the canvas and the GiB it needs into error and leaves
+// account->minimum unchanged. Returns 1 and sets *out_use_full, or returns 0.
+int minimax_h3_image_admit_request(MemoryAccount *account, int prefer_full,
+                                   uint64_t staged_base, int canvas_w,
+                                   int canvas_h, MinimaxH3RequestMemory req_mem,
                                    int *out_use_full, char *error,
                                    size_t error_cap);
 

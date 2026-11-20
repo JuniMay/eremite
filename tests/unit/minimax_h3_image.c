@@ -215,8 +215,9 @@ int main(void) {
   // Under a 50 GiB limit, 4896x4896 fits in full residence.
   memory_set_limit(mem, 50ull << 30);
   err[0] = '\0';
-  check(minimax_h3_image_admit_request(&acct, 1, 4896, 4896, mem_huge,
-                                       &use_full, err, sizeof err) == 1 &&
+  check(minimax_h3_image_admit_request(&acct, 1, mem_default.staged_bytes, 4896,
+                                       4896, mem_huge, &use_full, err,
+                                       sizeof err) == 1 &&
             use_full == 1 && acct.minimum == mem_huge.full_bytes,
         "4896x4896 admits in full residence when limit covers full_bytes");
 
@@ -224,8 +225,9 @@ int main(void) {
   memory_set_minimum(&acct, mem_default.full_bytes, MEMORY_REQUIRED);
   memory_set_limit(mem, 40ull << 30);
   err[0] = '\0';
-  check(minimax_h3_image_admit_request(&acct, 1, 4896, 4896, mem_huge,
-                                       &use_full, err, sizeof err) == 1 &&
+  check(minimax_h3_image_admit_request(&acct, 1, mem_default.staged_bytes, 4896,
+                                       4896, mem_huge, &use_full, err,
+                                       sizeof err) == 1 &&
             use_full == 0 && acct.minimum == mem_huge.staged_bytes,
         "4896x4896 falls back to staged when only staged_bytes fits");
 
@@ -235,11 +237,23 @@ int main(void) {
   memory_set_limit(mem, 22ull << 30);
   uint64_t min_before = acct.minimum;
   err[0] = '\0';
-  check(minimax_h3_image_admit_request(&acct, 0, 4896, 4896, mem_huge,
-                                       &use_full, err, sizeof err) == 0 &&
+  check(minimax_h3_image_admit_request(&acct, 0, mem_default.staged_bytes, 4896,
+                                       4896, mem_huge, &use_full, err,
+                                       sizeof err) == 0 &&
             acct.minimum == min_before && strstr(err, "4896x4896") != NULL &&
             strstr(err, "GiB") != NULL,
         "4896x4896 refuses early when staged_bytes exceeds limit");
+
+  // A staged request keeps at least the staged base reserved while it runs.
+  memory_set_limit(mem, 50ull << 30);
+  uint64_t staged_base = mem_default.staged_bytes + (1ull << 30);
+  memory_set_minimum(&acct, staged_base, MEMORY_REQUIRED);
+  err[0] = '\0';
+  check(minimax_h3_image_admit_request(&acct, 0, staged_base, 2048, 2048,
+                                       mem_default, &use_full, err,
+                                       sizeof err) == 1 &&
+            use_full == 0 && acct.minimum == staged_base,
+        "a staged request keeps the staged base reserved");
 
   printf("minimax_h3_image unit checks: %d failures\n", failures);
   return failures != 0;
