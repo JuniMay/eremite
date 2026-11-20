@@ -78,6 +78,12 @@ typedef struct {
   int *image_steps_total;
   // Optional counter increased after each finished denoising step.
   uint64_t *image_steps_completed;
+  // Optional: runs after each denoising step but the last, with the latent
+  // that the step predicts for the run's end and the number of finished
+  // steps. It returns 0 to stop the run.
+  int (*on_estimate)(void *context, const float *latents, int steps_done);
+  // The context passed to on_estimate.
+  void *estimate_context;
 } MinimaxH3RunHooks;
 
 // Returns nonzero when process shutdown was requested or hooks request cancel.

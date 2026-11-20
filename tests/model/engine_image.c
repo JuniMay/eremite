@@ -9,7 +9,8 @@
 // End-to-end C engine API test for MiniMax-H3-Image through eremite.h:
 // registration, full-residence load, synchronous and stream generation, PNG
 // and JPEG output, non-32 exact resizing, >4096-token prompt truncation,
-// reference editing, invalid input reporting, cancellation, and full unload.
+// reference editing, masks, transparent backgrounds, partial images, invalid
+// input reporting, cancellation, and full unload.
 //
 // Usage:
 //   build/tests/model-engine_image <model_dir> <text_enc.safetensors>
@@ -22,6 +23,30 @@ static void check(int cond, const char *label) {
   if (cond) return;
   fprintf(stderr, "FAIL: %s\n", label);
   failures++;
+}
+
+// The partial images that a call sent.
+typedef struct {
+  // Width and height in pixels that each must decode to.
+  int width, height;
+  // Partial images received.
+  int count;
+  // Whether each came with the next index and decoded to the size.
+  int in_order_and_sized;
+} PartialImages;
+
+// Counts one partial image of a call and checks its index and size.
+static void keep_partial_image(void *context, const uint8_t *data, size_t len,
+                               int index) {
+  PartialImages *partials = context;
+  int width = 0, height = 0;
+  const char *why = NULL;
+  uint8_t *pixels = image_decode_rgb(data, len, &width, &height, &why);
+  if (!pixels || index != partials->count || width != partials->width ||
+      height != partials->height)
+    partials->in_order_and_sized = 0;
+  free(pixels);
+  partials->count++;
 }
 
 // Reads a binary file into a heap buffer and sets *out_len.
@@ -417,6 +442,42 @@ int main(int argc, char **argv) {
             !long_alpha[256 * 256 - 1],
         "a transparent prompt past the token limit still clears the corners");
   free(long_alpha);
+  eremite_image_result_free(&res);
+
+  // Partial images: two estimates come before the image, in order and of the
+  // output size, and the image is the same as one without them.
+  eremite_image_request req_partial = req_png;
+  int ok_plain = eremite_generate_image(m, &req_partial, &res);
+  int plain_w = 0, plain_h = 0;
+  const char *plain_error = NULL;
+  uint8_t *plain = ok_plain ? image_decode_rgb(res.data, res.len, &plain_w,
+                                               &plain_h, &plain_error)
+                            : NULL;
+  eremite_image_result_free(&res);
+  PartialImages partials = {.width = req_png.width,
+                            .height = req_png.height,
+                            .in_order_and_sized = 1};
+  req_partial.partial_images = 2;
+  req_partial.on_partial_image = keep_partial_image;
+  req_partial.partial_image_context = &partials;
+  int ok_partial = eremite_generate_image(m, &req_partial, &res);
+  int partial_w = 0, partial_h = 0;
+  const char *partial_error = NULL;
+  uint8_t *with_partials = ok_partial
+                               ? image_decode_rgb(res.data, res.len, &partial_w,
+                                                  &partial_h, &partial_error)
+                               : NULL;
+  printf("partial images: ok=%d sent %d %s\n", ok_partial, partials.count,
+         ok_partial ? "" : res.error);
+  check(
+      plain && with_partials && partials.count == 2 &&
+          partials.in_order_and_sized && plain_w == partial_w &&
+          plain_h == partial_h &&
+          !memcmp(plain, with_partials, (size_t)plain_w * (size_t)plain_h * 3),
+      "two partial images come in order at the output size, and the image "
+      "matches one without them");
+  free(with_partials);
+  free(plain);
   eremite_image_result_free(&res);
 
   eremite_stream_free(stream);

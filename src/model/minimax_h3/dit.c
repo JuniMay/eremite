@@ -1039,6 +1039,11 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   size_t target_h_off =
       (size_t)(text_len + ref_patches) * (size_t)DIT_DIM * sizeof(float);
 
+  // The latent that a step predicts for the run's end, for on_estimate.
+  float *estimate = hooks && hooks->on_estimate
+                        ? xmalloc(latent_floats * sizeof(float))
+                        : NULL;
+
   // 6-step PDD Euler flow-matching loop.
   if (hooks && hooks->image_steps_total)
     *hooks->image_steps_total = dit->pdd_steps;
@@ -1236,7 +1241,18 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
                           lat_w, dt, out_latents);
     if (hooks && hooks->image_steps_completed)
       (*hooks->image_steps_completed)++;
+    if (estimate && step + 1 < dit->pdd_steps) {
+      // The data that the step aims for is x_next + sigma_next * v.
+      memcpy(estimate, out_latents, latent_floats * sizeof(float));
+      unpatchify_euler_step((const float *)ws.patch_out.ptr, h_lat, w_lat,
+                            lat_h, lat_w, (float)sigma_next, estimate);
+      if (!hooks->on_estimate(hooks->estimate_context, estimate, step + 1)) {
+        stopped = 1;
+        break;
+      }
+    }
   }
+  free(estimate);
 
   if (hooks && hooks->image_step) *hooks->image_step = 0;
   if (hooks && hooks->image_steps_total) *hooks->image_steps_total = 0;

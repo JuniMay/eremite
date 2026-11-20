@@ -128,9 +128,17 @@ MinimaxH3StageBytes minimax_h3_image_stage_bytes(int seq_len,
 
 // Computes full-residence and staged GPU memory peaks for a request with
 // ref_count reference images whose stages need stages beside the weights.
+// With partials set, sampling also holds the VAE decoder and its workspace,
+// which decode the partial images.
 MinimaxH3RequestMemory
 minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights,
-                                     MinimaxH3StageBytes stages, int ref_count);
+                                     MinimaxH3StageBytes stages, int ref_count,
+                                     int partials);
+
+// Returns the number of finished denoising steps, of steps, after which
+// partial image index of count comes: count partial images spread evenly over
+// the run. count is below steps.
+int minimax_h3_image_partial_step(int index, int count, int steps);
 
 // What reserving a request's memory gave.
 typedef enum {

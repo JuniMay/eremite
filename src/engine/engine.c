@@ -468,7 +468,10 @@ static int run_image_generation(eremite_model *m,
       .seed = request->seed,
       .refs = (const ImageInput *)request->refs,
       .ref_count = request->ref_count,
-      .mask = {.data = request->mask.data, .len = request->mask.len}};
+      .mask = {.data = request->mask.data, .len = request->mask.len},
+      .partial_images = request->partial_images,
+      .on_partial_image = request->on_partial_image,
+      .partial_image_context = request->partial_image_context};
   ImageResult res = {0};
   int ok = m->ops->generate_image(&req, wait, cancelled, &res);
   out->data = res.data;

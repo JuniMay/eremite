@@ -242,17 +242,27 @@ MinimaxH3StageBytes minimax_h3_image_stage_bytes(int seq_len,
       .decode = minimax_h3_image_vae_workspace_bytes()};
 }
 
-MinimaxH3RequestMemory minimax_h3_image_plan_request_memory(
-    MinimaxH3WeightBytes weights, MinimaxH3StageBytes stages, int ref_count) {
+MinimaxH3RequestMemory
+minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights,
+                                     MinimaxH3StageBytes stages, int ref_count,
+                                     int partials) {
   uint64_t core = weights.text + weights.dit + weights.vae;
   uint64_t edit = ref_count > 0 ? weights.vision + weights.vae_encoder : 0;
-  uint64_t full =
-      max_u64(max_u64(core + edit + stages.encode, core + stages.sample),
-              core + stages.decode);
+  // Partial images decode beside the DiT's workspace.
+  uint64_t partial_decode = partials ? stages.decode : 0;
+  uint64_t partial_vae = partials ? weights.vae : 0;
+  uint64_t full = max_u64(max_u64(core + edit + stages.encode,
+                                  core + stages.sample + partial_decode),
+                          core + stages.decode);
   uint64_t staged = max_u64(
-      max_u64(weights.text + edit + stages.encode, weights.dit + stages.sample),
+      max_u64(weights.text + edit + stages.encode,
+              weights.dit + stages.sample + partial_vae + partial_decode),
       weights.vae + stages.decode);
   return (MinimaxH3RequestMemory){.full_bytes = full, .staged_bytes = staged};
+}
+
+int minimax_h3_image_partial_step(int index, int count, int steps) {
+  return (index + 1) * steps / (count + 1);
 }
 
 // Sets account's minimum to bytes when they fit within the current memory
@@ -645,8 +655,56 @@ static uint8_t *encode_output(const uint8_t *canvas, int canvas_w, int canvas_h,
   return file;
 }
 
-// Runs one text-to-image or reference editing pass and writes the encoded PNG
-// or JPEG bytes and stage timings into out.
+// What sending a request's partial images needs.
+typedef struct {
+  // The request, whose receiver takes the partial images.
+  const ImageRequest *req;
+  // How a decoded canvas becomes the output file.
+  const OutputPlan *plan;
+  // The VAE that decodes each estimate.
+  MinimaxH3ImageVae *vae;
+  // The hooks that the decodes yield and stop by.
+  const MinimaxH3RunHooks *hooks;
+  // Canvas width and height in pixels, and latent height and width.
+  int canvas_w, canvas_h, h_lat, w_lat;
+  // The run's denoising steps, and the partial images that it sends.
+  int steps, partials;
+  // Partial images whose step the run passed, and partial images sent.
+  int passed, sent;
+  // The decoded canvas of an estimate, canvas_w by canvas_h RGB.
+  uint8_t *canvas;
+} PartialRun;
+
+// Sends a partial image when the run reaches the step of its next one: it
+// decodes the estimate latents, encodes them like the output, and passes the
+// file to the request's receiver. A partial image that does not encode, as
+// when its border has no key color yet, is skipped. Returns 0 when the decode
+// stops, which stops the run.
+static int send_partial_image(void *context, const float *latents,
+                              int steps_done) {
+  PartialRun *run = context;
+  if (run->passed >= run->partials ||
+      steps_done !=
+          minimax_h3_image_partial_step(run->passed, run->partials, run->steps))
+    return 1;
+  run->passed++;
+  if (!minimax_h3_image_vae_decode(run->vae, latents, run->h_lat, run->w_lat,
+                                   run->canvas, run->hooks))
+    return 0;
+  size_t len = 0;
+  char error[IMAGE_ERROR_BYTES];
+  uint8_t *file = encode_output(run->canvas, run->canvas_w, run->canvas_h,
+                                run->plan, &len, error, sizeof error);
+  if (file)
+    run->req->on_partial_image(run->req->partial_image_context, file, len,
+                               run->sent++);
+  free(file);
+  return 1;
+}
+
+// Runs one text-to-image or reference editing pass. It sends the request's
+// partial images as they come, and writes the encoded image and stage timings
+// into out.
 static int minimax_h3_image_generate(const ImageRequest *req,
                                      const PassWait *wait, const int *cancelled,
                                      ImageResult *out) {
@@ -695,6 +753,18 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   if (transparent && req->format == IMAGE_FORMAT_JPEG) {
     write_error(out->error, sizeof out->error,
                 "a transparent background needs output_format png or webp");
+    out->invalid_input = 1;
+    return 0;
+  }
+  if (req->partial_images < 0) {
+    write_error(out->error, sizeof out->error,
+                "partial_images must not be negative");
+    out->invalid_input = 1;
+    return 0;
+  }
+  if (req->partial_images > 0 && !req->on_partial_image) {
+    write_error(out->error, sizeof out->error,
+                "partial images need a receiver");
     out->invalid_input = 1;
     return 0;
   }
@@ -779,6 +849,10 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     set_runtime_error(out, &hooks);
     return 0;
   }
+  // The run sends at most one partial image for each step before the last.
+  int steps = minimax_h3_dit_pdd_steps(dit);
+  int partials =
+      req->partial_images < steps - 1 ? req->partial_images : steps - 1;
 
   // Reserve the GPU memory needed for the planned canvas and reference images
   // before running the text encoder so oversized canvases refuse early (or
@@ -799,7 +873,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
       read_weight_bytes(text_enc, vision_enc, dit, vae),
       minimax_h3_image_stage_bytes(planned_seq_len, ref_sizes, req->ref_count,
                                    canvas_w, canvas_h),
-      req->ref_count);
+      req->ref_count, partials > 0);
   int request_full = full_resident;
   MinimaxH3Admission admission = minimax_h3_image_admit_request(
       work_slot->account, full_resident, required_staged_bytes, canvas_w,
@@ -913,6 +987,26 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     memory_pin(dit_slot, 1);
     ok = minimax_h3_dit_load(dit);
   }
+  // Partial images decode during sampling, so the VAE decoder stays loaded
+  // from the first one through the last decode.
+  PartialRun partial_run = {.req = req,
+                            .plan = &plan,
+                            .vae = vae,
+                            .hooks = &hooks,
+                            .canvas_w = canvas_w,
+                            .canvas_h = canvas_h,
+                            .h_lat = h_lat,
+                            .w_lat = w_lat,
+                            .steps = steps,
+                            .partials = partials};
+  if (ok && partials > 0) {
+    memory_pin(vae_slot, 1);
+    ok = minimax_h3_image_vae_load(vae);
+    partial_run.canvas = xmalloc((size_t)canvas_w * (size_t)canvas_h *
+                                 (size_t)MINIMAX_H3_RGB_CHANNELS);
+    hooks.on_estimate = send_partial_image;
+    hooks.estimate_context = &partial_run;
+  }
   if (ok) {
     size_t lat_floats =
         (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * (size_t)h_lat * (size_t)w_lat;
@@ -921,6 +1015,9 @@ static int minimax_h3_image_generate(const ImageRequest *req,
                                req->ref_count ? dit_refs : NULL, req->ref_count,
                                h_lat, w_lat, req->seed, out_lat, &hooks);
   }
+  hooks.on_estimate = NULL;
+  hooks.estimate_context = NULL;
+  free(partial_run.canvas);
   if (!request_full) memory_pin(dit_slot, 0);
 
   gpu_free(&text_hidden);

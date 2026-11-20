@@ -6,14 +6,14 @@
 //! functions and its streams run on the engine's thread only; the tokenizer's
 //! run on any thread.
 
-use std::ffi::{CString, c_char, c_int};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr::{self, NonNull};
 
 use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 11;
+const ABI: c_int = 12;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -160,6 +160,13 @@ struct RawImageRequest {
     /// An edit's optional mask, whose alpha marks what changes; null data
     /// for none.
     mask: RawImageInput,
+    /// Partial images to send while the image generates; 0 sends none.
+    partial_images: c_int,
+    /// Receives each partial image: its encoded bytes and length, and its
+    /// 0-based index (eremite_partial_image_fn); None for none.
+    on_partial_image: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, c_int)>,
+    /// The context passed to `on_partial_image`.
+    partial_image_context: *mut c_void,
 }
 
 /// Output of one image generation or editing call (eremite_image_result).
@@ -2104,6 +2111,9 @@ impl Stream {
             },
             ref_count: inputs.raw_refs.len() as c_int,
             mask: inputs.raw_mask,
+            partial_images: 0,
+            on_partial_image: None,
+            partial_image_context: ptr::null_mut(),
         };
         unsafe { eremite_stream_generate_image(self.0, &req) }
     }

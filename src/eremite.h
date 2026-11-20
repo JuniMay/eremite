@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 11
+#define EREMITE_ABI 12
 
 // ---- the process ----
 
@@ -266,6 +266,13 @@ typedef struct {
   size_t len;
 } eremite_image_input;
 
+// Receives one partial image of an image call: the encoded bytes of an early
+// estimate of the image, len bytes, and its 0-based index among the call's
+// partial images. It runs inside the call, on the thread that runs the call:
+// it copies what it keeps and returns quickly.
+typedef void (*eremite_partial_image_fn)(void *context, const uint8_t *data,
+                                         size_t len, int index);
+
 // Parameters of one image generation or editing call.
 typedef struct {
   // Prompt text (UTF-8, NUL-terminated).
@@ -291,6 +298,14 @@ typedef struct {
   // image, whose alpha marks what changes. Transparent pixels change, and
   // opaque pixels keep the first image's. data is null for no mask.
   eremite_image_input mask;
+  // Partial images to send while the image generates, spread evenly over the
+  // denoising steps, each encoded like the image; 0 sends none. A model sends
+  // at most one fewer than its steps.
+  int partial_images;
+  // Receives each partial image; null when partial_images is 0.
+  eremite_partial_image_fn on_partial_image;
+  // The context passed to on_partial_image.
+  void *partial_image_context;
 } eremite_image_request;
 
 // Output of one image generation or editing call.

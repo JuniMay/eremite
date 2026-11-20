@@ -217,6 +217,16 @@ typedef struct {
   // image, whose alpha marks what changes. Transparent pixels change, and
   // opaque pixels keep the first image's. data is null for no mask.
   ImageInput mask;
+  // Partial images to send while the image generates, spread evenly over the
+  // denoising steps; 0 sends none. A model sends at most one fewer than its
+  // steps.
+  int partial_images;
+  // Receives each partial image: its encoded bytes, len bytes, and its
+  // 0-based index. Null when partial_images is 0.
+  void (*on_partial_image)(void *context, const uint8_t *data, size_t len,
+                           int index);
+  // The context passed to on_partial_image.
+  void *partial_image_context;
 } ImageRequest;
 
 // Capacity in bytes of ImageResult.error, including its NUL terminator.

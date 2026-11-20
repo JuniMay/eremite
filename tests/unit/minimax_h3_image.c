@@ -198,16 +198,47 @@ int main(void) {
                             .dit = 15ull << 30,
                             .vae = 2ull << 30,
                             .vae_encoder = 1ull << 30};
-  MinimaxH3RequestMemory mem_default = minimax_h3_image_plan_request_memory(
-      w, minimax_h3_image_stage_bytes(64, NULL, 0, 2048, 2048), 0);
+  MinimaxH3StageBytes default_stages =
+      minimax_h3_image_stage_bytes(64, NULL, 0, 2048, 2048);
+  MinimaxH3RequestMemory mem_default =
+      minimax_h3_image_plan_request_memory(w, default_stages, 0, 0);
   MinimaxH3RequestMemory mem_huge = minimax_h3_image_plan_request_memory(
-      w, minimax_h3_image_stage_bytes(64, NULL, 0, 4896, 4896), 0);
+      w, minimax_h3_image_stage_bytes(64, NULL, 0, 4896, 4896), 0, 0);
   uint64_t dit_delta = minimax_h3_dit_workspace_bytes(64, 0, 153 * 153) -
                        minimax_h3_dit_workspace_bytes(64, 0, 64 * 64);
   check(mem_huge.full_bytes == mem_default.full_bytes + dit_delta &&
             mem_huge.staged_bytes > mem_default.staged_bytes &&
             mem_huge.full_bytes > mem_huge.staged_bytes,
         "planned request memory scales exactly by DiT workspace growth");
+
+  // Partial images decode during sampling: the VAE decoder and its workspace
+  // join the sampling stage, in full residence and staged.
+  MinimaxH3RequestMemory mem_partial =
+      minimax_h3_image_plan_request_memory(w, default_stages, 0, 1);
+  uint64_t core = w.text + w.dit + w.vae;
+  uint64_t full_partial = core + default_stages.sample + default_stages.decode;
+  uint64_t staged_partial =
+      w.dit + w.vae + default_stages.sample + default_stages.decode;
+  check(mem_partial.full_bytes == (full_partial > mem_default.full_bytes
+                                       ? full_partial
+                                       : mem_default.full_bytes) &&
+            mem_partial.staged_bytes ==
+                (staged_partial > mem_default.staged_bytes
+                     ? staged_partial
+                     : mem_default.staged_bytes) &&
+            mem_partial.staged_bytes > mem_default.staged_bytes,
+        "partial images add the VAE decoder and its workspace to sampling");
+
+  // Partial images spread evenly over the steps before the last.
+  int steps = 6;
+  check(minimax_h3_image_partial_step(0, 1, steps) == 3 &&
+            minimax_h3_image_partial_step(0, 2, steps) == 2 &&
+            minimax_h3_image_partial_step(1, 2, steps) == 4 &&
+            minimax_h3_image_partial_step(0, 3, steps) == 1 &&
+            minimax_h3_image_partial_step(1, 3, steps) == 3 &&
+            minimax_h3_image_partial_step(2, 3, steps) == 4 &&
+            minimax_h3_image_partial_step(4, 5, steps) == 5,
+        "partial images spread evenly over the steps before the last");
 
   // An edit's encode stage holds the vision tower's workspace beside the image
   // outputs, the prompt's buffers beside the text layers' workspace, and the
@@ -376,6 +407,25 @@ int main(void) {
                                              &odd_result) &&
             odd_result.invalid_input,
         "an unknown background is invalid input");
+
+  // A request's partial images: the count must not be negative, and a count
+  // needs a receiver. Both checks run without the weights.
+  ImageRequest negative_partials = odd_background;
+  negative_partials.background = IMAGE_BACKGROUND_AUTO;
+  negative_partials.partial_images = -1;
+  ImageResult negative_result = {0};
+  check(!minimax_h3_image_ops.generate_image(&negative_partials, NULL, NULL,
+                                             &negative_result) &&
+            negative_result.invalid_input,
+        "a negative partial image count is invalid input");
+  ImageRequest unreceived_partials = negative_partials;
+  unreceived_partials.partial_images = 2;
+  ImageResult unreceived_result = {0};
+  check(!minimax_h3_image_ops.generate_image(&unreceived_partials, NULL, NULL,
+                                             &unreceived_result) &&
+            unreceived_result.invalid_input &&
+            strstr(unreceived_result.error, "receiver") != NULL,
+        "partial images without a receiver are invalid input");
 
   // A staged request keeps at least the staged base reserved while it runs.
   memory_set_limit(mem, 50ull << 30);
