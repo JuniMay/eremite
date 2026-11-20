@@ -26,14 +26,15 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=objc");
     println!("cargo:rustc-link-lib=icucore"); // the tokenizer's regexes and NFC
-    // The native parser and image decoder use the same libraries as Make.
+    // The native parser, image decoder and image encoders use the same
+    // libraries as Make.
     let libs = Command::new("pkg-config")
-        .args(["--libs", "yyjson", "libjpeg"])
+        .args(["--libs", "yyjson", "libjpeg", "libwebp"])
         .output()
         .expect("pkg-config runs");
     assert!(
         libs.status.success(),
-        "pkg-config requires yyjson and libjpeg"
+        "pkg-config requires yyjson, libjpeg and libwebp"
     );
     for flag in String::from_utf8_lossy(&libs.stdout).split_whitespace() {
         if let Some(dir) = flag.strip_prefix("-L") {

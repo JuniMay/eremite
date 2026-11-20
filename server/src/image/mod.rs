@@ -45,7 +45,7 @@ pub struct ParsedRequest {
     pub min_generation_area: i32,
     /// Encoded output image format.
     pub format: engine::ImageFormat,
-    /// JPEG compression quality in 1..=100.
+    /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
     /// Reference image bytes in upload order (empty for text-to-image).
     pub references: Vec<Vec<u8>>,
@@ -108,7 +108,8 @@ fn parse_response_format(value: Option<&str>) -> Result<(), chat::Error> {
     }
 }
 
-/// Validates and parses the `output_format` value (`png`, `jpeg` or `jpg`).
+/// Validates and parses the `output_format` value (`png`, `jpeg`, `jpg` or
+/// `webp`).
 fn parse_output_format(value: Option<&str>) -> Result<engine::ImageFormat, chat::Error> {
     match value {
         None => Ok(engine::ImageFormat::Png),
@@ -116,8 +117,9 @@ fn parse_output_format(value: Option<&str>) -> Result<engine::ImageFormat, chat:
         Some(raw) if raw.eq_ignore_ascii_case("jpeg") || raw.eq_ignore_ascii_case("jpg") => {
             Ok(engine::ImageFormat::Jpeg)
         }
+        Some(raw) if raw.eq_ignore_ascii_case("webp") => Ok(engine::ImageFormat::Webp),
         Some(other) => Err(chat::Error::new_bad_request(format!(
-            "output_format {other:?} is not supported; use \"png\" or \"jpeg\""
+            "output_format {other:?} is not supported; use \"png\", \"jpeg\" or \"webp\""
         ))),
     }
 }
@@ -211,10 +213,10 @@ fn read_json_request(
     let quality = read_optional_i64(
         object,
         "output_compression",
-        limits.min_jpeg_quality as i64,
-        limits.max_jpeg_quality as i64,
+        limits.min_quality as i64,
+        limits.max_quality as i64,
     )?
-    .unwrap_or(limits.default_jpeg_quality as i64) as i32;
+    .unwrap_or(limits.default_quality as i64) as i32;
     let min_generation_area = read_optional_i64(
         object,
         "min_generation_area",
@@ -534,10 +536,10 @@ impl EditForm {
         let quality = parse_form_i64(
             &fields,
             "output_compression",
-            limits.min_jpeg_quality as i64,
-            limits.max_jpeg_quality as i64,
+            limits.min_quality as i64,
+            limits.max_quality as i64,
         )?
-        .unwrap_or(limits.default_jpeg_quality as i64) as i32;
+        .unwrap_or(limits.default_quality as i64) as i32;
         let min_generation_area = parse_form_i64(
             &fields,
             "min_generation_area",
@@ -743,8 +745,13 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// Builds an OpenAI Images API JSON response containing `images` as base64
-/// `b64_json` items, with their `width` by `height` size.
-pub fn build_response(images: &[Vec<u8>], width: i32, height: i32) -> Value {
+/// `b64_json` items, with their `width` by `height` size and their `format`.
+pub fn build_response(
+    images: &[Vec<u8>],
+    width: i32,
+    height: i32,
+    format: engine::ImageFormat,
+) -> Value {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -756,6 +763,7 @@ pub fn build_response(images: &[Vec<u8>], width: i32, height: i32) -> Value {
         "created": created,
         "data": data,
         "size": format!("{width}x{height}"),
+        "output_format": format.name(),
     })
 }
 
@@ -777,9 +785,9 @@ mod tests {
             max_request_pixels: 32 * 1024 * 1024,
             max_images_per_request: 16,
             max_references: 16,
-            min_jpeg_quality: 1,
-            max_jpeg_quality: 100,
-            default_jpeg_quality: 95,
+            min_quality: 0,
+            max_quality: 100,
+            default_quality: 100,
             inference_steps: 6,
             guidance_scale: 1.0,
         }
@@ -828,7 +836,7 @@ mod tests {
         assert_eq!(req.seed, 42);
         assert_eq!(req.min_generation_area, limits.default_generation_area);
         assert_eq!(req.format, engine::ImageFormat::Png);
-        assert_eq!(req.quality, limits.default_jpeg_quality);
+        assert_eq!(req.quality, limits.default_quality);
         assert!(req.references.is_empty());
 
         let jpg_body = serde_json::to_vec(&json!({
@@ -894,6 +902,19 @@ mod tests {
     }
 
     #[test]
+    fn generation_request_takes_webp_and_the_lowest_compression() {
+        let limits = test_limits();
+        let body = serde_json::to_vec(&json!({
+            "prompt": "hi",
+            "output_format": "webp",
+            "output_compression": 0
+        }))
+        .unwrap();
+        let req = parse_generation_request(&body, &limits).unwrap();
+        assert_eq!((req.format, req.quality), (engine::ImageFormat::Webp, 0));
+    }
+
+    #[test]
     fn generation_request_rejects_invalid_and_unsupported_parameters() {
         let limits = test_limits();
         for bad in [
@@ -906,8 +927,8 @@ mod tests {
             json!({"prompt": "hi", "size": "512x512", "n": 17}),
             json!({"prompt": "hi", "size": "512x512", "seed": -1}),
             json!({"prompt": "hi", "size": "512x512", "response_format": "url"}),
-            json!({"prompt": "hi", "size": "512x512", "output_format": "webp"}),
-            json!({"prompt": "hi", "size": "512x512", "output_compression": 0}),
+            json!({"prompt": "hi", "size": "512x512", "output_format": "gif"}),
+            json!({"prompt": "hi", "size": "512x512", "output_compression": 101}),
             json!({"prompt": "hi", "size": "512x512", "min_generation_area": 512}),
             json!({"prompt": "hi", "size": "512x512", "min_generation_area": 20_000_000}),
             json!({"prompt": "hi", "size": "512x512", "num_inference_steps": 8}),
@@ -1095,9 +1116,15 @@ mod tests {
 
     #[test]
     fn response_formats_b64_json_items() {
-        let resp = build_response(&[b"foo".to_vec(), b"bar".to_vec()], 512, 384);
+        let resp = build_response(
+            &[b"foo".to_vec(), b"bar".to_vec()],
+            512,
+            384,
+            engine::ImageFormat::Webp,
+        );
         assert!(resp["created"].is_u64());
         assert_eq!(resp["size"], "512x384");
+        assert_eq!(resp["output_format"], "webp");
         let data = resp["data"].as_array().unwrap();
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["b64_json"], "Zm9v");

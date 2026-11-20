@@ -22,10 +22,11 @@ runs.
 
 ## Build
 
-Requirements: macOS 27 with Xcode 27, and `pkgconf`, `yyjson` and
-`jpeg-turbo` from Homebrew. The GPU code compiles its kernels at run time as
+Requirements: macOS 27 with Xcode 27, and `pkgconf`, `yyjson`, `jpeg-turbo`
+and `webp` from Homebrew. The GPU code compiles its kernels at run time as
 Metal 4.1, which needs macOS 27. JPEG images are decoded with jpeg-turbo, and
-images in other formats with ImageIO.
+images in other formats with ImageIO. WebP images are encoded with libwebp,
+because ImageIO does not write them.
 
 ```sh
 make            # the library, the command-line program and the test programs

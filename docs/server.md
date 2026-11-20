@@ -139,8 +139,9 @@ also takes `id`, `ctx` (at most 4096), `memory`, `idle_unload` and
 An image model serves `POST /v1/images/generations` (JSON) and
 `POST /v1/images/edits` (JSON or `multipart/form-data`, up to 128 MiB). The chat and
 decision endpoints refuse it, and Codex's catalog leaves it out. Both endpoints
-return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT"}`,
-where `size` is the size of the returned images:
+return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT",
+"output_format": "png"}`, where `size` is the size of the returned images and
+`output_format` is their format:
 
 - `prompt`: required string, passed verbatim and truncated to 4096 tokens.
 - `size`: `auto` (the default) or `WIDTHxHEIGHT` (each 1 to 8192). The
@@ -162,8 +163,10 @@ where `size` is the size of the returned images:
 - `generator_device`: accepted and ignored (initial noise always uses the
   deterministic CPU RNG).
 - `response_format`: omit or `"b64_json"`.
-- `output_format`: `"png"` (default), `"jpeg"` or `"jpg"`.
-- `output_compression`: optional JPEG quality, 1 to 100 (default 95).
+- `output_format`: `"png"` (default), `"jpeg"` (or `"jpg"`) or `"webp"`.
+  Other formats, such as `"gif"`, get HTTP 400.
+- `output_compression`: optional JPEG or WebP quality, 0 to 100 (default
+  100, as in OpenAI's API). PNG ignores it.
 - `min_generation_area`: optional integer from 1024 to 16777216 (default
   4194304, 2048 x 2048). When `size` has fewer pixels, the model generates on a
   larger 32-pixel-aligned canvas with the same aspect ratio and resizes back

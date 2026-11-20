@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 8;
+const ABI: c_int = 9;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -1794,12 +1794,12 @@ pub struct ImageLimits {
     pub max_images_per_request: c_int,
     /// Maximum reference images accepted by one edit request.
     pub max_references: c_int,
-    /// Smallest JPEG quality value accepted.
-    pub min_jpeg_quality: c_int,
-    /// Largest JPEG quality value accepted.
-    pub max_jpeg_quality: c_int,
-    /// Default JPEG quality when omitted.
-    pub default_jpeg_quality: c_int,
+    /// Smallest JPEG and WebP quality value accepted.
+    pub min_quality: c_int,
+    /// Largest JPEG and WebP quality value accepted.
+    pub max_quality: c_int,
+    /// Default JPEG and WebP quality when omitted.
+    pub default_quality: c_int,
     /// Required inference step count for distilled checkpoints.
     pub inference_steps: c_int,
     /// Required guidance scale for CFG-free checkpoints.
@@ -1849,6 +1849,19 @@ pub enum ImageFormat {
     Png = 0,
     /// Lossy JPEG encoding (EREMITE_IMAGE_JPEG).
     Jpeg = 1,
+    /// Lossy WebP encoding (EREMITE_IMAGE_WEBP).
+    Webp = 2,
+}
+
+impl ImageFormat {
+    /// Returns the format's name in OpenAI's output_format: png, jpeg or webp.
+    pub fn name(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpeg",
+            ImageFormat::Webp => "webp",
+        }
+    }
 }
 
 /// Scalar parameters of one image generation or editing call.
@@ -1862,7 +1875,7 @@ pub struct ImageCallParams {
     pub min_generation_area: i32,
     /// Encoded output image format.
     pub format: ImageFormat,
-    /// JPEG compression quality in 1..=100; 0 uses 95.
+    /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
     /// Deterministic RNG seed for initial latent noise.
     pub seed: u64,

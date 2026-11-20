@@ -209,6 +209,24 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         "valid JPEG SOI header"
     );
 
+    // 4a. Text-to-image WebP at the lowest compression value.
+    let webp_req = json!({
+        "prompt": "A yellow rubber duck on a bathroom tile floor.",
+        "size": "512x512",
+        "seed": 9,
+        "output_format": "webp",
+        "output_compression": 0,
+        "min_generation_area": 1024
+    });
+    let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&webp_req));
+    assert_eq!(code, 200, "t2i WebP failed: {answer}");
+    assert_eq!(answer["output_format"], "webp", "{answer}");
+    let webp_bytes = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
+    assert!(
+        webp_bytes.len() > 12 && &webp_bytes[..4] == b"RIFF" && &webp_bytes[8..12] == b"WEBP",
+        "valid WebP header"
+    );
+
     // 4b. Text-to-image with size omitted gets the model's default size.
     let auto_req = json!({"prompt": "A small green cactus in a terracotta pot.", "seed": 3});
     let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&auto_req));
@@ -304,7 +322,7 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let st = &status["status"];
     assert_eq!(st["loaded"], json!(true));
     assert_eq!(st["phase"], json!("idle"));
-    assert_eq!(st["totals"]["generated_images"], json!(6));
+    assert_eq!(st["totals"]["generated_images"], json!(7));
     assert_eq!(st["totals"]["generated_tokens"], json!(0));
     assert!(
         st["totals"]["prefilled_tokens"].as_u64().unwrap_or(0) > 0,
@@ -318,8 +336,8 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         st["totals"]["image_seconds"].as_f64().unwrap_or(0.0) > 0.0,
         "{st}"
     );
-    assert_eq!(st["engine_counters"]["generated_images"], json!(6));
-    assert_eq!(st["engine_counters"]["image_steps"], json!(36));
+    assert_eq!(st["engine_counters"]["generated_images"], json!(7));
+    assert_eq!(st["engine_counters"]["image_steps"], json!(42));
     assert_eq!(st["engine_counters"]["image_stage"], json!(0));
 
     server.stop();

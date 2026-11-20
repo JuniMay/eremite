@@ -423,9 +423,9 @@ int eremite_image_model_limits(const eremite_model *m,
       .max_request_pixels = lim.max_request_pixels,
       .max_images_per_request = lim.max_images_per_request,
       .max_references = lim.max_references,
-      .min_jpeg_quality = lim.min_jpeg_quality,
-      .max_jpeg_quality = lim.max_jpeg_quality,
-      .default_jpeg_quality = lim.default_jpeg_quality,
+      .min_quality = lim.min_quality,
+      .max_quality = lim.max_quality,
+      .default_quality = lim.default_quality,
       .inference_steps = lim.inference_steps,
       .guidance_scale = lim.guidance_scale};
   return 1;

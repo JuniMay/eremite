@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 8
+#define EREMITE_ABI 9
 
 // ---- the process ----
 
@@ -238,7 +238,9 @@ enum {
   // Lossless PNG encoding.
   EREMITE_IMAGE_PNG = 0,
   // Lossy JPEG encoding.
-  EREMITE_IMAGE_JPEG = 1
+  EREMITE_IMAGE_JPEG = 1,
+  // Lossy WebP encoding.
+  EREMITE_IMAGE_WEBP = 2
 };
 
 // Capacity in bytes of eremite_image_result.error, including its NUL
@@ -262,9 +264,9 @@ typedef struct {
   // Minimum generation canvas area in pixels (1024 to 16777216; 0 uses
   // 4194304).
   int min_generation_area;
-  // Output format: EREMITE_IMAGE_PNG or EREMITE_IMAGE_JPEG.
+  // Output format: EREMITE_IMAGE_PNG, EREMITE_IMAGE_JPEG or EREMITE_IMAGE_WEBP.
   int format;
-  // JPEG quality in 1 to 100 when format is EREMITE_IMAGE_JPEG; 0 uses 95.
+  // JPEG or WebP quality in 0 to 100; PNG ignores it.
   int quality;
   // Deterministic RNG seed for initial latent noise.
   uint64_t seed;
@@ -315,8 +317,8 @@ typedef struct {
   int max_images_per_request;
   // Maximum reference images accepted by one edit request.
   int max_references;
-  // Minimum, maximum and default JPEG quality values.
-  int min_jpeg_quality, max_jpeg_quality, default_jpeg_quality;
+  // Minimum, maximum and default JPEG and WebP quality values.
+  int min_quality, max_quality, default_quality;
   // Required inference step count for distilled checkpoints.
   int inference_steps;
   // Required guidance scale for CFG-free checkpoints.

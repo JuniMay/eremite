@@ -129,9 +129,9 @@ int main(void) {
             lim.max_request_pixels == MINIMAX_H3_IMAGE_MAX_REQUEST_PIXELS &&
             lim.max_images_per_request == MINIMAX_H3_IMAGE_MAX_IMAGES &&
             lim.max_references == MINIMAX_H3_IMAGE_MAX_REFS &&
-            lim.min_jpeg_quality == IMAGE_JPEG_QUALITY_MIN &&
-            lim.max_jpeg_quality == IMAGE_JPEG_QUALITY_MAX &&
-            lim.default_jpeg_quality == MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY &&
+            lim.min_quality == IMAGE_QUALITY_MIN &&
+            lim.max_quality == IMAGE_QUALITY_MAX &&
+            lim.default_quality == MINIMAX_H3_IMAGE_DEFAULT_QUALITY &&
             lim.inference_steps == MINIMAX_H3_IMAGE_STEPS &&
             lim.guidance_scale == MINIMAX_H3_IMAGE_GUIDANCE_SCALE,
         "MiniMax-H3 read_image_limits exports exact C model limits");

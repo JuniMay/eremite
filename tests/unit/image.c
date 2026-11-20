@@ -250,10 +250,38 @@ int main(void) {
   check(!encoded_png && !encoded_length && error,
         "encoding an empty PNG gives an error");
   error = 0;
-  encoded_jpeg = image_encode_jpeg(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE, 0,
-                                   &encoded_length, &error);
+  encoded_jpeg =
+      image_encode_jpeg(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE,
+                        IMAGE_QUALITY_MAX + 1, &encoded_length, &error);
   check(!encoded_jpeg && !encoded_length && error,
-        "encoding a JPEG with quality outside 1 to 100 gives an error");
+        "encoding a JPEG with quality outside 0 to 100 gives an error");
+  error = "unset";
+  encoded_jpeg = image_encode_jpeg(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE,
+                                   IMAGE_QUALITY_MIN, &encoded_length, &error);
+  check(encoded_jpeg && encoded_length > 0 && !error,
+        "a JPEG encodes at the lowest quality, 0");
+  free(encoded_jpeg);
+
+  // WebP: lossy, so the check is that it decodes to the same size.
+  error = "unset";
+  uint8_t *encoded_webp =
+      image_encode_webp(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE,
+                        JPEG_DEFAULT_QUALITY, &encoded_length, &error);
+  pixels = encoded_webp
+               ? decode(encoded_webp, encoded_length, JPEG_SIDE, JPEG_SIDE)
+               : 0;
+  check(encoded_webp && !error && encoded_length > 12 &&
+            !memcmp(encoded_webp, "RIFF", 4) &&
+            !memcmp(encoded_webp + 8, "WEBP", 4) && pixels,
+        "encoded WebP bytes decode back to the same size");
+  free(pixels);
+  free(encoded_webp);
+  error = 0;
+  encoded_webp =
+      image_encode_webp(&smooth[0][0][0], JPEG_SIDE, JPEG_SIDE,
+                        IMAGE_QUALITY_MAX + 1, &encoded_length, &error);
+  check(!encoded_webp && !encoded_length && error,
+        "encoding a WebP with quality outside 0 to 100 gives an error");
 
   CGColorSpaceRelease(gray_space);
   CGColorSpaceRelease(srgb);

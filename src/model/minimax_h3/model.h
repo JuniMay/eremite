@@ -45,8 +45,9 @@ static constexpr int MINIMAX_H3_IMAGE_MAX_IMAGES = 16;
 // Maximum number of reference images accepted by one edit request.
 static constexpr int MINIMAX_H3_IMAGE_MAX_REFS = 16;
 
-// Default JPEG quality when an image request leaves quality unset.
-static constexpr int MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY = 95;
+// Quality of a JPEG or WebP output when the request leaves it unset:
+// OpenAI's default output_compression.
+static constexpr int MINIMAX_H3_IMAGE_DEFAULT_QUALITY = 100;
 
 // Required inference step count of the distilled PDD checkpoint;
 // MiniMaxAI/MiniMax-H3-Image pdd_config.json:2 ("num_inference_steps": 6).

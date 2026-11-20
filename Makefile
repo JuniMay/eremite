@@ -25,9 +25,10 @@ BUILD := build
 OBJ := $(BUILD)/obj
 CFLAGS := -std=c23 -O2 -Wall -Wextra -Isrc
 
-# Libraries found through pkg-config: yyjson, and libjpeg from jpeg-turbo, which
-# decodes JPEG images as Pillow decodes them.
-PKGS := yyjson libjpeg
+# Libraries found through pkg-config: yyjson; libjpeg from jpeg-turbo, which
+# decodes JPEG images as Pillow decodes them; and libwebp, which encodes WebP
+# images, a format that ImageIO does not write.
+PKGS := yyjson libjpeg libwebp
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
 LDLIBS := $(shell pkg-config --libs $(PKGS))
 

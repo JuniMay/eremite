@@ -788,6 +788,7 @@ async fn run_image_request(
         parsed.count,
         parsed.references.len()
     );
+    let format = parsed.format;
     let (_cancel, mut events) = match worker::submit_image(worker::ImageRequest {
         model_index: index,
         prompt: parsed.prompt,
@@ -810,7 +811,9 @@ async fn run_image_request(
             images,
             width,
             height,
-        }) => build_json_response(image::build_response(&images, width, height).to_string()),
+        }) => {
+            build_json_response(image::build_response(&images, width, height, format).to_string())
+        }
         Some(worker::Event::Refused(message)) => {
             refuse_request(&peer, chat::Error::new_bad_request(message))
         }

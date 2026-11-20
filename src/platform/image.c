@@ -3,6 +3,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
 #include <jpeglib.h>
+#include <webp/encode.h>
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,7 +298,7 @@ uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,
   *length = 0;
   *err = 0;
   if (!check_encode_input(pixels, width, height, err)) return 0;
-  if (quality < IMAGE_JPEG_QUALITY_MIN || quality > IMAGE_JPEG_QUALITY_MAX) {
+  if (quality < IMAGE_QUALITY_MIN || quality > IMAGE_QUALITY_MAX) {
     *err = "the JPEG quality is out of range";
     return 0;
   }
@@ -331,4 +332,32 @@ uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,
   jpeg_destroy_compress(&c);
   *length = (size_t)file_length;
   return file;
+}
+
+uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
+                           int quality, size_t *length, const char **err) {
+  *length = 0;
+  *err = 0;
+  if (!check_encode_input(pixels, width, height, err)) return 0;
+  if (quality < IMAGE_QUALITY_MIN || quality > IMAGE_QUALITY_MAX) {
+    *err = "the WebP quality is out of range";
+    return 0;
+  }
+  if (width > WEBP_MAX_DIMENSION || height > WEBP_MAX_DIMENSION) {
+    *err = "the image is larger than WebP allows";
+    return 0;
+  }
+  uint8_t *encoded = 0;
+  size_t n = WebPEncodeRGB(pixels, width, height, width * (int)RGB_CHANNELS,
+                           (float)quality, &encoded);
+  uint8_t *out = 0;
+  if (n) {
+    out = xmalloc(n);
+    memcpy(out, encoded, n);
+    *length = n;
+  } else {
+    *err = "the WebP image could not be encoded";
+  }
+  WebPFree(encoded);
+  return out;
 }

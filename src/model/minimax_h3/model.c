@@ -519,19 +519,18 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     out->invalid_input = 1;
     return 0;
   }
-  if (req->format != IMAGE_FORMAT_PNG && req->format != IMAGE_FORMAT_JPEG) {
+  if (req->format != IMAGE_FORMAT_PNG && req->format != IMAGE_FORMAT_JPEG &&
+      req->format != IMAGE_FORMAT_WEBP) {
     write_error(out->error, sizeof out->error,
-                "output_format must be png or jpeg");
+                "output_format must be png, jpeg or webp");
     out->invalid_input = 1;
     return 0;
   }
-  int quality =
-      req->quality == 0 ? MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY : req->quality;
-  if (req->format == IMAGE_FORMAT_JPEG &&
-      (quality < IMAGE_JPEG_QUALITY_MIN || quality > IMAGE_JPEG_QUALITY_MAX)) {
+  if (req->format != IMAGE_FORMAT_PNG &&
+      (req->quality < IMAGE_QUALITY_MIN || req->quality > IMAGE_QUALITY_MAX)) {
     snprintf(out->error, sizeof out->error,
-             "JPEG quality must be between %d and %d", IMAGE_JPEG_QUALITY_MIN,
-             IMAGE_JPEG_QUALITY_MAX);
+             "output_compression must be between %d and %d", IMAGE_QUALITY_MIN,
+             IMAGE_QUALITY_MAX);
     out->invalid_input = 1;
     return 0;
   }
@@ -760,9 +759,12 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   if (req->format == IMAGE_FORMAT_PNG)
     out->data = image_encode_png(encode_src, req->width, req->height, &out->len,
                                  &enc_err);
+  else if (req->format == IMAGE_FORMAT_JPEG)
+    out->data = image_encode_jpeg(encode_src, req->width, req->height,
+                                  req->quality, &out->len, &enc_err);
   else
-    out->data = image_encode_jpeg(encode_src, req->width, req->height, quality,
-                                  &out->len, &enc_err);
+    out->data = image_encode_webp(encode_src, req->width, req->height,
+                                  req->quality, &out->len, &enc_err);
   free(canvas_rgb);
   free(final_rgb);
 
@@ -796,9 +798,9 @@ static void minimax_h3_image_read_limits(ImageLimits *out) {
       .max_request_pixels = MINIMAX_H3_IMAGE_MAX_REQUEST_PIXELS,
       .max_images_per_request = MINIMAX_H3_IMAGE_MAX_IMAGES,
       .max_references = MINIMAX_H3_IMAGE_MAX_REFS,
-      .min_jpeg_quality = IMAGE_JPEG_QUALITY_MIN,
-      .max_jpeg_quality = IMAGE_JPEG_QUALITY_MAX,
-      .default_jpeg_quality = MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY,
+      .min_quality = IMAGE_QUALITY_MIN,
+      .max_quality = IMAGE_QUALITY_MAX,
+      .default_quality = MINIMAX_H3_IMAGE_DEFAULT_QUALITY,
       .inference_steps = MINIMAX_H3_IMAGE_STEPS,
       .guidance_scale = MINIMAX_H3_IMAGE_GUIDANCE_SCALE};
 }

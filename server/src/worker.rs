@@ -225,7 +225,7 @@ pub struct ImageRequest {
     pub min_generation_area: i32,
     /// Encoded output image format.
     pub format: ImageFormat,
-    /// JPEG quality in 1..=100.
+    /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
     /// Optional reference image bytes in upload order (`<Picture 1>`, ...).
     pub references: Vec<Vec<u8>>,
