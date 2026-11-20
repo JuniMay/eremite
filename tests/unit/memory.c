@@ -18,6 +18,8 @@ static double clock_now = 100;
 static int order[16], order_count;
 // The free memory and the file cache that the system reports to the reserve.
 static uint64_t available_bytes, file_bytes;
+// The machine's RAM that the system reports; 0 reports none.
+static uint64_t machine_bytes;
 // Memory that another program released, and the bytes of it that come back to
 // the system's counts at each sleep.
 static uint64_t coming_back, coming_back_step;
@@ -250,7 +252,8 @@ static void state_goes_after_its_model(void) {
 
 // The kernel's counters as the tests set them.
 static SystemMemoryCounters fake_counters(void) {
-  return (SystemMemoryCounters){.free = available_bytes, .file = file_bytes};
+  return (SystemMemoryCounters){
+      .free = available_bytes, .file = file_bytes, .total = machine_bytes};
 }
 
 static void state_memory_keeps_the_reserve(void) {
@@ -523,6 +526,21 @@ static void speculative_memory_never_evicts(void) {
   REQUIRE(dense.evicted == 0);
   REQUIRE(claim(&wanted, 40, MEMORY_CACHE));
   REQUIRE(dense.evicted == 1 && memory_usage(memory).committed == 40);
+}
+
+static void ceiling_is_the_lowest_bound(void) {
+  Memory *memory = memory_new();
+  REQUIRE(memory_ceiling(memory) == UINT64_MAX);
+  memory_set_limit(memory, 1000);
+  REQUIRE(memory_ceiling(memory) == 1000);
+  memory_set_reserve(memory, 100, fake_counters, NULL);
+  machine_bytes = 0;
+  REQUIRE(memory_ceiling(memory) == 1000);
+  machine_bytes = 800;
+  REQUIRE(memory_ceiling(memory) == 700);
+  machine_bytes = 2000;
+  REQUIRE(memory_ceiling(memory) == 1000);
+  machine_bytes = 0;
 }
 
 static void refused_addition_evicts_nothing(void) {
@@ -879,6 +897,9 @@ int main(void) {
        claim_waits_while_memory_comes_back},
       {"a refused addition to two slots evicts nothing",
        refused_addition_evicts_nothing},
+      {"the ceiling is the limit, or the machine's RAM less the reserve when "
+       "that is lower",
+       ceiling_is_the_lowest_bound},
       {"slots that their owners keep go only for required memory, after the "
        "others",
        required_memory_takes_kept_slots_last},

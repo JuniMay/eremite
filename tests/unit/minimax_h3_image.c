@@ -217,7 +217,7 @@ int main(void) {
   err[0] = '\0';
   check(minimax_h3_image_admit_request(&acct, 1, mem_default.staged_bytes, 4896,
                                        4896, mem_huge, &use_full, err,
-                                       sizeof err) == 1 &&
+                                       sizeof err) == MINIMAX_H3_ADMITTED &&
             use_full == 1 && acct.minimum == mem_huge.full_bytes,
         "4896x4896 admits in full residence when limit covers full_bytes");
 
@@ -227,22 +227,37 @@ int main(void) {
   err[0] = '\0';
   check(minimax_h3_image_admit_request(&acct, 1, mem_default.staged_bytes, 4896,
                                        4896, mem_huge, &use_full, err,
-                                       sizeof err) == 1 &&
+                                       sizeof err) == MINIMAX_H3_ADMITTED &&
             use_full == 0 && acct.minimum == mem_huge.staged_bytes,
         "4896x4896 falls back to staged when only staged_bytes fits");
 
-  // Under a 22 GiB limit, 4896x4896 refuses early with a clear message and
-  // leaves the account's baseline minimum intact.
+  // Under a 22 GiB limit, 4896x4896 can never fit: it is refused early with a
+  // clear message, and the account's baseline minimum stays.
   memory_set_minimum(&acct, mem_default.staged_bytes, MEMORY_REQUIRED);
   memory_set_limit(mem, 22ull << 30);
   uint64_t min_before = acct.minimum;
   err[0] = '\0';
   check(minimax_h3_image_admit_request(&acct, 0, mem_default.staged_bytes, 4896,
                                        4896, mem_huge, &use_full, err,
-                                       sizeof err) == 0 &&
+                                       sizeof err) == MINIMAX_H3_NEVER_FITS &&
             acct.minimum == min_before && strstr(err, "4896x4896") != NULL &&
-            strstr(err, "GiB") != NULL,
-        "4896x4896 refuses early when staged_bytes exceeds limit");
+            strstr(err, "more than") != NULL,
+        "4896x4896 never fits when staged_bytes exceeds the limit");
+
+  // Under a 40 GiB limit with 20 GiB reserved by another model, 4896x4896
+  // does not fit now, but it would fit once the other model frees its memory.
+  MemoryAccount other;
+  memory_account_init(mem, &other, "other-model", 0);
+  memory_set_limit(mem, 40ull << 30);
+  int other_reserved = memory_set_minimum(&other, 20ull << 30, MEMORY_REQUIRED);
+  err[0] = '\0';
+  check(other_reserved &&
+            minimax_h3_image_admit_request(&acct, 0, mem_default.staged_bytes,
+                                           4896, 4896, mem_huge, &use_full, err,
+                                           sizeof err) == MINIMAX_H3_NOT_NOW &&
+            acct.minimum == min_before && strstr(err, "now") != NULL,
+        "4896x4896 does not fit now while another model holds the memory");
+  memory_set_minimum(&other, 0, MEMORY_REQUIRED);
 
   // A staged request keeps at least the staged base reserved while it runs.
   memory_set_limit(mem, 50ull << 30);
@@ -251,7 +266,7 @@ int main(void) {
   err[0] = '\0';
   check(minimax_h3_image_admit_request(&acct, 0, staged_base, 2048, 2048,
                                        mem_default, &use_full, err,
-                                       sizeof err) == 1 &&
+                                       sizeof err) == MINIMAX_H3_ADMITTED &&
             use_full == 0 && acct.minimum == staged_base,
         "a staged request keeps the staged base reserved");
 

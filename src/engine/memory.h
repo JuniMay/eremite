@@ -181,6 +181,11 @@ void memory_keep_file_cache(Memory *memory, uint64_t bytes);
 // The most memory the models may use now, within the limit and the reserve.
 uint64_t memory_current_limit(Memory *memory);
 
+// The most memory the models could ever use: the limit, and with system
+// readings the machine's RAM less the reserve, whichever is lower. UINT64_MAX
+// when nothing bounds it.
+uint64_t memory_ceiling(Memory *memory);
+
 // Starts an empty account and adds it to memory. Its slots may count up to
 // limit bytes together, its state slots included; 0 sets no limit of its own.
 void memory_account_init(Memory *memory, MemoryAccount *account,

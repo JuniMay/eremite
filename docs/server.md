@@ -165,8 +165,17 @@ Full residence is the primary mode: when enough memory fits, the text encoder
 (13.5 GiB), DiT (19.5 GiB) and VAE decoder (0.8 GiB) stay resident together
 (33.8 GiB), and the vision tower (1.1 GiB) and VAE encoder (0.1 GiB) load on
 demand at the first edit (35.0 GiB total). When available memory cannot hold
-all three core groups at once, the model falls back to staged loading (~21.3
-GiB peak). During a pass, the image model yields between layers to any running
+all three core groups at once, the model runs staged: each stage loads its own
+weights in turn. The model then keeps its largest stage's memory reserved: 21.8
+GiB for the default canvas and a full prompt.
+
+Before its text encoder runs, each request reserves the memory that its
+canvas, prompt and reference images need. A request that needs more than the
+model may ever use gets HTTP 400: more than the model's `memory`, the server's
+`memory`, or the machine's RAM less `reserve`. A request that does not fit now
+gets HTTP 503.
+
+During a pass, the image model yields between layers to any running
 text-decoding calls so decoding latency is not degraded.
 
 ## Codex's web search

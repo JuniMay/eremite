@@ -292,8 +292,9 @@ int main(int argc, char **argv) {
   check(freed > (20ull << 30) && eremite_is_loaded(m) == 0,
         "eremite_unload releases all weight groups cleanly");
 
-  // 8. A large canvas that exceeds memory under staged mode is refused before
-  //    running the text encoder, with a message naming the canvas and memory.
+  // 8. A canvas that needs more than the memory limit is refused before the
+  //    text encoder runs, as invalid input, with a message naming the canvas
+  //    and the memory.
   uint64_t tight_limit = staged_required + (512ull << 20);
   eremite_set_memory_limit(tight_limit);
   int staged_loaded = eremite_load(m);
@@ -314,11 +315,11 @@ int main(int argc, char **argv) {
   printf("huge canvas under %.2f GiB limit: ok=%d prefill_delta=%llu err=%s\n",
          (double)tight_limit / (double)(1ull << 30), ok_huge,
          (unsigned long long)(st.prefill_rows - prefill_before), res.error);
-  check(!ok_huge && res.invalid_input == 0 &&
+  check(!ok_huge && res.invalid_input == 1 &&
             st.prefill_rows == prefill_before &&
             strstr(res.error, "4896x4896") != NULL &&
-            strstr(res.error, "GiB") != NULL,
-        "oversized canvas is refused before text encoding with clear message");
+            strstr(res.error, "more than") != NULL,
+        "a canvas over the memory limit is refused early as invalid input");
   eremite_image_result_free(&res);
   eremite_set_request_running(m, 0);
   eremite_unload(m);

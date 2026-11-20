@@ -218,43 +218,50 @@ MinimaxH3RequestMemory minimax_h3_image_plan_request_memory(
   return (MinimaxH3RequestMemory){.full_bytes = full, .staged_bytes = staged};
 }
 
-// Checks whether bytes can fit within account's limit and the current memory
-// limit, waiting while released system memory returns if minimum needs to grow.
+// Sets account's minimum to bytes when they fit within the current memory
+// limit, waiting while released system memory comes back. Returns whether
+// they fit.
 static int try_admit_bytes(MemoryAccount *account, uint64_t bytes) {
-  if (bytes > account->limit) return 0;
   if (bytes <= memory_counted(account) &&
       bytes > memory_current_limit(account->memory))
     return 0;
   return memory_wait_for_minimum(account, bytes);
 }
 
-int minimax_h3_image_admit_request(MemoryAccount *account, int prefer_full,
-                                   uint64_t staged_base, int canvas_w,
-                                   int canvas_h, MinimaxH3RequestMemory req_mem,
-                                   int *out_use_full, char *error,
-                                   size_t error_cap) {
-  if (!account) return 0;
-  uint64_t saved_min = account->minimum;
-  if (prefer_full) {
-    uint64_t full_target = max_u64(req_mem.full_bytes, saved_min);
-    if (try_admit_bytes(account, full_target)) {
-      if (out_use_full) *out_use_full = 1;
-      return 1;
-    }
-    if (shutdown_requested()) return 0;
-  }
+MinimaxH3Admission minimax_h3_image_admit_request(
+    MemoryAccount *account, int prefer_full, uint64_t staged_base, int canvas_w,
+    int canvas_h, MinimaxH3RequestMemory req_mem, int *out_use_full,
+    char *error, size_t error_cap) {
+  uint64_t ceiling = memory_ceiling(account->memory);
+  if (account->limit < ceiling) ceiling = account->limit;
   uint64_t staged_target = max_u64(req_mem.staged_bytes, staged_base);
+  if (staged_target > ceiling) {
+    if (error && error_cap > 0)
+      snprintf(error, error_cap,
+               "generation canvas %dx%d needs %.1f GiB of memory, more than "
+               "the %.1f GiB that this model may use",
+               canvas_w, canvas_h, (double)staged_target / BYTES_PER_GIB,
+               (double)ceiling / BYTES_PER_GIB);
+    return MINIMAX_H3_NEVER_FITS;
+  }
+  if (prefer_full) {
+    uint64_t full_target = max_u64(req_mem.full_bytes, account->minimum);
+    if (full_target <= ceiling && try_admit_bytes(account, full_target)) {
+      if (out_use_full) *out_use_full = 1;
+      return MINIMAX_H3_ADMITTED;
+    }
+    if (shutdown_requested()) return MINIMAX_H3_NOT_NOW;
+  }
   if (try_admit_bytes(account, staged_target)) {
     if (out_use_full) *out_use_full = 0;
-    return 1;
+    return MINIMAX_H3_ADMITTED;
   }
-  if (!shutdown_requested() && error && error_cap > 0) {
+  if (!shutdown_requested() && error && error_cap > 0)
     snprintf(error, error_cap,
-             "generation canvas %dx%d requires %.1f GiB of memory, which does "
-             "not fit now",
+             "generation canvas %dx%d needs %.1f GiB of memory, which does not "
+             "fit now",
              canvas_w, canvas_h, (double)staged_target / BYTES_PER_GIB);
-  }
-  return 0;
+  return MINIMAX_H3_NOT_NOW;
 }
 
 // Returns the weight bytes of the five MiniMax-H3-Image weight groups.
@@ -560,11 +567,13 @@ static int minimax_h3_image_generate(const ImageRequest *req,
                                    canvas_w, canvas_h),
       req->ref_count);
   int request_full = full_resident;
-  if (!minimax_h3_image_admit_request(
-          work_slot->account, full_resident, required_staged_bytes, canvas_w,
-          canvas_h, req_mem, &request_full, out->error, sizeof out->error)) {
+  MinimaxH3Admission admission = minimax_h3_image_admit_request(
+      work_slot->account, full_resident, required_staged_bytes, canvas_w,
+      canvas_h, req_mem, &request_full, out->error, sizeof out->error);
+  if (admission != MINIMAX_H3_ADMITTED) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
     if (minimax_h3_should_stop(&hooks)) set_runtime_error(out, &hooks);
+    out->invalid_input = admission == MINIMAX_H3_NEVER_FITS;
     return 0;
   }
   if (full_resident && !request_full) pin_core_groups(0);

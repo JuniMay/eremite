@@ -30,8 +30,11 @@ static uint64_t file_of(vm_statistics64_data_t s) {
 
 SystemMemoryCounters system_memory_read_counters(void) {
   vm_statistics64_data_t s = vm();
-  return (SystemMemoryCounters){(uint64_t)s.free_count * vm_page_size,
-                                file_of(s), s.swapouts, s.compressions};
+  return (SystemMemoryCounters){.free = (uint64_t)s.free_count * vm_page_size,
+                                .file = file_of(s),
+                                .swapouts = s.swapouts,
+                                .compressions = s.compressions,
+                                .total = sysctl_u64("hw.memsize")};
 }
 
 void system_memory_read_info(SystemMemoryInfo *m) {

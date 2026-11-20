@@ -117,16 +117,29 @@ MinimaxH3RequestMemory
 minimax_h3_image_plan_request_memory(MinimaxH3WeightBytes weights,
                                      MinimaxH3StageBytes stages, int ref_count);
 
+// What reserving a request's memory gave.
+typedef enum {
+  // The request's memory is reserved, and the request runs.
+  MINIMAX_H3_ADMITTED,
+  // The request's memory does not fit now. It may fit once other programs or
+  // models free memory, so the client may try again later.
+  MINIMAX_H3_NOT_NOW,
+  // The request needs more than the model may ever use: its own limit, the
+  // memory limit, or the machine's RAM less the reserve. Trying again does
+  // not help.
+  MINIMAX_H3_NEVER_FITS
+} MinimaxH3Admission;
+
 // Reserves GPU memory in account for a planned canvas before running the text
 // encoder. With prefer_full, it tries full residence first: req_mem.full_bytes
 // or the account's minimum, the larger. Staged execution reserves
-// req_mem.staged_bytes or staged_base, the larger. On failure it writes a
-// message naming the canvas and the GiB it needs into error and leaves
-// account->minimum unchanged. Returns 1 and sets *out_use_full, or returns 0.
-int minimax_h3_image_admit_request(MemoryAccount *account, int prefer_full,
-                                   uint64_t staged_base, int canvas_w,
-                                   int canvas_h, MinimaxH3RequestMemory req_mem,
-                                   int *out_use_full, char *error,
-                                   size_t error_cap);
+// req_mem.staged_bytes or staged_base, the larger. Unless it reserves the
+// memory, it writes a message naming the canvas and the GiB it needs into
+// error and leaves account->minimum unchanged. On MINIMAX_H3_ADMITTED it sets
+// *out_use_full.
+MinimaxH3Admission minimax_h3_image_admit_request(
+    MemoryAccount *account, int prefer_full, uint64_t staged_base, int canvas_w,
+    int canvas_h, MinimaxH3RequestMemory req_mem, int *out_use_full,
+    char *error, size_t error_cap);
 
 #endif

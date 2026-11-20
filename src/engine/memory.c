@@ -208,6 +208,16 @@ uint64_t memory_current_limit(Memory *memory) {
   return limit < usage->limit ? limit : usage->limit;
 }
 
+uint64_t memory_ceiling(Memory *memory) {
+  uint64_t ceiling = memory->usage.limit;
+  if (!memory->read_counters) return ceiling;
+  uint64_t machine = memory->read_counters().total;
+  // A reading without the machine's RAM sets no bound of its own.
+  if (!machine) return ceiling;
+  uint64_t room = machine > memory->reserve ? machine - memory->reserve : 0;
+  return room < ceiling ? room : ceiling;
+}
+
 void memory_account_init(Memory *memory, MemoryAccount *account,
                          const char *name, uint64_t limit) {
   *account = (MemoryAccount){.memory = memory,

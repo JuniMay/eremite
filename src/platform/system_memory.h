@@ -15,6 +15,8 @@ typedef struct {
   uint64_t swapouts;
   // The pages compressed since boot.
   uint64_t compressions;
+  // The machine's RAM; 0 when unknown.
+  uint64_t total;
 } SystemMemoryCounters;
 
 // Reads the kernel's page counters.
