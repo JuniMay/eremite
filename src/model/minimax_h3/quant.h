@@ -35,4 +35,8 @@ float minimax_h3_read_scalar_f32(Tensor tensor);
 void minimax_h3_nvfp4_scales_add(WeightGroup *group, Buf *target, Tensor tensor,
                                  int rows, int cols);
 
+// Waits for the GPU command buffer numbered number to finish, yielding when
+// called inside a cooperative engine pass.
+void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number);
+
 #endif

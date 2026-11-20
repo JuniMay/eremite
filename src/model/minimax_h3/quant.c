@@ -1,6 +1,7 @@
 #include "model/minimax_h3/quant.h"
 #include "base/error.h"
 #include "engine/io.h"
+#include "engine/pass.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,4 +113,36 @@ void minimax_h3_nvfp4_scales_add(WeightGroup *group, Buf *target, Tensor tensor,
   Nvfp4ScalesParam param = {.tensor = tensor, .rows = rows, .cols = cols};
   weight_group_add_generated(group, target, (size_t)rows * (size_t)cols,
                              fill_nvfp4_scales, &param, sizeof param);
+}
+
+// Context passed to PassWait callbacks while yielding for GPU completion.
+typedef struct {
+  // The GPU whose command buffer is running.
+  Gpu *gpu;
+  // The committed command buffer number to wait for.
+  uint64_t number;
+} GpuWaitContext;
+
+// Returns whether the command buffer in context has finished.
+static int gpu_wait_ready(void *context) {
+  GpuWaitContext *wait = context;
+  return gpu_has_finished(wait->gpu, wait->number);
+}
+
+// Blocks until the command buffer in context finishes.
+static void gpu_wait_block(void *context) {
+  GpuWaitContext *wait = context;
+  gpu_wait_until_finished(wait->gpu, wait->number);
+}
+
+void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number) {
+  if (!number) return;
+  if (!pass_current()) {
+    gpu_wait_until_finished(gpu, number);
+    return;
+  }
+  GpuWaitContext context = {.gpu = gpu, .number = number};
+  pass_wait(&(PassWait){gpu_wait_ready, gpu_wait_block, &context, PASS_WAIT_GPU,
+                        NULL});
+  gpu_check_finished(gpu);
 }
