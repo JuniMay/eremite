@@ -330,6 +330,33 @@ int main(int argc, char **argv) {
             out_h == orig_h && !memcmp(out_px + top, orig + top, all - top),
         "a masked edit keeps the reference's pixels where the mask is opaque");
     free(out_px);
+    eremite_image_result_free(&res);
+
+    // A transparent masked edit: the matte reads the edit's own key-colored
+    // border, and then the mask keeps the reference's pixels, opaque.
+    req_masked.background = EREMITE_IMAGE_BACKGROUND_TRANSPARENT;
+    int ok_masked_clear = eremite_generate_image(m, &req_masked, &res);
+    out_px = ok_masked_clear ? image_decode_rgb(res.data, res.len, &out_w,
+                                                &out_h, &out_error)
+                             : NULL;
+    uint8_t *out_alpha =
+        ok_masked_clear
+            ? image_decode_alpha(res.data, res.len, &out_w, &out_h, &out_error)
+            : NULL;
+    // The mask keeps the rows from the middle one down.
+    size_t pixels = (size_t)orig_w * (size_t)orig_h,
+           first_kept = (size_t)orig_w * (size_t)(orig_h / 2), kept_opaque = 0;
+    for (size_t i = first_kept; out_alpha && i < pixels; i++)
+      kept_opaque += out_alpha[i] == 255;
+    printf("transparent masked edit %dx%d: ok=%d %s\n", orig_w, orig_h,
+           ok_masked_clear, ok_masked_clear ? "" : res.error);
+    check(out_px && out_alpha && out_w == orig_w && out_h == orig_h &&
+              !memcmp(out_px + top, orig + top, all - top) &&
+              kept_opaque == pixels - first_kept && !out_alpha[0],
+          "a transparent masked edit clears the edit's background and keeps "
+          "the reference's pixels opaque under the mask");
+    free(out_alpha);
+    free(out_px);
     free(mask_png);
     free(mask_px);
     free(orig);
@@ -364,6 +391,32 @@ int main(int argc, char **argv) {
             !clear_alpha[512 * 512 - 1] && opaque_pixels > 0,
         "a transparent background clears the corners and keeps the subject");
   free(clear_alpha);
+  eremite_image_result_free(&res);
+
+  // The key sentence goes before the prompt, so a prompt past the token limit
+  // keeps it, and the corners still turn clear.
+  enum { BALL_REPEATS = 1200 };  // about 4800 tokens, past the 4096 limit
+
+  const char *ball = "a small red ball ";
+  size_t ball_len = strlen(ball);
+  char *long_clear = xmalloc(ball_len * BALL_REPEATS + 1);
+  for (int i = 0; i < BALL_REPEATS; i++)
+    memcpy(long_clear + i * ball_len, ball, ball_len);
+  long_clear[BALL_REPEATS * ball_len] = '\0';
+  req_clear.prompt = long_clear;
+  req_clear.width = req_clear.height = 256;
+  int ok_long_clear = eremite_generate_image(m, &req_clear, &res);
+  free(long_clear);
+  uint8_t *long_alpha = ok_long_clear
+                            ? image_decode_alpha(res.data, res.len, &clear_w,
+                                                 &clear_h, &clear_error)
+                            : NULL;
+  printf("transparent with a long prompt: ok=%d %s\n", ok_long_clear,
+         ok_long_clear ? "" : res.error);
+  check(long_alpha && clear_w == 256 && clear_h == 256 && !long_alpha[0] &&
+            !long_alpha[256 * 256 - 1],
+        "a transparent prompt past the token limit still clears the corners");
+  free(long_alpha);
   eremite_image_result_free(&res);
 
   eremite_stream_free(stream);

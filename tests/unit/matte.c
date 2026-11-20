@@ -2,7 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 
-// Alpha mattes: keeping an original's pixels where a mask is opaque.
+// Alpha mattes: keeping an original's pixels where a mask is opaque, and
+// making a flat key-colored background transparent.
 
 // The number of failed checks.
 static int failures;
@@ -24,6 +25,22 @@ int main(void) {
   check(!memcmp(edited, expected, sizeof expected),
         "an opaque mask keeps the original, a clear one keeps the edit, and "
         "half alpha mixes them");
+
+  // Four RGBA pixels: an opaque mask keeps the original, opaque; a clear one
+  // keeps the edit, clear too; half alpha over a clear pixel takes the
+  // original's color at half alpha; and half alpha over an opaque pixel mixes
+  // the colors.
+  uint8_t edited_rgba[] = {10,  20,  30, 0, 40,  50,  60, 0,
+                           200, 100, 0,  0, 200, 100, 0,  255};
+  const uint8_t original_rgb[] = {110, 120, 130, 140, 150, 160,
+                                  0,   100, 255, 0,   100, 255};
+  const uint8_t mask_rgba[] = {255, 0, 128, 128};
+  matte_keep_masked_rgba(edited_rgba, original_rgb, mask_rgba, 4);
+  const uint8_t expected_rgba[] = {110, 120, 130, 255, 40,  50,  60,  0,
+                                   0,   100, 255, 128, 100, 100, 128, 255};
+  check(!memcmp(edited_rgba, expected_rgba, sizeof expected_rgba),
+        "an RGBA edit keeps the opaque original under an opaque mask, its own "
+        "pixels under a clear one, and mixes color and alpha between");
 
   // A 16 by 16 image: a green background with a few levels of noise, a red
   // square in the middle, and one pixel half green and half red at its edge.

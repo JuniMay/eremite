@@ -176,14 +176,17 @@ the returned images, `output_format` is their format, and `background` is
   100, as in OpenAI's API). PNG ignores it.
 - `background`: `"auto"` (default), `"opaque"` or `"transparent"`.
   MiniMax-H3-Image draws no alpha, so `auto` gives an opaque background. For
-  `transparent`, eremite adds a sentence to the prompt that asks for a flat
-  pure green (#00FF00) background, and then makes that background clear. The
-  key is the median color of the image's border, and a pixel's alpha comes
-  from how far its green leads its red and blue, measured against the
-  border's own spread. This is an approximation: the edges of hair, glass,
-  smoke and soft shadows suffer, and green parts of the subject turn clear.
-  An image whose border has no green key fails with HTTP 503. A transparent
-  background needs `output_format` `"png"` or `"webp"`; JPEG gets HTTP 400.
+  `transparent`, eremite puts a sentence before the prompt that asks for a
+  flat pure green (#00FF00) background; the token limit cuts a long prompt's
+  end, so the sentence stays. It then makes that background clear. The key
+  is the median color of the image's border, and a pixel's alpha comes from
+  how far its green leads its red and blue, measured against the border's
+  own spread. With a mask, the key comes from the edit's own border, and the
+  mask then keeps the first image's pixels, opaque. This is an
+  approximation: the edges of hair, glass, smoke and soft shadows suffer, and
+  green parts of the subject turn clear. An image whose border has no green
+  key fails with HTTP 503. A transparent background needs `output_format`
+  `"png"` or `"webp"`; JPEG gets HTTP 400.
 - `min_generation_area`: optional integer from 1024 to 16777216 (default
   4194304, 2048 x 2048). When `size` has fewer pixels, the model generates on a
   larger 32-pixel-aligned canvas with the same aspect ratio and resizes back

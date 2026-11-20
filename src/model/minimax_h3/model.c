@@ -501,21 +501,25 @@ static void set_runtime_error(ImageResult *out,
 // that Codex's imagegen skill uses.
 static const uint8_t KEY_COLOR[MINIMAX_H3_RGB_CHANNELS] = {0, 255, 0};
 
-// The sentence that a transparent request adds to its prompt: a flat
+// The sentence that a transparent request puts before its prompt: a flat
 // background of the key color, which then becomes transparent.
 static const char KEY_BACKGROUND[] =
-    " The background is one flat, uniform pure green (#00FF00) color that "
+    "The background is one flat, uniform pure green (#00FF00) color that "
     "fills the frame from edge to edge, with no texture, gradient, shadows or "
-    "reflections.";
+    "reflections. ";
 
-// Returns a new string: prompt followed by KEY_BACKGROUND.
+// Returns a new string: KEY_BACKGROUND, then prompt. The sentence goes first
+// because the token limit cuts a long prompt's end.
 static char *add_key_background(const char *prompt) {
   size_t prompt_len = strlen(prompt), key_len = strlen(KEY_BACKGROUND);
-  char *joined = xmalloc(prompt_len + key_len + 1);
-  memcpy(joined, prompt, prompt_len);
-  memcpy(joined + prompt_len, KEY_BACKGROUND, key_len + 1);
+  char *joined = xmalloc(key_len + prompt_len + 1);
+  memcpy(joined, KEY_BACKGROUND, key_len);
+  memcpy(joined + key_len, prompt, prompt_len + 1);
   return joined;
 }
+
+// Channels of an RGBA pixel: RGB and alpha.
+static constexpr size_t RGBA_CHANNELS = MINIMAX_H3_RGB_CHANNELS + 1;
 
 // Returns whether a width by height output has the shape of a source_w by
 // source_h image, within the pixel that scaling a size down rounds off.
@@ -526,14 +530,19 @@ static int keeps_shape(int width, int height, int source_w, int source_h) {
 }
 
 // Keeps the first image's pixels where its mask is opaque, in the width by
-// height RGB output. original and mask are source_w by source_h, and they are
-// resized to the output first when its size differs.
-static void keep_masked_original(uint8_t *output, int width, int height,
-                                 const uint8_t *original, const uint8_t *mask,
-                                 int source_w, int source_h) {
+// height output: RGBA when has_alpha is set, else RGB. original and mask are
+// source_w by source_h, and they are resized to the output first when its
+// size differs.
+static void keep_masked_original(uint8_t *output, int has_alpha, int width,
+                                 int height, const uint8_t *original,
+                                 const uint8_t *mask, int source_w,
+                                 int source_h) {
   size_t pixels = (size_t)width * (size_t)height;
   if (source_w == width && source_h == height) {
-    matte_keep_masked(output, original, mask, pixels);
+    if (has_alpha)
+      matte_keep_masked_rgba(output, original, mask, pixels);
+    else
+      matte_keep_masked(output, original, mask, pixels);
     return;
   }
   uint8_t *resized =
@@ -549,11 +558,91 @@ static void keep_masked_original(uint8_t *output, int width, int height,
   uint8_t *mask_resized = xmalloc(pixels);
   for (size_t i = 0; i < pixels; i++)
     mask_resized[i] = gray_resized[i * MINIMAX_H3_RGB_CHANNELS];
-  matte_keep_masked(output, resized, mask_resized, pixels);
+  if (has_alpha)
+    matte_keep_masked_rgba(output, resized, mask_resized, pixels);
+  else
+    matte_keep_masked(output, resized, mask_resized, pixels);
   free(mask_resized);
   free(gray_resized);
   free(gray);
   free(resized);
+}
+
+// How a decoded canvas becomes a request's output file.
+typedef struct {
+  // Output width and height in pixels.
+  int width, height;
+  // Encoded output format.
+  ImageFormat format;
+  // JPEG or WebP quality; PNG ignores it.
+  int quality;
+  // Whether the key-colored background becomes transparent.
+  int transparent;
+  // An edit's first image, in RGB, whose pixels the mask keeps; null without
+  // a mask.
+  const uint8_t *original;
+  // The mask's alpha, the first image's size; null without a mask.
+  const uint8_t *mask;
+  // Width and height of the first image and its mask.
+  int source_w, source_h;
+} OutputPlan;
+
+// Encodes the output file of a canvas_w by canvas_h RGB canvas by plan. The
+// canvas is resized to the output size, a transparent request's key-colored
+// background becomes clear, and then a mask keeps the first image's pixels.
+// Returns the file and sets *len, or returns null with error set.
+static uint8_t *encode_output(const uint8_t *canvas, int canvas_w, int canvas_h,
+                              const OutputPlan *plan, size_t *len, char *error,
+                              size_t error_cap) {
+  int width = plan->width, height = plan->height;
+  size_t pixels = (size_t)width * (size_t)height;
+  uint8_t *rgb = NULL;
+  if (canvas_w == width && canvas_h == height) {
+    rgb = xmalloc(pixels * MINIMAX_H3_RGB_CHANNELS);
+    memcpy(rgb, canvas, pixels * MINIMAX_H3_RGB_CHANNELS);
+  } else {
+    rgb = image_resize_rgb_lanczos(canvas, canvas_w, canvas_h, width, height);
+  }
+  // The matte reads the model's own border, before a mask puts the first
+  // image's pixels there.
+  uint8_t *rgba = NULL;
+  if (plan->transparent) {
+    rgba = xmalloc(pixels * RGBA_CHANNELS);
+    int keyed = matte_remove_key(rgb, width, height, KEY_COLOR, rgba);
+    free(rgb);
+    rgb = NULL;
+    if (!keyed) {
+      free(rgba);
+      write_error(error, error_cap,
+                  "the image came back without a flat key-colored "
+                  "background, so no part of it could be made transparent");
+      return NULL;
+    }
+  }
+  if (plan->mask)
+    keep_masked_original(rgba ? rgba : rgb, rgba != NULL, width, height,
+                         plan->original, plan->mask, plan->source_w,
+                         plan->source_h);
+
+  const char *why = NULL;
+  uint8_t *file = NULL;
+  if (rgba && plan->format == IMAGE_FORMAT_PNG)
+    file = image_encode_png_rgba(rgba, width, height, len, &why);
+  else if (rgba)
+    file =
+        image_encode_webp_rgba(rgba, width, height, plan->quality, len, &why);
+  else if (plan->format == IMAGE_FORMAT_PNG)
+    file = image_encode_png(rgb, width, height, len, &why);
+  else if (plan->format == IMAGE_FORMAT_JPEG)
+    file = image_encode_jpeg(rgb, width, height, plan->quality, len, &why);
+  else
+    file = image_encode_webp(rgb, width, height, plan->quality, len, &why);
+  free(rgba);
+  free(rgb);
+  if (!file)
+    snprintf(error, error_cap, "failed to encode output image: %s",
+             why ? why : "unknown error");
+  return file;
 }
 
 // Runs one text-to-image or reference editing pass and writes the encoded PNG
@@ -732,7 +821,6 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   MinimaxH3RefLatent dit_refs[MINIMAX_H3_IMAGE_MAX_REFS] = {0};
   float *out_lat = NULL;
   uint8_t *canvas_rgb = NULL;
-  uint8_t *final_rgb = NULL;
   MemorySlot *text_slot =
       weight_group_slot(minimax_h3_text_encoder_weights(text_enc));
   MemorySlot *dit_slot = weight_group_slot(minimax_h3_dit_weights(dit));
@@ -808,6 +896,15 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   }
   pin_edit_groups(0);
   if (!request_full) memory_pin(text_slot, 0);
+  OutputPlan plan = {.width = req->width,
+                     .height = req->height,
+                     .format = req->format,
+                     .quality = req->quality,
+                     .transparent = transparent,
+                     .original = original,
+                     .mask = mask_alpha,
+                     .source_w = ref_images[0].width,
+                     .source_h = ref_images[0].height};
 
   // Stage 2: 6-step PDD DiT sampling.
   int h_lat = canvas_h / MINIMAX_H3_VAE_SPATIAL_RATIO;
@@ -867,69 +964,17 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     return 0;
   }
 
-  uint8_t *output_rgb = canvas_rgb;
-  if (canvas_w != req->width || canvas_h != req->height) {
-    final_rgb = image_resize_rgb_lanczos(canvas_rgb, canvas_w, canvas_h,
-                                         req->width, req->height);
-    free(canvas_rgb);
-    canvas_rgb = NULL;
-    output_rgb = final_rgb;
-  }
-  if (mask_alpha)
-    keep_masked_original(output_rgb, req->width, req->height, original,
-                         mask_alpha, ref_images[0].width, ref_images[0].height);
+  out->data = encode_output(canvas_rgb, canvas_w, canvas_h, &plan, &out->len,
+                            out->error, sizeof out->error);
+  free(canvas_rgb);
   free(original);
   free(mask_alpha);
   free(keyed_prompt);
-  const uint8_t *encode_src = output_rgb;
-
-  // A transparent request turns its key-colored background into alpha.
-  uint8_t *rgba = NULL;
-  if (transparent) {
-    rgba = xmalloc((size_t)req->width * (size_t)req->height *
-                   (MINIMAX_H3_RGB_CHANNELS + 1));
-    if (!matte_remove_key(encode_src, req->width, req->height, KEY_COLOR,
-                          rgba)) {
-      free(rgba);
-      free(canvas_rgb);
-      free(final_rgb);
-      clear_active_progress();
-      write_error(out->error, sizeof out->error,
-                  "the image came back without a flat key-colored "
-                  "background, so no part of it could be made transparent");
-      return 0;
-    }
-  }
-
-  const char *enc_err = NULL;
-  if (rgba && req->format == IMAGE_FORMAT_PNG)
-    out->data = image_encode_png_rgba(rgba, req->width, req->height, &out->len,
-                                      &enc_err);
-  else if (rgba)
-    out->data = image_encode_webp_rgba(rgba, req->width, req->height,
-                                       req->quality, &out->len, &enc_err);
-  else if (req->format == IMAGE_FORMAT_PNG)
-    out->data = image_encode_png(encode_src, req->width, req->height, &out->len,
-                                 &enc_err);
-  else if (req->format == IMAGE_FORMAT_JPEG)
-    out->data = image_encode_jpeg(encode_src, req->width, req->height,
-                                  req->quality, &out->len, &enc_err);
-  else
-    out->data = image_encode_webp(encode_src, req->width, req->height,
-                                  req->quality, &out->len, &enc_err);
-  free(rgba);
-  free(canvas_rgb);
-  free(final_rgb);
 
   double gen_s = now() - gen_start;
   total_image_seconds += gen_s;
   clear_active_progress();
-
-  if (!out->data) {
-    snprintf(out->error, sizeof out->error, "failed to encode output image: %s",
-             enc_err ? enc_err : "unknown error");
-    return 0;
-  }
+  if (!out->data) return 0;
   out->prompt_tokens = text_len;
   out->prefill_seconds = prefill_s;
   out->image_seconds = gen_s;

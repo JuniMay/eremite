@@ -12,6 +12,12 @@
 void matte_keep_masked(uint8_t *edited, const uint8_t *original,
                        const uint8_t *mask, size_t pixels);
 
+// Blends each of the pixels RGBA pixels of edited, with straight alpha, toward
+// the opaque RGB pixels of original by the pixel's alpha in mask: 255 keeps the
+// original, opaque, 0 keeps the edit, and values between mix the two.
+void matte_keep_masked_rgba(uint8_t *edited, const uint8_t *original,
+                            const uint8_t *mask, size_t pixels);
+
 // Writes into rgba the width by height RGBA pixels, with straight alpha, of
 // rgb: an image generated on a flat background of the color requested, which
 // becomes transparent. The key is the median color of the image's border, and

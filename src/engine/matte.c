@@ -7,6 +7,9 @@
 // Channels of an RGB pixel.
 static constexpr size_t RGB_CHANNELS = 3;
 
+// Channels of an RGBA pixel.
+static constexpr size_t RGBA_CHANNELS = 4;
+
 // The alpha of an opaque pixel.
 static constexpr unsigned OPAQUE = 255;
 
@@ -24,8 +27,25 @@ void matte_keep_masked(uint8_t *edited, const uint8_t *original,
   }
 }
 
-// Channels of an RGBA pixel.
-static constexpr size_t RGBA_CHANNELS = 4;
+void matte_keep_masked_rgba(uint8_t *edited, const uint8_t *original,
+                            const uint8_t *mask, size_t pixels) {
+  for (size_t i = 0; i < pixels; i++) {
+    unsigned keep = mask[i], change = OPAQUE - keep;
+    uint8_t *px = edited + i * RGBA_CHANNELS;
+    unsigned edit_alpha = px[RGB_CHANNELS];
+    // The mixed alpha, in units of 1/255 of a level.
+    unsigned alpha = edit_alpha * change + OPAQUE * keep;
+    if (alpha == 0) continue;
+    // Colors mix weighted by their alpha, and the sum is divided by the
+    // mixed alpha to give a straight color again. Rounds to the nearest level.
+    for (size_t c = 0; c < RGB_CHANNELS; c++)
+      px[c] = (uint8_t)((px[c] * edit_alpha * change +
+                         original[i * RGB_CHANNELS + c] * OPAQUE * keep +
+                         alpha / 2) /
+                        alpha);
+    px[RGB_CHANNELS] = (uint8_t)((alpha + OPAQUE / 2) / OPAQUE);
+  }
+}
 
 // Levels of an 8-bit channel.
 static constexpr int LEVELS = 256;
