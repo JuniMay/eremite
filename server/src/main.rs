@@ -852,42 +852,38 @@ async fn collect_image_response(
     stream: image::ImageStream,
     mut events: tokio::sync::mpsc::UnboundedReceiver<worker::Event>,
 ) -> Response {
-    let mut images = Vec::new();
-    let (mut width, mut height) = (0, 0);
-    loop {
+    let mut collector = image::ImageCollector::default();
+    let end = loop {
         match events.recv().await {
-            Some(worker::Event::Image {
-                image,
-                width: image_width,
-                height: image_height,
-            }) => {
-                images.push(image);
-                (width, height) = (image_width, image_height);
+            Some(event) => {
+                if let Some(end) = collector.take(event) {
+                    break end;
+                }
             }
-            Some(worker::Event::PartialImage { .. }) => {}
-            Some(worker::Event::ImagesDone) => {
-                let response =
-                    image::build_response(&images, width, height, stream.format, stream.background);
-                return build_json_response(response.to_string());
-            }
-            Some(worker::Event::Refused(message)) => {
-                return refuse_request(peer, chat::Error::new_bad_request(message));
-            }
-            Some(worker::Event::Failed(message)) => {
-                return chat::build_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server_error",
-                    &message,
-                );
-            }
-            _ => {
-                return chat::build_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server_error",
-                    "the server is stopping",
-                );
-            }
+            None => break image::ImagesEnd::Stopped,
         }
+    };
+    match end {
+        image::ImagesEnd::Done {
+            images,
+            width,
+            height,
+        } => {
+            let response =
+                image::build_response(&images, width, height, stream.format, stream.background);
+            build_json_response(response.to_string())
+        }
+        image::ImagesEnd::Refused(message) => {
+            refuse_request(peer, chat::Error::new_bad_request(message))
+        }
+        image::ImagesEnd::Failed(message) => {
+            chat::build_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", &message)
+        }
+        image::ImagesEnd::Stopped => chat::build_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the server is stopping",
+        ),
     }
 }
 

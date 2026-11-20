@@ -874,6 +874,62 @@ pub fn build_response(
     })
 }
 
+/// How an image request ended, for its JSON answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImagesEnd {
+    /// All its images came: in order, with their width and height.
+    Done {
+        images: Vec<Vec<u8>>,
+        width: i32,
+        height: i32,
+    },
+    /// The worker refused the request. The string says why.
+    Refused(String),
+    /// The request failed. The string says why.
+    Failed(String),
+    /// The request ended without all its images: the server stopped, or the
+    /// client left.
+    Stopped,
+}
+
+/// Gathers an image request's images from its worker events for one JSON
+/// answer.
+#[derive(Debug, Default)]
+pub struct ImageCollector {
+    /// The images so far, in order.
+    images: Vec<Vec<u8>>,
+    /// The images' width and height in pixels.
+    width: i32,
+    height: i32,
+}
+
+impl ImageCollector {
+    /// Takes the request's next worker event. When the event is the
+    /// request's last, it returns how the request ended.
+    pub fn take(&mut self, event: worker::Event) -> Option<ImagesEnd> {
+        match event {
+            worker::Event::Image {
+                image,
+                width,
+                height,
+            } => {
+                self.images.push(image);
+                (self.width, self.height) = (width, height);
+                None
+            }
+            worker::Event::PartialImage { .. } => None,
+            worker::Event::ImagesDone => Some(ImagesEnd::Done {
+                images: std::mem::take(&mut self.images),
+                width: self.width,
+                height: self.height,
+            }),
+            worker::Event::Refused(message) => Some(ImagesEnd::Refused(message)),
+            worker::Event::Failed(message) => Some(ImagesEnd::Failed(message)),
+            _ => Some(ImagesEnd::Stopped),
+        }
+    }
+}
+
 /// The endpoint that an image request came to, which names its stream's
 /// events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1487,6 +1543,61 @@ mod tests {
                 "type": "error",
                 "error": {"type": "server_error", "code": null, "message": "memory is short", "param": null},
             })
+        );
+    }
+
+    #[test]
+    fn collector_gathers_images_in_order_until_the_last_event() {
+        let mut collector = ImageCollector::default();
+        for event in [
+            worker::Event::PartialImage {
+                image: b"p".to_vec(),
+                width: 64,
+                height: 32,
+                index: 0,
+            },
+            worker::Event::Image {
+                image: b"first".to_vec(),
+                width: 64,
+                height: 32,
+            },
+            worker::Event::Image {
+                image: b"second".to_vec(),
+                width: 64,
+                height: 32,
+            },
+        ] {
+            assert_eq!(collector.take(event), None);
+        }
+        assert_eq!(
+            collector.take(worker::Event::ImagesDone),
+            Some(ImagesEnd::Done {
+                images: vec![b"first".to_vec(), b"second".to_vec()],
+                width: 64,
+                height: 32,
+            })
+        );
+
+        let mut failing = ImageCollector::default();
+        let image = worker::Event::Image {
+            image: b"first".to_vec(),
+            width: 8,
+            height: 8,
+        };
+        assert_eq!(failing.take(image), None);
+        assert_eq!(
+            failing.take(worker::Event::Failed("memory is short".into())),
+            Some(ImagesEnd::Failed("memory is short".into()))
+        );
+        assert_eq!(
+            ImageCollector::default().take(worker::Event::Refused("too large".into())),
+            Some(ImagesEnd::Refused("too large".into()))
+        );
+        assert_eq!(
+            ImageCollector::default().take(worker::Event::Done {
+                reason: worker::FinishReason::Cancelled,
+            }),
+            Some(ImagesEnd::Stopped)
         );
     }
 
