@@ -741,7 +741,11 @@ fn convert_events_to_inference_chunks(
                     ended_by_shutdown.store(true, Ordering::Relaxed);
                     break;
                 }
-                Event::Done { .. } | Event::Refused(_) | Event::Failed(_) | Event::Decided { .. } => {
+                Event::Done { .. }
+                | Event::Refused(_)
+                | Event::Failed(_)
+                | Event::Decided { .. }
+                | Event::Images { .. } => {
                     break;
                 }
             }

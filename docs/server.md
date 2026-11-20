@@ -2,7 +2,8 @@
 
 `build/eremite-server` serves the models that its configuration file lists
 (README.md, Serve). This document lists every setting, and explains how the
-server handles requests, memory, decision models and Codex's web search.
+server handles requests, memory, decision models, image models and Codex's
+web search.
 
 ## Settings
 
@@ -45,9 +46,12 @@ Each entry under `models` holds one model's settings:
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `model` | the checkpoint's folder | required |
-| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case |
+| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image` |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
-| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's |
+| `text_encoder` | MiniMax-H3-Image: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3-Image |
+| `dit` | MiniMax-H3-Image: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3-Image |
+| `vae` | MiniMax-H3-Image: the safetensors file of the FP16 image VAE | required for MiniMax-H3-Image |
+| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3-Image: 4096 |
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
@@ -61,7 +65,8 @@ Each entry under `models` holds one model's settings:
 
 A request names its model by its `id` in `model`. A request that names no
 served model goes to the only model that answers its endpoint: a chat request
-to the model that generates text, a decision to the decision model.
+to the model that generates text, a decision to the decision model, and an
+image request to the image model.
 
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
@@ -119,6 +124,49 @@ choice's likeliest `choice`, its `confidence` and every option's
 `probabilities`; a score's probability-weighted `score`, its likeliest level's
 `confidence` and every level's `probabilities`. `usage` counts the tokens that
 the passes read, each image's tokens included.
+
+## Image models
+
+MiniMax-H3-Image generates images from text and edits one or more reference
+images. Its `model` folder holds `model_index.json` (`_class_name`
+`MiniMaxH3ImagePipeline`) and `tokenizer/tokenizer.json`, and its entry also
+sets `text_encoder`, `dit` and `vae` to the quantized Comfy-Org safetensors
+files (Qwen3-VL-32B NVFP4, pruned INT8-ConvRot DiT and FP16 VAE). Its entry
+also takes `id`, `ctx` (at most 4096), `memory` and `idle_unload`, and refuses
+text-generation settings.
+
+An image model serves `POST /v1/images/generations` (JSON) and
+`POST /v1/images/edits` (`multipart/form-data`, up to 128 MiB). The chat and
+decision endpoints refuse it, and Codex's catalog leaves it out. Both endpoints
+return `{"created": ..., "data": [{"b64_json": "..."}]}`:
+
+- `prompt`: required string, passed verbatim and truncated to 4096 tokens.
+- `size`: required `WIDTHxHEIGHT` (each 1 to 8192). The returned image has
+  exactly this size.
+- `image` (or `image[]`): `/v1/images/edits` only; 1 to 16 image files in
+  upload order, defining `<Picture 1>`, `<Picture 2>`, and so on in `prompt`.
+- `n`: optional image count, 1 to 16 (default 1); image `i` uses `seed + i`.
+- `seed`: optional nonnegative integer (random when omitted).
+- `generator_device`: accepted and ignored (initial noise always uses the
+  deterministic CPU RNG).
+- `response_format`: omit or `"b64_json"`.
+- `output_format`: `"png"` (default), `"jpeg"` or `"jpg"`.
+- `output_compression`: optional JPEG quality, 1 to 100 (default 95).
+- `min_generation_area`: optional integer from 1024 to 16777216 (default
+  4194304, 2048 x 2048). When `size` has fewer pixels, the model generates on a
+  larger 32-pixel-aligned canvas with the same aspect ratio and resizes back
+  with Lanczos-3; pass `1024` to disable automatic upscaling.
+- `num_inference_steps`: omit or `6` (other values return HTTP 400).
+- `guidance_scale`: omit or `1` (other values return HTTP 400).
+- `negative_prompt`: unsupported; nonempty values return HTTP 400.
+
+Full residence is the primary mode: when enough memory fits, the text encoder
+(13.5 GiB), DiT (19.5 GiB) and VAE decoder (0.8 GiB) stay resident together
+(33.8 GiB), and the vision tower (1.1 GiB) and VAE encoder (0.1 GiB) load on
+demand at the first edit (35.0 GiB total). When available memory cannot hold
+all three core groups at once, the model falls back to staged loading (~21.3
+GiB peak). During a pass, the image model yields between layers to any running
+text-decoding calls so decoding latency is not degraded.
 
 ## Codex's web search
 

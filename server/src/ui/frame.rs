@@ -46,6 +46,9 @@ pub enum Kind {
     /// A decision model: it answers questions in one pass over their input,
     /// and keeps no sessions.
     Decision,
+    /// An image model: it generates or edits images from a prompt, and keeps
+    /// no sessions.
+    Image,
 }
 
 /// A sub-view of Models.
@@ -64,7 +67,7 @@ impl Kind {
     pub fn list_sub_views(self) -> &'static [SubView] {
         match self {
             Kind::Llm => &[SubView::States, SubView::Experts],
-            Kind::Decision => &[],
+            Kind::Decision | Kind::Image => &[],
         }
     }
 }

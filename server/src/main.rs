@@ -17,7 +17,7 @@
 //! The configuration file (config.rs) holds every setting. The command line
 //! names only that file.
 
-use eremite_server::{chat, codex, config, control, decision, engine, http, ui, worker};
+use eremite_server::{chat, codex, config, control, decision, engine, http, image, ui, worker};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -78,13 +78,15 @@ struct Served {
     format: Format,
 }
 
-/// A model family's chat format, with a served model's defaults.
+/// A model family's format, with a served model's defaults.
 enum Format {
     /// DeepSeek V4.1's format (chat/deepseek.rs).
     DeepSeek(deepseek::Defaults),
     /// d1's prompt (decision/d1.rs), with the checkpoint's d1 settings. A d1
     /// model is a decision model: it answers questions and generates no text.
     D1(d1::Checkpoint),
+    /// MiniMax-H3-Image: text-to-image generation and multi-reference editing.
+    MinimaxH3Image,
 }
 
 /// What the HTTP handlers share.
@@ -119,25 +121,21 @@ fn makes_decisions(model: &Served) -> bool {
     matches!(model.format, Format::D1(_))
 }
 
-/// Finds the index of the model that the request's `body` names, in any case.
-/// For an unknown name, or none, it returns the only model that `answers`
-/// accepts, those that answer the request's endpoint, or else the only model
-/// served. Otherwise it returns an error message.
-fn find_model_index(
+/// Returns whether `model` is an image model: whether it answers POST
+/// /v1/images/generations and POST /v1/images/edits.
+fn generates_images(model: &Served) -> bool {
+    matches!(model.format, Format::MinimaxH3Image)
+}
+
+/// Finds the index of the model named `name` (in any case). For an unknown
+/// name or None, returns the only model accepted by `answers`, or else the
+/// only served model. Otherwise returns an error message.
+fn find_model_index_by_name(
     shared: &Shared,
-    body: &[u8],
+    name: Option<&str>,
     answers: fn(&Served) -> bool,
 ) -> Result<usize, String> {
-    /// The part of a request's body that names its model.
-    #[derive(serde::Deserialize)]
-    struct Named {
-        /// The model's name.
-        model: Option<String>,
-    }
-    let name = serde_json::from_slice::<Named>(body)
-        .ok()
-        .and_then(|named| named.model);
-    if let Some(name) = &name
+    if let Some(name) = name
         && let Some(index) = shared
             .models
             .iter()
@@ -169,6 +167,25 @@ fn find_model_index(
             known.join(", ")
         ),
     })
+}
+
+/// Finds the index of the model that the request's JSON `body` names, in any
+/// case.
+fn find_model_index(
+    shared: &Shared,
+    body: &[u8],
+    answers: fn(&Served) -> bool,
+) -> Result<usize, String> {
+    /// The part of a request's body that names its model.
+    #[derive(serde::Deserialize)]
+    struct Named {
+        /// The model's name.
+        model: Option<String>,
+    }
+    let name = serde_json::from_slice::<Named>(body)
+        .ok()
+        .and_then(|named| named.model);
+    find_model_index_by_name(shared, name.as_deref(), answers)
 }
 
 /// The handlers' state: what they share.
@@ -339,7 +356,7 @@ async fn list_codex_models(State(shared): App) -> Response {
                 context_window: model.ctx,
                 default_effort: defaults.is_thinking_on.then_some(defaults.effort),
             }),
-            Format::D1(_) => None,
+            Format::D1(_) | Format::MinimaxH3Image => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -471,10 +488,16 @@ async fn answer_decisions(
     let queued = tokio::task::spawn_blocking(move || {
         let model = &handlers.models[index];
         let Format::D1(checkpoint) = &model.format else {
-            return Err(chat::Error::new_bad_request(format!(
-                "{} generates text: it makes no decisions",
-                model.id
-            )));
+            let reason = match &model.format {
+                Format::DeepSeek(_) => {
+                    format!("{} generates text: it makes no decisions", model.id)
+                }
+                Format::MinimaxH3Image => {
+                    format!("{} is an image model: it makes no decisions", model.id)
+                }
+                Format::D1(_) => unreachable!(),
+            };
+            return Err(chat::Error::new_bad_request(reason));
         };
         let mut request = decision::api::read_request(&body)?;
         let mut plan = d1::plan(
@@ -614,6 +637,10 @@ async fn answer_generation(
             "{} is a decision model: it answers questions and generates no text",
             handlers.models[index].id
         ))),
+        Format::MinimaxH3Image => Err(chat::Error::new_bad_request(format!(
+            "{} is an image model: it generates images and generates no text",
+            handlers.models[index].id
+        ))),
     })
     .await;
     match queued {
@@ -637,6 +664,125 @@ async fn answer_generation(
 enum Prepared {
     /// A request in DeepSeek V4.1's format.
     DeepSeek(deepseek::PreparedRequest),
+}
+
+/// Answers POST /v1/images/generations: parses a JSON text-to-image request,
+/// submits it to the served image model, and returns `data[i].b64_json`.
+async fn answer_image_generations(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Body,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let body = match http::read_body(body, shared.limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let parsed = match image::parse_generation_request(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    run_image_request(shared, peer, body.len(), parsed).await
+}
+
+/// Answers POST /v1/images/edits: parses a multipart/form-data image editing
+/// request with one or more reference images, submits it to the served image
+/// model, and returns `data[i].b64_json`.
+async fn answer_image_edits(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let edit_limits = http::Limits {
+        max_body_bytes: image::MAX_EDIT_BODY_BYTES,
+        ..shared.limits
+    };
+    let body = match http::read_body(body, edit_limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let parsed = match image::parse_edit_request(content_type, &body) {
+        Ok(parsed) => parsed,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    run_image_request(shared, peer, body.len(), parsed).await
+}
+
+/// Resolves the target image model for `parsed`, queues the worker request,
+/// and turns the worker's final event into an OpenAI Images API response.
+async fn run_image_request(
+    shared: Arc<Shared>,
+    peer: String,
+    body_bytes: usize,
+    parsed: image::ParsedRequest,
+) -> Response {
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {body_bytes} body bytes"
+    ));
+    let index = match find_model_index_by_name(&shared, parsed.model.as_deref(), generates_images) {
+        Ok(index) => index,
+        Err(message) => {
+            return chat::build_error_response(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                &message,
+            );
+        }
+    };
+    let model = &shared.models[index];
+    if !generates_images(model) {
+        return refuse_request(
+            &peer,
+            chat::Error::new_bad_request(format!("{} generates no images", model.id)),
+        );
+    }
+    let note = format!(
+        "http {arrival} from {peer}: image {}x{}, n={}, refs={}",
+        parsed.width,
+        parsed.height,
+        parsed.count,
+        parsed.references.len()
+    );
+    let (_cancel, mut events) = match worker::submit_image(worker::ImageRequest {
+        model_index: index,
+        prompt: parsed.prompt,
+        width: parsed.width,
+        height: parsed.height,
+        count: parsed.count,
+        seed: parsed.seed,
+        min_generation_area: parsed.min_generation_area,
+        format: parsed.format,
+        quality: parsed.quality,
+        references: parsed.references,
+        note,
+    })
+    .map_err(convert_submit_error)
+    {
+        Ok(pair) => pair,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    match events.recv().await {
+        Some(worker::Event::Images { images }) => {
+            build_json_response(image::build_response(&images).to_string())
+        }
+        Some(worker::Event::Refused(message)) => {
+            refuse_request(&peer, chat::Error::new_bad_request(message))
+        }
+        Some(worker::Event::Failed(message)) => {
+            chat::build_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", &message)
+        }
+        _ => chat::build_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "the server is stopping",
+        ),
+    }
 }
 
 /// Answers a request for an unknown path with 404.
@@ -721,6 +867,10 @@ fn main() {
             model
                 .fit_decision_model(context)
                 .unwrap_or_else(|error| die(&error));
+        } else if family == Family::MinimaxH3Image {
+            model
+                .fit_image_model(image::MAX_PROMPT_TOKENS)
+                .unwrap_or_else(|error| die(&error));
         }
         let mut options = model.engine.clone();
         options
@@ -729,6 +879,7 @@ fn main() {
         let id = model.id.clone().unwrap_or_else(|| match family {
             Family::DeepSeek => deepseek::DEFAULT_MODEL_ID.into(),
             Family::D1 => d1::derive_model_names(&model.engine.model).0,
+            Family::MinimaxH3Image => image::DEFAULT_MODEL_ID.into(),
         });
         if served
             .iter()
@@ -757,12 +908,15 @@ fn main() {
                 .iter()
                 .position(|settings| settings.id.eq_ignore_ascii_case(id))
                 .unwrap_or_else(|| die(&format!("search_ranking_model: no model is named {id}")));
-            if families[index] != Family::D1 {
-                die(&format!(
+            match families[index] {
+                Family::D1 => index,
+                Family::DeepSeek => die(&format!(
                     "search_ranking_model: {id} generates text: it makes no decisions"
-                ));
+                )),
+                Family::MinimaxH3Image => die(&format!(
+                    "search_ranking_model: {id} is an image model: it makes no decisions"
+                )),
             }
-            index
         });
     // The folder of the saved states. There is none without a folder, or with
     // state_disk 0.
@@ -821,10 +975,12 @@ fn main() {
                 d1::Checkpoint::read(&settings.options.model, tokenizer)
                     .unwrap_or_else(|error| die(&error)),
             ),
+            Family::MinimaxH3Image => Format::MinimaxH3Image,
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
             Family::D1 => d1::derive_model_names(&settings.options.model).1,
+            Family::MinimaxH3Image => image::DISPLAY_NAME.to_string(),
         };
         worker::log_model_line(
             served_models.len(),
@@ -879,14 +1035,15 @@ fn main() {
                     kind: match family {
                         Family::DeepSeek => ui::frame::Kind::Llm,
                         Family::D1 => ui::frame::Kind::Decision,
+                        Family::MinimaxH3Image => ui::frame::Kind::Image,
                     },
                 },
                 tokenizer: model.tokenizer,
                 find_role: match family {
                     Family::DeepSeek => deepseek::find_role_of_token,
-                    // A decision model keeps no sessions whose text the view
-                    // shows.
-                    Family::D1 => |_| None,
+                    // Decision and image models keep no sessions whose text
+                    // the view shows.
+                    Family::D1 | Family::MinimaxH3Image => |_| None,
                 },
             })
             .collect();
@@ -1020,6 +1177,22 @@ fn main() {
         .route(
             "/decisions",
             post(answer_decisions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/images/generations",
+            post(answer_image_generations).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/images/generations",
+            post(answer_image_generations).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/images/edits",
+            post(answer_image_edits).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/images/edits",
+            post(answer_image_edits).fallback(refuse_other_than_post),
         )
         .fallback(refuse_unknown_endpoint)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))

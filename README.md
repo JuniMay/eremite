@@ -66,7 +66,8 @@ model memory, state memory included. `build/eremite` alone lists the options.
 
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
 Completions and Responses APIs at `http://HOST:PORT/v1`, OpenAI's Decisions API
-at `POST /v1/decisions`, Codex's model catalog at `/v1/codex/models`, and
+at `POST /v1/decisions`, OpenAI's Images API at `POST /v1/images/generations`
+and `POST /v1/images/edits`, Codex's model catalog at `/v1/codex/models`, and
 standalone web search at `POST /v1/alpha/search`.
 
 Its settings are in a JSON file: `build/eremite-server --config FILE`, or
@@ -83,6 +84,12 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
     },
     {
       "model": "/path/to/d1-2B"
+    },
+    {
+      "model": "/path/to/MiniMax-H3-Image",
+      "text_encoder": "/path/to/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "dit": "/path/to/minimax_h3_image_pruned_int8_convrot.safetensors",
+      "vae": "/path/to/minimax_h3_image_vae_fp16.safetensors"
     }
   ]
 }
@@ -93,7 +100,7 @@ Without `api_key_file`, the server takes the key from the environment variable
 `EREMITE_API_KEY`.
 
 `docs/server.md` lists every setting, and explains how the server handles
-requests, memory, decision models and Codex's web search.
+requests, memory, decision models, image models and Codex's web search.
 
 `scripts/setup-searxng.sh` installs SearXNG in
 `~/.local/share/eremite/searxng`, the server's default `searxng_dir`. It needs
@@ -104,9 +111,11 @@ git and Python 3.10 or later, and downloads about 100 MB.
 eremite was inspired by [ds4](https://github.com/antirez/ds4), antirez's
 local inference engine for DeepSeek 4 Flash and Pro. It also builds on:
 
-- [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash and
-  [Liquid AI](https://www.liquid.ai)'s d1 decision models, with Liquid AI's
-  prompt for reranking.
+- [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash,
+  [Liquid AI](https://www.liquid.ai)'s d1 decision models (with Liquid AI's
+  prompt for reranking), and [MiniMax](https://huggingface.co/MiniMaxAI)'s
+  MiniMax-H3-Image with [Comfy-Org](https://huggingface.co/Comfy-Org)'s
+  quantized checkpoints.
 - The ggml library of [llama.cpp](https://github.com/ggml-org/llama.cpp): the
   GGUF format and the codebooks of its i-quants. Their MIT license is in
   `src/kernels/gguf_grids.metal`.

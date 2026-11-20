@@ -121,6 +121,55 @@ struct RawMedia {
     _opaque: [u8; 0],
 }
 
+/// Size of the fixed error message buffer in eremite_image_result.
+const IMAGE_ERROR_BYTES: usize = 256;
+
+/// One encoded input image passed to an image model (eremite_image_input).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawImageInput {
+    /// Pointer to the encoded image bytes.
+    data: *const u8,
+    /// Byte length of the encoded image.
+    len: usize,
+}
+
+/// Parameters of one image generation or editing call (eremite_image_request).
+#[repr(C)]
+struct RawImageRequest {
+    /// NUL-terminated UTF-8 prompt string.
+    prompt: *const c_char,
+    /// Requested output width in pixels.
+    width: c_int,
+    /// Requested output height in pixels.
+    height: c_int,
+    /// Minimum generation canvas area in pixels.
+    min_generation_area: c_int,
+    /// Encoded output format code.
+    format: c_int,
+    /// JPEG compression quality in 1..=100.
+    quality: c_int,
+    /// Deterministic RNG seed.
+    seed: u64,
+    /// Array of encoded reference image descriptors, or null for text-to-image.
+    refs: *const RawImageInput,
+    /// Number of entries in `refs`.
+    ref_count: c_int,
+}
+
+/// Output of one image generation or editing call (eremite_image_result).
+#[repr(C)]
+struct RawImageResult {
+    /// Heap-allocated encoded output image bytes, or null on failure.
+    data: *mut u8,
+    /// Byte length of `data`.
+    len: usize,
+    /// NUL-terminated error message on failure.
+    error: [c_char; IMAGE_ERROR_BYTES],
+    /// Nonzero when the failure came from invalid caller input.
+    invalid_input: c_int,
+}
+
 /// What a prefill ran (eremite_prefill_info).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -356,6 +405,8 @@ unsafe extern "C" {
     fn eremite_vocab_size(m: *const RawModel) -> c_int;
     fn eremite_is_stop_token(m: *const RawModel, token: i32) -> c_int;
     fn eremite_is_decision_model(m: *const RawModel) -> c_int;
+    fn eremite_is_image_model(m: *const RawModel) -> c_int;
+    fn eremite_image_result_free(result: *mut RawImageResult);
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
     fn eremite_state_bytes(m: *const RawModel, s: *const RawState, positions: c_int) -> usize;
@@ -442,6 +493,9 @@ unsafe extern "C" {
         count: c_int,
         images: *const RawMedia,
     );
+    fn eremite_stream_generate_image(x: *mut RawStream, request: *const RawImageRequest);
+    fn eremite_stream_cancel(x: *mut RawStream);
+    fn eremite_stream_image_result(x: *mut RawStream, out: *mut RawImageResult) -> c_int;
     fn eremite_stream_next_token(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
     fn eremite_stream_logits(x: *const RawStream) -> *const f32;
@@ -613,7 +667,7 @@ pub fn log(line: &str) {
 }
 
 /// Which format a checkpoint's requests take: its family, from config.json's
-/// model_type.
+/// model_type or model_index.json's _class_name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
     /// DeepSeek V4.1, model_type deepseek_v41.
@@ -621,24 +675,41 @@ pub enum Architecture {
     /// LiquidAI's d1 decision models: model_type lfm3_vl, with d1's question
     /// layout (d1_attention "set").
     D1,
+    /// MiniMax-H3-Image text-to-image and image editing model
+    /// (_class_name MiniMaxH3ImagePipeline or model_type minimax_h3_image).
+    MinimaxH3Image,
 }
 
 impl Architecture {
     /// Returns the family of the checkpoint in `dir`, or why there is none.
     pub fn of(dir: &str) -> Result<Architecture, String> {
-        let path = std::path::Path::new(dir).join("config.json");
-        let text =
-            std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let root = std::path::Path::new(dir);
+        let config_path = root.join("config.json");
+        let (path, key) = match std::fs::read(&config_path) {
+            Ok(text) => (config_path, Some((text, "model_type"))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let index_path = root.join("model_index.json");
+                match std::fs::read(&index_path) {
+                    Ok(text) => (index_path, Some((text, "_class_name"))),
+                    Err(_) => {
+                        return Err(format!("cannot read {}: {err}", config_path.display()));
+                    }
+                }
+            }
+            Err(err) => return Err(format!("cannot read {}: {err}", config_path.display())),
+        };
+        let (text, key) = key.expect("read succeeded");
         let config: serde_json::Value =
             serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        match config.get("model_type").and_then(serde_json::Value::as_str) {
+        match config.get(key).and_then(serde_json::Value::as_str) {
             Some("deepseek_v41") => Ok(Architecture::DeepSeek),
             Some("lfm3_vl") if config["d1_attention"] == "set" => Ok(Architecture::D1),
+            Some("MiniMaxH3ImagePipeline" | "minimax_h3_image") => Ok(Architecture::MinimaxH3Image),
             Some(t) => Err(format!(
-                "{}: model_type {t} is not one this server runs",
+                "{}: {key} {t} is not one this server runs",
                 path.display()
             )),
-            None => Err(format!("{}: no model_type", path.display())),
+            None => Err(format!("{}: no {key}", path.display())),
         }
     }
 }
@@ -670,6 +741,19 @@ pub enum BackendOptions {
     Unspecified,
     /// DeepSeek's settings.
     DeepSeek(DeepSeekOptions),
+    /// MiniMax-H3-Image's checkpoint paths.
+    MinimaxH3Image(MinimaxH3Options),
+}
+
+/// MiniMax-H3-Image's own settings.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct MinimaxH3Options {
+    /// Safetensors file of the Qwen3-VL text and vision encoder.
+    pub text_encoder: Option<String>,
+    /// Safetensors file of the pruned INT8-ConvRot DiT.
+    pub dit: Option<String>,
+    /// Safetensors file of the FP16 image VAE.
+    pub vae: Option<String>,
 }
 
 /// DeepSeek's own settings.
@@ -697,8 +781,8 @@ impl DeepSeekOptions {
 
 impl Options {
     /// Sets the family's own settings to the checkpoint's family. Returns an
-    /// error if they were set for another family, and for a decision model
-    /// with drafts or lookup.
+    /// error if they were set for another family, or if required image paths
+    /// are missing, or for a decision/image model with drafts or lookup.
     pub fn configure(&mut self, architecture: Architecture) -> Result<(), String> {
         self.backend = match (&self.backend, architecture) {
             (BackendOptions::Unspecified, Architecture::DeepSeek) => {
@@ -706,6 +790,12 @@ impl Options {
             }
             (BackendOptions::DeepSeek(d), Architecture::DeepSeek) => {
                 BackendOptions::DeepSeek(d.clone())
+            }
+            (BackendOptions::MinimaxH3Image(_), Architecture::DeepSeek) => {
+                return Err(format!(
+                    "{}: MiniMax-H3-Image checkpoint paths do not apply to DeepSeek",
+                    self.model
+                ));
             }
             (BackendOptions::Unspecified, Architecture::D1) => {
                 if self.draft != 0 || self.lookup != 0 {
@@ -722,6 +812,39 @@ impl Options {
                     self.model
                 ));
             }
+            (BackendOptions::MinimaxH3Image(_), Architecture::D1) => {
+                return Err(format!(
+                    "{}: MiniMax-H3-Image checkpoint paths for a decision model",
+                    self.model
+                ));
+            }
+            (BackendOptions::MinimaxH3Image(h3), Architecture::MinimaxH3Image) => {
+                if self.draft != 0 || self.lookup != 0 {
+                    return Err(format!(
+                        "{}: an image model takes no drafts and no lookup",
+                        self.model
+                    ));
+                }
+                if h3.text_encoder.is_none() || h3.dit.is_none() || h3.vae.is_none() {
+                    return Err(format!(
+                        "{}: MiniMax-H3-Image requires text_encoder, dit and vae paths",
+                        self.model
+                    ));
+                }
+                BackendOptions::MinimaxH3Image(h3.clone())
+            }
+            (BackendOptions::Unspecified, Architecture::MinimaxH3Image) => {
+                return Err(format!(
+                    "{}: MiniMax-H3-Image requires text_encoder, dit and vae paths",
+                    self.model
+                ));
+            }
+            (BackendOptions::DeepSeek(_), Architecture::MinimaxH3Image) => {
+                return Err(format!(
+                    "{}: DeepSeek's settings for an image model",
+                    self.model
+                ));
+            }
         };
         Ok(())
     }
@@ -730,7 +853,7 @@ impl Options {
     pub fn deepseek(&self) -> Option<&DeepSeekOptions> {
         match &self.backend {
             BackendOptions::DeepSeek(d) => Some(d),
-            BackendOptions::Unspecified => None,
+            BackendOptions::Unspecified | BackendOptions::MinimaxH3Image(_) => None,
         }
     }
 
@@ -742,6 +865,32 @@ impl Options {
         }
         match &mut self.backend {
             BackendOptions::DeepSeek(d) => Ok(d),
+            BackendOptions::MinimaxH3Image(_) => {
+                Err("DeepSeek's settings cannot be combined with MiniMax-H3-Image paths".into())
+            }
+            BackendOptions::Unspecified => unreachable!("set above"),
+        }
+    }
+
+    /// Returns MiniMax-H3-Image's settings, or None for another family.
+    pub fn minimax_h3(&self) -> Option<&MinimaxH3Options> {
+        match &self.backend {
+            BackendOptions::MinimaxH3Image(h3) => Some(h3),
+            BackendOptions::Unspecified | BackendOptions::DeepSeek(_) => None,
+        }
+    }
+
+    /// Returns MiniMax-H3-Image's settings to change. Settings not set yet
+    /// become MiniMax-H3-Image's.
+    pub fn minimax_h3_mut(&mut self) -> Result<&mut MinimaxH3Options, String> {
+        if matches!(self.backend, BackendOptions::Unspecified) {
+            self.backend = BackendOptions::MinimaxH3Image(MinimaxH3Options::default());
+        }
+        match &mut self.backend {
+            BackendOptions::MinimaxH3Image(h3) => Ok(h3),
+            BackendOptions::DeepSeek(_) => {
+                Err("MiniMax-H3-Image paths cannot be combined with DeepSeek's settings".into())
+            }
             BackendOptions::Unspecified => unreachable!("set above"),
         }
     }
@@ -790,7 +939,10 @@ pub struct Model {
     raw: *mut RawModel,
     /// The checkpoint's directory.
     directory: String,
-    /// Whether the weight files passed validate_weight_files.
+    /// Explicit safetensors files for multi-file models (MiniMax-H3-Image);
+    /// empty for directory-indexed checkpoints.
+    weight_files: Vec<String>,
+    /// Whether the weight files passed validation.
     validated: std::cell::Cell<bool>,
 }
 
@@ -801,11 +953,63 @@ const MEDIA_MESSAGE_BYTES: usize = 256;
 /// one is taken as damaged. The reason for this value is unknown.
 const MAX_WEIGHT_HEADER_BYTES: u64 = 64 << 20;
 
+/// Checks that every tensor in the safetensors file at `path` (or those listed
+/// in `required_tensors` when non-empty) lies inside the file.
+fn validate_safetensors_file(
+    path: &std::path::Path,
+    label: &str,
+    required_tensors: &[&str],
+) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("model weight shard {label} is unavailable: {e}"))?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    // A safetensors file starts with its header's length, 8 bytes.
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| format!("cannot read weight shard {label}: {e}"))?;
+    let header = u64::from_le_bytes(prefix);
+    if header > MAX_WEIGHT_HEADER_BYTES || header > size.saturating_sub(8) {
+        return Err(format!("invalid weight header in {label}"));
+    }
+    let mut data = vec![0; header as usize];
+    file.read_exact(&mut data)
+        .map_err(|e| format!("cannot read weight header {label}: {e}"))?;
+    let values: serde_json::Value =
+        serde_json::from_slice(&data).map_err(|e| format!("invalid weight header {label}: {e}"))?;
+    let owned: Vec<&str>;
+    let tensors: &[&str] = if required_tensors.is_empty() {
+        owned = values
+            .as_object()
+            .ok_or("weight header is not an object")?
+            .keys()
+            .filter(|key| key.as_str() != "__metadata__")
+            .map(String::as_str)
+            .collect();
+        &owned
+    } else {
+        required_tensors
+    };
+    for &tensor in tensors {
+        let offsets = values
+            .get(tensor)
+            .and_then(|v| v.get("data_offsets"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|v| v.len() == 2)
+            .ok_or_else(|| format!("missing weight {tensor} in {label}"))?;
+        let start = offsets[0].as_u64().ok_or("invalid weight offset")?;
+        let end = offsets[1].as_u64().ok_or("invalid weight offset")?;
+        if start > end || end > size - header - 8 {
+            return Err(format!("weight {tensor} extends past {label}"));
+        }
+    }
+    Ok(())
+}
+
 /// Checks that every weight of the checkpoint in `directory` lies inside its
 /// safetensors file: the files of model.safetensors.index.json's weight_map,
 /// or model.safetensors alone. Returns what is missing or damaged.
 fn validate_weight_files(directory: &str) -> Result<(), String> {
-    use std::io::Read;
     let root = std::path::Path::new(directory);
     let index = root.join("model.safetensors.index.json");
     let bytes = if index.exists() {
@@ -832,46 +1036,7 @@ fn validate_weight_files(directory: &str) -> Result<(), String> {
         }
     }
     for (name, tensors) in files {
-        let mut file = std::fs::File::open(root.join(name))
-            .map_err(|e| format!("model weight shard {name} is unavailable: {e}"))?;
-        let size = file.metadata().map_err(|e| e.to_string())?.len();
-        // A safetensors file starts with its header's length, 8 bytes.
-        let mut prefix = [0u8; 8];
-        file.read_exact(&mut prefix)
-            .map_err(|e| format!("cannot read weight shard {name}: {e}"))?;
-        let header = u64::from_le_bytes(prefix);
-        if header > MAX_WEIGHT_HEADER_BYTES || header > size.saturating_sub(8) {
-            return Err(format!("invalid weight header in {name}"));
-        }
-        let mut data = vec![0; header as usize];
-        file.read_exact(&mut data)
-            .map_err(|e| format!("cannot read weight header {name}: {e}"))?;
-        let values: serde_json::Value = serde_json::from_slice(&data)
-            .map_err(|e| format!("invalid weight header {name}: {e}"))?;
-        let tensors = if tensors.is_empty() {
-            values
-                .as_object()
-                .ok_or("weight header is not an object")?
-                .keys()
-                .filter(|key| key.as_str() != "__metadata__")
-                .map(String::as_str)
-                .collect()
-        } else {
-            tensors
-        };
-        for tensor in tensors {
-            let offsets = values
-                .get(tensor)
-                .and_then(|v| v.get("data_offsets"))
-                .and_then(serde_json::Value::as_array)
-                .filter(|v| v.len() == 2)
-                .ok_or_else(|| format!("missing weight {tensor} in {name}"))?;
-            let start = offsets[0].as_u64().ok_or("invalid weight offset")?;
-            let end = offsets[1].as_u64().ok_or("invalid weight offset")?;
-            if start > end || end > size - header - 8 {
-                return Err(format!("weight {tensor} extends past {name}"));
-            }
-        }
+        validate_safetensors_file(&root.join(name), name, &tensors)?;
     }
     Ok(())
 }
@@ -894,8 +1059,12 @@ impl Model {
             return None;
         }
         let deepseek = o.deepseek().cloned().unwrap_or_default();
+        let minimax_h3 = o.minimax_h3().cloned().unwrap_or_default();
         let model = c_string(&o.model);
         let experts = deepseek.experts.as_deref().map(c_string);
+        let text_encoder = minimax_h3.text_encoder.as_deref().map(c_string);
+        let dit = minimax_h3.dit.as_deref().map(c_string);
+        let vae = minimax_h3.vae.as_deref().map(c_string);
         let raw = RawConfig {
             abi: ABI,
             model: model.as_ptr(),
@@ -913,15 +1082,22 @@ impl Model {
                 packed_state_rows: deepseek.packed_state_rows.into(),
             },
             minimax_h3: RawMinimaxH3Config {
-                text_encoder: ptr::null(),
-                dit: ptr::null(),
-                vae: ptr::null(),
+                text_encoder: text_encoder.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                dit: dit.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                vae: vae.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             },
         };
+        let mut weight_files = Vec::new();
+        if let Some(h3) = o.minimax_h3() {
+            for path in [&h3.text_encoder, &h3.dit, &h3.vae].into_iter().flatten() {
+                weight_files.push(path.clone());
+            }
+        }
         let m = unsafe { eremite_open(&raw) };
         (!m.is_null()).then_some(Model {
             raw: m,
             directory: o.model.clone(),
+            weight_files,
             validated: std::cell::Cell::new(false),
         })
     }
@@ -931,7 +1107,13 @@ impl Model {
     /// model runs admitted requests. Returns why the model did not load.
     pub fn load(&self) -> Result<(), String> {
         if !self.validated.get() {
-            validate_weight_files(&self.directory)?;
+            if self.weight_files.is_empty() {
+                validate_weight_files(&self.directory)?;
+            } else {
+                for path in &self.weight_files {
+                    validate_safetensors_file(std::path::Path::new(path), path, &[])?;
+                }
+            }
             self.validated.set(true);
         }
         if unsafe { eremite_load(self.raw) != 0 } {
@@ -1036,6 +1218,11 @@ impl Model {
     /// one pass each, and keeps no states.
     pub fn is_decision_model(&self) -> bool {
         unsafe { eremite_is_decision_model(self.raw) != 0 }
+    }
+
+    /// Returns whether the model is an image generation model.
+    pub fn is_image_model(&self) -> bool {
+        unsafe { eremite_is_image_model(self.raw) != 0 }
     }
 
     /// Makes a new state, or returns None when its memory does not fit.
@@ -1485,6 +1672,71 @@ impl Drop for Media {
     }
 }
 
+/// Encoded image output format for image generation models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// Lossless PNG encoding (EREMITE_IMAGE_PNG).
+    Png = 0,
+    /// Lossy JPEG encoding (EREMITE_IMAGE_JPEG).
+    Jpeg = 1,
+}
+
+/// Scalar parameters of one image generation or editing call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageCallParams {
+    /// Exact requested output width in pixels.
+    pub width: i32,
+    /// Exact requested output height in pixels.
+    pub height: i32,
+    /// Minimum generation canvas area in pixels; 0 uses the model default.
+    pub min_generation_area: i32,
+    /// Encoded output image format.
+    pub format: ImageFormat,
+    /// JPEG compression quality in 1..=100; 0 uses 95.
+    pub quality: i32,
+    /// Deterministic RNG seed for initial latent noise.
+    pub seed: u64,
+}
+
+/// Error returned when an image generation call fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageError {
+    /// Human-readable error message from the engine.
+    pub message: String,
+    /// True when the client supplied invalid inputs (HTTP 400); false for
+    /// runtime, memory or cancellation errors.
+    pub invalid_input: bool,
+}
+
+/// Owned prompt C string and reference image bytes kept alive across an
+/// asynchronous image stream call.
+pub struct ImageInputs {
+    /// NUL-terminated UTF-8 prompt passed to C.
+    prompt: CString,
+    /// Reference image byte buffers pointed into by `raw_refs`.
+    _references: Vec<Vec<u8>>,
+    /// Heap-allocated C descriptors whose address stays stable across moves.
+    raw_refs: Box<[RawImageInput]>,
+}
+
+impl ImageInputs {
+    /// Packages `prompt` and `references` into stable memory for C FFI.
+    pub fn new(prompt: &str, references: Vec<Vec<u8>>) -> ImageInputs {
+        let raw_refs: Vec<RawImageInput> = references
+            .iter()
+            .map(|bytes| RawImageInput {
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+            })
+            .collect();
+        ImageInputs {
+            prompt: c_string(prompt),
+            _references: references,
+            raw_refs: raw_refs.into_boxed_slice(),
+        }
+    }
+}
+
 /// One model's calls, one after another, on their own stack and working
 /// buffers (eremite_stream). The calls of several streams run at the same
 /// time. A posted call runs when run_streams advances its stream. What the
@@ -1608,6 +1860,62 @@ impl Stream {
         Some(unsafe { std::slice::from_raw_parts(logits.0.as_ptr(), count) }.to_vec())
     }
 
+    /// Posts one image generation or editing call on this stream. `inputs`
+    /// must remain alive until the call finishes.
+    pub fn generate_image(&self, inputs: &ImageInputs, params: ImageCallParams) {
+        let req = RawImageRequest {
+            prompt: inputs.prompt.as_ptr(),
+            width: params.width as c_int,
+            height: params.height as c_int,
+            min_generation_area: params.min_generation_area as c_int,
+            format: params.format as c_int,
+            quality: params.quality as c_int,
+            seed: params.seed,
+            refs: if inputs.raw_refs.is_empty() {
+                ptr::null()
+            } else {
+                inputs.raw_refs.as_ptr()
+            },
+            ref_count: inputs.raw_refs.len() as c_int,
+        };
+        unsafe { eremite_stream_generate_image(self.0, &req) }
+    }
+
+    /// Requests cooperative cancellation of the call running on this stream at
+    /// its next layer boundary.
+    pub fn cancel(&self) {
+        unsafe { eremite_stream_cancel(self.0) }
+    }
+
+    /// Takes the finished image call's encoded bytes, or its error.
+    pub fn take_image_result(&self) -> Result<Vec<u8>, ImageError> {
+        let mut raw = RawImageResult {
+            data: ptr::null_mut(),
+            len: 0,
+            error: [0; IMAGE_ERROR_BYTES],
+            invalid_input: 0,
+        };
+        let ok = unsafe { eremite_stream_image_result(self.0, &mut raw) != 0 };
+        let result = if ok && !raw.data.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(raw.data, raw.len) }.to_vec();
+            Ok(bytes)
+        } else {
+            let message = unsafe { std::ffi::CStr::from_ptr(raw.error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            Err(ImageError {
+                message: if message.is_empty() {
+                    "image generation failed".into()
+                } else {
+                    message
+                },
+                invalid_input: raw.invalid_input != 0,
+            })
+        };
+        unsafe { eremite_image_result_free(&mut raw) };
+        result
+    }
+
     /// Returns the finished verify call's next token, and how many of its
     /// drafts it kept.
     pub fn next_token(&self) -> (i32, usize) {
@@ -1717,6 +2025,38 @@ mod tests {
         assert!(error.ends_with("no model_type"), "{error}");
         std::fs::write(&config, "{").unwrap();
         assert!(Architecture::of(dir.path()).is_err(), "not JSON");
+        std::fs::remove_file(&config).unwrap();
+        let index = dir.0.join("model_index.json");
+        std::fs::write(&index, r#"{"_class_name": "MiniMaxH3ImagePipeline"}"#).unwrap();
+        assert_eq!(
+            Architecture::of(dir.path()),
+            Ok(Architecture::MinimaxH3Image)
+        );
+    }
+
+    #[test]
+    fn an_image_model_requires_paths_and_rejects_drafts_lookup_and_deepseek_settings() {
+        let mut options = Options::default();
+        assert!(options.configure(Architecture::MinimaxH3Image).is_err());
+        let h3 = options.minimax_h3_mut().unwrap();
+        h3.text_encoder = Some("/m/te.safetensors".into());
+        h3.dit = Some("/m/dit.safetensors".into());
+        h3.vae = Some("/m/vae.safetensors".into());
+        options.configure(Architecture::MinimaxH3Image).unwrap();
+        assert!(options.minimax_h3().is_some());
+        assert!(options.deepseek().is_none());
+
+        for change in [
+            |o: &mut Options| o.draft = 1,
+            |o: &mut Options| o.lookup = 3,
+        ] {
+            let mut bad = options.clone();
+            change(&mut bad);
+            assert!(bad.configure(Architecture::MinimaxH3Image).is_err());
+        }
+        let mut wrong_family = options.clone();
+        assert!(wrong_family.configure(Architecture::DeepSeek).is_err());
+        assert!(wrong_family.configure(Architecture::D1).is_err());
     }
 
     #[test]

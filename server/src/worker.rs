@@ -41,8 +41,9 @@ use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
 use crate::decision::d1;
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
-    self, CacheCounts, DraftChoice, ExpandError, Logits, Lookup, Media, Model, PrefillInfo,
-    Sampler, SnapshotHandle, StateHandle, Stream,
+    self, CacheCounts, DraftChoice, ExpandError, ImageCallParams, ImageError, ImageFormat,
+    ImageInputs, Logits, Lookup, Media, Model, PrefillInfo, Sampler, SnapshotHandle, StateHandle,
+    Stream,
 };
 use crate::state_cache::{
     self, Cache, Entry, Evicted, ModelLimits, Plan, PlanLimits, Snapshot, SnapshotKind,
@@ -107,6 +108,9 @@ pub enum Event {
         logits: Vec<Vec<f32>>,
         tokens: usize,
     },
+    /// An image generation or editing request finished: the encoded PNG or
+    /// JPEG bytes of each produced image. This is the last event.
+    Images { images: Vec<Vec<u8>> },
 }
 
 /// How a request samples its tokens.
@@ -172,6 +176,33 @@ impl DecisionRequest {
     fn count_tokens(&self) -> usize {
         self.passes.iter().map(|pass| pass.tokens.len()).sum()
     }
+}
+
+/// An image model's generation or editing request: one or more images generated
+/// from a prompt and optional reference images.
+pub struct ImageRequest {
+    /// The index of the request's model, in the configured order.
+    pub model_index: usize,
+    /// Raw prompt text passed verbatim to the model.
+    pub prompt: String,
+    /// Exact requested output width in pixels.
+    pub width: i32,
+    /// Exact requested output height in pixels.
+    pub height: i32,
+    /// Number of images to generate (`n`).
+    pub count: usize,
+    /// Base seed for the first image (`seed.wrapping_add(i)` for later ones).
+    pub seed: u64,
+    /// Minimum generation canvas area in pixels.
+    pub min_generation_area: i32,
+    /// Encoded output image format.
+    pub format: ImageFormat,
+    /// JPEG quality in 1..=100.
+    pub quality: i32,
+    /// Optional reference image bytes in upload order (`<Picture 1>`, ...).
+    pub references: Vec<Vec<u8>>,
+    /// The log shows "req ID NOTE" with this note when the request is queued.
+    pub note: String,
 }
 
 /// Why the worker did not queue a request.
@@ -296,6 +327,8 @@ struct Queue {
     waiting: Vec<VecDeque<Job>>,
     /// Each model's waiting decisions, the oldest first.
     decisions: Vec<VecDeque<Job<DecisionRequest>>>,
+    /// Each model's waiting image requests, the oldest first.
+    images: Vec<VecDeque<Job<ImageRequest>>>,
     /// Set at the stop. No request is queued after it.
     closed: bool,
     /// The id of the last queued request. The first request gets 1.
@@ -411,6 +444,19 @@ impl RequestStatus {
             prompt_tokens: job.request.count_tokens(),
             reused_tokens: 0,
             generated_tokens: 0,
+            routes: Vec::new(),
+        }
+    }
+
+    /// Returns the status of an image request `job`.
+    fn for_image(job: &Job<ImageRequest>, status: &'static str, generated: usize) -> RequestStatus {
+        RequestStatus {
+            id: job.id,
+            status,
+            session: None,
+            prompt_tokens: job.request.count,
+            reused_tokens: 0,
+            generated_tokens: generated,
             routes: Vec::new(),
         }
     }
@@ -722,6 +768,7 @@ pub fn start(
                 queue: Mutex::new(Queue {
                     waiting: (0..model_count).map(|_| VecDeque::new()).collect(),
                     decisions: (0..model_count).map(|_| VecDeque::new()).collect(),
+                    images: (0..model_count).map(|_| VecDeque::new()).collect(),
                     control: Control::new(engine::read_memory().limit),
                     ..Queue::default()
                 }),
@@ -855,6 +902,23 @@ pub fn submit_decision(
     let (model_index, note) = (request.model_index, request.note.clone());
     queue_job(request, model_index, &note, &counts, |queue| {
         &mut queue.decisions
+    })
+}
+
+/// Submits the image `request` to its model's queue, as submit does.
+pub fn submit_image(
+    request: ImageRequest,
+) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
+    let counts = format!(
+        "size={}x{}, n={}, refs={}",
+        request.width,
+        request.height,
+        request.count,
+        request.references.len()
+    );
+    let (model_index, note) = (request.model_index, request.note.clone());
+    queue_job(request, model_index, &note, &counts, |queue| {
+        &mut queue.images
     })
 }
 
@@ -1329,6 +1393,22 @@ struct Decision {
     started_at: Instant,
 }
 
+/// An image generation or editing request from its first image to its last.
+struct ImageTask {
+    /// The submitted image request.
+    job: Job<ImageRequest>,
+    /// Prompt C string and reference bytes kept alive across stream calls.
+    inputs: ImageInputs,
+    /// Encoded PNG/JPEG images generated so far.
+    outputs: Vec<Vec<u8>>,
+    /// Error from the last failed call, if any.
+    failure: Option<ImageError>,
+    /// Whether an image generation call is currently running on a stream.
+    in_call: bool,
+    /// When the first image started generating.
+    started_at: Instant,
+}
+
 /// An engine call that runs on a stream, and what to do when it ends.
 enum Call {
     /// One prefill call of the request. It prefills the prompt up to `end`.
@@ -1355,6 +1435,8 @@ enum Call {
     /// The next pass of a decision model's request. The request keeps the
     /// pass's tokens until the call ends.
     Decide { request_id: u64 },
+    /// One image generation or editing call of an image model's request.
+    GenerateImage { request_id: u64 },
 }
 
 /// A running call and the stream it runs on.
@@ -1388,6 +1470,13 @@ struct WorkerModel {
     admitted_decisions: VecDeque<Job<DecisionRequest>>,
     /// The decision that runs its passes.
     decision: Option<Decision>,
+    /// Whether the model is an image generation model: it generates images,
+    /// not text or decisions.
+    is_image_model: bool,
+    /// Admitted image requests that wait for their turn.
+    admitted_images: VecDeque<Job<ImageRequest>>,
+    /// The image request currently running.
+    image: Option<ImageTask>,
     /// The token that starts a think block, if the model has one.
     think_start_token: Option<i32>,
     /// The token that ends a think block, if the model has one.
@@ -1812,6 +1901,9 @@ impl Worker {
                     is_decision_model: model.is_decision_model(),
                     admitted_decisions: VecDeque::new(),
                     decision: None,
+                    is_image_model: model.is_image_model(),
+                    admitted_images: VecDeque::new(),
+                    image: None,
                     think_start_token: model.tokenizer().find_added_token("<think>"),
                     think_end_token: model.tokenizer().find_added_token("</think>"),
                     logged_decoding_count: 0,
@@ -1971,11 +2063,12 @@ impl Worker {
             if queue.control.phase != Phase::Running {
                 return;
             }
-            queue
-                .waiting
-                .iter()
-                .zip(&queue.decisions)
-                .map(|(jobs, decisions)| !jobs.is_empty() || !decisions.is_empty())
+            (0..queue.waiting.len())
+                .map(|i| {
+                    !queue.waiting[i].is_empty()
+                        || !queue.decisions[i].is_empty()
+                        || !queue.images[i].is_empty()
+                })
                 .collect()
         };
         let mut drained = false;
@@ -2162,6 +2255,13 @@ impl Worker {
                     decision.failure = Some(error.clone());
                     worker_model.end_decision(&self.shared, decision);
                 }
+                if let Some(mut image) = worker_model.image.take() {
+                    image.failure = Some(ImageError {
+                        message: error.clone(),
+                        invalid_input: false,
+                    });
+                    worker_model.end_image(&self.shared, image);
+                }
                 continue;
             }
             worker_model.model.set_request_running(true);
@@ -2332,6 +2432,7 @@ impl Worker {
             let idle = |queue: &Queue, models: &[WorkerModel]| {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
                     && queue.decisions.iter().all(|jobs| jobs.is_empty())
+                    && queue.images.iter().all(|jobs| jobs.is_empty())
                     && queue.states_to_delete.is_empty()
                     && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
@@ -2364,41 +2465,73 @@ impl Worker {
             if queue.control.phase != Phase::Running || !queue.states_to_delete.is_empty() {
                 continue;
             }
-            let mut admitted_by_model: Vec<(Vec<Job>, Vec<Job<DecisionRequest>>)> = Vec::new();
+            /// Requests drained from the queue for one model in one worker turn.
+            struct AdmittedModelJobs {
+                /// Queued generation requests for the model.
+                generations: Vec<Job>,
+                /// Queued decision requests for the model.
+                decisions: Vec<Job<DecisionRequest>>,
+                /// Queued image requests for the model.
+                images: Vec<Job<ImageRequest>>,
+            }
+            let mut admitted_by_model = Vec::with_capacity(self.models.len());
             for worker_model in &self.models {
                 let index = worker_model.model_index;
-                let (admitted, decisions): (Vec<Job>, Vec<Job<DecisionRequest>>) =
-                    if engine::is_stopping() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        (
-                            queue.waiting[index].drain(..).collect(),
-                            queue.decisions[index].drain(..).collect(),
-                        )
-                    };
-                if !admitted.is_empty() || !decisions.is_empty() {
+                let batch = if engine::is_stopping() {
+                    AdmittedModelJobs {
+                        generations: Vec::new(),
+                        decisions: Vec::new(),
+                        images: Vec::new(),
+                    }
+                } else {
+                    AdmittedModelJobs {
+                        generations: queue.waiting[index].drain(..).collect(),
+                        decisions: queue.decisions[index].drain(..).collect(),
+                        images: queue.images[index].drain(..).collect(),
+                    }
+                };
+                if !batch.generations.is_empty()
+                    || !batch.decisions.is_empty()
+                    || !batch.images.is_empty()
+                {
                     worker_model.log_line(&format!(
                         "{}: admitted={}, running={}",
                         worker_model.settings.id,
-                        admitted.len() + decisions.len(),
+                        batch.generations.len() + batch.decisions.len() + batch.images.len(),
                         worker_model.generations.len()
                             + usize::from(worker_model.decision.is_some())
+                            + usize::from(worker_model.image.is_some())
                     ));
                 }
-                admitted_by_model.push((admitted, decisions));
+                admitted_by_model.push(batch);
             }
             drop(queue);
-            for (worker_model, (admitted, decisions)) in
-                self.models.iter_mut().zip(admitted_by_model)
-            {
+            for (worker_model, batch) in self.models.iter_mut().zip(admitted_by_model) {
+                let AdmittedModelJobs {
+                    generations: admitted,
+                    decisions,
+                    images,
+                } = batch;
                 if worker_model.is_decision_model {
+                    for job in images {
+                        worker_model.refuse_image(
+                            job,
+                            "the model is a decision model: it generates no images",
+                        );
+                    }
                     worker_model.run_decision_step(&shared, admitted, decisions);
+                } else if worker_model.is_image_model {
+                    worker_model.run_image_step(&shared, admitted, decisions, images);
                 } else {
                     for job in decisions {
                         worker_model.refuse_decision(
                             job,
                             "the model generates text: it makes no decisions",
                         );
+                    }
+                    for job in images {
+                        worker_model
+                            .refuse_image(job, "the model generates text: it generates no images");
                     }
                     worker_model.run_step(&shared, admitted, &mut self.states);
                 }
@@ -2421,36 +2554,54 @@ impl Worker {
             if let Some(decision) = worker_model.decision.take() {
                 worker_model.end_decision(&shared, decision);
             }
+            if let Some(image) = worker_model.image.take() {
+                worker_model.end_image(&shared, image);
+            }
         }
-        let (mut waiting, decisions): (Vec<Job>, Vec<Vec<Job<DecisionRequest>>>) = {
+        let mut waiting: Vec<Job>;
+        let decisions: Vec<Vec<Job<DecisionRequest>>>;
+        let images: Vec<Vec<Job<ImageRequest>>>;
+        {
             let mut queue = lock(&shared.queue);
             queue.closed = true;
-            (
-                queue
-                    .waiting
-                    .iter_mut()
-                    .flat_map(|jobs| jobs.drain(..))
-                    .collect(),
-                queue
-                    .decisions
-                    .iter_mut()
-                    .map(|jobs| jobs.drain(..).collect())
-                    .collect(),
-            )
-        };
+            waiting = queue
+                .waiting
+                .iter_mut()
+                .flat_map(|jobs| jobs.drain(..))
+                .collect();
+            decisions = queue
+                .decisions
+                .iter_mut()
+                .map(|jobs| jobs.drain(..).collect())
+                .collect();
+            images = queue
+                .images
+                .iter_mut()
+                .map(|jobs| jobs.drain(..).collect())
+                .collect();
+        }
         // The deletions asked before the stop run before the stop saves the
         // states. No request runs now, and the closed queue takes no more.
         let states_to_delete = std::mem::take(&mut lock(&shared.queue).states_to_delete);
         self.delete_session_states(states_to_delete);
-        for (worker_model, decisions) in self.models.iter_mut().zip(decisions) {
+        for ((worker_model, decisions), images) in self.models.iter_mut().zip(decisions).zip(images)
+        {
             waiting.extend(worker_model.admitted.drain(..));
-            let ended: Vec<Job<DecisionRequest>> = worker_model
+            let ended_decisions: Vec<Job<DecisionRequest>> = worker_model
                 .admitted_decisions
                 .drain(..)
                 .chain(decisions)
                 .collect();
-            for job in ended {
+            for job in ended_decisions {
                 worker_model.end_waiting_decision(job, FinishReason::ServerStop);
+            }
+            let ended_images: Vec<Job<ImageRequest>> = worker_model
+                .admitted_images
+                .drain(..)
+                .chain(images)
+                .collect();
+            for job in ended_images {
+                worker_model.end_waiting_image(job, FinishReason::ServerStop);
             }
         }
         for job in waiting {
@@ -2505,14 +2656,18 @@ impl WorkerModel {
         self.view.write_model_line(self.model_index, line);
     }
 
-    /// Returns whether the model runs requests: generations, or a decision.
+    /// Returns whether the model runs requests: generations, a decision or an
+    /// image task.
     fn runs_requests(&self) -> bool {
-        !self.generations.is_empty() || self.decision.is_some()
+        !self.generations.is_empty() || self.decision.is_some() || self.image.is_some()
     }
 
-    /// Returns whether admitted requests or decisions wait for their turn.
+    /// Returns whether admitted requests, decisions or image tasks wait for
+    /// their turn.
     fn has_admitted_requests(&self) -> bool {
-        !self.admitted.is_empty() || !self.admitted_decisions.is_empty()
+        !self.admitted.is_empty()
+            || !self.admitted_decisions.is_empty()
+            || !self.admitted_images.is_empty()
     }
 
     /// Lists the ways `prompt` can resume from this model's states, the
@@ -2781,44 +2936,60 @@ impl WorkerModel {
             status.shown_prompt_tokens,
             status.shown_reused_tokens,
             status.shown_generated_tokens,
-        ) = match (first, &self.decision) {
-            (Some(generation), _) => (
+        ) = match (first, &self.decision, &self.image) {
+            (Some(generation), _, _) => (
                 generation.job.id,
                 generation.prompt_tokens,
                 generation.reused_tokens,
                 generation.generated,
             ),
-            (None, Some(decision)) => (decision.job.id, decision.job.request.count_tokens(), 0, 0),
-            (None, None) => (0, 0, 0, 0),
+            (None, Some(decision), _) => {
+                (decision.job.id, decision.job.request.count_tokens(), 0, 0)
+            }
+            (None, None, Some(image)) => (
+                image.job.id,
+                image.job.request.count,
+                0,
+                image.outputs.len(),
+            ),
+            (None, None, None) => (0, 0, 0, 0),
         };
-        status.requests = self
-            .generations
-            .iter()
-            .map(|generation| RequestStatus {
-                id: generation.job.id,
-                status: if generation.is_decoding() {
-                    "decoding"
-                } else {
-                    "prefill"
-                },
-                session: Some(generation.session),
-                prompt_tokens: generation.prompt_tokens,
-                reused_tokens: generation.reused_tokens,
-                generated_tokens: generation.generated,
-                routes: generation.routes.iter().cloned().collect(),
-            })
-            .chain(
-                self.decision
-                    .iter()
-                    .map(|decision| RequestStatus::for_decision(&decision.job, "prefill")),
-            )
-            .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
-            .chain(
-                self.admitted_decisions
-                    .iter()
-                    .map(|job| RequestStatus::for_decision(job, "waiting")),
-            )
-            .collect();
+        status.requests =
+            self.generations
+                .iter()
+                .map(|generation| RequestStatus {
+                    id: generation.job.id,
+                    status: if generation.is_decoding() {
+                        "decoding"
+                    } else {
+                        "prefill"
+                    },
+                    session: Some(generation.session),
+                    prompt_tokens: generation.prompt_tokens,
+                    reused_tokens: generation.reused_tokens,
+                    generated_tokens: generation.generated,
+                    routes: generation.routes.iter().cloned().collect(),
+                })
+                .chain(
+                    self.decision
+                        .iter()
+                        .map(|decision| RequestStatus::for_decision(&decision.job, "prefill")),
+                )
+                .chain(self.image.iter().map(|image| {
+                    RequestStatus::for_image(&image.job, "prefill", image.outputs.len())
+                }))
+                .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
+                .chain(
+                    self.admitted_decisions
+                        .iter()
+                        .map(|job| RequestStatus::for_decision(job, "waiting")),
+                )
+                .chain(
+                    self.admitted_images
+                        .iter()
+                        .map(|job| RequestStatus::for_image(job, "waiting", 0)),
+                )
+                .collect();
     }
 
     /// Starts an admitted request. It checks the request's media and prompt. It
@@ -3502,6 +3673,7 @@ impl WorkerModel {
                 proposed_count,
             } => self.finish_verify_call(stream, request_id, rows, proposed_count, states),
             Call::Decide { request_id } => self.finish_decide_call(stream, request_id),
+            Call::GenerateImage { request_id } => self.finish_image_call(stream, request_id),
         }
     }
 
@@ -4468,6 +4640,225 @@ impl WorkerModel {
     /// Refuses the decision `job` with `message`. It logs the refusal and sends
     /// it as the last event.
     fn refuse_decision(&self, job: Job<DecisionRequest>, message: &str) {
+        self.log_line(&format!("req {}: refused: {message}", job.id));
+        job.send_last_event(Event::Refused(message.into()));
+    }
+
+    // ---- an image model's requests ----
+
+    /// Runs one step of an image generation model. Refuses chat and decision
+    /// requests, queues admitted image jobs, advances any running image task,
+    /// and starts the next waiting image job when idle.
+    fn run_image_step(
+        &mut self,
+        shared: &Shared,
+        replies: Vec<Job>,
+        decisions: Vec<Job<DecisionRequest>>,
+        images: Vec<Job<ImageRequest>>,
+    ) {
+        for job in replies {
+            refuse(job, "the model is an image model: it generates no text");
+        }
+        for job in decisions {
+            self.refuse_decision(job, "the model is an image model: it makes no decisions");
+        }
+        self.admitted_images.extend(images);
+        if let Some(image) = self.image.take() {
+            self.continue_image(shared, image);
+        }
+        while self.image.is_none() {
+            let Some(job) = self.admitted_images.pop_front() else {
+                break;
+            };
+            self.start_image(shared, job);
+        }
+        let phase = if self.image.is_some() {
+            "prefill"
+        } else {
+            "idle"
+        };
+        self.update_status(shared, phase);
+    }
+
+    /// Advances the running `image` task: signals cooperative cancellation if
+    /// the client dropped its connection while a GPU call is in flight, ends
+    /// the task once all images or a failure/cancellation occur, or starts the
+    /// next image pass for `n > 1`.
+    fn continue_image(&mut self, shared: &Shared, image: ImageTask) {
+        if image.in_call {
+            if image.job.flags.cancelled.load(Ordering::SeqCst) {
+                for running in &self.running_calls {
+                    if matches!(running.call, Call::GenerateImage { request_id } if request_id == image.job.id)
+                    {
+                        running.stream.cancel();
+                    }
+                }
+            }
+            self.image = Some(image);
+        } else if image.failure.is_some()
+            || image.outputs.len() == image.job.request.count
+            || engine::is_stopping()
+            || image.job.flags.cancelled.load(Ordering::SeqCst)
+        {
+            self.end_image(shared, image);
+        } else {
+            self.start_image_pass(image);
+        }
+    }
+
+    /// Starts the admitted image request `job`: loads weights on first use,
+    /// packages stable C FFI input buffers, and posts the first image pass.
+    fn start_image(&mut self, shared: &Shared, mut job: Job<ImageRequest>) {
+        if engine::is_stopping() {
+            return self.end_waiting_image(job, FinishReason::ServerStop);
+        }
+        if job.flags.cancelled.load(Ordering::SeqCst) {
+            return self.end_waiting_image(job, FinishReason::Cancelled);
+        }
+        let was_loaded = self.model.is_loaded();
+        if !was_loaded {
+            self.update_status(shared, "loading");
+        }
+        if let Err(error) = load_model(shared, &self.model) {
+            if engine::is_stopping() {
+                return self.end_waiting_image(job, FinishReason::ServerStop);
+            }
+            lock(&shared.models[self.model_index].status).load_error = Some(error.clone());
+            self.log_line(&format!("{}: {error}", self.settings.id));
+            job.send_last_event(Event::Failed(error));
+            return;
+        }
+        lock(&shared.models[self.model_index].status).load_error = None;
+        if !was_loaded {
+            self.log_line(&format!("{}: loaded", self.settings.id));
+        }
+        self.last_used_at = Instant::now();
+        let refs = std::mem::take(&mut job.request.references);
+        let inputs = ImageInputs::new(&job.request.prompt, refs);
+        let task = ImageTask {
+            job,
+            inputs,
+            outputs: Vec::new(),
+            failure: None,
+            in_call: false,
+            started_at: Instant::now(),
+        };
+        if task.job.request.count == 0 {
+            return self.end_image(shared, task);
+        }
+        self.start_image_pass(task);
+    }
+
+    /// Posts the next image generation pass of `task` on a new engine stream.
+    fn start_image_pass(&mut self, mut task: ImageTask) {
+        let index = task.outputs.len() as u64;
+        let req = &task.job.request;
+        let stream = Stream::new(&self.model);
+        stream.generate_image(
+            &task.inputs,
+            ImageCallParams {
+                width: req.width,
+                height: req.height,
+                min_generation_area: req.min_generation_area,
+                format: req.format,
+                quality: req.quality,
+                seed: req.seed.wrapping_add(index),
+            },
+        );
+        task.in_call = true;
+        self.running_calls.push(RunningCall {
+            stream,
+            call: Call::GenerateImage {
+                request_id: task.job.id,
+            },
+        });
+        self.image = Some(task);
+    }
+
+    /// Collects the finished image bytes or error from `stream` into the
+    /// active image task.
+    fn finish_image_call(&mut self, stream: Stream, request_id: u64) {
+        let Some(task) = self.image.as_mut().filter(|task| task.job.id == request_id) else {
+            return;
+        };
+        task.in_call = false;
+        match stream.take_image_result() {
+            Ok(bytes) => task.outputs.push(bytes),
+            Err(error) => {
+                if !task.job.flags.cancelled.load(Ordering::SeqCst) && !engine::is_stopping() {
+                    task.failure = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Ends `task`, logging elapsed time and sending the final worker event.
+    fn end_image(&mut self, shared: &Shared, task: ImageTask) {
+        let done = task.outputs.len();
+        let count = task.job.request.count;
+        let seconds = task.started_at.elapsed().as_secs_f64();
+        let (how, event) = if let Some(error) = task.failure {
+            if error.invalid_input {
+                (
+                    format!("refused: {}", error.message),
+                    Event::Refused(error.message),
+                )
+            } else {
+                (
+                    format!("failed: {}", error.message),
+                    Event::Failed(error.message),
+                )
+            }
+        } else if done == count {
+            (
+                "generated".to_string(),
+                Event::Images {
+                    images: task.outputs,
+                },
+            )
+        } else if task.job.flags.cancelled.load(Ordering::SeqCst) {
+            (
+                "client gone".to_string(),
+                Event::Done {
+                    reason: FinishReason::Cancelled,
+                },
+            )
+        } else {
+            (
+                "stopped by the server's stop".to_string(),
+                Event::Done {
+                    reason: FinishReason::ServerStop,
+                },
+            )
+        };
+        self.log_line(&format!(
+            "req {}: {how}: {done} of {count} images ({}x{}) in {seconds:.2} s",
+            task.job.id, task.job.request.width, task.job.request.height
+        ));
+        let mut status = lock(&shared.models[self.model_index].status);
+        status.total_requests += 1;
+        status.total_prefill_seconds += seconds;
+        drop(status);
+        task.job.send_last_event(event);
+    }
+
+    /// Ends an image request `job` before it started running.
+    fn end_waiting_image(&self, job: Job<ImageRequest>, reason: FinishReason) {
+        self.log_line(&format!(
+            "req {}: ended before image generation ({}), waited {:.3} s",
+            job.id,
+            if reason == FinishReason::Cancelled {
+                "cancelled"
+            } else {
+                "shutdown"
+            },
+            job.queued_at.elapsed().as_secs_f64()
+        ));
+        job.send_last_event(Event::Done { reason });
+    }
+
+    /// Refuses the image request `job` with `message`.
+    fn refuse_image(&self, job: Job<ImageRequest>, message: &str) {
         self.log_line(&format!("req {}: refused: {message}", job.id));
         job.send_last_event(Event::Refused(message.into()));
     }

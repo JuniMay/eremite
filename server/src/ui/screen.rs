@@ -48,6 +48,7 @@ pub fn draw_screen(
                 (Kind::Llm, SubView::States) => draw_states(buf, view_area, screen, choices),
                 (Kind::Llm, SubView::Experts) => draw_experts(buf, view_area, screen, choices),
                 (Kind::Decision, _) => draw_decision_model(buf, view_area, model),
+                (Kind::Image, _) => draw_image_model(buf, view_area, model),
             }
         }
     }
@@ -60,6 +61,18 @@ fn draw_decision_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
     }
     let line = Line::from(plain(format!(
         " {} is a decision model: it keeps no sessions and has no experts.",
+        model.name
+    )));
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// Draws the one line of an image model in 4 Models in `area`.
+fn draw_image_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
+    if area.height == 0 {
+        return;
+    }
+    let line = Line::from(plain(format!(
+        " {} is an image model: it keeps no sessions and has no experts.",
         model.name
     )));
     buf.set_line(area.x, area.y, &line, area.width);
@@ -82,12 +95,12 @@ fn list_keys(screen: &Screen, choices: &Choices, columns: usize) -> Keys {
     if choices.view == View::Models {
         own.extend(list_model_keys(screen, choices));
     }
-    let is_decision_model = screen
+    let has_no_sub_views = screen
         .models
         .get(choices.model)
-        .is_some_and(|model| model.kind == Kind::Decision);
+        .is_some_and(|model| matches!(model.kind, Kind::Decision | Kind::Image));
     let shows_one_line = choices.view == View::Models
-        && (is_decision_model
+        && (has_no_sub_views
             || choices.sub_view == SubView::Experts
                 && screen
                     .statuses

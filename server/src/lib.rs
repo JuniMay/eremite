@@ -13,6 +13,7 @@ pub mod decision;
 pub mod disk;
 pub mod engine;
 pub mod http;
+pub mod image;
 pub mod state_cache;
 pub mod ui;
 pub mod worker;
