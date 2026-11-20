@@ -7,29 +7,48 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Qwen3-VL-32B vision tower constants matching text_encoder/config.json.
+// Qwen3-VL-32B vision tower constants from MiniMaxAI/MiniMax-H3-Image
+// text_encoder/config.json:40-59 (depth 27, hidden_size 1152, num_heads 16,
+// intermediate_size 4304, patch_size 16, temporal_patch_size 2,
+// spatial_merge_size 2, num_position_embeddings 2304).
 static constexpr int VIS_LAYERS = 27, VIS_DIM = 1152, VIS_HEADS = 16,
-                     VIS_PAD_HEAD = 128, VIS_QKV_WIDTH = 3 * VIS_DIM,
+                     VIS_PAD_HEAD = 128,
+                     VIS_QKV_WIDTH = MINIMAX_H3_QKV_PARTS * VIS_DIM,
                      VIS_MLP_RAW = 4304, VIS_MLP_PAD = 4352,
-                     VIS_PATCH_SIDE = 16, VIS_TEMPORAL_PATCH = 2,
-                     VIS_MERGE_SIDE = 2,
+                     VIS_PATCH_SIDE = 16,
+                     VIS_PATCH_AREA = VIS_PATCH_SIDE * VIS_PATCH_SIDE,
+                     VIS_TEMPORAL_PATCH = 2, VIS_MERGE_SIDE = 2,
                      VIS_MERGE_UNIT = VIS_MERGE_SIDE * VIS_MERGE_SIDE,
-                     VIS_PATCH_DIM = 3 * VIS_TEMPORAL_PATCH * VIS_PATCH_SIDE *
-                                     VIS_PATCH_SIDE,
+                     VIS_PATCH_DIM = MINIMAX_H3_RGB_CHANNELS *
+                                     VIS_TEMPORAL_PATCH * VIS_PATCH_AREA,
                      VIS_MERGE_DIM = VIS_DIM * VIS_MERGE_UNIT,
                      VIS_POS_ENTRIES = 2304, VIS_ROPE_FREQS = 18;
 
-// Reference image sizing and prompt truncation constants matching MiniMax-H3.
+// Reference image sizing and prompt truncation constants from Comfy-Org/ComfyUI
+// comfy_extras/nodes_minimax_h3.py:32,41-42 (CANVAS_MULTIPLE 32,
+// IMAGE_REF_SHORT_EDGE 1024, IMAGE_REF_VAE_MAX_SHORT_EDGE 2048) and
+// comfy/text_encoders/minimax.py:43-44 (min_pixels 3136, max_pixels 12845056).
 static constexpr int REF_GRID_MULTIPLE = 32, REF_VISION_SHORT_EDGE = 1024,
                      REF_VAE_MIN_SHORT_EDGE = 1024,
                      REF_VAE_MAX_SHORT_EDGE = 2048, REF_SMART_MIN_PIXELS = 3136,
                      REF_SMART_MAX_PIXELS = 12845056, PROMPT_MAX_TOKENS = 4096;
 
-// DeepStack vision block indices where multi-scale features are extracted.
+// Reference prompt template budgets for "Picture %d: " plus flanking
+// <|vision_start|> and <|vision_end|>: "Picture 16: " is 12 ASCII bytes and at
+// most 5 BPE tokens, so 32 bytes / 16 tokens per label and 4 guard tokens
+// comfortably cover up to 16 reference images.
+static constexpr size_t REF_LABEL_BUF_CAP = 32;
+static constexpr int REF_LABEL_MAX_TOKENS = 16,
+                     REF_TEMPLATE_TOKENS = REF_LABEL_MAX_TOKENS + 2,
+                     REF_SEQ_GUARD_TOKENS = 4;
+
+// DeepStack vision block indices from MiniMaxAI/MiniMax-H3-Image
+// text_encoder/config.json:41-45 ("deepstack_visual_indexes": [8, 16, 24]).
 static const int DEEPSTACK_LAYERS[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS] = {8, 16,
                                                                        24};
 
-// Vision LayerNorm epsilon and 2D RoPE base frequency.
+// Vision LayerNorm epsilon and 2D RoPE base frequency from Comfy-Org/ComfyUI
+// comfy/text_encoders/qwen35.py:629,680 (theta = 10000.0, eps = 1e-6).
 static constexpr float VIS_NORM_EPS = 1e-6f;
 static constexpr double VIS_ROPE_THETA = 10000.0;
 
@@ -256,7 +275,7 @@ static void add_vis_merger(WeightGroup *group, const TensorIndex *tensors,
     die("unexpected vision merger norm shape for %s", prefix);
   weight_group_add_vector(group, &m->norm_w, nw, 0.0f, 0);
   weight_group_add_vector(group, &m->norm_b, nb, 0.0f, 0);
-  char name[128];
+  char name[MINIMAX_H3_NAME_CAP];
   snprintf(name, sizeof name, "%s.linear_fc1", prefix);
   add_vis_lin(group, tensors, &m->fc1, VIS_MERGE_DIM, VIS_MERGE_DIM,
               VIS_MERGE_DIM, VIS_MERGE_DIM, name);
@@ -370,7 +389,7 @@ minimax_h3_vision_encoder_open(MinimaxH3TextEncoder *text_enc,
         vis->weights, &b->norm2_b,
         tensor_index_get(vis->tensors, "visual.blocks.%d.norm2.bias", i), 0.0f,
         0);
-    char name[128];
+    char name[MINIMAX_H3_NAME_CAP];
     snprintf(name, sizeof name, "visual.blocks.%d.attn.qkv", i);
     add_vis_lin(vis->weights, vis->tensors, &b->qkv, VIS_QKV_WIDTH, VIS_DIM,
                 VIS_QKV_WIDTH, VIS_DIM, name);
@@ -387,7 +406,7 @@ minimax_h3_vision_encoder_open(MinimaxH3TextEncoder *text_enc,
 
   add_vis_merger(vis->weights, vis->tensors, &vis->merger, 0, "visual.merger");
   for (int i = 0; i < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; i++) {
-    char name[128];
+    char name[MINIMAX_H3_NAME_CAP];
     snprintf(name, sizeof name, "visual.deepstack_merger_list.%d", i);
     add_vis_merger(vis->weights, vis->tensors, &vis->deepstack[i], 1, name);
   }
@@ -584,25 +603,30 @@ int minimax_h3_vision_encoder_encode_image(
   }
 
   // Patchify single RGB image into 2x2 merge-ordered rows [num_patches, 1536]
-  // with mean=0.5, std=0.5 normalization and temporal repeat t=0,1.
+  // with mean=0.5, std=0.5 normalization (processor/preprocessor_config.json:
+  // 9-18) and temporal repeat t=0,1.
   float *pin = (float *)ws.patch_in.ptr;
   for (int by = 0; by < mh; by++) {
     for (int bx = 0; bx < mw; bx++) {
       for (int my = 0; my < VIS_MERGE_SIDE; my++) {
         for (int mx = 0; mx < VIS_MERGE_SIDE; mx++) {
-          int tok = ((by * mw + bx) * 2 + my) * 2 + mx;
+          int tok =
+              ((by * mw + bx) * VIS_MERGE_SIDE + my) * VIS_MERGE_SIDE + mx;
           float *row = pin + (size_t)tok * (size_t)VIS_PATCH_DIM;
-          int y0 = (by * 2 + my) * VIS_PATCH_SIDE;
-          int x0 = (bx * 2 + mx) * VIS_PATCH_SIDE;
+          int y0 = (by * VIS_MERGE_SIDE + my) * VIS_PATCH_SIDE;
+          int x0 = (bx * VIS_MERGE_SIDE + mx) * VIS_PATCH_SIDE;
           for (int py = 0; py < VIS_PATCH_SIDE; py++) {
             const uint8_t *srow =
-                rgb + ((size_t)(y0 + py) * (size_t)width + (size_t)x0) * 3u;
+                rgb + ((size_t)(y0 + py) * (size_t)width + (size_t)x0) *
+                          (size_t)MINIMAX_H3_RGB_CHANNELS;
             for (int px = 0; px < VIS_PATCH_SIDE; px++) {
               int sp = py * VIS_PATCH_SIDE + px;
-              for (int c = 0; c < 3; c++) {
-                float v = (float)srow[px * 3 + c] * (2.0f / 255.0f) - 1.0f;
-                row[(c * 2 + 0) * 256 + sp] = v;
-                row[(c * 2 + 1) * 256 + sp] = v;
+              for (int c = 0; c < MINIMAX_H3_RGB_CHANNELS; c++) {
+                float v = (float)srow[px * MINIMAX_H3_RGB_CHANNELS + c] *
+                              (2.0f / MINIMAX_H3_PIXEL_MAX) -
+                          1.0f;
+                for (int t = 0; t < VIS_TEMPORAL_PATCH; t++)
+                  row[(c * VIS_TEMPORAL_PATCH + t) * VIS_PATCH_AREA + sp] = v;
               }
             }
           }
@@ -661,8 +685,8 @@ int minimax_h3_vision_encoder_encode_image(
     gpu_bind_buffer(&cmd, 3, &ws.kh, 0);
     gpu_bind_buffer(&cmd, 4, &ws.vh, 0);
     gpu_copy_bytes(&cmd, 5, &hp, sizeof hp);
-    gpu_run_kernel(&cmd, (uint32_t)(3 * VIS_HEADS), padded, 1, HEADS_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, (uint32_t)(MINIMAX_H3_QKV_PARTS * VIS_HEADS), padded,
+                   1, HEADS_THREADS, 1, 1);
 
     gpu_select_kernel(&cmd, vis->k_vis_attend);
     gpu_bind_buffer(&cmd, 0, &ws.qh, 0);
@@ -825,25 +849,28 @@ int minimax_h3_encode_multimodal_prompt(
     total_vis += enc_refs[i].n_merged;
   }
 
-  // Tokenize labels ("Picture 1: ", ...) and prompt text.
+  // Tokenize reference labels ("Picture %d: ", Comfy-Org/ComfyUI
+  // comfy/text_encoders/minimax.py:8,233 and
+  // comfy_extras/nodes_minimax_h3.py:768) and raw prompt text.
   int *prompt_ids = xmalloc((size_t)PROMPT_MAX_TOKENS * sizeof(int));
   int prompt_len = 0;
   if (prompt && prompt[0] != '\0')
     prompt_len = minimax_h3_text_encoder_tokenize(text_enc, prompt, prompt_ids,
                                                   PROMPT_MAX_TOKENS);
 
-  int max_seq = total_vis + prompt_len + ref_count * 32 + 4;
+  int max_seq = total_vis + prompt_len + ref_count * REF_TEMPLATE_TOKENS +
+                REF_SEQ_GUARD_TOKENS;
   int *ids = xmalloc((size_t)max_seq * sizeof(int));
   int *tags = xmalloc((size_t)max_seq * sizeof(int));
   int *vis_indices = xmalloc((size_t)total_vis * sizeof(int));
   int seq_len = 0, vis_cursor = 0;
 
   for (int i = 0; i < ref_count; i++) {
-    char label[32];
+    char label[REF_LABEL_BUF_CAP];
     snprintf(label, sizeof label, "Picture %d: ", i + 1);
-    int label_ids[16];
-    int l_len =
-        minimax_h3_text_encoder_tokenize(text_enc, label, label_ids, 16);
+    int label_ids[REF_LABEL_MAX_TOKENS];
+    int l_len = minimax_h3_text_encoder_tokenize(text_enc, label, label_ids,
+                                                 REF_LABEL_MAX_TOKENS);
     for (int j = 0; j < l_len; j++) {
       ids[seq_len] = label_ids[j];
       tags[seq_len] = TAG_TEXT;
@@ -872,12 +899,13 @@ int minimax_h3_encode_multimodal_prompt(
   }
   free(prompt_ids);
 
-  // Build qwen2vl_mrope_position_ids [seq_len, 3] (interleaved t, h, w).
-  int *pos_ids = xmalloc((size_t)seq_len * 3u * sizeof(int));
+  // Build qwen2vl_mrope_position_ids [seq_len, MINIMAX_H3_POS_AXES] (t, h, w).
+  int *pos_ids =
+      xmalloc((size_t)seq_len * (size_t)MINIMAX_H3_POS_AXES * sizeof(int));
   for (int i = 0; i < seq_len; i++) {
-    pos_ids[3 * i] = i;
-    pos_ids[3 * i + 1] = i;
-    pos_ids[3 * i + 2] = i;
+    pos_ids[MINIMAX_H3_POS_AXES * i] = i;
+    pos_ids[MINIMAX_H3_POS_AXES * i + 1] = i;
+    pos_ids[MINIMAX_H3_POS_AXES * i + 2] = i;
   }
   int offset = 0;
   for (int i = 0; i < ref_count; i++) {
@@ -891,16 +919,16 @@ int minimax_h3_encode_multimodal_prompt(
     for (int k = 0; k < size; k++) {
       int row = k / mw, col = k % mw;
       int idx = start + k;
-      pos_ids[3 * idx] = base;
-      pos_ids[3 * idx + 1] = base + row;
-      pos_ids[3 * idx + 2] = base + col;
+      pos_ids[MINIMAX_H3_POS_AXES * idx] = base;
+      pos_ids[MINIMAX_H3_POS_AXES * idx + 1] = base + row;
+      pos_ids[MINIMAX_H3_POS_AXES * idx + 2] = base + col;
     }
     int start_next = len_max + start + offset;
     for (int idx = end; idx < seq_len; idx++) {
       int p = start_next + (idx - end);
-      pos_ids[3 * idx] = p;
-      pos_ids[3 * idx + 1] = p;
-      pos_ids[3 * idx + 2] = p;
+      pos_ids[MINIMAX_H3_POS_AXES * idx] = p;
+      pos_ids[MINIMAX_H3_POS_AXES * idx + 1] = p;
+      pos_ids[MINIMAX_H3_POS_AXES * idx + 2] = p;
     }
     offset += len_max - size;
   }
