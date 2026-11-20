@@ -7,14 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Attention and feed-forward dimensions of Qwen3-VL-32B.
+// Attention and feed-forward dimensions of Qwen3-VL-32B from
+// MiniMaxAI/MiniMax-H3-Image text_encoder/config.json:13-35 (vocab_size 151936,
+// num_attention_heads 64, num_key_value_heads 8, head_dim 128,
+// intermediate_size 25600).
 static constexpr int QWEN_VOCAB = 151936, QWEN_HEADS = 64, QWEN_KV_HEADS = 8,
                      QWEN_HEAD_DIM = 128,
                      QWEN_Q_WIDTH = QWEN_HEADS * QWEN_HEAD_DIM,
                      QWEN_KV_WIDTH = QWEN_KV_HEADS * QWEN_HEAD_DIM,
                      QWEN_FFN_DIM = 25600, QWEN_ROPE_PAIRS = QWEN_HEAD_DIM / 2;
 
-// RMSNorm epsilon and RoPE base frequency for Qwen3-VL-32B.
+// RMSNorm epsilon and MRoPE base frequency from MiniMaxAI/MiniMax-H3-Image
+// text_encoder/config.json:23-33 (rms_norm_eps 1e-6, rope_theta 5000000,
+// interleaved mrope_section [24, 20, 20]).
 static constexpr float QWEN_RMS_EPS = 1e-6f;
 static constexpr double QWEN_ROPE_THETA = 5000000.0;
 
@@ -230,7 +235,7 @@ MinimaxH3TextEncoder *minimax_h3_text_encoder_open(Gpu *gpu,
                          "model.layers.%d.self_attn.k_norm.weight", i),
         0.0f, 0);
 
-    char name[128];
+    char name[MINIMAX_H3_NAME_CAP];
     snprintf(name, sizeof name, "model.layers.%d.self_attn.q_proj", i);
     add_nvfp4_lin(enc->weights, enc->tensors, &l->q_proj, QWEN_Q_WIDTH,
                   MINIMAX_H3_TEXT_DIM, name);
@@ -339,7 +344,7 @@ uint64_t minimax_h3_text_encoder_workspace_bytes(int seq_len,
                          (uint64_t)ATTN_PAD * ATTN_PAD;
   uint64_t bytes = 0;
   bytes += (uint64_t)seq_len * sizeof(int);
-  bytes += (uint64_t)seq_len * 3u * sizeof(int);
+  bytes += (uint64_t)seq_len * (uint64_t)MINIMAX_H3_POS_AXES * sizeof(int);
   bytes += (uint64_t)seq_len * (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
   bytes += padded_m * (uint64_t)QWEN_FFN_DIM * sizeof(uint16_t);
   bytes += (uint64_t)seq_len * (uint64_t)QWEN_Q_WIDTH * sizeof(float);
@@ -362,8 +367,8 @@ static int alloc_workspace(MinimaxH3TextEncoder *enc, int seq_len,
   MemorySlot *slot = &enc->workspace_slot;
   ws->ids =
       gpu_try_alloc_required(enc->gpu, slot, (size_t)seq_len * sizeof(int));
-  ws->pos_ids =
-      gpu_try_alloc_required(enc->gpu, slot, (size_t)seq_len * 3 * sizeof(int));
+  ws->pos_ids = gpu_try_alloc_required(
+      enc->gpu, slot, (size_t)seq_len * MINIMAX_H3_POS_AXES * sizeof(int));
   ws->norm = gpu_try_alloc_required(
       enc->gpu, slot, (size_t)seq_len * MINIMAX_H3_TEXT_DIM * sizeof(float));
   ws->xb = gpu_try_alloc_required(
@@ -485,12 +490,13 @@ int minimax_h3_text_encoder_encode_tokens(
   memcpy(ws.ids.ptr, ids, (size_t)seq_len * sizeof(int));
   int *pos_dst = (int *)ws.pos_ids.ptr;
   if (pos_ids) {
-    memcpy(pos_dst, pos_ids, (size_t)seq_len * 3 * sizeof(int));
+    memcpy(pos_dst, pos_ids,
+           (size_t)seq_len * (size_t)MINIMAX_H3_POS_AXES * sizeof(int));
   } else {
     for (int i = 0; i < seq_len; i++) {
-      pos_dst[3 * i] = i;
-      pos_dst[3 * i + 1] = i;
-      pos_dst[3 * i + 2] = i;
+      pos_dst[MINIMAX_H3_POS_AXES * i] = i;
+      pos_dst[MINIMAX_H3_POS_AXES * i + 1] = i;
+      pos_dst[MINIMAX_H3_POS_AXES * i + 2] = i;
     }
   }
   if (visual_count > 0 && visual_indices)

@@ -13,16 +13,22 @@
 // back to the pad token. Output is the unnormalized hidden state after
 // layer 49.
 
-// Width of each output hidden-state vector.
+// Width of each output hidden-state vector; MiniMaxAI/MiniMax-H3-Image
+// text_encoder/config.json:15 ("hidden_size": 5120).
 static constexpr int MINIMAX_H3_TEXT_DIM = 5120;
 
-// Number of Qwen3-VL transformer layers executed for MiniMax-H3 conditioning.
+// Number of Qwen3-VL transformer layers executed for MiniMax-H3 conditioning
+// (truncated from 64 in text_encoder/config.json:21; unnormalized hidden state
+// after layer 50); Comfy-Org/ComfyUI comfy/text_encoders/minimax.py:16-18,137.
 static constexpr int MINIMAX_H3_TEXT_LAYERS = 50;
 
-// Number of DeepStack visual feature tensors injected after layers 0, 1 and 2.
+// Number of DeepStack visual feature tensors injected after layers 0, 1 and 2;
+// MiniMaxAI/MiniMax-H3-Image text_encoder/config.json:41-45.
 static constexpr int MINIMAX_H3_TEXT_DEEPSTACK_LAYERS = 3;
 
-// Token IDs used by MiniMax-H3's Qwen3-VL prompt presentation.
+// Token IDs used by MiniMax-H3's Qwen3-VL prompt presentation;
+// text_encoder/config.json:10,60-61 and
+// comfy/text_encoders/minimax.py:30-31,137.
 static constexpr int MINIMAX_H3_TEXT_PAD_TOKEN = 151643,
                      MINIMAX_H3_TEXT_VISION_START_TOKEN = 151652,
                      MINIMAX_H3_TEXT_VISION_END_TOKEN = 151653;

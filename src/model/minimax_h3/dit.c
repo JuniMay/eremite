@@ -10,14 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-// MiniMax-H3-Image DiT architecture constants matching transformer/config.json.
+// MiniMax-H3-Image DiT architecture constants from MiniMaxAI/MiniMax-H3-Image
+// transformer/config.json:4-26 (hidden_size 5376, num_layers 50,
+// token_refiner_num_layers 2, num_attention_heads 56, attention_head_dim 128,
+// ffn_hidden_size 14336, patch_size [1, 2, 2], adaln_out_features 96768,
+// final_adaln_out_features 10752, rope_inv_freq_len 16).
 static constexpr int DIT_DIM = 5376, DIT_LAYERS = 50, DIT_REFINER_LAYERS = 2,
                      DIT_HEADS = 56, DIT_HEAD_DIM = 128,
                      DIT_INNER = DIT_HEADS * DIT_HEAD_DIM,
-                     DIT_QKV_WIDTH = 3 * DIT_INNER, DIT_FFN_DIM = 14336,
-                     DIT_FC1_WIDTH = 2 * DIT_FFN_DIM, DIT_PATCH_SIDE = 2,
-                     DIT_PATCH_DIM = MINIMAX_H3_VAE_LATENT_CHANNELS *
-                                     DIT_PATCH_SIDE * DIT_PATCH_SIDE,
+                     DIT_QKV_WIDTH = MINIMAX_H3_QKV_PARTS * DIT_INNER,
+                     DIT_FFN_DIM = 14336, DIT_FC1_WIDTH = 2 * DIT_FFN_DIM,
+                     DIT_PATCH_SIDE = 2,
+                     DIT_PATCH_AREA = DIT_PATCH_SIDE * DIT_PATCH_SIDE,
+                     DIT_PATCH_DIM =
+                         MINIMAX_H3_VAE_LATENT_CHANNELS * DIT_PATCH_AREA,
                      DIT_ROPE_FREQS = 16, DIT_ADALN_GRID = 1025,
                      DIT_ADALN_RANK = 8, DIT_ADALN_MODALITIES = 3,
                      DIT_ADALN_CHUNKS = 6,
@@ -25,27 +31,42 @@ static constexpr int DIT_DIM = 5376, DIT_LAYERS = 50, DIT_REFINER_LAYERS = 2,
                      DIT_ADALN_OUT = DIT_ADALN_MODALITIES * DIT_ADALN_STRIDE,
                      DIT_FINAL_ADALN_OUT = 2 * DIT_DIM;
 
-// Default PDD step count when checkpoint metadata omits one.
+// Default PDD step count when checkpoint metadata omits one;
+// MiniMaxAI/MiniMax-H3-Image pdd_config.json:2 ("num_inference_steps": 6).
 static constexpr int DEFAULT_PDD_STEPS = 6;
 
-// Default 6-step PDD decreasing sigma schedule when metadata omits one.
+// Default 6-step PDD decreasing sigma schedule when metadata omits one;
+// MiniMaxAI/MiniMax-H3-Image pdd_config.json:3-11 ("sigmas") and
+// Comfy-Org/ComfyUI comfy/ldm/minimax/model.py:833-835 (MiniMaxH3ImageModel).
 static const double DEFAULT_PDD_SIGMAS[DEFAULT_PDD_STEPS + 1] = {
     1.0,  0.9675236940383911, 0.8875485062599182,
     0.75, 0.5327739119529724, 0.23200887441635132,
     0.0,
 };
 
-// RMSNorm epsilon matching transformer/config.json.
+// RMSNorm epsilon from MiniMaxAI/MiniMax-H3-Image transformer/config.json:24-26
+// (norm_eps, qk_norm_eps, final_norm_eps).
 static constexpr float DIT_NORM_EPS = 1e-5f;
 
-// Spatial RoPE coordinate scale over area-normalized patch grids.
+// Spatial RoPE coordinate scale over area-normalized patch grids;
+// Comfy-Org/ComfyUI comfy/ldm/minimax/model.py:81 (_axis_from_sqrt_area).
 static constexpr double DIT_ROPE_SPATIAL_SCALE = 32.0;
 
-// Noise-augmentation timestep pinned on conditioning reference images.
+// Half-unit offset centering normalized spatial coordinates within a unit span;
+// Comfy-Org/ComfyUI comfy/ldm/minimax/model.py:81 ((1.0 - ratio) / 2.0).
+static constexpr double CELL_CENTER = 0.5;
+
+// Noise-augmentation timestep pinned on conditioning reference images;
+// Comfy-Org/ComfyUI comfy/ldm/minimax/model.py:34 (VISUAL_COND_TIMESTEP).
 static constexpr double DIT_VISUAL_COND_TIMESTEP = 0.999;
 
-// AdaLN modality tags: visual (0) and text (1).
+// AdaLN modality tags: visual (0) and text (1);
+// Comfy-Org/ComfyUI comfy/ldm/minimax/model.py:239 (SEG_TAG).
 static constexpr uint32_t TAG_VISUAL = 0, TAG_TEXT = 1;
+
+// Row index of the conditioning reference timestep in the 2-row AdaLN table
+// (row 0 holds main denoising timestep t_main; row 1 holds t_ref).
+static constexpr uint32_t DIT_REF_T_ROW = 1;
 
 // Offsets of the 6 modulation vectors inside one modality's AdaLN slice.
 static constexpr uint32_t OFF_SHIFT_MSA = 0 * DIT_DIM,
@@ -391,7 +412,7 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
         tensor_index_get(dit->tensors,
                          "token_refiner.blocks.%d.attn.k_norm.weight", i),
         0.0f, 0);
-    char name[128];
+    char name[MINIMAX_H3_NAME_CAP];
     snprintf(name, sizeof name, "token_refiner.blocks.%d.attn.qkv_proj", i);
     add_bf16_lin(dit->weights, dit->tensors, &r->qkv_proj, DIT_QKV_WIDTH,
                  DIT_DIM, 0, name);
@@ -449,7 +470,7 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
     weight_group_add_tensor(dit->weights, &b->adaln_w, aw, 0);
     weight_group_add_tensor(dit->weights, &b->adaln_b, ab, 0);
 
-    char name[128];
+    char name[MINIMAX_H3_NAME_CAP];
     snprintf(name, sizeof name, "blocks.%d.attn.qkv_proj", i);
     add_int8_lin(dit->weights, dit->tensors, &b->qkv_proj, DIT_QKV_WIDTH,
                  DIT_DIM, name);
@@ -529,31 +550,9 @@ int minimax_h3_dit_load(MinimaxH3Dit *dit) {
   return weight_group_load(dit->weights);
 }
 
-// Deterministic SplitMix64 generator for Gaussian latent noise.
-static uint64_t splitmix64_next(uint64_t *state) {
-  uint64_t z = (*state += 0x9e3779b97f4a7c15ull);
-  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-  return z ^ (z >> 31);
-}
-
-// Fills count floats with standard normal N(0, 1) draws via Box-Muller.
-static void fill_gaussian(float *out, size_t count, uint64_t seed) {
-  uint64_t state = seed;
-  static constexpr double TWO_PI = 6.28318530717958647692;
-  static constexpr double INV_2_53 = 1.0 / 9007199254740992.0;
-  for (size_t i = 0; i < count; i += 2) {
-    double u1 = ((double)(splitmix64_next(&state) >> 11) + 0.5) * INV_2_53;
-    double u2 = (double)(splitmix64_next(&state) >> 11) * INV_2_53;
-    double r = sqrt(-2.0 * log(u1));
-    double theta = TWO_PI * u2;
-    out[i] = (float)(r * cos(theta));
-    if (i + 1 < count) out[i + 1] = (float)(r * sin(theta));
-  }
-}
-
 // Interpolates the rank-8 curve-form AdaLN time embedding for t in [0, 1].
-static void interp_t_emb(const MinimaxH3Dit *dit, double t, float out[8]) {
+static void interp_t_emb(const MinimaxH3Dit *dit, double t,
+                         float out[DIT_ADALN_RANK]) {
   double clamped = t < 0.0 ? 0.0 : t > 1.0 ? 1.0 : t;
   double pos = clamped * (double)(DIT_ADALN_GRID - 1);
   int i0 = (int)floor(pos);
@@ -575,13 +574,15 @@ static void fill_frame_positions(float *dst_pos, int lat_h, int lat_w,
   double ratio_h = (double)lat_h / sqrt_area;
   double ratio_w = (double)lat_w / sqrt_area;
   for (int py = 0; py < nh; py++) {
-    double ch = ((double)py * (ratio_h / (double)nh) + (1.0 - ratio_h) * 0.5) *
-                DIT_ROPE_SPATIAL_SCALE;
+    double ch =
+        ((double)py * (ratio_h / (double)nh) + (1.0 - ratio_h) * CELL_CENTER) *
+        DIT_ROPE_SPATIAL_SCALE;
     for (int px = 0; px < nw; px++) {
-      double cw =
-          ((double)px * (ratio_w / (double)nw) + (1.0 - ratio_w) * 0.5) *
-          DIT_ROPE_SPATIAL_SCALE;
-      float *p = dst_pos + ((size_t)py * (size_t)nw + (size_t)px) * 3u;
+      double cw = ((double)px * (ratio_w / (double)nw) +
+                   (1.0 - ratio_w) * CELL_CENTER) *
+                  DIT_ROPE_SPATIAL_SCALE;
+      float *p = dst_pos + ((size_t)py * (size_t)nw + (size_t)px) *
+                               (size_t)MINIMAX_H3_POS_AXES;
       p[0] = (float)t_coord;
       p[1] = (float)ch;
       p[2] = (float)cw;
@@ -608,7 +609,7 @@ static void patchify_latent(const float *z, int orig_h, int orig_w, int lat_h,
             float v = (y < orig_h && x < orig_w)
                           ? zc[(size_t)y * (size_t)orig_w + (size_t)x]
                           : 0.0f;
-            row[c * 4 + dy * 2 + dx] = v;
+            row[c * DIT_PATCH_AREA + dy * DIT_PATCH_SIDE + dx] = v;
           }
         }
       }
@@ -635,7 +636,7 @@ static void unpatchify_euler_step(const float *rows, int orig_h, int orig_w,
             int x = px * DIT_PATCH_SIDE + dx;
             if (x >= orig_w) continue;
             zc[(size_t)y * (size_t)orig_w + (size_t)x] +=
-                dt * row[c * 4 + dy * 2 + dx];
+                dt * row[c * DIT_PATCH_AREA + dy * DIT_PATCH_SIDE + dx];
           }
         }
       }
@@ -683,15 +684,15 @@ uint64_t minimax_h3_dit_workspace_bytes(int text_len, int ref_patches,
   bytes += (uint64_t)seq_len * sizeof(float);
   bytes += (uint64_t)seq_len * (uint64_t)DIT_QKV_WIDTH * sizeof(float);
   bytes += (uint64_t)seq_len * (uint64_t)DIT_INNER * sizeof(float);
-  bytes += 3u * (uint64_t)DIT_HEADS * padded_seq * (uint64_t)DIT_HEAD_DIM *
-           sizeof(uint16_t);
+  bytes += (uint64_t)MINIMAX_H3_QKV_PARTS * (uint64_t)DIT_HEADS * padded_seq *
+           (uint64_t)DIT_HEAD_DIM * sizeof(uint16_t);
   bytes += (uint64_t)seq_len * (uint64_t)DIT_FC1_WIDTH * sizeof(float);
   bytes += (uint64_t)seq_len * (uint64_t)DIT_FFN_DIM * sizeof(float);
   bytes += 2u * (uint64_t)DIT_ADALN_RANK * sizeof(float);
   bytes += 2u * (uint64_t)DIT_ADALN_OUT * sizeof(float);
   bytes += (uint64_t)seq_len * sizeof(uint32_t);
   bytes += (uint64_t)target_patches * sizeof(uint32_t);
-  bytes += (uint64_t)seq_len * 3u * sizeof(float);
+  bytes += (uint64_t)seq_len * (uint64_t)MINIMAX_H3_POS_AXES * sizeof(float);
   bytes += (uint64_t)total_vis * (uint64_t)DIT_PATCH_DIM * sizeof(float);
   bytes += (uint64_t)target_patches * (uint64_t)DIT_PATCH_DIM * sizeof(float);
   return bytes;
@@ -743,8 +744,8 @@ static int alloc_dit_workspace(MinimaxH3Dit *dit, int text_len, int total_vis,
                                         (size_t)seq_len * sizeof(uint32_t));
   ws->final_mod_rows = gpu_try_alloc_required(
       dit->gpu, slot, (size_t)target_patches * sizeof(uint32_t));
-  ws->pos = gpu_try_alloc_required(dit->gpu, slot,
-                                   (size_t)seq_len * 3 * sizeof(float));
+  ws->pos = gpu_try_alloc_required(
+      dit->gpu, slot, (size_t)seq_len * MINIMAX_H3_POS_AXES * sizeof(float));
   ws->patch_in = gpu_try_alloc_required(
       dit->gpu, slot, (size_t)total_vis * DIT_PATCH_DIM * sizeof(float));
   ws->patch_out = gpu_try_alloc_required(
@@ -854,8 +855,8 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
     gpu_bind_buffer(&cmd, 6, &ws->kh, 0);
     gpu_bind_buffer(&cmd, 7, &ws->vh, 0);
     gpu_copy_bytes(&cmd, 8, &hp, sizeof hp);
-    gpu_run_kernel(&cmd, (uint32_t)(3 * DIT_HEADS), padded, 1, HEADS_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, (uint32_t)(MINIMAX_H3_QKV_PARTS * DIT_HEADS), padded,
+                   1, HEADS_THREADS, 1, 1);
 
     gpu_select_kernel(&cmd, dit->k_attend);
     gpu_bind_buffer(&cmd, 0, &ws->qh, 0);
@@ -953,13 +954,14 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
     return 0;
   }
 
-  // Build 3D MM-RoPE coordinates [seq_len, 3] and per-token AdaLN row indices.
+  // Build 3D MM-RoPE coordinates [seq_len, MINIMAX_H3_POS_AXES] and per-token
+  // AdaLN row indices.
   float *pos = (float *)ws.pos.ptr;
   uint32_t *mod_rows = (uint32_t *)ws.mod_rows.ptr;
   for (int i = 0; i < text_len; i++) {
-    pos[3 * i] = (float)i;
-    pos[3 * i + 1] = 0.0f;
-    pos[3 * i + 2] = 0.0f;
+    pos[MINIMAX_H3_POS_AXES * i] = (float)i;
+    pos[MINIMAX_H3_POS_AXES * i + 1] = 0.0f;
+    pos[MINIMAX_H3_POS_AXES * i + 2] = 0.0f;
     uint32_t tag = text_tags ? (uint32_t)text_tags[i] : TAG_TEXT;
     mod_rows[i] = tag;
   }
@@ -975,14 +977,17 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
     int rh = (refs[i].h_lat + 1) / 2 * 2;
     int rw = (refs[i].w_lat + 1) / 2 * 2;
     int n = (rh / DIT_PATCH_SIDE) * (rw / DIT_PATCH_SIDE);
-    fill_frame_positions(pos + (size_t)row_off * 3u, rh, rw, cursor);
-    for (int j = 0; j < n; j++) mod_rows[row_off + j] = 3u + TAG_VISUAL;
+    fill_frame_positions(pos + (size_t)row_off * (size_t)MINIMAX_H3_POS_AXES,
+                         rh, rw, cursor);
+    uint32_t ref_mod_row =
+        DIT_REF_T_ROW * (uint32_t)DIT_ADALN_MODALITIES + TAG_VISUAL;
+    for (int j = 0; j < n; j++) mod_rows[row_off + j] = ref_mod_row;
 
     float *dst = patch_in + (size_t)vis_off * DIT_PATCH_DIM;
     patchify_latent(refs[i].latents, refs[i].h_lat, refs[i].w_lat, rh, rw, dst);
     size_t count = (size_t)n * DIT_PATCH_DIM;
     float *noise = xmalloc(count * sizeof(float));
-    fill_gaussian(noise, count, seed);
+    minimax_h3_fill_gaussian(noise, count, seed);
     float aug = (float)DIT_VISUAL_COND_TIMESTEP;
     for (size_t k = 0; k < count; k++)
       dst[k] = aug * dst[k] + (1.0f - aug) * noise[k];
@@ -993,7 +998,8 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
     vis_off += n;
   }
 
-  fill_frame_positions(pos + (size_t)row_off * 3u, lat_h, lat_w, cursor);
+  fill_frame_positions(pos + (size_t)row_off * (size_t)MINIMAX_H3_POS_AXES,
+                       lat_h, lat_w, cursor);
   for (int j = 0; j < target_patches; j++) mod_rows[row_off + j] = TAG_VISUAL;
   memset(ws.final_mod_rows.ptr, 0, (size_t)target_patches * sizeof(uint32_t));
 
@@ -1003,7 +1009,7 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   // Initialize target latent with standard normal noise from seed.
   size_t latent_floats =
       (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * (size_t)h_lat * (size_t)w_lat;
-  fill_gaussian(out_latents, latent_floats, seed);
+  minimax_h3_fill_gaussian(out_latents, latent_floats, seed);
 
   uint32_t padded_seq = ((uint32_t)seq_len + TILE_M - 1) / TILE_M * TILE_M;
   uint32_t num_t = ref_count > 0 ? 2u : 1u;
@@ -1110,8 +1116,8 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
       gpu_bind_buffer(&cmd, 6, &ws.kh, 0);
       gpu_bind_buffer(&cmd, 7, &ws.vh, 0);
       gpu_copy_bytes(&cmd, 8, &heads_p, sizeof heads_p);
-      gpu_run_kernel(&cmd, (uint32_t)(3 * DIT_HEADS), padded_seq, 1,
-                     HEADS_THREADS, 1, 1);
+      gpu_run_kernel(&cmd, (uint32_t)(MINIMAX_H3_QKV_PARTS * DIT_HEADS),
+                     padded_seq, 1, HEADS_THREADS, 1, 1);
 
       gpu_select_kernel(&cmd, dit->k_attend);
       gpu_bind_buffer(&cmd, 0, &ws.qh, 0);
