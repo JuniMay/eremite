@@ -10,14 +10,17 @@
 // Maximum prompt tokens retained from the text prompt before encoding.
 static constexpr int MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS = 4096;
 
-// Spatial multiple in pixels required by the VAE (16x) and DiT (2x2 patch).
+// Spatial multiple in pixels required by the VAE (16x) and DiT (2x2 patch);
+// Comfy-Org/ComfyUI comfy_extras/nodes_minimax_h3.py:32 (CANVAS_MULTIPLE = 32).
 static constexpr int MINIMAX_H3_IMAGE_PATCH_PX = 32;
 
-// Minimum and maximum values accepted for min_generation_area in pixels.
+// Minimum and maximum values accepted for min_generation_area in pixels (one
+// 32x32 patch up to 4096x4096).
 static constexpr int MINIMAX_H3_IMAGE_MIN_AREA = 1024,
                      MINIMAX_H3_IMAGE_MAX_AREA = 16777216;
 
-// Default minimum generation canvas area in pixels (2048 by 2048).
+// Default minimum generation canvas area in pixels (2048 by 2048);
+// Comfy-Org/ComfyUI comfy_extras/nodes_minimax_h3.py:39 (IMAGE_SIZE = 2048).
 static constexpr int MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA = 4194304;
 
 // Maximum single-axis output or canvas dimension in pixels.
@@ -40,13 +43,15 @@ static constexpr int MINIMAX_H3_IMAGE_MAX_REFS = 16;
 // Default JPEG quality when an image request leaves quality unset.
 static constexpr int MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY = 95;
 
-// Required inference step count of the 6-step distilled PDD checkpoint.
+// Required inference step count of the distilled PDD checkpoint;
+// MiniMaxAI/MiniMax-H3-Image pdd_config.json:2 ("num_inference_steps": 6).
 static constexpr int MINIMAX_H3_IMAGE_STEPS = 6;
 
 // Required guidance scale of the CFG-free distilled checkpoint.
 static constexpr double MINIMAX_H3_IMAGE_GUIDANCE_SCALE = 1.0;
 
-// Vocabulary size of the Qwen3-VL tokenizer used by MiniMax-H3.
+// Vocabulary size of the Qwen3-VL tokenizer used by MiniMax-H3;
+// MiniMaxAI/MiniMax-H3-Image text_encoder/config.json:35 ("vocab_size").
 static constexpr int MINIMAX_H3_IMAGE_VOCAB = 151936;
 
 // Computes the generation canvas dimensions (positive multiples of 32 pixels)

@@ -143,6 +143,22 @@ int main(void) {
             text_max > text_small && vae_tile > 0,
         "workspace size estimates are positive and grow with canvas/prompt");
 
+  // Shared SplitMix64 + Box-Muller Gaussian RNG is deterministic and ~N(0, 1).
+  float g1[4096], g2[4096], g3[4096];
+  minimax_h3_fill_gaussian(g1, 4096, 42);
+  minimax_h3_fill_gaussian(g2, 4096, 42);
+  minimax_h3_fill_gaussian(g3, 4096, 43);
+  double sum = 0.0, sq = 0.0;
+  for (int i = 0; i < 4096; i++) {
+    sum += g1[i];
+    sq += (double)g1[i] * (double)g1[i];
+  }
+  double mean = sum / 4096.0;
+  double std = sqrt(sq / 4096.0 - mean * mean);
+  check(memcmp(g1, g2, sizeof g1) == 0 && memcmp(g1, g3, sizeof g1) != 0 &&
+            fabs(mean) < 0.1 && fabs(std - 1.0) < 0.1,
+        "shared Gaussian RNG is deterministic, seed-sensitive and ~N(0, 1)");
+
   printf("minimax_h3_image unit checks: %d failures\n", failures);
   return failures != 0;
 }

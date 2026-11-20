@@ -258,6 +258,8 @@ static float value(const uint8_t *bytes, int index, int dtype) {
   return result;
 }
 
+// Returns the byte width of one vector tensor element (2 for BF16/FP16, 4 for
+// FP32).
 static size_t vector_element_bytes(int dtype) {
   return dtype == 'b' || dtype == 'h' ? 2 : 4;
 }

@@ -30,6 +30,13 @@ static constexpr size_t PASS_STACK_BYTES = 1u << 20;
 // Maximum path buffer length in bytes when resolving checkpoint files.
 static constexpr size_t PATH_CAP = 2048;
 
+// Guard factor above MINIMAX_H3_IMAGE_MAX_DIM before rounding scaled canvas
+// axes: rejects extreme aspect ratios early while preventing int overflow.
+static constexpr double CANVAS_ASPECT_OVERSIZE_FACTOR = 2.0;
+
+// Bytes in one gibibyte for log messages.
+static constexpr double BYTES_PER_GIB = (double)(1ull << 30);
+
 // Shared GPU device for the active MiniMax-H3-Image model.
 static Gpu *model_gpu;
 
@@ -99,8 +106,8 @@ int minimax_h3_image_plan_canvas(int width, int height, int min_area,
   double scale = req_area < (double)area ? sqrt((double)area / req_area) : 1.0;
   double sw = (double)width * scale;
   double sh = (double)height * scale;
-  if (sw > (double)MINIMAX_H3_IMAGE_MAX_DIM * 2.0 ||
-      sh > (double)MINIMAX_H3_IMAGE_MAX_DIM * 2.0) {
+  if (sw > (double)MINIMAX_H3_IMAGE_MAX_DIM * CANVAS_ASPECT_OVERSIZE_FACTOR ||
+      sh > (double)MINIMAX_H3_IMAGE_MAX_DIM * CANVAS_ASPECT_OVERSIZE_FACTOR) {
     write_error(error, error_cap,
                 "aspect ratio exceeds the maximum canvas dimension");
     return 0;
@@ -175,6 +182,8 @@ static void pin_edit_groups(int pinned) {
                pinned);
 }
 
+// Opens MiniMax-H3-Image sub-models on first call and loads core T2I weights
+// in full-residence mode, falling back to staged loading if memory is short.
 static int minimax_h3_image_load(Gpu *gpu, MemorySlot *work, const char *dir,
                                  const Options *o) {
   if (!text_enc) {
@@ -242,13 +251,16 @@ static int minimax_h3_image_load(Gpu *gpu, MemorySlot *work, const char *dir,
   memory_pin(text_slot, 0);
   full_resident = 0;
   say("%s: full residence (%.1f GiB) did not fit; running staged (%.1f GiB)",
-      dir, (double)required_full_bytes / (double)(1ull << 30),
-      (double)required_staged_bytes / (double)(1ull << 30));
+      dir, (double)required_full_bytes / BYTES_PER_GIB,
+      (double)required_staged_bytes / BYTES_PER_GIB);
   return 1;
 }
 
+// Returns null because MiniMax-H3-Image manages multiple weight groups.
 static MemorySlot *minimax_h3_image_weight_slot(void) { return NULL; }
 
+// Returns nonzero when the required weight groups for the active residency
+// mode are resident in GPU memory.
 static int minimax_h3_image_is_loaded(void) {
   if (!text_enc || !dit || !vae) return 0;
   int text_ready = memory_ready(
@@ -260,6 +272,7 @@ static int minimax_h3_image_is_loaded(void) {
   return text_ready || dit_ready || vae_ready;
 }
 
+// Pins core weight groups while a request runs and unpins all groups when idle.
 static void minimax_h3_image_set_request_running(int running) {
   if (running) {
     if (full_resident) pin_core_groups(1);
@@ -269,6 +282,8 @@ static void minimax_h3_image_set_request_running(int running) {
   pin_edit_groups(0);
 }
 
+// Copies MiniMax-H3-Image counters, live stage progress and resident weight
+// bytes into c.
 static void minimax_h3_image_read_counters(ModelCounters *c) {
   uint64_t resident = 0;
   if (text_enc) resident += minimax_h3_text_encoder_resident_bytes(text_enc);
@@ -293,8 +308,10 @@ static void minimax_h3_image_read_counters(ModelCounters *c) {
                        .required_bytes = required_staged_bytes};
 }
 
+// Returns the Qwen3-VL tokenizer vocabulary size.
 static int minimax_h3_image_vocab_size(void) { return MINIMAX_H3_IMAGE_VOCAB; }
 
+// Returns 0 because MiniMax-H3-Image has no routed expert cache.
 static int minimax_h3_image_run_idle_work(void) { return 0; }
 
 // Writes a runtime failure message matching cancellation, shutdown or OOM.
@@ -309,6 +326,8 @@ static void set_runtime_error(ImageResult *out,
                 "image generation failed: memory is short");
 }
 
+// Runs one text-to-image or reference editing pass and writes the encoded PNG
+// or JPEG bytes and stage timings into out.
 static int minimax_h3_image_generate(const ImageRequest *req,
                                      const PassWait *wait, const int *cancelled,
                                      ImageResult *out) {
@@ -501,7 +520,8 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     ok = minimax_h3_image_vae_load(vae);
   }
   if (ok) {
-    canvas_rgb = xmalloc((size_t)canvas_w * (size_t)canvas_h * 3u);
+    canvas_rgb = xmalloc((size_t)canvas_w * (size_t)canvas_h *
+                         (size_t)MINIMAX_H3_RGB_CHANNELS);
     ok = minimax_h3_image_vae_decode(vae, out_lat, h_lat, w_lat, canvas_rgb,
                                      &hooks);
   }
@@ -571,17 +591,23 @@ static void minimax_h3_image_read_limits(ImageLimits *out) {
       .guidance_scale = MINIMAX_H3_IMAGE_GUIDANCE_SCALE};
 }
 
+// Allocates a cooperative engine pass with stack space for image generation.
 static Pass *minimax_h3_image_pass_new(void (*body)(void *), void *argument) {
   return pass_new(body, argument, PASS_STACK_BYTES);
 }
 
+// Starts a cooperative image pass (no per-pass bindings required).
 static void minimax_h3_image_pass_begin(void) {}
 
+// Ends a cooperative image pass (no per-pass bindings to release).
 static void minimax_h3_image_pass_end(void) {}
 
+// Checkpoint _class_name and model_type identifiers handled by
+// MiniMax-H3-Image.
 static const char *const minimax_h3_image_types[] = {"MiniMaxH3ImagePipeline",
                                                      "minimax_h3_image", 0};
 
+// ModelOps table registering MiniMax-H3-Image with the engine.
 const ModelOps minimax_h3_image_ops = {
     .family = "MiniMax-H3-Image",
     .model_types = minimax_h3_image_types,

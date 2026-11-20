@@ -4,6 +4,7 @@
 #include "engine/io.h"
 #include "engine/pass.h"
 #include <errno.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -20,6 +21,50 @@ static constexpr size_t SCALE_TILE_BYTES =
 
 // Maximum bytes read per uncached sector-aligned pread call.
 static constexpr size_t READ_CHUNK_BYTES = 16u << 20;
+
+// SplitMix64 Weyl sequence increment and Stafford Mix13 mixing multipliers.
+static constexpr uint64_t SPLITMIX64_GAMMA = 0x9e3779b97f4a7c15ull,
+                          SPLITMIX64_MUL1 = 0xbf58476d1ce4e5b9ull,
+                          SPLITMIX64_MUL2 = 0x94d049bb133111ebull;
+
+// SplitMix64 right-shift amounts for the three avalanche steps.
+static constexpr unsigned SPLITMIX64_SHIFT1 = 30, SPLITMIX64_SHIFT2 = 27,
+                          SPLITMIX64_SHIFT3 = 31;
+
+// Right shift extracting the top 53 mantissa bits for IEEE-754 double draws.
+static constexpr unsigned DOUBLE_MANTISSA_SHIFT = 11;
+
+// Scale turning a 53-bit integer into a double in [0, 1).
+static constexpr double INV_2_53 = 1.0 / 9007199254740992.0;
+
+// Half-ULP offset keeping Box-Muller's first uniform draw strictly above 0.
+static constexpr double UNIFORM_HALF_STEP = 0.5;
+
+// Full circle in radians for Box-Muller's polar angle.
+static constexpr double TWO_PI = 6.28318530717958647692;
+
+// Advances SplitMix64 state and returns the next 64-bit pseudorandom integer.
+static uint64_t splitmix64_next(uint64_t *state) {
+  uint64_t z = (*state += SPLITMIX64_GAMMA);
+  z = (z ^ (z >> SPLITMIX64_SHIFT1)) * SPLITMIX64_MUL1;
+  z = (z ^ (z >> SPLITMIX64_SHIFT2)) * SPLITMIX64_MUL2;
+  return z ^ (z >> SPLITMIX64_SHIFT3);
+}
+
+void minimax_h3_fill_gaussian(float *out, size_t count, uint64_t seed) {
+  uint64_t state = seed;
+  for (size_t i = 0; i < count; i += 2) {
+    double u1 = ((double)(splitmix64_next(&state) >> DOUBLE_MANTISSA_SHIFT) +
+                 UNIFORM_HALF_STEP) *
+                INV_2_53;
+    double u2 =
+        (double)(splitmix64_next(&state) >> DOUBLE_MANTISSA_SHIFT) * INV_2_53;
+    double r = sqrt(-2.0 * log(u1));
+    double theta = TWO_PI * u2;
+    out[i] = (float)(r * cos(theta));
+    if (i + 1 < count) out[i + 1] = (float)(r * sin(theta));
+  }
+}
 
 // Parameters stored by a WeightGroup entry that unswizzles NVFP4 scales.
 typedef struct {

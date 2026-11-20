@@ -19,6 +19,25 @@ static constexpr int MINIMAX_H3_NVFP4_GROUP = 16;
 // Number of input channels rotated together by ConvRot's regular Hadamard.
 static constexpr int MINIMAX_H3_CONVROT_GROUP = 256;
 
+// Color channels in one 8-bit sRGB pixel (red, green, blue).
+static constexpr int MINIMAX_H3_RGB_CHANNELS = 3;
+
+// Spatial-temporal position axes for 3D RoPE and M-RoPE (time, height, width).
+static constexpr int MINIMAX_H3_POS_AXES = 3;
+
+// Projections packed in one fused QKV linear output (query, key, value).
+static constexpr int MINIMAX_H3_QKV_PARTS = 3;
+
+// Maximum value of one unsigned 8-bit pixel channel.
+static constexpr float MINIMAX_H3_PIXEL_MAX = 255.0f;
+
+// Stack buffer length in bytes for formatting checkpoint tensor names.
+static constexpr size_t MINIMAX_H3_NAME_CAP = 128;
+
+// Fills count floats with deterministic standard normal N(0, 1) draws seeded
+// by seed, using SplitMix64 uniform draws and the Box-Muller transform.
+void minimax_h3_fill_gaussian(float *out, size_t count, uint64_t seed);
+
 // Unswizzles a cuBLASLt blocked E4M3 scale matrix into row-major order of rows
 // by cols bytes. blocked must hold ceil(rows / 128) * 128 by
 // ceil(cols / 4) * 4 bytes.
