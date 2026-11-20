@@ -68,16 +68,17 @@ kernel void minimax_h3_mm_bf16(device const bfloat *w [[buffer(0)]],
                                constant MinimaxH3Bf16MM &p [[buffer(4)]],
                                uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr auto desc =
-      matmul2d_descriptor(64, 64, static_cast<int>(dynamic_extent), false, true,
-                          false, matmul2d_descriptor::mode::multiply);
-  matmul2d<desc, execution_simdgroups<4>> op;
+      matmul2d_descriptor(MINIMAX_H3_DIT_TILE_M, MINIMAX_H3_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
   uint padded_m = (p.m + MINIMAX_H3_DIT_TILE_M - 1u) / MINIMAX_H3_DIT_TILE_M *
                   MINIMAX_H3_DIT_TILE_M;
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tx(
       (device bfloat *)xb, dextents<int32_t, 2>(p.k, padded_m));
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tw(
       (device bfloat *)w, dextents<int32_t, 2>(p.k, p.n));
-  uint m0 = tg.y * 64u, n0 = tg.x * 64u;
+  uint m0 = tg.y * MINIMAX_H3_DIT_TILE_M, n0 = tg.x * MINIMAX_H3_TILE_N;
   auto a = tx.slice(0, m0);
   auto b = tw.slice(0, n0);
   auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
@@ -107,7 +108,7 @@ kernel void minimax_h3_mm_f32(device const float *w [[buffer(0)]],
   device const float *xr = x + row * p.k;
   device const float *wr = w + col * p.k;
   float sum = 0.0f;
-  for (uint j = lane; j < p.k; j += 32u) sum += xr[j] * wr[j];
+  for (uint j = lane; j < p.k; j += MINIMAX_H3_SIMD_WIDTH) sum += xr[j] * wr[j];
   sum = simd_sum(sum);
   if (lane == 0u) y[row * p.ldy + col] = sum + bias[col];
 }
@@ -142,7 +143,7 @@ kernel void minimax_h3_dit_norm_mod(device const float *x [[buffer(0)]],
                                     uint row [[threadgroup_position_in_grid]],
                                     uint t [[thread_index_in_threadgroup]],
                                     uint nt [[threads_per_threadgroup]]) {
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   device const float *xr = x + row * p.dim;
   device float *yr = y + row * p.dim;
   float ss = 0.0f;
@@ -198,8 +199,8 @@ kernel void minimax_h3_dit_heads(device const float *qkv [[buffer(0)]],
   }
 
   device const float *src =
-      qkv + row * (3u * MINIMAX_H3_DIT_INNER) + kind * MINIMAX_H3_DIT_INNER +
-      h * MINIMAX_H3_DIT_HEAD_DIM;
+      qkv + row * (MINIMAX_H3_QKV_PARTS * MINIMAX_H3_DIT_INNER) +
+      kind * MINIMAX_H3_DIT_INNER + h * MINIMAX_H3_DIT_HEAD_DIM;
   float a = src[t];
   float b = src[t + MINIMAX_H3_DIT_HALF_HEAD];
   if (kind == 2u) {
@@ -208,7 +209,7 @@ kernel void minimax_h3_dit_heads(device const float *qkv [[buffer(0)]],
     return;
   }
 
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   threadgroup float hnorm[MINIMAX_H3_DIT_HEAD_DIM];
   device const float *w = kind == 0u ? q_norm : k_norm;
   float r = rsqrt(tg_sum(a * a + b * b, tmp, t, MINIMAX_H3_DIT_HALF_HEAD) /
@@ -229,7 +230,7 @@ kernel void minimax_h3_dit_heads(device const float *qkv [[buffer(0)]],
   if (t < MINIMAX_H3_DIT_ROT_PAIRS) {
     uint axis = t / MINIMAX_H3_DIT_ROPE_FREQS;
     uint fi = t % MINIMAX_H3_DIT_ROPE_FREQS;
-    float angle = pos[row * 3u + axis] * inv_freq[fi];
+    float angle = pos[row * MINIMAX_H3_POS_AXES + axis] * inv_freq[fi];
     float c = cos(angle), s = sin(angle);
     float u0 = hnorm[t], u1 = hnorm[t + MINIMAX_H3_DIT_ROT_PAIRS];
     dst[t] = bfloat(u0 * c - u1 * s);

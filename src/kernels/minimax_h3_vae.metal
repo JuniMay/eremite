@@ -23,6 +23,9 @@ constant constexpr uint MINIMAX_H3_VAE_LATENT_CH = 24,
 // 2 * pi factor applied to normalized [-1, 1] patch coordinates in VAE RoPE.
 constant constexpr float MINIMAX_H3_VAE_TWO_PI = 6.28318530717958647692f;
 
+// Center offset of a discrete spatial cell when mapping grid indices to [-1, 1].
+constant constexpr float MINIMAX_H3_VAE_CELL_CENTER = 0.5f;
+
 // Parameters for converting FP32 activations to padded FP16 rows.
 struct MinimaxH3F16X {
   uint m, k, lda;
@@ -92,17 +95,19 @@ kernel void minimax_h3_mm_f16(device const half *w [[buffer(0)]],
                               constant MinimaxH3F16MM &p [[buffer(4)]],
                               uint2 tg [[threadgroup_position_in_grid]]) {
   constexpr auto desc =
-      matmul2d_descriptor(64, 64, static_cast<int>(dynamic_extent), false, true,
-                          false, matmul2d_descriptor::mode::multiply);
-  matmul2d<desc, execution_simdgroups<4>> op;
+      matmul2d_descriptor(MINIMAX_H3_VAE_TILE_M, MINIMAX_H3_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
   uint padded_m = (p.m + MINIMAX_H3_VAE_TILE_M - 1u) / MINIMAX_H3_VAE_TILE_M *
                   MINIMAX_H3_VAE_TILE_M;
-  uint padded_n = (p.n + 63u) / 64u * 64u;
+  uint padded_n = (p.n + MINIMAX_H3_TILE_N - 1u) / MINIMAX_H3_TILE_N *
+                  MINIMAX_H3_TILE_N;
   tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(
       (device half *)xh, dextents<int32_t, 2>(p.k, padded_m));
   tensor<device half, dextents<int32_t, 2>, tensor_inline> tw(
       (device half *)w, dextents<int32_t, 2>(p.k, padded_n));
-  uint m0 = tg.y * 64u, n0 = tg.x * 64u;
+  uint m0 = tg.y * MINIMAX_H3_VAE_TILE_M, n0 = tg.x * MINIMAX_H3_TILE_N;
   auto a = tx.slice(0, m0);
   auto b = tw.slice(0, n0);
   auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
@@ -150,7 +155,7 @@ kernel void minimax_h3_layernorm(device const float *x [[buffer(0)]],
                                  uint row [[threadgroup_position_in_grid]],
                                  uint t [[thread_index_in_threadgroup]],
                                  uint nt [[threads_per_threadgroup]]) {
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   x += row * p.n;
   y += row * p.n;
   float sum = 0.0f;
@@ -236,8 +241,8 @@ kernel void minimax_h3_vae_heads(device const float *qkv [[buffer(0)]],
   }
 
   device const float *src =
-      qkv + row * (3u * MINIMAX_H3_VAE_DIM) +
-      (h * 3u + kind) * MINIMAX_H3_VAE_HEAD_DIM;
+      qkv + row * (MINIMAX_H3_QKV_PARTS * MINIMAX_H3_VAE_DIM) +
+      (h * MINIMAX_H3_QKV_PARTS + kind) * MINIMAX_H3_VAE_HEAD_DIM;
   float a = src[lane];
   float b = src[lane + MINIMAX_H3_VAE_HALF_HEAD];
   if (kind == 2u) {
@@ -257,8 +262,12 @@ kernel void minimax_h3_vae_heads(device const float *qkv [[buffer(0)]],
   uint patches = p.h_lat * p.w_lat;
   if (row < patches) {
     uint py = row / p.w_lat, px = row % p.w_lat;
-    float cy = ((float(py) + 0.5f) / float(p.h_lat)) * 2.0f - 1.0f;
-    float cx = ((float(px) + 0.5f) / float(p.w_lat)) * 2.0f - 1.0f;
+    float cy =
+        ((float(py) + MINIMAX_H3_VAE_CELL_CENTER) / float(p.h_lat)) * 2.0f -
+        1.0f;
+    float cx =
+        ((float(px) + MINIMAX_H3_VAE_CELL_CENTER) / float(p.w_lat)) * 2.0f -
+        1.0f;
     uint pair = lane & (MINIMAX_H3_VAE_ROT_PAIRS - 1u);
     float coord = pair < MINIMAX_H3_VAE_FREQ_PER_AXIS ? cy : cx;
     uint fi = pair < MINIMAX_H3_VAE_FREQ_PER_AXIS
@@ -409,7 +418,7 @@ kernel void minimax_h3_groupnorm_silu(device const float *x [[buffer(0)]],
                                       uint g [[threadgroup_position_in_grid]],
                                       uint t [[thread_index_in_threadgroup]],
                                       uint nt [[threads_per_threadgroup]]) {
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   uint gc = p.channels / p.groups;
   uint c0 = g * gc;
   uint count = p.hw * gc;

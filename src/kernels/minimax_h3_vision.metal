@@ -12,6 +12,7 @@ constant constexpr uint MINIMAX_H3_VIS_DIM = 1152,
                         MINIMAX_H3_VIS_HALF_HEAD = 36,
                         MINIMAX_H3_VIS_FREQS = 18,
                         MINIMAX_H3_VIS_PAD_HEAD = 128,
+                        MINIMAX_H3_VIS_PAD_HALF = MINIMAX_H3_VIS_PAD_HEAD / 2,
                         MINIMAX_H3_VIS_POS_SIDE = 48,
                         MINIMAX_H3_VIS_ATTN_ROWS = 16,
                         MINIMAX_H3_VIS_ATTN_KEYS = 64,
@@ -86,16 +87,22 @@ kernel void minimax_h3_gelu_tanh(device float *x [[buffer(0)]],
   x[i] = 0.5f * v * (1.0f + tanh(inner));
 }
 
-// High-precision erf approximation (Abramowitz & Stegun 7.1.26, max error
+// High-precision erf approximation (Abramowitz and Stegun 7.1.26, max error
 // 1.5e-7) for exact GELU in Qwen3-VL patch mergers.
 inline float minimax_h3_erf(float x) {
+  // Polynomial argument scale p and coefficients a1..a5 from A&S 7.1.26.
+  constexpr float ERF_P = 0.3275911f;
+  constexpr float ERF_A1 = 0.254829592f;
+  constexpr float ERF_A2 = -0.284496736f;
+  constexpr float ERF_A3 = 1.421413741f;
+  constexpr float ERF_A4 = -1.453152027f;
+  constexpr float ERF_A5 = 1.061405429f;
   float s = x < 0.0f ? -1.0f : 1.0f;
   float a = fabs(x);
-  float t = 1.0f / (1.0f + 0.3275911f * a);
-  float poly = t * (0.254829592f +
-                    t * (-0.284496736f +
-                         t * (1.421413741f +
-                              t * (-1.453152027f + t * 1.061405429f))));
+  float t = 1.0f / (1.0f + ERF_P * a);
+  float poly = t * (ERF_A1 +
+                    t * (ERF_A2 +
+                         t * (ERF_A3 + t * (ERF_A4 + t * ERF_A5))));
   return s * (1.0f - poly * exp(-a * a));
 }
 
@@ -128,16 +135,16 @@ kernel void minimax_h3_vis_heads(device const float *qkv [[buffer(0)]],
                        (h * p.padded + row) * MINIMAX_H3_VIS_PAD_HEAD;
   if (row >= p.rows) {
     dst[t] = bfloat(0.0f);
-    dst[t + 64u] = bfloat(0.0f);
+    dst[t + MINIMAX_H3_VIS_PAD_HALF] = bfloat(0.0f);
     return;
   }
 
   device const float *src =
-      qkv + row * (3u * MINIMAX_H3_VIS_DIM) + kind * MINIMAX_H3_VIS_DIM +
-      h * MINIMAX_H3_VIS_HEAD_DIM;
+      qkv + row * (MINIMAX_H3_QKV_PARTS * MINIMAX_H3_VIS_DIM) +
+      kind * MINIMAX_H3_VIS_DIM + h * MINIMAX_H3_VIS_HEAD_DIM;
   if (kind == 2u) {
     dst[t] = bfloat(src[t]);
-    uint hi = t + 64u;
+    uint hi = t + MINIMAX_H3_VIS_PAD_HALF;
     dst[hi] = hi < MINIMAX_H3_VIS_HEAD_DIM ? bfloat(src[hi]) : bfloat(0.0f);
     return;
   }
@@ -156,7 +163,7 @@ kernel void minimax_h3_vis_heads(device const float *qkv [[buffer(0)]],
     dst[t] = bfloat(u0 * cs - u1 * sn);
     dst[t + MINIMAX_H3_VIS_HALF_HEAD] = bfloat(u1 * cs + u0 * sn);
   }
-  uint hi = t + 64u;
+  uint hi = t + MINIMAX_H3_VIS_PAD_HALF;
   if (hi >= MINIMAX_H3_VIS_HEAD_DIM) dst[hi] = bfloat(0.0f);
 }
 

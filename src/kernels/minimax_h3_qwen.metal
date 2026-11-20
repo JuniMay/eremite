@@ -56,7 +56,7 @@ kernel void minimax_h3_rmsnorm(device const float *x [[buffer(0)]],
                                uint row [[threadgroup_position_in_grid]],
                                uint t [[thread_index_in_threadgroup]],
                                uint nt [[threads_per_threadgroup]]) {
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   x += row * p.n;
   y += row * p.n;
   float ss = 0.0f;
@@ -142,7 +142,7 @@ kernel void minimax_h3_qwen_heads(device const float *q [[buffer(0)]],
     return;
   }
 
-  threadgroup float tmp[32];
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
   device const float *src =
       is_q ? q + row * MINIMAX_H3_QWEN_Q_WIDTH + h * MINIMAX_H3_QWEN_HEAD_DIM
            : k + row * MINIMAX_H3_QWEN_KV_WIDTH + h * MINIMAX_H3_QWEN_HEAD_DIM;
@@ -158,11 +158,11 @@ kernel void minimax_h3_qwen_heads(device const float *q [[buffer(0)]],
   // axis 0 (T) everywhere else.
   uint axis = 0;
   if (t < MINIMAX_H3_QWEN_MROPE_INTERLEAVE_END) {
-    uint mod3 = t % 3u;
-    if (mod3 == 1u) axis = 1u;
-    else if (mod3 == 2u) axis = 2u;
+    uint mod = t % MINIMAX_H3_POS_AXES;
+    if (mod == 1u) axis = 1u;
+    else if (mod == 2u) axis = 2u;
   }
-  float angle = float(pos_ids[row * 3u + axis]) * inv_freq[t];
+  float angle = float(pos_ids[row * MINIMAX_H3_POS_AXES + axis]) * inv_freq[t];
   float c = cos(angle), s = sin(angle);
   float rot_a = a * c - b * s;
   float rot_b = b * c + a * s;
