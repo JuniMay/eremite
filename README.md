@@ -49,8 +49,12 @@ against the reference tokenizer's ids.
 DeepSeek V4.1 Flash's checkpoint (510 GB) into
 `FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017`, the routed experts of its
 UD-IQ2_XXS GGUF quantization (165 GB) into
-`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, and LiquidAI's
-d1-2B decision model (3.9 GB) into `FOLDER/LiquidAI/d1-2B`. Other
+`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, LiquidAI's
+d1-2B decision model (3.9 GB) into `FOLDER/LiquidAI/d1-2B`, and
+MiniMax-H3-Image's metadata and tokenizer (23 MB) into
+`FOLDER/MiniMaxAI/MiniMax-H3-Image` with Comfy-Org's quantized checkpoints into
+`FOLDER/Comfy-Org/MiniMax-H3` (15.7 GB text and vision encoder) and
+`FOLDER/Comfy-Org/MiniMax-H3-Image` (21.0 GB DiT and 1.2 GB VAE). Other
 quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists the
 files without downloading them. It needs Python 3.10 or later, and runs again
 from where an interrupted download stopped.
