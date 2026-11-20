@@ -11,15 +11,39 @@
 
 // Every tensor of every file, by name, in a hash table with linear probing.
 
+// The initial capacity when storing header metadata entries.
+static constexpr size_t METADATA_INITIAL_CAPACITY = 8;
+
+// A tensor entry in the hash table.
 typedef struct {
+  // The tensor's name.
   const char *name;
+  // The tensor's location, type and shape.
   Tensor t;
 } Entry;
 
+// A string entry from a header's __metadata__ object.
+typedef struct {
+  // The entry's key.
+  char *key;
+  // The entry's string value.
+  char *value;
+} Metadata;
+
+// A checkpoint's tensor table, open files and header metadata.
 struct TensorIndex {
+  // Open-addressed table of tensors by name.
   Entry *table;
+  // Number of slots in table, always a power of two.
   size_t capacity;
-  int *fds, nfiles;
+  // Open file descriptors for the checkpoint's safetensors files.
+  int *fds;
+  // Number of open file descriptors in fds.
+  int nfiles;
+  // Header metadata entries read from the opened files.
+  Metadata *metadata;
+  // Number of stored metadata entries and the allocated capacity.
+  size_t metadata_count, metadata_capacity;
 };
 
 static uint64_t hash(const char *s) {
@@ -50,11 +74,34 @@ static Json *tensor_header(const char *path, int *fd, uint64_t *bytes) {
 
 static TensorIndex *tensor_index(size_t count) {
   TensorIndex *index = xmalloc(sizeof *index);
+  size_t slots = count ? count : 1;
   index->capacity = 1;
-  while (index->capacity < 2 * count) index->capacity *= 2;
+  while (index->capacity < 2 * slots) index->capacity *= 2;
   index->table = xmalloc(index->capacity * sizeof *index->table);
-  index->fds = xmalloc(count * sizeof *index->fds);
+  index->fds = xmalloc(slots * sizeof *index->fds);
   return index;
+}
+
+// Records string entries from a header's __metadata__ object; an earlier file's
+// value for the same key is kept.
+static void index_metadata(TensorIndex *index, const Json *meta) {
+  if (meta->type != J_OBJ) return;
+  for (int i = 0; i < meta->n; i++) {
+    const Json *entry = &meta->kid[i];
+    if (entry->type != J_STR || !entry->key || !entry->s) continue;
+    if (tensor_index_metadata(index, entry->key)) continue;
+    if (index->metadata_count == index->metadata_capacity) {
+      size_t next = index->metadata_capacity ? index->metadata_capacity * 2
+                                             : METADATA_INITIAL_CAPACITY;
+      Metadata *grown = realloc(index->metadata, next * sizeof *grown);
+      if (!grown) die("out of memory for safetensors metadata");
+      index->metadata = grown;
+      index->metadata_capacity = next;
+    }
+    char *key = strdup(entry->key), *value = strdup(entry->s);
+    if (!key || !value) die("out of memory for safetensors metadata");
+    index->metadata[index->metadata_count++] = (Metadata){key, value};
+  }
 }
 
 // Adds a file's tensors; a name that an earlier file gave keeps its tensor.
@@ -62,7 +109,10 @@ static void index_tensors(TensorIndex *index, Json *hdr, int fd, uint64_t n) {
   index->fds[index->nfiles++] = fd;
   for (int k = 0; k < hdr->n; k++) {
     Json *e = &hdr->kid[k];
-    if (!strcmp(e->key, "__metadata__")) continue;
+    if (!strcmp(e->key, "__metadata__")) {
+      index_metadata(index, e);
+      continue;
+    }
     Entry *en = slot(index, e->key);
     if (en->name) continue;
     en->name = strdup(e->key);
@@ -74,6 +124,7 @@ static void index_tensors(TensorIndex *index, Json *hdr, int fd, uint64_t n) {
     t->off = 8 + n + (uint64_t)of->kid[0].num;
     t->size = (uint64_t)of->kid[1].num - (uint64_t)of->kid[0].num;
     t->dtype = !strcmp(dt, "BF16")      ? 'b'
+               : !strcmp(dt, "F16")     ? 'h'
                : !strcmp(dt, "F32")     ? 'f'
                : !strcmp(dt, "F8_E4M3") ? '8'
                : !strcmp(dt, "F8_E8M0") ? 'e'
@@ -83,10 +134,19 @@ static void index_tensors(TensorIndex *index, Json *hdr, int fd, uint64_t n) {
                : !strcmp(dt, "I64")     ? 'l'
                                         : '?';
     t->ndim = sh->n;
-    for (int d = 0; d < sh->n && d < 4; d++)
+    for (int d = 0; d < sh->n && d < TENSOR_MAX_DIMS; d++)
       t->shape[d] = (int64_t)sh->kid[d].num;
   }
   json_free(hdr);
+}
+
+TensorIndex *tensor_index_open_file(const char *path) {
+  int fd;
+  uint64_t bytes;
+  Json *header = tensor_header(path, &fd, &bytes);
+  TensorIndex *index = tensor_index((size_t)header->n);
+  index_tensors(index, header, fd, bytes);
+  return index;
 }
 
 TensorIndex *tensor_index_open(const char *dir) {
@@ -94,12 +154,7 @@ TensorIndex *tensor_index_open(const char *dir) {
   snprintf(path, sizeof path, "%s/model.safetensors.index.json", dir);
   if (access(path, R_OK)) {
     snprintf(path, sizeof path, "%s/model.safetensors", dir);
-    int fd;
-    uint64_t bytes;
-    Json *header = tensor_header(path, &fd, &bytes);
-    TensorIndex *index = tensor_index(header->n);
-    index_tensors(index, header, fd, bytes);
-    return index;
+    return tensor_index_open_file(path);
   }
   char *text = read_file(path, NULL);
   Json *root = json_parse(text), *map = json_get(root, "weight_map");
@@ -129,8 +184,18 @@ void tensor_index_close(TensorIndex *index) {
   if (!index) return;
   for (size_t i = 0; i < index->capacity; i++)
     free((char *)index->table[i].name);
+  for (size_t i = 0; i < index->metadata_count; i++) {
+    free(index->metadata[i].key);
+    free(index->metadata[i].value);
+  }
   for (int i = 0; i < index->nfiles; i++) close(index->fds[i]);
-  free(index->table), free(index->fds), free(index);
+  free(index->metadata), free(index->table), free(index->fds), free(index);
+}
+
+const char *tensor_index_metadata(const TensorIndex *index, const char *key) {
+  for (size_t i = 0; i < index->metadata_count; i++)
+    if (!strcmp(index->metadata[i].key, key)) return index->metadata[i].value;
+  return NULL;
 }
 
 Tensor tensor_index_get(const TensorIndex *index, const char *fmt, ...) {

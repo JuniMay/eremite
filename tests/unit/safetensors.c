@@ -35,6 +35,7 @@ static void remove_files(const char *dir, const char *const *names, int count) {
 int main(void) {
   char dir[] = "/tmp/eremite-safetensors-XXXXXX";
   if (!mkdtemp(dir)) return 1;
+  char path[256];
   const char single[] =
       "{\"__metadata__\":{\"format\":\"pt\"},"
       "\"a\":{\"dtype\":\"BF16\",\"shape\":[2,3],\"data_offsets\":[0,12]},"
@@ -53,10 +54,32 @@ int main(void) {
         "the next tensor's bytes follow");
   check(tensor_index_has(index, "a") && !tensor_index_has(index, "c"),
         "the index has the header's tensors and no others");
+  const char *format = tensor_index_metadata(index, "format");
+  check(format && !strcmp(format, "pt") &&
+            !tensor_index_metadata(index, "missing"),
+        "header metadata strings are read by key");
   uint8_t read_back[16];
   check(pread(b.fd, read_back, 16, (off_t)b.off) == 16 &&
             !memcmp(read_back, data + 12, 16),
         "the tensor's file holds its bytes at its offset");
+
+  // A standalone file opened by path, with an F16 5D tensor and JSON metadata.
+  const char standalone[] =
+      "{\"__metadata__\":{\"config\":\"{\\\"steps\\\":6}\"},"
+      "\"conv\":{\"dtype\":\"F16\",\"shape\":[2,1,1,2,3],"
+      "\"data_offsets\":[0,24]}}";
+  write_file(dir, "weights.safetensors", standalone, data, 24);
+  snprintf(path, sizeof path, "%s/weights.safetensors", dir);
+  TensorIndex *direct = tensor_index_open_file(path);
+  Tensor conv = tensor_index_get(direct, "conv");
+  check(conv.dtype == 'h' && conv.ndim == 5 && conv.shape[0] == 2 &&
+            conv.shape[1] == 1 && conv.shape[2] == 1 && conv.shape[3] == 2 &&
+            conv.shape[4] == 3 && conv.size == 24,
+        "a single file opens by path with F16 dtype and five dimensions");
+  const char *config = tensor_index_metadata(direct, "config");
+  check(config && !strcmp(config, "{\"steps\":6}"),
+        "a single file exposes its header metadata");
+  tensor_index_close(direct);
 
   // A sharded checkpoint, opened while the first stays open.
   char sharded[256];
@@ -65,7 +88,6 @@ int main(void) {
   const char *index_json = "{\"metadata\":{},\"weight_map\":{\"x\":\"one."
                            "safetensors\",\"y\":\"two.safetensors\","
                            "\"z\":\"one.safetensors\"}}";
-  char path[256];
   snprintf(path, sizeof path, "%s/model.safetensors.index.json", sharded);
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0 ||
@@ -108,7 +130,9 @@ int main(void) {
                                      "one.safetensors", "two.safetensors"},
                3);
   rmdir(sharded);
-  remove_files(dir, (const char *const[]){"model.safetensors"}, 1);
+  remove_files(
+      dir, (const char *const[]){"model.safetensors", "weights.safetensors"},
+      2);
   rmdir(dir);
   return failures != 0;
 }
