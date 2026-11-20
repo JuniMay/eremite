@@ -159,7 +159,7 @@ static void add_nvfp4_lin(WeightGroup *group, const TensorIndex *tensors,
   lin->n = n;
   lin->k = k;
   lin->scale2 = minimax_h3_read_scalar_f32(s2);
-  weight_group_add_tensor(group, &lin->w, w, 1);
+  weight_group_add_tensor(group, &lin->w, w, 0);
   minimax_h3_nvfp4_scales_add(group, &lin->scale, s, n,
                               k / MINIMAX_H3_NVFP4_GROUP);
   lin->has_pre_scale = tensor_index_has(tensors, "%s.pre_quant_scale", prefix);
@@ -201,7 +201,7 @@ MinimaxH3TextEncoder *minimax_h3_text_encoder_open(Gpu *gpu,
     die("unexpected Qwen3-VL embed_tokens.weight shape");
   if (es.dtype != 'f' || es.shape[0] != QWEN_VOCAB)
     die("unexpected Qwen3-VL embed_tokens.weight_scale shape");
-  weight_group_add_tensor(enc->weights, &enc->embed_w, ew, 1);
+  weight_group_add_tensor(enc->weights, &enc->embed_w, ew, 0);
   weight_group_add_tensor(enc->weights, &enc->embed_scale, es, 0);
   weight_group_add_generated(enc->weights, &enc->inv_freq,
                              (size_t)QWEN_ROPE_PAIRS * sizeof(float),
@@ -398,7 +398,7 @@ static void run_nvfp4_from_xb(const MinimaxH3TextEncoder *enc,
   Nvfp4MMParam mp = {(uint32_t)seq_len, (uint32_t)lin->n, (uint32_t)lin->k,
                      (uint32_t)lin->n, lin->scale2};
   gpu_select_kernel(cmd, enc->k_mm_nvfp4);
-  gpu_bind_buffer(cmd, 0, &lin->w, lin->w.off);
+  gpu_bind_buffer(cmd, 0, &lin->w, 0);
   gpu_bind_buffer(cmd, 1, &lin->scale, 0);
   gpu_bind_buffer(cmd, 2, xb, 0);
   gpu_bind_buffer(cmd, 3, y, 0);
@@ -477,7 +477,7 @@ int minimax_h3_text_encoder_encode_tokens(
   // Token embedding lookup (skips negative IDs pre-filled by embeds_override).
   GpuCommandBuffer cmd = gpu_begin(enc->gpu);
   gpu_select_kernel(&cmd, enc->k_embed);
-  gpu_bind_buffer(&cmd, 0, &enc->embed_w, enc->embed_w.off);
+  gpu_bind_buffer(&cmd, 0, &enc->embed_w, 0);
   gpu_bind_buffer(&cmd, 1, &enc->embed_scale, 0);
   gpu_bind_buffer(&cmd, 2, &ws.ids, 0);
   gpu_bind_buffer(&cmd, 3, out_hidden, 0);
