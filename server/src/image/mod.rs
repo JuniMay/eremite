@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+use crate::worker::ImageSize;
 use crate::{chat, engine, http};
 
 /// Default served model id for MiniMax-H3-Image when `id` is omitted.
@@ -34,10 +35,8 @@ pub struct ParsedRequest {
     pub model: Option<String>,
     /// Raw prompt string passed verbatim to MiniMax-H3-Image.
     pub prompt: String,
-    /// Exact requested output width in pixels.
-    pub width: i32,
-    /// Exact requested output height in pixels.
-    pub height: i32,
+    /// The output size that the request asks for.
+    pub size: ImageSize,
     /// Number of images to produce (`n`).
     pub count: usize,
     /// Deterministic RNG seed for the first image (`seed + i` for later ones).
@@ -52,12 +51,16 @@ pub struct ParsedRequest {
     pub references: Vec<Vec<u8>>,
 }
 
-/// Parses a `WIDTHxHEIGHT` size string into validated pixel dimensions.
-fn parse_size(raw: &str, limits: &engine::ImageLimits) -> Result<(i32, i32), chat::Error> {
-    let trimmed = raw.trim();
+/// Parses a request's `size`: omitted or `auto` asks the server to pick it,
+/// and `WIDTHxHEIGHT` gives validated pixel dimensions.
+fn parse_size(raw: Option<&str>, limits: &engine::ImageLimits) -> Result<ImageSize, chat::Error> {
+    let trimmed = raw.map_or("", str::trim);
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(ImageSize::Auto);
+    }
     let Some((w_str, h_str)) = trimmed.split_once(['x', 'X']) else {
         return Err(chat::Error::new_bad_request(
-            "size must have the form WIDTHxHEIGHT",
+            "size must be auto or have the form WIDTHxHEIGHT",
         ));
     };
     let width: i32 = w_str
@@ -72,7 +75,7 @@ fn parse_size(raw: &str, limits: &engine::ImageLimits) -> Result<(i32, i32), cha
             limits.max_dim
         )));
     }
-    Ok((width, height))
+    Ok(ImageSize::Exact { width, height })
 }
 
 /// Checks that total output pixels across all requested images fit within the
@@ -174,13 +177,13 @@ pub fn parse_generation_request(
     let prompt = read_optional_string(object, "prompt")?
         .ok_or_else(|| chat::Error::new_bad_request("prompt is required"))?
         .to_string();
-    let size_raw = read_optional_string(object, "size")?
-        .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-    let (width, height) = parse_size(size_raw, limits)?;
+    let size = parse_size(read_optional_string(object, "size")?, limits)?;
 
     let count = read_optional_i64(object, "n", 1, limits.max_images_per_request as i64)?
         .unwrap_or(1) as usize;
-    validate_total_pixels(width, height, count, limits)?;
+    if let ImageSize::Exact { width, height } = size {
+        validate_total_pixels(width, height, count, limits)?;
+    }
     let seed = match object.get("seed") {
         None | Some(Value::Null) => rand::random(),
         Some(value) => value
@@ -238,8 +241,7 @@ pub fn parse_generation_request(
     Ok(ParsedRequest {
         model,
         prompt,
-        width,
-        height,
+        size,
         count,
         seed,
         min_generation_area,
@@ -492,14 +494,13 @@ impl EditForm {
             .get("prompt")
             .ok_or_else(|| chat::Error::new_bad_request("prompt is required"))?
             .clone();
-        let size_raw = fields
-            .get("size")
-            .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-        let (width, height) = parse_size(size_raw, limits)?;
+        let size = parse_size(fields.get("size").map(String::as_str), limits)?;
 
         let count = parse_form_i64(&fields, "n", 1, limits.max_images_per_request as i64)?
             .unwrap_or(1) as usize;
-        validate_total_pixels(width, height, count, limits)?;
+        if let ImageSize::Exact { width, height } = size {
+            validate_total_pixels(width, height, count, limits)?;
+        }
         let seed = match fields
             .get("seed")
             .map(|s| s.trim())
@@ -574,8 +575,7 @@ impl EditForm {
         Ok(ParsedRequest {
             model,
             prompt,
-            width,
-            height,
+            size,
             count,
             seed,
             min_generation_area,
@@ -622,8 +622,8 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// Builds an OpenAI Images API JSON response containing `images` as base64
-/// `b64_json` items.
-pub fn build_response(images: &[Vec<u8>]) -> Value {
+/// `b64_json` items, with their `width` by `height` size.
+pub fn build_response(images: &[Vec<u8>], width: i32, height: i32) -> Value {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -634,6 +634,7 @@ pub fn build_response(images: &[Vec<u8>]) -> Value {
     json!({
         "created": created,
         "data": data,
+        "size": format!("{width}x{height}"),
     })
 }
 
@@ -695,7 +696,13 @@ mod tests {
         let req = parse_generation_request(&body, &limits).unwrap();
         assert_eq!(req.model, None);
         assert_eq!(req.prompt, "A red ceramic mug on wood.");
-        assert_eq!((req.width, req.height), (4736, 3552));
+        assert_eq!(
+            req.size,
+            ImageSize::Exact {
+                width: 4736,
+                height: 3552
+            }
+        );
         assert_eq!(req.count, 1);
         assert_eq!(req.seed, 42);
         assert_eq!(req.min_generation_area, limits.default_generation_area);
@@ -716,7 +723,13 @@ mod tests {
         .unwrap();
         let req = parse_generation_request(&jpg_body, &limits).unwrap();
         assert_eq!(req.model.as_deref(), Some("minimax-h3-image"));
-        assert_eq!((req.width, req.height), (512, 512));
+        assert_eq!(
+            req.size,
+            ImageSize::Exact {
+                width: 512,
+                height: 512
+            }
+        );
         assert_eq!(req.count, 2);
         assert_eq!(req.format, engine::ImageFormat::Jpeg);
         assert_eq!(req.quality, 85);
@@ -745,12 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn generation_request_without_a_size_or_with_auto_leaves_it_to_the_server() {
+        let limits = test_limits();
+        for body in [
+            json!({"prompt": "hi"}),
+            json!({"prompt": "hi", "size": "auto"}),
+            json!({"prompt": "hi", "size": "AUTO"}),
+            json!({"prompt": "hi", "size": "4096x4096", "n": 16, "size": "auto"}),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            let req = parse_generation_request(&bytes, &limits).unwrap();
+            assert_eq!(req.size, ImageSize::Auto, "{body}");
+        }
+    }
+
+    #[test]
     fn generation_request_rejects_invalid_and_unsupported_parameters() {
         let limits = test_limits();
         for bad in [
             json!({"size": "512x512"}),
-            json!({"prompt": "hi"}),
             json!({"prompt": "hi", "size": "512"}),
+            json!({"prompt": "hi", "size": "big"}),
             json!({"prompt": "hi", "size": "0x512"}),
             json!({"prompt": "hi", "size": "9000x512"}),
             json!({"prompt": "hi", "size": "512x512", "n": 0}),
@@ -819,7 +847,13 @@ mod tests {
         let req = parse_edit_request(Some(&ct), &body, &limits).unwrap();
         assert_eq!(req.model.as_deref(), Some("minimax-h3-image"));
         assert_eq!(req.prompt, "Combine <Picture 1> and <Picture 2>.");
-        assert_eq!((req.width, req.height), (1024, 1024));
+        assert_eq!(
+            req.size,
+            ImageSize::Exact {
+                width: 1024,
+                height: 1024
+            }
+        );
         assert_eq!(req.seed, 1234);
         assert_eq!(req.min_generation_area, 1024);
         assert_eq!(req.references, vec![img1.to_vec(), img2.to_vec()]);
@@ -858,8 +892,9 @@ mod tests {
 
     #[test]
     fn response_formats_b64_json_items() {
-        let resp = build_response(&[b"foo".to_vec(), b"bar".to_vec()]);
+        let resp = build_response(&[b"foo".to_vec(), b"bar".to_vec()], 512, 384);
         assert!(resp["created"].is_u64());
+        assert_eq!(resp["size"], "512x384");
         let data = resp["data"].as_array().unwrap();
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["b64_json"], "Zm9v");

@@ -119,6 +119,7 @@ fn a_decision_model_ranks_search_results_or_they_keep_their_order() {
         },
         idle_unload: config::Budgets::default().idle_unload_s,
         max_cached_states: 256,
+        default_size: None,
     };
     assert!(worker::start(
         vec![settings],

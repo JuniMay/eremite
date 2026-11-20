@@ -109,8 +109,13 @@ pub enum Event {
         tokens: usize,
     },
     /// An image generation or editing request finished: the encoded PNG or
-    /// JPEG bytes of each produced image. This is the last event.
-    Images { images: Vec<Vec<u8>> },
+    /// JPEG bytes of each produced image, and their width and height. This is
+    /// the last event.
+    Images {
+        images: Vec<Vec<u8>>,
+        width: i32,
+        height: i32,
+    },
 }
 
 /// How a request samples its tokens.
@@ -178,6 +183,31 @@ impl DecisionRequest {
     }
 }
 
+/// The output size that an image request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSize {
+    /// The server picks it: the model's default_size for text-to-image, and
+    /// the first reference image's own size for an edit.
+    Auto,
+    /// Exactly `width` by `height` pixels.
+    Exact {
+        /// The width in pixels.
+        width: i32,
+        /// The height in pixels.
+        height: i32,
+    },
+}
+
+impl std::fmt::Display for ImageSize {
+    /// Writes "auto" or WIDTHxHEIGHT.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ImageSize::Auto => f.write_str("auto"),
+            ImageSize::Exact { width, height } => write!(f, "{width}x{height}"),
+        }
+    }
+}
+
 /// An image model's generation or editing request: one or more images generated
 /// from a prompt and optional reference images.
 pub struct ImageRequest {
@@ -185,10 +215,8 @@ pub struct ImageRequest {
     pub model_index: usize,
     /// Raw prompt text passed verbatim to the model.
     pub prompt: String,
-    /// Exact requested output width in pixels.
-    pub width: i32,
-    /// Exact requested output height in pixels.
-    pub height: i32,
+    /// The output size that the request asks for.
+    pub size: ImageSize,
     /// Number of images to generate (`n`).
     pub count: usize,
     /// Base seed for the first image (`seed.wrapping_add(i)` for later ones).
@@ -296,6 +324,10 @@ pub struct ModelSettings {
     pub idle_unload: f64,
     /// The most states of the model that the state cache keeps.
     pub max_cached_states: usize,
+    /// The output width and height of a text-to-image request whose size is
+    /// auto: the settings' default_size, or else the image model's own. None
+    /// for a model that generates no images.
+    pub default_size: Option<(i32, i32)>,
 }
 
 /// What the terminal UI asks of the worker. The default asks for nothing.
@@ -748,6 +780,28 @@ pub fn image_limits(model_index: usize) -> Option<engine::ImageLimits> {
     clone_shared().models.get(model_index)?.image_limits
 }
 
+/// Returns the size that an image model's text-to-image requests with size
+/// auto get: the settings' `default_size`, or else `model`'s own default.
+/// Err says why a given default_size does not fit the model as it is.
+fn check_default_size(
+    model: &Model,
+    default_size: Option<(i32, i32)>,
+) -> Result<(i32, i32), String> {
+    let Some((width, height)) = default_size else {
+        let limits = model
+            .image_limits()
+            .ok_or("the model generates no images")?;
+        return Ok((limits.default_width, limits.default_height));
+    };
+    match model.fit_image_size(width, height)? {
+        fitted if fitted == (width, height) => Ok(fitted),
+        (fit_w, fit_h) => Err(format!(
+            "default_size {width}x{height} is larger than the model generates; \
+             {fit_w}x{fit_h} has its shape and fits"
+        )),
+    }
+}
+
 /// Starts the engine thread. The thread registers each model without loading
 /// its weights. `view` holds what the terminal UI asks of the worker. This call
 /// returns true once the worker takes requests. It returns false when the
@@ -785,10 +839,18 @@ pub fn start(
                 };
                 let image_limits = model.image_limits();
                 let mut resolved = settings.clone();
-                if resolved.options.ctx == 0
-                    && let Some(lim) = image_limits
-                {
-                    resolved.options.ctx = lim.max_prompt_tokens;
+                if let Some(lim) = image_limits {
+                    if resolved.options.ctx == 0 {
+                        resolved.options.ctx = lim.max_prompt_tokens;
+                    }
+                    match check_default_size(&model, resolved.default_size) {
+                        Ok(size) => resolved.default_size = Some(size),
+                        Err(message) => {
+                            engine::log(&format!("{}: {message}", resolved.id));
+                            let _ = started_sender.send(false);
+                            return;
+                        }
+                    }
                 }
                 models.push(SharedModel {
                     settings: resolved,
@@ -949,9 +1011,8 @@ pub fn submit_image(
     request: ImageRequest,
 ) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
     let counts = format!(
-        "size={}x{}, n={}, refs={}",
-        request.width,
-        request.height,
+        "size={}, n={}, refs={}",
+        request.size,
         request.count,
         request.references.len()
     );
@@ -1452,6 +1513,9 @@ struct Decision {
 struct ImageTask {
     /// The submitted image request.
     job: Job<ImageRequest>,
+    /// The output width and height in pixels, with an auto size resolved.
+    width: i32,
+    height: i32,
     /// Prompt C string and reference bytes kept alive across stream calls.
     inputs: ImageInputs,
     /// Encoded PNG/JPEG images generated so far.
@@ -4831,6 +4895,14 @@ impl WorkerModel {
         if job.flags.cancelled.load(Ordering::SeqCst) {
             return self.end_waiting_image(job, FinishReason::Cancelled);
         }
+        let (width, height) = match self.resolve_image_size(&job.request) {
+            Ok(size) => size,
+            Err(message) => {
+                self.log_line(&format!("req {}: refused: {message}", job.id));
+                job.send_last_event(Event::Refused(message));
+                return;
+            }
+        };
         let was_loaded = self.model.is_loaded();
         if !was_loaded {
             self.update_status(shared, "loading");
@@ -4853,6 +4925,8 @@ impl WorkerModel {
         let inputs = ImageInputs::new(&job.request.prompt, refs);
         let task = ImageTask {
             job,
+            width,
+            height,
             inputs,
             outputs: Vec::new(),
             prompt_tokens: 0,
@@ -4870,6 +4944,38 @@ impl WorkerModel {
         self.start_image_pass(task);
     }
 
+    /// Returns the output size of `request`: its exact size, the model's
+    /// default_size for text-to-image with size auto, or for an edit with size
+    /// auto its first image's own size fitted to the model. Err says why the
+    /// size cannot be used, its total pixels across the request included.
+    fn resolve_image_size(&self, request: &ImageRequest) -> Result<(i32, i32), String> {
+        let (width, height) = match (request.size, request.references.first()) {
+            (ImageSize::Exact { width, height }, _) => return Ok((width, height)),
+            (ImageSize::Auto, None) => self
+                .settings
+                .default_size
+                .ok_or("the model generates no images")?,
+            (ImageSize::Auto, Some(image)) => {
+                let (image_w, image_h) = engine::read_image_size(image)
+                    .map_err(|why| format!("reference image 1: {why}"))?;
+                self.model.fit_image_size(image_w, image_h)?
+            }
+        };
+        let limit = self
+            .model
+            .image_limits()
+            .ok_or("the model generates no images")?
+            .max_request_pixels;
+        let pixels = width as i64 * height as i64 * request.count as i64;
+        if pixels > limit {
+            return Err(format!(
+                "total output pixels ({width}x{height} x {} = {pixels}) exceed {limit} pixel limit",
+                request.count
+            ));
+        }
+        Ok((width, height))
+    }
+
     /// Posts the next image generation pass of `task` on a new engine stream.
     fn start_image_pass(&mut self, mut task: ImageTask) {
         let index = task.outputs.len() as u64;
@@ -4879,8 +4985,8 @@ impl WorkerModel {
         stream.generate_image(
             &task.inputs,
             ImageCallParams {
-                width: req.width,
-                height: req.height,
+                width: task.width,
+                height: task.height,
                 min_generation_area: req.min_generation_area,
                 format: req.format,
                 quality: req.quality,
@@ -4942,6 +5048,8 @@ impl WorkerModel {
                 "generated".to_string(),
                 Event::Images {
                     images: task.outputs,
+                    width: task.width,
+                    height: task.height,
                 },
             )
         } else if task.job.flags.cancelled.load(Ordering::SeqCst) {
@@ -4961,7 +5069,7 @@ impl WorkerModel {
         };
         self.log_line(&format!(
             "req {}: {how}: {done} of {count} images ({}x{}) in {seconds:.2} s",
-            task.job.id, task.job.request.width, task.job.request.height
+            task.job.id, task.width, task.height
         ));
         let mut status = lock(&shared.models[self.model_index].status);
         status.total_requests += 1;
@@ -5206,8 +5314,10 @@ mod tests {
             request: ImageRequest {
                 model_index: 0,
                 prompt: "red mug".into(),
-                width: 512,
-                height: 512,
+                size: ImageSize::Exact {
+                    width: 512,
+                    height: 512,
+                },
                 count: 4,
                 seed: 1,
                 min_generation_area: 1024,

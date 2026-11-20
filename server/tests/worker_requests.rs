@@ -138,6 +138,7 @@ fn requests_run_to_their_end_and_report_their_events() {
         options,
         idle_unload: 0.0,
         max_cached_states: 256,
+        default_size: None,
     };
     assert!(worker::start(
         vec![settings],

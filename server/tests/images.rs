@@ -187,6 +187,7 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         .expect("b64_json string");
     let png_bytes = decode_base64(png_b64);
     assert_eq!(png_dimensions(&png_bytes), Some((500, 500)));
+    assert_eq!(answer["size"], "500x500", "{answer}");
 
     // 4. Text-to-image JPEG with model omitted (default single image model).
     let jpg_req = json!({
@@ -208,6 +209,14 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         "valid JPEG SOI header"
     );
 
+    // 4b. Text-to-image with size omitted gets the model's default size.
+    let auto_req = json!({"prompt": "A small green cactus in a terracotta pot.", "seed": 3});
+    let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&auto_req));
+    assert_eq!(code, 200, "auto t2i failed: {answer}");
+    assert_eq!(answer["size"], "2048x2048", "{answer}");
+    let auto_png = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
+    assert_eq!(png_dimensions(&auto_png), Some((2048, 2048)));
+
     // 5. Reference image editing via multipart/form-data on /v1/images/edits.
     let ref_bytes = if let Ok(ref_path) = std::env::var("EREMITE_MINIMAX_H3_REF_IMAGE") {
         std::fs::read(&ref_path).expect("read EREMITE_MINIMAX_H3_REF_IMAGE")
@@ -215,40 +224,46 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         png_bytes.clone()
     };
     let boundary = "eremite-images-test-boundary";
-    let mut form = Vec::new();
-    for (name, val) in [
-        (
-            "prompt",
-            "Keep <Picture 1> with warm golden sunset lighting.",
-        ),
-        ("size", "512x512"),
-        ("seed", "1234"),
-        ("generator_device", "cpu"),
-        ("response_format", "b64_json"),
-        ("output_format", "png"),
-        ("min_generation_area", "1024"),
-    ] {
+    let edit_form = |size: Option<&str>| {
+        let mut form = Vec::new();
+        for (name, val) in [
+            (
+                "prompt",
+                "Keep <Picture 1> with warm golden sunset lighting.",
+            ),
+            ("seed", "1234"),
+            ("generator_device", "cpu"),
+            ("response_format", "b64_json"),
+            ("output_format", "png"),
+            ("min_generation_area", "1024"),
+        ]
+        .into_iter()
+        .chain(size.map(|size| ("size", size)))
+        {
+            form.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
         form.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"ref.png\"\r\nContent-Type: image/png\r\n\r\n"
             )
             .as_bytes(),
         );
-    }
-    form.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"ref.png\"\r\nContent-Type: image/png\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    form.extend_from_slice(&ref_bytes);
-    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        form.extend_from_slice(&ref_bytes);
+        form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        form
+    };
+    let content_type = format!("multipart/form-data; boundary={boundary}");
 
     let (code, answer) = post_raw(
         &server,
         "/v1/images/edits",
-        &format!("multipart/form-data; boundary={boundary}"),
-        &form,
+        &content_type,
+        &edit_form(Some("512x512")),
     );
     assert_eq!(code, 200, "edit failed: {answer}");
     let edit_b64 = answer["data"][0]["b64_json"]
@@ -257,13 +272,21 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let edit_bytes = decode_base64(edit_b64);
     assert_eq!(png_dimensions(&edit_bytes), Some((512, 512)));
 
+    // 5b. An edit with size omitted keeps the size of its first image.
+    let ref_size = png_dimensions(&ref_bytes).expect("a PNG reference image");
+    let (code, answer) = post_raw(&server, "/v1/images/edits", &content_type, &edit_form(None));
+    assert_eq!(code, 200, "auto edit failed: {answer}");
+    assert_eq!(answer["size"], format!("{}x{}", ref_size.0, ref_size.1));
+    let auto_edit = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
+    assert_eq!(png_dimensions(&auto_edit), Some(ref_size));
+
     // 6. Status endpoint reports loaded image model with separated counters.
     let (code, status) = ask(&server, "GET", "/v1/models/minimax-h3-image", None);
     assert_eq!(code, 200, "{status}");
     let st = &status["status"];
     assert_eq!(st["loaded"], json!(true));
     assert_eq!(st["phase"], json!("idle"));
-    assert_eq!(st["totals"]["generated_images"], json!(3));
+    assert_eq!(st["totals"]["generated_images"], json!(5));
     assert_eq!(st["totals"]["generated_tokens"], json!(0));
     assert!(
         st["totals"]["prefilled_tokens"].as_u64().unwrap_or(0) > 0,
@@ -277,8 +300,8 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         st["totals"]["image_seconds"].as_f64().unwrap_or(0.0) > 0.0,
         "{st}"
     );
-    assert_eq!(st["engine_counters"]["generated_images"], json!(3));
-    assert_eq!(st["engine_counters"]["image_steps"], json!(18));
+    assert_eq!(st["engine_counters"]["generated_images"], json!(5));
+    assert_eq!(st["engine_counters"]["image_steps"], json!(30));
     assert_eq!(st["engine_counters"]["image_stage"], json!(0));
 
     server.stop();

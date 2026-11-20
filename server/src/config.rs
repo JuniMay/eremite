@@ -45,6 +45,9 @@ pub struct ModelConfig {
     pub idle_unload: Option<f64>,
     /// The most states of the model that the state cache keeps.
     pub max_cached_states: usize,
+    /// An image model's output width and height for text-to-image requests
+    /// whose size is auto; None: the model's own default.
+    pub default_size: Option<(i32, i32)>,
     /// The keys that the model's entry gives, in the file's order.
     pub keys: Vec<String>,
 }
@@ -61,7 +64,7 @@ const GENERATING_KEYS: [&str; 7] = [
 ];
 
 /// The keys of a model's entry that only an image generation model takes.
-const IMAGE_KEYS: [&str; 3] = ["text_encoder", "dit", "vae"];
+pub const IMAGE_KEYS: [&str; 4] = ["text_encoder", "dit", "vae", "default_size"];
 
 impl ModelConfig {
     /// Creates the settings of the model in the directory `model`. The context
@@ -79,6 +82,7 @@ impl ModelConfig {
             },
             idle_unload: None,
             max_cached_states: 256,
+            default_size: None,
             keys: Vec::new(),
         }
     }
@@ -210,6 +214,7 @@ impl ModelConfig {
                 return Err(format!("{name} is server-wide; move it outside models"));
             }
             "idle_unload" => self.idle_unload = Some(read_idle_seconds(value)?),
+            "default_size" => self.default_size = Some(read_size(value)?),
             "max_cached_states" => {
                 self.max_cached_states = value
                     .as_u64()
@@ -411,6 +416,20 @@ impl Server {
             _ => return Err(format!("no server setting {name}")),
         }
         Ok(())
+    }
+}
+
+/// Reads an image model's default_size: WIDTHxHEIGHT, two positive pixel
+/// counts.
+fn read_size(value: &Value) -> Result<(i32, i32), String> {
+    let message = "default_size takes WIDTHxHEIGHT, two positive pixel counts";
+    let (width, height) = value
+        .as_str()
+        .and_then(|text| text.split_once(['x', 'X']))
+        .ok_or(message)?;
+    match (width.trim().parse::<i32>(), height.trim().parse::<i32>()) {
+        (Ok(width), Ok(height)) if width > 0 && height > 0 => Ok((width, height)),
+        _ => Err(message.into()),
     }
 }
 
@@ -1208,5 +1227,40 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn an_image_model_takes_a_default_size() {
+        let entry = |size: Value| {
+            json!({"models": [{
+                "model": "/m/h3",
+                "text_encoder": "/m/te.st",
+                "dit": "/m/dit.st",
+                "vae": "/m/vae.st",
+                "default_size": size
+            }]})
+        };
+        let models = parse(&entry(json!("1024x768"))).unwrap().models;
+        assert_eq!(models[0].default_size, Some((1024, 768)));
+        assert_eq!(
+            parse(&json!({"models": [{"model": "/m/h3"}]}))
+                .unwrap()
+                .models[0]
+                .default_size,
+            None
+        );
+        for bad in [json!("big"), json!("0x768"), json!("1024x"), json!(1024)] {
+            let error = parse(&entry(bad.clone())).unwrap_err();
+            assert!(
+                error.contains("default_size takes WIDTHxHEIGHT"),
+                "{bad}: {error}"
+            );
+        }
+        let mut decision =
+            parse(&json!({"models": [{"model": "/m/d1", "default_size": "512x512"}]}))
+                .unwrap()
+                .models[0]
+                .clone();
+        assert!(decision.fit_decision_model(4096).is_err());
     }
 }

@@ -21,6 +21,7 @@ fn the_worker_registers_its_models_and_stops() {
                 options,
                 idle_unload: 0.0,
                 max_cached_states: 256,
+                default_size: None,
             }
         })
         .into_iter()

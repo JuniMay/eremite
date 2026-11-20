@@ -239,6 +239,7 @@ fn decisions_run_their_passes_and_return_their_logits() {
         },
         idle_unload: IDLE_UNLOAD_S,
         max_cached_states: 256,
+        default_size: None,
     };
     assert!(worker::start(
         vec![settings],

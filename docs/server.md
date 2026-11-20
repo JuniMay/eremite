@@ -51,6 +51,7 @@ Each entry under `models` holds one model's settings:
 | `text_encoder` | MiniMax-H3-Image: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3-Image |
 | `dit` | MiniMax-H3-Image: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3-Image |
 | `vae` | MiniMax-H3-Image: the safetensors file of the FP16 image VAE | required for MiniMax-H3-Image |
+| `default_size` | MiniMax-H3-Image: the `WIDTHxHEIGHT` of a text-to-image request whose `size` is `auto` or omitted; it must fit the model as it is | `2048x2048`, the default generation canvas |
 | `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3-Image: 4096 |
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
@@ -132,17 +133,22 @@ images. Its `model` folder holds `model_index.json` (`_class_name`
 `MiniMaxH3ImagePipeline`) and `tokenizer/tokenizer.json`, and its entry also
 sets `text_encoder`, `dit` and `vae` to the quantized Comfy-Org safetensors
 files (Qwen3-VL-32B NVFP4, pruned INT8-ConvRot DiT and FP16 VAE). Its entry
-also takes `id`, `ctx` (at most 4096), `memory` and `idle_unload`, and refuses
-text-generation settings.
+also takes `id`, `ctx` (at most 4096), `memory`, `idle_unload` and
+`default_size`, and refuses text-generation settings.
 
 An image model serves `POST /v1/images/generations` (JSON) and
 `POST /v1/images/edits` (`multipart/form-data`, up to 128 MiB). The chat and
 decision endpoints refuse it, and Codex's catalog leaves it out. Both endpoints
-return `{"created": ..., "data": [{"b64_json": "..."}]}`:
+return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT"}`,
+where `size` is the size of the returned images:
 
 - `prompt`: required string, passed verbatim and truncated to 4096 tokens.
-- `size`: required `WIDTHxHEIGHT` (each 1 to 8192). The returned image has
-  exactly this size. Total output pixels across all images in one request
+- `size`: `auto` (the default) or `WIDTHxHEIGHT` (each 1 to 8192). The
+  returned image has exactly the size given. With `auto`, a text-to-image
+  request gets the model's `default_size`, and an edit gets the size of its
+  first image. A first image larger than the model generates is scaled down
+  to the largest size of its shape that fits; an image whose shape fits no
+  canvas gets HTTP 400. Total output pixels across all images in one request
   (`width * height * n`) may be at most 33,554,432 (32 Mi pixels).
 - `image` (or `image[]`): `/v1/images/edits` only; 1 to 16 image files in
   upload order, defining `<Picture 1>`, `<Picture 2>`, and so on in `prompt`.

@@ -783,17 +783,15 @@ async fn run_image_request(
     parsed: image::ParsedRequest,
 ) -> Response {
     let note = format!(
-        "http {arrival} from {peer}: image {}x{}, n={}, refs={}",
-        parsed.width,
-        parsed.height,
+        "http {arrival} from {peer}: image {}, n={}, refs={}",
+        parsed.size,
         parsed.count,
         parsed.references.len()
     );
     let (_cancel, mut events) = match worker::submit_image(worker::ImageRequest {
         model_index: index,
         prompt: parsed.prompt,
-        width: parsed.width,
-        height: parsed.height,
+        size: parsed.size,
         count: parsed.count,
         seed: parsed.seed,
         min_generation_area: parsed.min_generation_area,
@@ -808,9 +806,11 @@ async fn run_image_request(
         Err(error) => return refuse_request(&peer, error),
     };
     match events.recv().await {
-        Some(worker::Event::Images { images }) => {
-            build_json_response(image::build_response(&images).to_string())
-        }
+        Some(worker::Event::Images {
+            images,
+            width,
+            height,
+        }) => build_json_response(image::build_response(&images, width, height).to_string()),
         Some(worker::Event::Refused(message)) => {
             refuse_request(&peer, chat::Error::new_bad_request(message))
         }
@@ -909,6 +909,15 @@ fn main() {
                 .unwrap_or_else(|error| die(&error));
         } else if family == Family::MinimaxH3Image {
             model.fit_image_model().unwrap_or_else(|error| die(&error));
+        } else if let Some(key) = model
+            .keys
+            .iter()
+            .find(|key| config::IMAGE_KEYS.contains(&key.as_str()))
+        {
+            die(&format!(
+                "{}: {key} is a setting of an image model",
+                model.engine.model
+            ));
         }
         let mut options = model.engine.clone();
         options
@@ -932,6 +941,7 @@ fn main() {
                 .idle_unload
                 .unwrap_or(configuration.budgets.idle_unload_s),
             max_cached_states: model.max_cached_states,
+            default_size: model.default_size,
         });
         families.push(family);
     }
