@@ -183,10 +183,13 @@ void eremite_request_stop(void) { shutdown_request(); }
 
 static char *copy(const char *s) { return s ? strdup(s) : 0; }
 
+// Maximum path buffer length in bytes when locating a model's tokenizer.
+static constexpr size_t MODEL_PATH_CAP = 2048;
+
 // Resolves dir or dir/tokenizer for a model whose tokenizer.json sits in a
 // tokenizer subfolder.
 static Tokenizer *open_model_tokenizer(const char *dir, const char *media) {
-  char path[2048];
+  char path[MODEL_PATH_CAP];
   snprintf(path, sizeof path, "%s/tokenizer.json", dir);
   if (access(path, R_OK) == 0) return tokenizer_open(dir, media);
   snprintf(path, sizeof path, "%s/tokenizer", dir);
@@ -433,6 +436,8 @@ static int run_image_generation(eremite_model *m,
   if (!m->ops->generate_image) die("%s: not an image model", m->dir);
   static_assert(sizeof(eremite_image_input) == sizeof(ImageInput),
                 "image input structs match");
+  static_assert(sizeof(out->error) == IMAGE_ERROR_BYTES,
+                "image error buffers match");
   ImageRequest req = {.prompt = request->prompt,
                       .width = request->width,
                       .height = request->height,

@@ -75,6 +75,9 @@ constant constexpr uint MINIMAX_H3_POS_AXES = 3;
 // Number of projections (Q, K, V) packed into one fused QKV tensor.
 constant constexpr uint MINIMAX_H3_QKV_PARTS = 3;
 
+// Elements processed per vectorized float4/bfloat4/half4 load or store.
+constant constexpr uint MINIMAX_H3_VEC4_WIDTH = 4;
+
 // Converts m rows of k FP32 activations into BF16 rows (zeroing padded rows
 // past m), optionally multiplying each channel by a BF16 pre_quant_scale.
 // Thread x: group of 4 columns; thread y: output row up to padded_m.
@@ -84,15 +87,15 @@ kernel void minimax_h3_x_bf16(device const float4 *x [[buffer(0)]],
                               constant MinimaxH3Bf16X &p [[buffer(3)]],
                               uint2 i [[thread_position_in_grid]]) {
   uint col4 = i.x, row = i.y;
-  uint k4 = p.k / 4;
+  uint k4 = p.k / MINIMAX_H3_VEC4_WIDTH;
   if (col4 >= k4) return;
   if (row >= p.m) {
     y[row * k4 + col4] = bfloat4(0);
     return;
   }
-  float4 v = x[row * (p.lda / 4) + col4];
+  float4 v = x[row * (p.lda / MINIMAX_H3_VEC4_WIDTH) + col4];
   if (p.has_scale) {
-    uint2 q = *(device const uint2 *)(scale + col4 * 4);
+    uint2 q = *(device const uint2 *)(scale + col4 * MINIMAX_H3_VEC4_WIDTH);
     v *= bf16x4(q);
   }
   y[row * k4 + col4] = bfloat4(v);

@@ -741,7 +741,9 @@ static void run_f16_linear(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
   gpu_bind_buffer(cmd, 0, x, 0);
   gpu_bind_buffer(cmd, 1, xh, 0);
   gpu_copy_bytes(cmd, 2, &xp, sizeof xp);
-  gpu_run_kernel(cmd, ((uint32_t)lin->k / 4u + ELEM_THREADS - 1) / ELEM_THREADS,
+  gpu_run_kernel(cmd,
+                 ((uint32_t)lin->k / MINIMAX_H3_VEC4_WIDTH + ELEM_THREADS - 1) /
+                     ELEM_THREADS,
                  padded, 1, ELEM_THREADS, 1, 1);
 
   F16MMParam mp = {(uint32_t)rows, (uint32_t)lin->n, (uint32_t)lin->k,

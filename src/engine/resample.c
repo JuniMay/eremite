@@ -33,12 +33,17 @@ typedef struct {
   double support;
 } Filter;
 
+// Filter support half-widths matching Pillow's libImaging/Resample.c.
+static constexpr double BICUBIC_SUPPORT = 2.0;
+static constexpr double LANCZOS_SUPPORT = 3.0;
+static constexpr double BILINEAR_SUPPORT = 1.0;
+
 // Pillow's bicubic filter (a = -0.5, support 2).
 static double cubic(double x) {
   const double a = -0.5;
   x = fabs(x);
   if (x < 1) return ((a + 2) * x - (a + 3)) * x * x + 1;
-  if (x < 2) return (((x - 5) * x + 8) * x - 4) * a;
+  if (x < BICUBIC_SUPPORT) return (((x - 5) * x + 8) * x - 4) * a;
   return 0;
 }
 
@@ -53,21 +58,21 @@ static double sinc(double x) {
 // Pillow's Lanczos-3 filter (support 3).
 static double lanczos(double x) {
   x = fabs(x);
-  if (x < 3.0) return sinc(x) * sinc(x / 3.0);
+  if (x < LANCZOS_SUPPORT) return sinc(x) * sinc(x / LANCZOS_SUPPORT);
   return 0.0;
 }
 
 // Pillow's bilinear triangle filter (support 1).
 static double bilinear(double x) {
   x = fabs(x);
-  if (x < 1.0) return 1.0 - x;
+  if (x < BILINEAR_SUPPORT) return 1.0 - x;
   return 0.0;
 }
 
 // Built-in resampling filters matching Pillow's libImaging/Resample.c.
-static const Filter FILTER_BICUBIC = {cubic, 2.0};
-static const Filter FILTER_LANCZOS = {lanczos, 3.0};
-static const Filter FILTER_BILINEAR = {bilinear, 1.0};
+static const Filter FILTER_BICUBIC = {cubic, BICUBIC_SUPPORT};
+static const Filter FILTER_LANCZOS = {lanczos, LANCZOS_SUPPORT};
+static const Filter FILTER_BILINEAR = {bilinear, BILINEAR_SUPPORT};
 
 // Each output pixel's taps along one axis (precompute_coeffs and
 // normalize_coeffs_8bpc): the first input pixel and their count in bounds,

@@ -507,9 +507,11 @@ static void run_vis_linear(const MinimaxH3VisionEncoder *vis,
   gpu_bind_buffer(cmd, 1, &vis->inv_freq, 0);
   gpu_bind_buffer(cmd, 2, xb, 0);
   gpu_copy_bytes(cmd, 3, &xp, sizeof xp);
-  gpu_run_kernel(cmd,
-                 ((uint32_t)lin->k / 4u + GRID2D_THREADS - 1) / GRID2D_THREADS,
-                 padded, 1, GRID2D_THREADS, 1, 1);
+  gpu_run_kernel(
+      cmd,
+      ((uint32_t)lin->k / MINIMAX_H3_VEC4_WIDTH + GRID2D_THREADS - 1) /
+          GRID2D_THREADS,
+      padded, 1, GRID2D_THREADS, 1, 1);
 
   Bf16MMParam mp = {(uint32_t)rows, (uint32_t)lin->n, (uint32_t)lin->k,
                     (uint32_t)lin->n, 1};

@@ -241,6 +241,10 @@ enum {
   EREMITE_IMAGE_JPEG = 1
 };
 
+// Capacity in bytes of eremite_image_result.error, including its NUL
+// terminator.
+enum { EREMITE_IMAGE_ERROR_BYTES = 256 };
+
 // One encoded input image passed for image editing.
 typedef struct {
   // Encoded image bytes (PNG, JPEG or another format macOS decodes).
@@ -277,7 +281,7 @@ typedef struct {
   // Byte length of data.
   size_t len;
   // Error message when data is null; empty on success.
-  char error[256];
+  char error[EREMITE_IMAGE_ERROR_BYTES];
   // Nonzero when the request inputs were invalid; zero for load, memory or
   // stop failures.
   int invalid_input;

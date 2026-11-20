@@ -419,9 +419,11 @@ static void stage_bf16_x(const MinimaxH3TextEncoder *enc, GpuCommandBuffer *cmd,
   gpu_bind_buffer(cmd, 1, scale_buf, 0);
   gpu_bind_buffer(cmd, 2, xb, 0);
   gpu_copy_bytes(cmd, 3, &xp, sizeof xp);
-  gpu_run_kernel(cmd,
-                 ((uint32_t)lin->k / 4u + BF16X_THREADS - 1) / BF16X_THREADS,
-                 padded_m, 1, BF16X_THREADS, 1, 1);
+  gpu_run_kernel(
+      cmd,
+      ((uint32_t)lin->k / MINIMAX_H3_VEC4_WIDTH + BF16X_THREADS - 1) /
+          BF16X_THREADS,
+      padded_m, 1, BF16X_THREADS, 1, 1);
 }
 
 // Dispatches an NVFP4 linear projection from pre-staged BF16 activations xb.

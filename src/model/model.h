@@ -200,6 +200,9 @@ typedef struct {
   int ref_count;
 } ImageRequest;
 
+// Capacity in bytes of ImageResult.error, including its NUL terminator.
+static constexpr size_t IMAGE_ERROR_BYTES = 256;
+
 // Output of one image generation or editing pass.
 typedef struct {
   // Heap-allocated PNG or JPEG bytes; null on failure.
@@ -207,7 +210,7 @@ typedef struct {
   // Byte length of data.
   size_t len;
   // Error message when data is null; empty on success.
-  char error[256];
+  char error[IMAGE_ERROR_BYTES];
   // Nonzero when the failure was a client input error; zero for load, memory
   // or stop failures.
   int invalid_input;

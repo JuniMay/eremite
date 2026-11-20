@@ -75,13 +75,13 @@ kernel void minimax_h3_x_f16(device const float4 *x [[buffer(0)]],
                              constant MinimaxH3F16X &p [[buffer(2)]],
                              uint2 i [[thread_position_in_grid]]) {
   uint col4 = i.x, row = i.y;
-  uint k4 = p.k / 4u;
+  uint k4 = p.k / MINIMAX_H3_VEC4_WIDTH;
   if (col4 >= k4) return;
   if (row >= p.m) {
     y[row * k4 + col4] = half4(0);
     return;
   }
-  y[row * k4 + col4] = half4(x[row * (p.lda / 4u) + col4]);
+  y[row * k4 + col4] = half4(x[row * (p.lda / MINIMAX_H3_VEC4_WIDTH) + col4]);
 }
 
 // Native FP16 matrix product accumulating in FP32, with optional FP32 bias.
