@@ -21,6 +21,13 @@ static constexpr int MINIMAX_H3_IMAGE_MIN_AREA = 1024,
 // Comfy-Org/ComfyUI comfy_extras/nodes_minimax_h3.py:39 (IMAGE_SIZE = 2048).
 static constexpr int MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA = 4194304;
 
+// Side in pixels of a text-to-image output whose size is auto: the default
+// generation canvas's side, so that the output needs no resize.
+static constexpr int MINIMAX_H3_IMAGE_DEFAULT_SIDE = 2048;
+static_assert(MINIMAX_H3_IMAGE_DEFAULT_SIDE * MINIMAX_H3_IMAGE_DEFAULT_SIDE ==
+                  MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA,
+              "the default side spans the default generation area");
+
 // Maximum single-axis output or canvas dimension in pixels.
 static constexpr int MINIMAX_H3_IMAGE_MAX_DIM = 8192;
 
@@ -81,6 +88,13 @@ typedef struct {
 int minimax_h3_image_plan_canvas(int width, int height, int min_area,
                                  int *out_canvas_w, int *out_canvas_h,
                                  char *error, size_t error_cap);
+
+// Writes into *out_w and *out_h the largest size of a width by height image's
+// shape that the model generates: the size itself when it fits, otherwise the
+// shape scaled down. Returns 1, or returns 0 with a message in error when no
+// size of that shape fits.
+int minimax_h3_image_fit_size(int width, int height, int *out_w, int *out_h,
+                              char *error, size_t error_cap);
 
 // Sizes of one reference image of an edit.
 typedef struct {

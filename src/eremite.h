@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 7
+#define EREMITE_ABI 8
 
 // ---- the process ----
 
@@ -300,6 +300,9 @@ typedef struct {
   int max_prompt_tokens;
   // Maximum single-axis output or canvas dimension in pixels.
   int max_dim;
+  // Output width and height in pixels of a text-to-image call whose size is
+  // auto.
+  int default_width, default_height;
   // Minimum and maximum accepted min_generation_area in pixels.
   int min_generation_area, max_generation_area;
   // Default min_generation_area in pixels when omitted.
@@ -326,6 +329,17 @@ int eremite_is_image_model(const eremite_model *m);
 // null, out is null, or m generates no images.
 int eremite_image_model_limits(const eremite_model *m,
                                eremite_image_limits *out);
+// Reads the width and height of the first image of the encoded bytes data, of
+// len bytes, without decoding its pixels. Returns 1, or returns 0 with the
+// reason in error.
+int eremite_image_read_size(const uint8_t *data, size_t len, int *width,
+                            int *height, char *error, size_t error_cap);
+// Writes into *out_width and *out_height the largest size of a width by height
+// image's shape that m generates: the size itself when it fits. Returns 1, or
+// returns 0 with the reason in error when no size of that shape fits.
+int eremite_image_fit_size(const eremite_model *m, int width, int height,
+                           int *out_width, int *out_height, char *error,
+                           size_t error_cap);
 // Runs one image generation or editing call synchronously and writes the
 // result into out. Caller releases out->data with eremite_image_result_free.
 // Returns 1 on success or 0 on failure.

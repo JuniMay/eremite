@@ -18,6 +18,7 @@
 #include "model/model.h"
 #include "platform/system_memory.h"
 #include "platform/threads.h"
+#include "platform/image.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -413,6 +414,8 @@ int eremite_image_model_limits(const eremite_model *m,
   *out = (eremite_image_limits){
       .max_prompt_tokens = lim.max_prompt_tokens,
       .max_dim = lim.max_dim,
+      .default_width = lim.default_width,
+      .default_height = lim.default_height,
       .min_generation_area = lim.min_generation_area,
       .max_generation_area = lim.max_generation_area,
       .default_generation_area = lim.default_generation_area,
@@ -426,6 +429,22 @@ int eremite_image_model_limits(const eremite_model *m,
       .inference_steps = lim.inference_steps,
       .guidance_scale = lim.guidance_scale};
   return 1;
+}
+
+int eremite_image_read_size(const uint8_t *data, size_t len, int *width,
+                            int *height, char *error, size_t error_cap) {
+  const char *why = 0;
+  if (image_read_size(data, len, width, height, &why)) return 1;
+  snprintf(error, error_cap, "%s", why);
+  return 0;
+}
+
+int eremite_image_fit_size(const eremite_model *m, int width, int height,
+                           int *out_width, int *out_height, char *error,
+                           size_t error_cap) {
+  if (!m->ops->fit_image_size) die("%s: not an image model", m->dir);
+  return m->ops->fit_image_size(width, height, out_width, out_height, error,
+                                error_cap);
 }
 
 // Converts an eremite_image_request and runs the image model's generation pass.

@@ -240,6 +240,14 @@ int main(int argc, char **argv) {
     size_t rlen = 0;
     uint8_t *rdata = read_binary_file(ref_path, &rlen);
     eremite_image_input ref_in = {.data = rdata, .len = rlen};
+    int ref_w = 0, ref_h = 0, fit_w = 0, fit_h = 0;
+    char size_error[EREMITE_IMAGE_ERROR_BYTES] = {0};
+    check(eremite_image_read_size(rdata, rlen, &ref_w, &ref_h, size_error,
+                                  sizeof size_error) &&
+              eremite_image_fit_size(m, ref_w, ref_h, &fit_w, &fit_h,
+                                     size_error, sizeof size_error) &&
+              fit_w == ref_w && fit_h == ref_h,
+          "the reference image's size reads and fits the model as it is");
     eremite_image_request req_edit = {
         .prompt = "Keep <Picture 1> unchanged with warm golden lighting.",
         .width = 512,

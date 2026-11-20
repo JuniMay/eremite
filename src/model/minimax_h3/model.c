@@ -155,6 +155,42 @@ int minimax_h3_image_plan_canvas(int width, int height, int min_area,
   return 1;
 }
 
+int minimax_h3_image_fit_size(int width, int height, int *out_w, int *out_h,
+                              char *error, size_t error_cap) {
+  *out_w = *out_h = 0;
+  if (width < 1 || height < 1) {
+    write_error(error, error_cap, "the image is empty");
+    return 0;
+  }
+  double scale = fmin(1.0, fmin((double)MINIMAX_H3_IMAGE_MAX_DIM / width,
+                                (double)MINIMAX_H3_IMAGE_MAX_DIM / height));
+  double area = (double)width * (double)height * scale * scale;
+  if (area > (double)MINIMAX_H3_IMAGE_MAX_CANVAS_AREA)
+    scale *= sqrt((double)MINIMAX_H3_IMAGE_MAX_CANVAS_AREA / area);
+  // The canvas rounds each side to whole patches, which can put it over the
+  // largest canvas. Each step takes one patch off the longer side, and the
+  // longest side has MINIMAX_H3_IMAGE_MAX_DIM / MINIMAX_H3_IMAGE_PATCH_PX
+  // patches at most.
+  int longer = width > height ? width : height;
+  for (int step = 0;
+       step <= MINIMAX_H3_IMAGE_MAX_DIM / MINIMAX_H3_IMAGE_PATCH_PX; step++) {
+    double s = scale - (double)step * MINIMAX_H3_IMAGE_PATCH_PX / longer;
+    if (s <= 0.0) break;
+    int w = (int)floor((double)width * s), h = (int)floor((double)height * s);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (minimax_h3_image_plan_canvas(w, h, 0, NULL, NULL, NULL, 0)) {
+      *out_w = w, *out_h = h;
+      return 1;
+    }
+  }
+  if (error && error_cap > 0)
+    snprintf(error, error_cap,
+             "no MiniMax-H3-Image canvas fits the shape of a %dx%d image",
+             width, height);
+  return 0;
+}
+
 // Returns the larger of two byte counts.
 static uint64_t max_u64(uint64_t a, uint64_t b) { return a > b ? a : b; }
 
@@ -751,6 +787,8 @@ static void minimax_h3_image_read_limits(ImageLimits *out) {
   *out = (ImageLimits){
       .max_prompt_tokens = MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS,
       .max_dim = MINIMAX_H3_IMAGE_MAX_DIM,
+      .default_width = MINIMAX_H3_IMAGE_DEFAULT_SIDE,
+      .default_height = MINIMAX_H3_IMAGE_DEFAULT_SIDE,
       .min_generation_area = MINIMAX_H3_IMAGE_MIN_AREA,
       .max_generation_area = MINIMAX_H3_IMAGE_MAX_AREA,
       .default_generation_area = MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA,
@@ -793,6 +831,7 @@ const ModelOps minimax_h3_image_ops = {
     .vocab_size = minimax_h3_image_vocab_size,
     .generate_image = minimax_h3_image_generate,
     .read_image_limits = minimax_h3_image_read_limits,
+    .fit_image_size = minimax_h3_image_fit_size,
     .run_idle_work = minimax_h3_image_run_idle_work,
     .pass_new = minimax_h3_image_pass_new,
     .pass_begin = minimax_h3_image_pass_begin,

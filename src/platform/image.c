@@ -209,6 +209,35 @@ uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height,
   return image.p;
 }
 
+int image_read_size(const void *data, size_t len, int *width, int *height,
+                    const char **error) {
+  *width = *height = 0;
+  *error = 0;
+  CFDataRef d = CFDataCreate(0, data, (CFIndex)len);
+  CGImageSourceRef src = d ? CGImageSourceCreateWithData(d, 0) : 0;
+  CFDictionaryRef props = src && CGImageSourceGetCount(src)
+                              ? CGImageSourceCopyPropertiesAtIndex(src, 0, 0)
+                              : 0;
+  CFNumberRef w =
+      props ? CFDictionaryGetValue(props, kCGImagePropertyPixelWidth) : 0;
+  CFNumberRef h =
+      props ? CFDictionaryGetValue(props, kCGImagePropertyPixelHeight) : 0;
+  int read_w = 0, read_h = 0;
+  if (!w || !h || !CFNumberGetValue(w, kCFNumberIntType, &read_w) ||
+      !CFNumberGetValue(h, kCFNumberIntType, &read_h))
+    *error = "the image could not be read";
+  else if (read_w <= 0 || read_h <= 0)
+    *error = "the image is empty";
+  else if ((double)read_w * read_h > BOMB)
+    *error = "the image has more than 178,956,970 pixels";
+  else
+    *width = read_w, *height = read_h;
+  if (props) CFRelease(props);
+  if (src) CFRelease(src);
+  if (d) CFRelease(d);
+  return *error == 0;
+}
+
 // Validates dimensions and pixel pointer for encoding. Returns 0 with *err set
 // if invalid.
 static int check_encode_input(const uint8_t *pixels, int width, int height,

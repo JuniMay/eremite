@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 7;
+const ABI: c_int = 8;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -426,6 +426,23 @@ unsafe extern "C" {
     fn eremite_is_decision_model(m: *const RawModel) -> c_int;
     fn eremite_is_image_model(m: *const RawModel) -> c_int;
     fn eremite_image_model_limits(m: *const RawModel, out: *mut ImageLimits) -> c_int;
+    fn eremite_image_read_size(
+        data: *const u8,
+        len: usize,
+        width: *mut c_int,
+        height: *mut c_int,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+    fn eremite_image_fit_size(
+        m: *const RawModel,
+        width: c_int,
+        height: c_int,
+        out_width: *mut c_int,
+        out_height: *mut c_int,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
     fn eremite_image_result_free(result: *mut RawImageResult);
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
@@ -575,6 +592,34 @@ unsafe extern "C" {
     fn eremite_token_bytes(t: *const RawTokenizer, id: i32, len: *mut usize) -> *const c_char;
     fn eremite_token_kind(t: *const RawTokenizer, id: i32) -> c_int;
     fn eremite_find_added_token(t: *const RawTokenizer, text: *const c_char, len: usize) -> i32;
+}
+
+/// Returns the text of the NUL-terminated message in `error`.
+fn error_text(error: &[c_char]) -> String {
+    unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Returns the width and height of the first image of the encoded `image`,
+/// read without decoding its pixels. Err holds why it cannot be read.
+pub fn read_image_size(image: &[u8]) -> Result<(i32, i32), String> {
+    let (mut width, mut height) = (0, 0);
+    let mut error = [0 as c_char; IMAGE_ERROR_BYTES];
+    let ok = unsafe {
+        eremite_image_read_size(
+            image.as_ptr(),
+            image.len(),
+            &mut width,
+            &mut height,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if ok != 0 {
+        return Ok((width, height));
+    }
+    Err(error_text(&error))
 }
 
 /// Returns `s` as a C string. A NUL byte would end the string early, so the
@@ -1253,6 +1298,29 @@ impl Model {
         (ok != 0).then_some(out)
     }
 
+    /// Returns the largest size of a `width` by `height` image's shape that
+    /// the model generates: the size itself when it fits. Err holds why no
+    /// size of that shape fits.
+    pub fn fit_image_size(&self, width: i32, height: i32) -> Result<(i32, i32), String> {
+        let (mut out_width, mut out_height) = (0, 0);
+        let mut error = [0 as c_char; IMAGE_ERROR_BYTES];
+        let ok = unsafe {
+            eremite_image_fit_size(
+                self.raw,
+                width,
+                height,
+                &mut out_width,
+                &mut out_height,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok != 0 {
+            return Ok((out_width, out_height));
+        }
+        Err(error_text(&error))
+    }
+
     /// Makes a new state, or returns None when its memory does not fit.
     pub fn state_new(&self) -> Option<StateHandle> {
         let s = unsafe { eremite_state_new(self.raw) };
@@ -1708,6 +1776,10 @@ pub struct ImageLimits {
     pub max_prompt_tokens: c_int,
     /// Maximum single-axis output or canvas dimension in pixels.
     pub max_dim: c_int,
+    /// Output width in pixels of a text-to-image call whose size is auto.
+    pub default_width: c_int,
+    /// Output height in pixels of a text-to-image call whose size is auto.
+    pub default_height: c_int,
     /// Minimum accepted min_generation_area in pixels.
     pub min_generation_area: c_int,
     /// Maximum accepted min_generation_area in pixels.

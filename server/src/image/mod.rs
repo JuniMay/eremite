@@ -646,6 +646,8 @@ mod tests {
         engine::ImageLimits {
             max_prompt_tokens: 4096,
             max_dim: 8192,
+            default_width: 2048,
+            default_height: 2048,
             min_generation_area: 1024,
             max_generation_area: 16_777_216,
             default_generation_area: 4_194_304,

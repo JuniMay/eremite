@@ -229,6 +229,9 @@ typedef struct {
   int max_prompt_tokens;
   // Maximum single-axis output or canvas dimension in pixels.
   int max_dim;
+  // Output width and height in pixels of a text-to-image call whose size is
+  // auto.
+  int default_width, default_height;
   // Minimum and maximum accepted min_generation_area in pixels.
   int min_generation_area, max_generation_area;
   // Default min_generation_area in pixels when omitted.
@@ -368,6 +371,12 @@ typedef struct {
   // Writes the image model's request and output limits into out. Null for a
   // model that generates no images.
   void (*read_image_limits)(ImageLimits *out);
+  // Writes into *out_width and *out_height the largest size of a width by
+  // height image's shape that the model generates: the size itself when it
+  // fits. Returns 1, or returns 0 with a message in error when no size of that
+  // shape fits. Null for a model that generates no images.
+  int (*fit_image_size)(int width, int height, int *out_width, int *out_height,
+                        char *error, size_t error_cap);
   // Drafts. propose_drafts writes up to drafts_per_pass() drafts after token
   // at pos, once every position before it has run. It returns the sampled
   // proposals' probabilities, n vocabulary rows, or null for proposals without

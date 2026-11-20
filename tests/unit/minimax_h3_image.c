@@ -120,6 +120,8 @@ int main(void) {
   minimax_h3_image_ops.read_image_limits(&lim);
   check(lim.max_prompt_tokens == MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS &&
             lim.max_dim == MINIMAX_H3_IMAGE_MAX_DIM &&
+            lim.default_width == MINIMAX_H3_IMAGE_DEFAULT_SIDE &&
+            lim.default_height == MINIMAX_H3_IMAGE_DEFAULT_SIDE &&
             lim.min_generation_area == MINIMAX_H3_IMAGE_MIN_AREA &&
             lim.max_generation_area == MINIMAX_H3_IMAGE_MAX_AREA &&
             lim.default_generation_area == MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA &&
@@ -133,6 +135,31 @@ int main(void) {
             lim.inference_steps == MINIMAX_H3_IMAGE_STEPS &&
             lim.guidance_scale == MINIMAX_H3_IMAGE_GUIDANCE_SCALE,
         "MiniMax-H3 read_image_limits exports exact C model limits");
+
+  // An image's size that fits stays as it is. A larger one scales down to the
+  // largest canvas with its shape kept, and a very thin one fits no canvas.
+  int fit_w = 0, fit_h = 0;
+  check(
+      minimax_h3_image_fit_size(1024, 1024, &fit_w, &fit_h, err, sizeof err) &&
+          fit_w == 1024 && fit_h == 1024,
+      "an image size that fits stays as it is");
+  check(
+      minimax_h3_image_fit_size(8000, 6000, &fit_w, &fit_h, err, sizeof err) &&
+          (int64_t)fit_w * fit_h <= MINIMAX_H3_IMAGE_MAX_CANVAS_AREA &&
+          fabs((double)fit_w / fit_h - 8000.0 / 6000.0) < 0.01 &&
+          minimax_h3_image_plan_canvas(fit_w, fit_h, 0, &cw, &ch, err,
+                                       sizeof err),
+      "a large image size scales down to the largest canvas, shape kept");
+  check(
+      minimax_h3_image_fit_size(12000, 4000, &fit_w, &fit_h, err, sizeof err) &&
+          fit_w <= MINIMAX_H3_IMAGE_MAX_DIM &&
+          fabs((double)fit_w / fit_h - 3.0) < 0.01,
+      "a wide image size scales down to the longest side");
+  err[0] = '\0';
+  check(
+      !minimax_h3_image_fit_size(100, 8000, &fit_w, &fit_h, err, sizeof err) &&
+          !fit_w && !fit_h && strstr(err, "100x8000") != NULL,
+      "a very thin image fits no canvas");
 
   // Workspace byte estimates scale monotonically with canvas and prompt sizes.
   uint64_t dit_small = minimax_h3_dit_workspace_bytes(64, 0, 256);

@@ -212,6 +212,12 @@ int main(void) {
             !memcmp(pixels, rgb, sizeof rgb),
         "encoded PNG bytes round-trip to the exact RGB pixels");
   free(pixels);
+  int read_w = 0, read_h = 0;
+  error = "unset";
+  check(
+      image_read_size(encoded_png, encoded_length, &read_w, &read_h, &error) &&
+          read_w == WIDTH && read_h == HEIGHT && !error,
+      "a PNG file's size reads without decoding its pixels");
   free(encoded_png);
 
   error = "unset";
@@ -225,6 +231,15 @@ int main(void) {
   check(encoded_jpeg && !error && encoded_length == jpeg_length &&
             !memcmp(encoded_jpeg, jpeg, jpeg_length) && pixels != 0,
         "encoded JPEG bytes match libjpeg defaults and decode back");
+  error = "unset";
+  check(
+      image_read_size(encoded_jpeg, encoded_length, &read_w, &read_h, &error) &&
+          read_w == JPEG_SIDE && read_h == JPEG_SIDE && !error,
+      "a JPEG file's size reads without decoding its pixels");
+  error = 0;
+  check(!image_read_size(text, sizeof text - 1, &read_w, &read_h, &error) &&
+            error && !read_w && !read_h,
+        "bytes that hold no image give no size and an error");
   free(pixels);
   free(jpeg);
   free(encoded_jpeg);
