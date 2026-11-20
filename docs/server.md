@@ -187,6 +187,25 @@ the returned images, `output_format` is their format, and `background` is
   green parts of the subject turn clear. An image whose border has no green
   key fails with HTTP 503. A transparent background needs `output_format`
   `"png"` or `"webp"`; JPEG gets HTTP 400.
+- `stream`: optional boolean (default `false`); a form field takes `true` or
+  `false`. With `true`, the response is a stream of server-sent events. Each
+  image's partial images come as `image_generation.partial_image` events
+  (`image_edit.partial_image` for edits), and then the image comes as an
+  `image_generation.completed` event (`image_edit.completed`). Each event's
+  data is a JSON object with `type`, `b64_json`, `created_at`, `size`,
+  `output_format` and `background`, and a partial image adds
+  `partial_image_index`, which starts at 0 for each image. The events carry
+  no `usage` or `quality`. A request refused before its first event gets a
+  plain HTTP 400 or 503; an error after that comes as an `error` event whose
+  data holds an `error` object, and it ends the stream.
+- `partial_images`: optional, 0 to 3 (default 0), used only with `stream`.
+  A partial image is the clean image that a denoising step predicts,
+  decoded and encoded like the final image. The partial images spread evenly
+  over the 6 steps: after step 3 for one, after steps 2 and 4 for two, and
+  after steps 1, 3 and 4 for three. Each costs one more VAE decode, and
+  during sampling the request also holds the VAE decoder and its workspace.
+  With a transparent background, a partial image whose border has no green
+  key yet is skipped. Partial images leave the final image as it is.
 - `min_generation_area`: optional integer from 1024 to 16777216 (default
   4194304, 2048 x 2048). When `size` has fewer pixels, the model generates on a
   larger 32-pixel-aligned canvas with the same aspect ratio and resizes back
@@ -204,10 +223,10 @@ weights in turn. The model then keeps its largest stage's memory reserved: 21.8
 GiB for the default canvas and a full prompt.
 
 Before its text encoder runs, each request reserves the memory that its
-canvas, prompt and reference images need. A request that needs more than the
-model may ever use gets HTTP 400: more than the model's `memory`, the server's
-`memory`, or the machine's RAM less `reserve`. A request that does not fit now
-gets HTTP 503.
+canvas, prompt, reference images and partial images need. A request that
+needs more than the model may ever use gets HTTP 400: more than the model's
+`memory`, the server's `memory`, or the machine's RAM less `reserve`. A
+request that does not fit now gets HTTP 503.
 
 During a pass, the image model yields between layers to any running
 text-decoding calls so decoding latency is not degraded.

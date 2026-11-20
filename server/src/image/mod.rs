@@ -2,7 +2,7 @@
 //! /v1/images/edits) for MiniMax-H3-Image. Parses JSON text-to-image requests
 //! and multipart/form-data image editing requests, validates MiniMax-H3-Image
 //! parameters, encodes generated PNG, JPEG or WebP bytes as base64, and formats
-//! OpenAI image responses.
+//! OpenAI image responses and stream events.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::worker::ImageSize;
-use crate::{chat, engine, http};
+use crate::{chat, engine, http, worker};
 
 /// Default served model id for MiniMax-H3-Image when `id` is omitted.
 pub const DEFAULT_MODEL_ID: &str = "minimax-h3-image";
@@ -24,6 +24,9 @@ pub const MAX_EDIT_BODY_BYTES: usize = 128 * http::MIB;
 const CRLF_HEADER_END: &[u8] = b"\r\n\r\n";
 /// LF blank-line separator between multipart headers and part body.
 const LF_HEADER_END: &[u8] = b"\n\n";
+
+/// The most partial images that OpenAI's image API takes in one request.
+const MAX_PARTIAL_IMAGES: i64 = 3;
 
 /// RFC 4648 standard base64 alphabet.
 const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -49,6 +52,10 @@ pub struct ParsedRequest {
     pub quality: i32,
     /// Output background.
     pub background: engine::ImageBackground,
+    /// Whether the response streams server-sent events.
+    pub stream: bool,
+    /// Partial images to stream before each image; 0 sends none.
+    pub partial_images: usize,
     /// Reference image bytes in upload order (empty for text-to-image).
     pub references: Vec<Vec<u8>>,
     /// An edit's mask image bytes, whose alpha marks what changes; None for
@@ -244,6 +251,13 @@ fn read_json_request(
     parse_response_format(read_optional_string(object, "response_format")?)?;
     let format = parse_output_format(read_optional_string(object, "output_format")?)?;
     let background = parse_background(read_optional_string(object, "background")?, format)?;
+    let stream = match object.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(stream)) => *stream,
+        Some(_) => return Err(chat::Error::new_bad_request("stream must be a boolean")),
+    };
+    let partial_images =
+        read_optional_i64(object, "partial_images", 0, MAX_PARTIAL_IMAGES)?.unwrap_or(0) as usize;
     let quality = read_optional_i64(
         object,
         "output_compression",
@@ -299,6 +313,8 @@ fn read_json_request(
         format,
         quality,
         background,
+        stream,
+        partial_images,
         references: Vec::new(),
         mask: None,
     })
@@ -587,6 +603,20 @@ impl EditForm {
                 .filter(|s| !s.is_empty()),
             format,
         )?;
+        let stream = match fields
+            .get("stream")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            None => false,
+            Some(raw) if raw.eq_ignore_ascii_case("true") => true,
+            Some(raw) if raw.eq_ignore_ascii_case("false") => false,
+            Some(_) => {
+                return Err(chat::Error::new_bad_request("stream must be true or false"));
+            }
+        };
+        let partial_images =
+            parse_form_i64(&fields, "partial_images", 0, MAX_PARTIAL_IMAGES)?.unwrap_or(0) as usize;
         let quality = parse_form_i64(
             &fields,
             "output_compression",
@@ -646,6 +676,8 @@ impl EditForm {
             format,
             quality,
             background,
+            stream,
+            partial_images,
             references,
             mask,
         })
@@ -840,6 +872,120 @@ pub fn build_response(
         "output_format": format.name(),
         "background": background.response_name(),
     })
+}
+
+/// The endpoint that an image request came to, which names its stream's
+/// events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageEndpoint {
+    /// POST /v1/images/generations, whose events are image_generation.*.
+    Generations,
+    /// POST /v1/images/edits, whose events are image_edit.*.
+    Edits,
+}
+
+/// What the stream events of one image request share.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageStream {
+    /// The endpoint, which names the events.
+    pub endpoint: ImageEndpoint,
+    /// The Unix time in seconds when the request came.
+    pub created_at: u64,
+    /// The images' format.
+    pub format: engine::ImageFormat,
+    /// The images' background.
+    pub background: engine::ImageBackground,
+}
+
+impl ImageStream {
+    /// Formats the server-sent event of a `width` by `height` partial image,
+    /// with its 0-based `index`.
+    pub fn format_partial_image(
+        &self,
+        image: &[u8],
+        width: i32,
+        height: i32,
+        index: usize,
+    ) -> String {
+        let mut event = self.describe_image(image, width, height);
+        event["partial_image_index"] = json!(index);
+        self.format_event("partial_image", event)
+    }
+
+    /// Formats the server-sent event of a finished `width` by `height` image.
+    pub fn format_completed_image(&self, image: &[u8], width: i32, height: i32) -> String {
+        self.format_event("completed", self.describe_image(image, width, height))
+    }
+
+    /// Formats the error event that ends a stream, with the error's `kind`
+    /// and `message`.
+    pub fn format_error(kind: &str, message: &str) -> String {
+        let event = json!({
+            "type": "error",
+            "error": {"type": kind, "code": null, "message": message, "param": null},
+        });
+        format!("event: error\ndata: {event}\n\n")
+    }
+
+    /// Formats the server-sent event of one of the request's worker events, and
+    /// says whether the stream ends with it. ImagesDone ends the stream
+    /// without an event.
+    pub fn format_worker_event(&self, event: worker::Event) -> (Option<String>, bool) {
+        match event {
+            worker::Event::PartialImage {
+                image,
+                width,
+                height,
+                index,
+            } => (
+                Some(self.format_partial_image(&image, width, height, index)),
+                false,
+            ),
+            worker::Event::Image {
+                image,
+                width,
+                height,
+            } => (
+                Some(self.format_completed_image(&image, width, height)),
+                false,
+            ),
+            worker::Event::ImagesDone => (None, true),
+            worker::Event::Refused(message) => (
+                Some(Self::format_error("invalid_request_error", &message)),
+                true,
+            ),
+            worker::Event::Failed(message) => {
+                (Some(Self::format_error("server_error", &message)), true)
+            }
+            _ => (
+                Some(Self::format_error("server_error", "the server is stopping")),
+                true,
+            ),
+        }
+    }
+
+    /// Returns the fields of an image's event other than its type.
+    fn describe_image(&self, image: &[u8], width: i32, height: i32) -> Value {
+        json!({
+            "b64_json": encode_base64(image),
+            "created_at": self.created_at,
+            "size": format!("{width}x{height}"),
+            "output_format": self.format.name(),
+            "background": self.background.response_name(),
+        })
+    }
+
+    /// Formats the event named by the endpoint and `name`, with the fields
+    /// of `event`.
+    fn format_event(&self, name: &str, mut event: Value) -> String {
+        let prefix = match self.endpoint {
+            ImageEndpoint::Generations => "image_generation",
+            ImageEndpoint::Edits => "image_edit",
+        };
+        let kind = format!("{prefix}.{name}");
+        event["type"] = json!(kind);
+        format!("event: {kind}\ndata: {event}\n\n")
+    }
 }
 
 #[cfg(test)]
@@ -1230,6 +1376,180 @@ mod tests {
         ] {
             let error = parse(bad.clone()).expect_err("refused");
             assert!(error.message.contains(message), "{bad}: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn requests_read_stream_and_partial_images() {
+        let limits = test_limits();
+        let parse = |body: Value| {
+            parse_generation_request(&serde_json::to_vec(&body).unwrap(), &limits)
+                .map(|req| (req.stream, req.partial_images))
+        };
+        assert_eq!(parse(json!({"prompt": "p"})).unwrap(), (false, 0));
+        assert_eq!(
+            parse(json!({"prompt": "p", "stream": true, "partial_images": 3})).unwrap(),
+            (true, 3)
+        );
+        for (bad, message) in [
+            (
+                json!({"prompt": "p", "stream": "yes"}),
+                "stream must be a boolean",
+            ),
+            (
+                json!({"prompt": "p", "stream": true, "partial_images": 4}),
+                "partial_images must be between 0 and 3",
+            ),
+            (
+                json!({"prompt": "p", "stream": true, "partial_images": -1}),
+                "partial_images must be between 0 and 3",
+            ),
+        ] {
+            let error = parse(bad.clone()).expect_err("refused");
+            assert!(error.message.contains(message), "{bad}: {}", error.message);
+        }
+
+        let boundary = "b4";
+        let form = |stream: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\n{stream}\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"partial_images\"\r\n\r\n2\r\n\
+                 --{boundary}--\r\n"
+            )
+        };
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let req = parse_edit_request(Some(&ct), form("true").as_bytes(), &limits).unwrap();
+        assert_eq!((req.stream, req.partial_images), (true, 2));
+        assert!(parse_edit_request(Some(&ct), form("maybe").as_bytes(), &limits).is_err());
+    }
+
+    /// Splits a server-sent event into its event name and its data's JSON.
+    fn split_event(event: &str) -> (String, Value) {
+        let (head, data) = event.split_once("\ndata: ").expect("an event and its data");
+        assert!(data.ends_with("\n\n"), "{event}");
+        let name = head.strip_prefix("event: ").expect("an event line");
+        (
+            name.to_string(),
+            serde_json::from_str(data.trim_end()).expect("JSON data"),
+        )
+    }
+
+    #[test]
+    fn stream_events_name_the_endpoint_and_carry_the_image() {
+        let edits = ImageStream {
+            endpoint: ImageEndpoint::Edits,
+            created_at: 7,
+            format: engine::ImageFormat::Png,
+            background: engine::ImageBackground::Transparent,
+        };
+        let (name, data) = split_event(&edits.format_partial_image(b"foo", 512, 384, 1));
+        assert_eq!(name, "image_edit.partial_image");
+        assert_eq!(
+            data,
+            json!({
+                "type": "image_edit.partial_image",
+                "b64_json": "Zm9v",
+                "created_at": 7,
+                "size": "512x384",
+                "output_format": "png",
+                "background": "transparent",
+                "partial_image_index": 1,
+            })
+        );
+        let generations = ImageStream {
+            endpoint: ImageEndpoint::Generations,
+            background: engine::ImageBackground::Auto,
+            ..edits
+        };
+        let (name, data) = split_event(&generations.format_completed_image(b"bar", 64, 32));
+        assert_eq!(name, "image_generation.completed");
+        assert_eq!(
+            data,
+            json!({
+                "type": "image_generation.completed",
+                "b64_json": "YmFy",
+                "created_at": 7,
+                "size": "64x32",
+                "output_format": "png",
+                "background": "opaque",
+            })
+        );
+        let (name, data) = split_event(&ImageStream::format_error(
+            "server_error",
+            "memory is short",
+        ));
+        assert_eq!(name, "error");
+        assert_eq!(
+            data,
+            json!({
+                "type": "error",
+                "error": {"type": "server_error", "code": null, "message": "memory is short", "param": null},
+            })
+        );
+    }
+
+    #[test]
+    fn worker_events_become_stream_events_until_the_last() {
+        let stream = ImageStream {
+            endpoint: ImageEndpoint::Generations,
+            created_at: 7,
+            format: engine::ImageFormat::Webp,
+            background: engine::ImageBackground::Opaque,
+        };
+        let (partial, ends) = stream.format_worker_event(worker::Event::PartialImage {
+            image: b"a".to_vec(),
+            width: 8,
+            height: 8,
+            index: 0,
+        });
+        assert!(!ends);
+        assert_eq!(
+            split_event(&partial.unwrap()).0,
+            "image_generation.partial_image"
+        );
+        let (completed, ends) = stream.format_worker_event(worker::Event::Image {
+            image: b"b".to_vec(),
+            width: 8,
+            height: 8,
+        });
+        assert!(!ends);
+        assert_eq!(
+            split_event(&completed.unwrap()).0,
+            "image_generation.completed"
+        );
+        assert_eq!(
+            stream.format_worker_event(worker::Event::ImagesDone),
+            (None, true)
+        );
+        for (event, kind, message) in [
+            (
+                worker::Event::Refused("too large".into()),
+                "invalid_request_error",
+                "too large",
+            ),
+            (
+                worker::Event::Failed("memory is short".into()),
+                "server_error",
+                "memory is short",
+            ),
+            (
+                worker::Event::Done {
+                    reason: worker::FinishReason::ServerStop,
+                },
+                "server_error",
+                "the server is stopping",
+            ),
+        ] {
+            let (text, ends) = stream.format_worker_event(event);
+            let (name, data) = split_event(&text.unwrap());
+            assert!(ends);
+            assert_eq!(name, "error");
+            assert_eq!(
+                (&data["error"]["type"], &data["error"]["message"]),
+                (&json!(kind), &json!(message))
+            );
         }
     }
 

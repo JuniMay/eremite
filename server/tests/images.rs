@@ -2,8 +2,8 @@
 //! POST /v1/images/edits (JSON or multipart/form-data). Verifies model
 //! listing, Codex catalog exclusion, chat and decision refusals, HTTP 400
 //! validation errors, exact and auto output sizes (including non-32
-//! resizing), PNG, JPEG and WebP encoding, transparent backgrounds, and
-//! reference image editing.
+//! resizing), PNG, JPEG and WebP encoding, transparent backgrounds, streamed
+//! partial images, and reference image editing.
 //!
 //! Set EREMITE_MINIMAX_H3_MODEL_DIR, EREMITE_MINIMAX_H3_TEXT_ENCODER,
 //! EREMITE_MINIMAX_H3_DIT, EREMITE_MINIMAX_H3_VAE, and optionally
@@ -59,8 +59,29 @@ fn ask(server: &Server, method: &str, path: &str, body: Option<&Value>) -> (u16,
     (code, serde_json::from_slice(&answer).unwrap_or(Value::Null))
 }
 
-/// Sends a raw POST request with custom Content-Type and body bytes.
+/// Sends a raw POST request with custom Content-Type and body bytes, and
+/// parses the response body as JSON.
 fn post_raw(server: &Server, path: &str, content_type: &str, body: &[u8]) -> (u16, Value) {
+    let (status, rest) = post_bytes(server, path, content_type, body);
+    (status, serde_json::from_slice(&rest).unwrap_or(Value::Null))
+}
+
+/// Sends a JSON POST request and returns the status and the JSON data of each
+/// server-sent event of the response.
+fn post_events(server: &Server, path: &str, body: &Value) -> (u16, Vec<Value>) {
+    let body = serde_json::to_vec(body).expect("JSON");
+    let (status, rest) = post_bytes(server, path, "application/json", &body);
+    let events = String::from_utf8_lossy(&rest)
+        .split("\n\n")
+        .filter_map(|event| event.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect();
+    (status, events)
+}
+
+/// Sends a raw POST request with custom Content-Type and body bytes, and
+/// returns the status and the response body, its chunks joined.
+fn post_bytes(server: &Server, path: &str, content_type: &str, body: &[u8]) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -99,7 +120,7 @@ fn post_raw(server: &Server, path: &str, content_type: &str, body: &[u8]) -> (u1
         }
         rest = out;
     }
-    (status, serde_json::from_slice(&rest).unwrap_or(Value::Null))
+    (status, rest)
 }
 
 /// Decodes standard RFC 4648 base64 into raw bytes.
@@ -361,6 +382,47 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     assert!(
         png_has_alpha(&clear_png),
         "a transparent PNG has an alpha channel"
+    );
+
+    // 4d. A streamed request sends two partial images, then the image, all
+    // PNGs of its size.
+    let stream_req = json!({
+        "prompt": "A blue glass bottle on a wooden shelf.",
+        "size": "512x512",
+        "seed": 13,
+        "stream": true,
+        "partial_images": 2,
+        "min_generation_area": 1024
+    });
+    let (code, events) = post_events(&server, "/v1/images/generations", &stream_req);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert_eq!(code, 200, "{types:?}");
+    assert_eq!(
+        types,
+        [
+            "image_generation.partial_image",
+            "image_generation.partial_image",
+            "image_generation.completed"
+        ]
+    );
+    for (index, event) in events.iter().enumerate() {
+        let png = decode_base64(event["b64_json"].as_str().expect("b64_json"));
+        assert_eq!(png_dimensions(&png), Some((512, 512)), "event {index}");
+        assert_eq!(
+            (
+                &event["size"],
+                &event["output_format"],
+                &event["background"]
+            ),
+            (&json!("512x512"), &json!("png"), &json!("opaque"))
+        );
+    }
+    assert_eq!(
+        (
+            &events[0]["partial_image_index"],
+            &events[1]["partial_image_index"]
+        ),
+        (&json!(0), &json!(1))
     );
 
     // 5. Reference image editing via multipart/form-data on /v1/images/edits.

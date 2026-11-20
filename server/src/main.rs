@@ -730,7 +730,14 @@ async fn answer_image_generations(
         Ok(parsed) => parsed,
         Err(error) => return refuse_request(&peer, error),
     };
-    run_image_request(index, arrival, peer, parsed).await
+    run_image_request(
+        index,
+        arrival,
+        peer,
+        parsed,
+        image::ImageEndpoint::Generations,
+    )
+    .await
 }
 
 /// Answers POST /v1/images/edits: parses the JSON or multipart/form-data body,
@@ -771,25 +778,39 @@ async fn answer_image_edits(
         Ok(parsed) => parsed,
         Err(error) => return refuse_request(&peer, error),
     };
-    run_image_request(index, arrival, peer, parsed).await
+    run_image_request(index, arrival, peer, parsed, image::ImageEndpoint::Edits).await
 }
 
-/// Queues the validated image request `parsed` for model `index` and turns the
-/// worker's events into an OpenAI Images API response.
+/// Queues the validated image request `parsed`, which came to `endpoint`, for
+/// model `index`, and turns the worker's events into an OpenAI Images API
+/// response: one JSON object, or server-sent events when it streams.
 async fn run_image_request(
     index: usize,
     arrival: u64,
     peer: String,
     parsed: image::ParsedRequest,
+    endpoint: image::ImageEndpoint,
 ) -> Response {
+    let streamed = if parsed.stream {
+        format!(", streamed with {} partial images", parsed.partial_images)
+    } else {
+        String::new()
+    };
     let note = format!(
-        "http {arrival} from {peer}: image {}, n={}, refs={}",
+        "http {arrival} from {peer}: image {}, n={}, refs={}{streamed}",
         parsed.size,
         parsed.count,
         parsed.references.len()
     );
-    let format = parsed.format;
-    let background = parsed.background;
+    let stream = image::ImageStream {
+        endpoint,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        format: parsed.format,
+        background: parsed.background,
+    };
+    let streams = parsed.stream;
     let (cancel, events) = match worker::submit_image(worker::ImageRequest {
         model_index: index,
         prompt: parsed.prompt,
@@ -800,7 +821,12 @@ async fn run_image_request(
         format: parsed.format,
         quality: parsed.quality,
         background: parsed.background,
-        partial_images: 0,
+        // Partial images exist only in a stream.
+        partial_images: if parsed.stream {
+            parsed.partial_images
+        } else {
+            0
+        },
         references: parsed.references,
         mask: parsed.mask,
         note,
@@ -810,17 +836,20 @@ async fn run_image_request(
         Ok(pair) => pair,
         Err(error) => return refuse_request(&peer, error),
     };
-    let response = collect_image_response(&peer, format, background, events).await;
-    drop(cancel);
-    response
+    if streams {
+        stream_image_events(&peer, stream, cancel, events).await
+    } else {
+        let response = collect_image_response(&peer, stream, events).await;
+        drop(cancel);
+        response
+    }
 }
 
 /// Collects an image request's images from its `events` and answers with
-/// one JSON object, with the images' `format` and `background`.
+/// one JSON object.
 async fn collect_image_response(
     peer: &str,
-    format: engine::ImageFormat,
-    background: engine::ImageBackground,
+    stream: image::ImageStream,
     mut events: tokio::sync::mpsc::UnboundedReceiver<worker::Event>,
 ) -> Response {
     let mut images = Vec::new();
@@ -837,7 +866,8 @@ async fn collect_image_response(
             }
             Some(worker::Event::PartialImage { .. }) => {}
             Some(worker::Event::ImagesDone) => {
-                let response = image::build_response(&images, width, height, format, background);
+                let response =
+                    image::build_response(&images, width, height, stream.format, stream.background);
                 return build_json_response(response.to_string());
             }
             Some(worker::Event::Refused(message)) => {
@@ -859,6 +889,59 @@ async fn collect_image_response(
             }
         }
     }
+}
+
+/// Answers an image request with server-sent events: its partial images and
+/// its images as they come. A refusal or failure before the first event gets
+/// a plain error response instead. The body owns `cancel`, so the request
+/// stops when the client leaves.
+async fn stream_image_events(
+    peer: &str,
+    stream: image::ImageStream,
+    cancel: worker::CancelGuard,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<worker::Event>,
+) -> Response {
+    let first = match events.recv().await {
+        Some(event @ (worker::Event::PartialImage { .. } | worker::Event::Image { .. })) => event,
+        Some(worker::Event::Refused(message)) => {
+            return refuse_request(peer, chat::Error::new_bad_request(message));
+        }
+        Some(worker::Event::Failed(message)) => {
+            return chat::build_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                &message,
+            );
+        }
+        _ => {
+            return chat::build_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "the server is stopping",
+            );
+        }
+    };
+    let body = async_stream::stream! {
+        let _cancel = cancel;
+        let mut next = Some(first);
+        while let Some(event) = next {
+            let (text, ends) = stream.format_worker_event(event);
+            if let Some(text) = text {
+                yield Ok::<String, std::io::Error>(text);
+            }
+            if ends {
+                return;
+            }
+            next = events.recv().await;
+        }
+        // The worker dropped the request's events without a last event.
+        yield Ok(image::ImageStream::format_error("server_error", "the server is stopping"));
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .expect("a valid response")
 }
 
 /// Answers a request for an unknown path with 404.
