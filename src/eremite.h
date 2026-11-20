@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 9
+#define EREMITE_ABI 10
 
 // ---- the process ----
 
@@ -274,6 +274,10 @@ typedef struct {
   const eremite_image_input *refs;
   // Number of reference images (0 for text-to-image, 1 to 16 for editing).
   int ref_count;
+  // An edit's optional mask: an encoded image the size of the first reference
+  // image, whose alpha marks what changes. Transparent pixels change, and
+  // opaque pixels keep the first image's. data is null for no mask.
+  eremite_image_input mask;
 } eremite_image_request;
 
 // Output of one image generation or editing call.

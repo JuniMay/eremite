@@ -3,6 +3,7 @@
 #include "base/error.h"
 #include "base/log.h"
 #include "base/shutdown.h"
+#include "engine/matte.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/resample.h"
@@ -496,6 +497,45 @@ static void set_runtime_error(ImageResult *out,
                 "image generation failed: memory is short");
 }
 
+// Returns whether a width by height output has the shape of a source_w by
+// source_h image, within the pixel that scaling a size down rounds off.
+static int keeps_shape(int width, int height, int source_w, int source_h) {
+  long long skew = (long long)width * source_h - (long long)height * source_w;
+  long long longer = source_w > source_h ? source_w : source_h;
+  return skew <= longer && -skew <= longer;
+}
+
+// Keeps the first image's pixels where its mask is opaque, in the width by
+// height RGB output. original and mask are source_w by source_h, and they are
+// resized to the output first when its size differs.
+static void keep_masked_original(uint8_t *output, int width, int height,
+                                 const uint8_t *original, const uint8_t *mask,
+                                 int source_w, int source_h) {
+  size_t pixels = (size_t)width * (size_t)height;
+  if (source_w == width && source_h == height) {
+    matte_keep_masked(output, original, mask, pixels);
+    return;
+  }
+  uint8_t *resized =
+      image_resize_rgb_lanczos(original, source_w, source_h, width, height);
+  // The mask resizes as a gray RGB image, of which one channel is kept.
+  size_t source_pixels = (size_t)source_w * (size_t)source_h;
+  uint8_t *gray = xmalloc(source_pixels * MINIMAX_H3_RGB_CHANNELS);
+  for (size_t i = 0; i < source_pixels; i++)
+    memset(gray + i * MINIMAX_H3_RGB_CHANNELS, mask[i],
+           MINIMAX_H3_RGB_CHANNELS);
+  uint8_t *gray_resized =
+      image_resize_rgb_lanczos(gray, source_w, source_h, width, height);
+  uint8_t *mask_resized = xmalloc(pixels);
+  for (size_t i = 0; i < pixels; i++)
+    mask_resized[i] = gray_resized[i * MINIMAX_H3_RGB_CHANNELS];
+  matte_keep_masked(output, resized, mask_resized, pixels);
+  free(mask_resized);
+  free(gray_resized);
+  free(gray);
+  free(resized);
+}
+
 // Runs one text-to-image or reference editing pass and writes the encoded PNG
 // or JPEG bytes and stage timings into out.
 static int minimax_h3_image_generate(const ImageRequest *req,
@@ -570,6 +610,37 @@ static int minimax_h3_image_generate(const ImageRequest *req,
         (MinimaxH3RefImage){.rgb = decoded_rgb[i], .width = rw, .height = rh};
   }
 
+  // A mask is the first image's size, and the output keeps that image's shape,
+  // so that the mask lines up with both.
+  uint8_t *mask_alpha = NULL;
+  if (req->mask.data) {
+    const char *why = NULL;
+    int mask_w = 0, mask_h = 0;
+    if (req->ref_count == 0)
+      write_error(out->error, sizeof out->error,
+                  "a mask needs an image to edit");
+    else if (!(mask_alpha = image_decode_alpha(req->mask.data, req->mask.len,
+                                               &mask_w, &mask_h, &why)))
+      snprintf(out->error, sizeof out->error, "mask: %s",
+               why ? why : "cannot decode image");
+    else if (mask_w != ref_images[0].width || mask_h != ref_images[0].height)
+      snprintf(out->error, sizeof out->error,
+               "the mask is %dx%d, but the first image is %dx%d", mask_w,
+               mask_h, ref_images[0].width, ref_images[0].height);
+    else if (!keeps_shape(req->width, req->height, ref_images[0].width,
+                          ref_images[0].height))
+      snprintf(out->error, sizeof out->error,
+               "with a mask, the output must keep the first image's %dx%d "
+               "shape",
+               ref_images[0].width, ref_images[0].height);
+    if (out->error[0]) {
+      free(mask_alpha);
+      for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
+      out->invalid_input = 1;
+      return 0;
+    }
+  }
+
   MinimaxH3RunHooks hooks = {.yield_wait = wait,
                              .cancelled = cancelled,
                              .prefill_layer = &active_prefill_layer,
@@ -580,6 +651,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
                              .image_steps_completed = &total_image_steps};
   if (minimax_h3_should_stop(&hooks) || !text_enc || !dit || !vae) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
+    free(mask_alpha);
     set_runtime_error(out, &hooks);
     return 0;
   }
@@ -607,6 +679,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
       canvas_h, req_mem, &request_full, out->error, sizeof out->error);
   if (admission != MINIMAX_H3_ADMITTED) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
+    free(mask_alpha);
     if (minimax_h3_should_stop(&hooks)) set_runtime_error(out, &hooks);
     out->invalid_input = admission == MINIMAX_H3_NEVER_FITS;
     return 0;
@@ -683,7 +756,13 @@ static int minimax_h3_image_generate(const ImageRequest *req,
         .latents = ref_lat_bufs[i], .h_lat = rh_lat, .w_lat = rw_lat};
   }
 
-  // Raw reference pixels and encoder pins are no longer needed after Stage 1.
+  // With a mask, the first image's pixels stay for the end. The other raw
+  // reference pixels and the encoder pins are no longer needed after Stage 1.
+  uint8_t *original = NULL;
+  if (mask_alpha) {
+    original = decoded_rgb[0];
+    decoded_rgb[0] = NULL;
+  }
   for (int i = 0; i < req->ref_count; i++) {
     free(decoded_rgb[i]);
     decoded_rgb[i] = NULL;
@@ -742,18 +821,26 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     if (gen_start > 0.0) total_image_seconds += now() - gen_start;
     clear_active_progress();
     free(canvas_rgb);
+    free(original);
+    free(mask_alpha);
     set_runtime_error(out, &hooks);
     return 0;
   }
 
-  const uint8_t *encode_src = canvas_rgb;
+  uint8_t *output_rgb = canvas_rgb;
   if (canvas_w != req->width || canvas_h != req->height) {
     final_rgb = image_resize_rgb_lanczos(canvas_rgb, canvas_w, canvas_h,
                                          req->width, req->height);
     free(canvas_rgb);
     canvas_rgb = NULL;
-    encode_src = final_rgb;
+    output_rgb = final_rgb;
   }
+  if (mask_alpha)
+    keep_masked_original(output_rgb, req->width, req->height, original,
+                         mask_alpha, ref_images[0].width, ref_images[0].height);
+  free(original);
+  free(mask_alpha);
+  const uint8_t *encode_src = output_rgb;
 
   const char *enc_err = NULL;
   if (req->format == IMAGE_FORMAT_PNG)

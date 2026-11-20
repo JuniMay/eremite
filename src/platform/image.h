@@ -12,6 +12,12 @@ static constexpr int IMAGE_QUALITY_MIN = 0, IMAGE_QUALITY_MAX = 100;
 uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height,
                           const char **error);
 
+// Decodes the alpha channel of an image file's first image into rows of 8-bit
+// alpha values, 255 for opaque, and sets *width and *height; returns null with
+// *error set when it cannot, or when the image has no alpha channel.
+uint8_t *image_decode_alpha(const void *data, size_t len, int *width,
+                            int *height, const char **error);
+
 // Reads the width and height of an image file's first image, as decoding
 // would give them, without decoding its pixels. Returns 1, or returns 0 with
 // *error set when it cannot.
@@ -22,6 +28,12 @@ int image_read_size(const void *data, size_t len, int *width, int *height,
 // buffer and sets *length; returns null with *error set when it cannot.
 uint8_t *image_encode_png(const uint8_t *pixels, int width, int height,
                           size_t *length, const char **error);
+
+// Encodes width by height rows of 8-bit sRGB pixels with straight alpha,
+// RGBA, as a PNG file in a new buffer and sets *length; returns null with
+// *error set when it cannot.
+uint8_t *image_encode_png_rgba(const uint8_t *pixels, int width, int height,
+                               size_t *length, const char **error);
 
 // Encodes width by height rows of 8-bit RGB pixels as a JPEG file at quality
 // (IMAGE_QUALITY_MIN to IMAGE_QUALITY_MAX) in a new buffer and sets *length;

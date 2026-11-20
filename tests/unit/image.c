@@ -140,7 +140,45 @@ int main(void) {
   check(pixels && !memcmp(pixels, rgb, sizeof rgb),
         "a PNG file with alpha decodes to its colors, with alpha dropped");
   free(pixels);
+  int alpha_w = 0, alpha_h = 0;
+  const char *alpha_error = "unset";
+  uint8_t *alpha =
+      image_decode_alpha(CFDataGetBytePtr(png), (size_t)CFDataGetLength(png),
+                         &alpha_w, &alpha_h, &alpha_error);
+  int alpha_exact =
+      alpha && !alpha_error && alpha_w == WIDTH && alpha_h == HEIGHT;
+  for (int y = 0; alpha_exact && y < HEIGHT; y++)
+    for (int x = 0; x < WIDTH; x++)
+      alpha_exact &= alpha[y * WIDTH + x] == rgba[y][x][3];
+  check(alpha_exact, "a PNG file's alpha decodes to its exact values");
+  free(alpha);
   CFRelease(png);
+  png = encode_png(&rgb[0][0][0], 3, srgb, kCGImageAlphaNone);
+  alpha_error = 0;
+  alpha =
+      image_decode_alpha(CFDataGetBytePtr(png), (size_t)CFDataGetLength(png),
+                         &alpha_w, &alpha_h, &alpha_error);
+  check(!alpha && alpha_error && !alpha_w && !alpha_h,
+        "a PNG file without alpha gives no alpha and an error");
+  CFRelease(png);
+  size_t rgba_length = 0;
+  const char *rgba_error = "unset";
+  uint8_t *encoded_rgba = image_encode_png_rgba(&rgba[0][0][0], WIDTH, HEIGHT,
+                                                &rgba_length, &rgba_error);
+  pixels = encoded_rgba ? decode(encoded_rgba, rgba_length, WIDTH, HEIGHT) : 0;
+  alpha = encoded_rgba ? image_decode_alpha(encoded_rgba, rgba_length, &alpha_w,
+                                            &alpha_h, &alpha_error)
+                       : 0;
+  alpha_exact = alpha && alpha_w == WIDTH && alpha_h == HEIGHT;
+  for (int y = 0; alpha_exact && y < HEIGHT; y++)
+    for (int x = 0; x < WIDTH; x++)
+      alpha_exact &= alpha[y * WIDTH + x] == rgba[y][x][3];
+  check(encoded_rgba && !rgba_error && pixels &&
+            !memcmp(pixels, rgb, sizeof rgb) && alpha_exact,
+        "encoded RGBA PNG bytes round-trip to their colors and alpha");
+  free(alpha);
+  free(pixels);
+  free(encoded_rgba);
 
   // Gray pixels.
   uint8_t gray[HEIGHT][WIDTH];

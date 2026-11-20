@@ -203,11 +203,52 @@ static Rgb decode(const void *bytes, size_t len, const char **err) {
 // Number of 8-bit channels in an RGB pixel, and bits per channel.
 static constexpr size_t RGB_CHANNELS = 3, RGB_CHANNEL_BITS = 8;
 
+// Number of 8-bit channels in an RGBA pixel.
+static constexpr size_t RGBA_CHANNELS = 4;
+
 uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height,
                           const char **err) {
   Rgb image = decode(data, len, err);
   *width = image.w, *height = image.h;
   return image.p;
+}
+
+uint8_t *image_decode_alpha(const void *data, size_t len, int *width,
+                            int *height, const char **err) {
+  *width = *height = 0;
+  *err = 0;
+  CFDataRef d = CFDataCreate(0, data, (CFIndex)len);
+  CGImageSourceRef src = d ? CGImageSourceCreateWithData(d, 0) : 0;
+  CGImageRef img = src && CGImageSourceGetCount(src)
+                       ? CGImageSourceCreateImageAtIndex(src, 0, 0)
+                       : 0;
+  size_t w = img ? CGImageGetWidth(img) : 0,
+         h = img ? CGImageGetHeight(img) : 0;
+  CGImageAlphaInfo alpha = img ? CGImageGetAlphaInfo(img) : kCGImageAlphaNone;
+  uint8_t *out = 0;
+  if (!img)
+    *err = "the image could not be decoded";
+  else if (!w || !h)
+    *err = "the image is empty";
+  else if ((double)w * h > BOMB)
+    *err = "the image has more than 178,956,970 pixels";
+  else if (alpha == kCGImageAlphaNone || alpha == kCGImageAlphaNoneSkipFirst ||
+           alpha == kCGImageAlphaNoneSkipLast)
+    *err = "the image has no alpha channel";
+  else {
+    out = xmalloc(w * h);
+    memset(out, 0, w * h);
+    CGContextRef ctx =
+        CGBitmapContextCreate(out, w, h, 8, w, 0, kCGImageAlphaOnly);
+    if (!ctx) die("cannot draw an image of %zu x %zu pixels", w, h);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+    CGContextRelease(ctx);
+    *width = (int)w, *height = (int)h;
+  }
+  if (img) CGImageRelease(img);
+  if (src) CFRelease(src);
+  if (d) CFRelease(d);
+  return out;
 }
 
 int image_read_size(const void *data, size_t len, int *width, int *height,
@@ -254,21 +295,25 @@ static int check_encode_input(const uint8_t *pixels, int width, int height,
   return 1;
 }
 
-uint8_t *image_encode_png(const uint8_t *pixels, int width, int height,
-                          size_t *length, const char **err) {
+// Encodes width by height rows of channels-byte pixels as a PNG file: RGB, or
+// RGBA with straight alpha when alpha is set.
+static uint8_t *encode_png(const uint8_t *pixels, int width, int height,
+                           int alpha, size_t *length, const char **err) {
   *length = 0;
   *err = 0;
   if (!check_encode_input(pixels, width, height, err)) return 0;
-  size_t row = (size_t)width * RGB_CHANNELS;
+  size_t channels = alpha ? RGBA_CHANNELS : RGB_CHANNELS;
+  size_t row = (size_t)width * channels;
   CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   CGDataProviderRef provider =
       CGDataProviderCreateWithData(0, pixels, row * (size_t)height, 0);
   CGImageRef image =
       space && provider
-          ? CGImageCreate((size_t)width, (size_t)height, RGB_CHANNEL_BITS,
-                          RGB_CHANNEL_BITS * RGB_CHANNELS, row, space,
-                          (CGBitmapInfo)kCGImageAlphaNone, provider, 0, false,
-                          kCGRenderingIntentDefault)
+          ? CGImageCreate(
+                (size_t)width, (size_t)height, RGB_CHANNEL_BITS,
+                RGB_CHANNEL_BITS * channels, row, space,
+                (CGBitmapInfo)(alpha ? kCGImageAlphaLast : kCGImageAlphaNone),
+                provider, 0, false, kCGRenderingIntentDefault)
           : 0;
   CFMutableDataRef file = image ? CFDataCreateMutable(0, 0) : 0;
   CGImageDestinationRef dest =
@@ -291,6 +336,16 @@ uint8_t *image_encode_png(const uint8_t *pixels, int width, int height,
   if (provider) CGDataProviderRelease(provider);
   if (space) CGColorSpaceRelease(space);
   return out;
+}
+
+uint8_t *image_encode_png(const uint8_t *pixels, int width, int height,
+                          size_t *length, const char **err) {
+  return encode_png(pixels, width, height, 0, length, err);
+}
+
+uint8_t *image_encode_png_rgba(const uint8_t *pixels, int width, int height,
+                               size_t *length, const char **err) {
+  return encode_png(pixels, width, height, 1, length, err);
 }
 
 uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,

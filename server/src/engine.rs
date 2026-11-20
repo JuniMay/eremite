@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 9;
+const ABI: c_int = 10;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -155,6 +155,9 @@ struct RawImageRequest {
     refs: *const RawImageInput,
     /// Number of entries in `refs`.
     ref_count: c_int,
+    /// An edit's optional mask, whose alpha marks what changes; null data
+    /// for none.
+    mask: RawImageInput,
 }
 
 /// Output of one image generation or editing call (eremite_image_result).
@@ -2060,6 +2063,10 @@ impl Stream {
                 inputs.raw_refs.as_ptr()
             },
             ref_count: inputs.raw_refs.len() as c_int,
+            mask: RawImageInput {
+                data: ptr::null(),
+                len: 0,
+            },
         };
         unsafe { eremite_stream_generate_image(self.0, &req) }
     }

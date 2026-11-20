@@ -200,6 +200,10 @@ typedef struct {
   const ImageInput *refs;
   // Number of reference images (0 for text-to-image).
   int ref_count;
+  // An edit's optional mask: an encoded image the size of the first reference
+  // image, whose alpha marks what changes. Transparent pixels change, and
+  // opaque pixels keep the first image's. data is null for no mask.
+  ImageInput mask;
 } ImageRequest;
 
 // Capacity in bytes of ImageResult.error, including its NUL terminator.

@@ -457,15 +457,17 @@ static int run_image_generation(eremite_model *m,
                 "image input structs match");
   static_assert(sizeof(out->error) == IMAGE_ERROR_BYTES,
                 "image error buffers match");
-  ImageRequest req = {.prompt = request->prompt,
-                      .width = request->width,
-                      .height = request->height,
-                      .min_generation_area = request->min_generation_area,
-                      .format = (ImageFormat)request->format,
-                      .quality = request->quality,
-                      .seed = request->seed,
-                      .refs = (const ImageInput *)request->refs,
-                      .ref_count = request->ref_count};
+  ImageRequest req = {
+      .prompt = request->prompt,
+      .width = request->width,
+      .height = request->height,
+      .min_generation_area = request->min_generation_area,
+      .format = (ImageFormat)request->format,
+      .quality = request->quality,
+      .seed = request->seed,
+      .refs = (const ImageInput *)request->refs,
+      .ref_count = request->ref_count,
+      .mask = {.data = request->mask.data, .len = request->mask.len}};
   ImageResult res = {0};
   int ok = m->ops->generate_image(&req, wait, cancelled, &res);
   out->data = res.data;

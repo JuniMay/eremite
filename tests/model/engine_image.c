@@ -287,6 +287,53 @@ int main(int argc, char **argv) {
     check(st.dense_bytes > (20ull << 30) && st.generated_images == 4 &&
               st.image_steps == 24 && st.decode_rows == 0,
           "stats report edit weights, 4 images, 24 steps and 0 decode rows");
+
+    // A masked edit keeps the reference's pixels where the mask is opaque:
+    // here its bottom half, which must come back exactly.
+    int orig_w = 0, orig_h = 0;
+    const char *orig_error = NULL;
+    uint8_t *orig =
+        image_decode_rgb(rdata, rlen, &orig_w, &orig_h, &orig_error);
+    uint8_t *mask_px = xmalloc((size_t)orig_w * (size_t)orig_h * 4);
+    for (int y = 0; y < orig_h; y++)
+      for (int x = 0; x < orig_w; x++) {
+        uint8_t *px = mask_px + ((size_t)y * (size_t)orig_w + (size_t)x) * 4;
+        px[0] = px[1] = px[2] = 0;
+        px[3] = y < orig_h / 2 ? 0 : 255;
+      }
+    size_t mask_len = 0;
+    const char *mask_error = NULL;
+    uint8_t *mask_png =
+        image_encode_png_rgba(mask_px, orig_w, orig_h, &mask_len, &mask_error);
+    eremite_image_request req_masked = {
+        .prompt = "Turn <Picture 1> into a pencil sketch.",
+        .width = orig_w,
+        .height = orig_h,
+        .min_generation_area = 1024,
+        .format = EREMITE_IMAGE_PNG,
+        .seed = 5,
+        .refs = &ref_in,
+        .ref_count = 1,
+        .mask = {.data = mask_png, .len = mask_len}};
+    int ok_masked = eremite_generate_image(m, &req_masked, &res);
+    int out_w = 0, out_h = 0;
+    const char *out_error = NULL;
+    uint8_t *out_px = ok_masked ? image_decode_rgb(res.data, res.len, &out_w,
+                                                   &out_h, &out_error)
+                                : NULL;
+    size_t top = (size_t)orig_w * (size_t)(orig_h / 2) * 3,
+           all = (size_t)orig_w * (size_t)orig_h * 3;
+    printf("masked edit %dx%d: ok=%d %s\n", orig_w, orig_h, ok_masked,
+           ok_masked ? "" : res.error);
+    check(
+        orig && mask_png && ok_masked && out_px && out_w == orig_w &&
+            out_h == orig_h && !memcmp(out_px + top, orig + top, all - top),
+        "a masked edit keeps the reference's pixels where the mask is opaque");
+    free(out_px);
+    free(mask_png);
+    free(mask_px);
+    free(orig);
+    eremite_image_result_free(&res);
   }
 
   eremite_stream_free(stream);

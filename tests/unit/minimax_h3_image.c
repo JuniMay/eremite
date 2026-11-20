@@ -8,6 +8,7 @@
 #include "platform/image.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Unit tests for MiniMax-H3-Image canvas planning and run-hook cancellation.
@@ -285,6 +286,72 @@ int main(void) {
             acct.minimum == min_before && strstr(err, "now") != NULL,
         "4896x4896 does not fit now while another model holds the memory");
   memory_set_minimum(&other, 0, MEMORY_REQUIRED);
+
+  // A mask is checked before any GPU work: it needs an image to edit, an
+  // alpha channel and the first image's size, and the output keeps the first
+  // image's shape. These checks run without the model's weights.
+  enum { REF_W = 64, REF_H = 48 };
+
+  static uint8_t ref_rgb[REF_H][REF_W][3], mask_rgba[REF_H][REF_W][4];
+  for (int y = 0; y < REF_H; y++)
+    for (int x = 0; x < REF_W; x++) {
+      ref_rgb[y][x][0] = (uint8_t)(3 * x);
+      mask_rgba[y][x][3] = y < REF_H / 2 ? 0 : 255;
+    }
+  size_t ref_len = 0, mask_len = 0, flat_len = 0, small_len = 0;
+  const char *encode_error = 0;
+  uint8_t *ref_png = image_encode_png(&ref_rgb[0][0][0], REF_W, REF_H, &ref_len,
+                                      &encode_error);
+  uint8_t *mask_png = image_encode_png_rgba(&mask_rgba[0][0][0], REF_W, REF_H,
+                                            &mask_len, &encode_error);
+  uint8_t *flat_png = image_encode_png(&ref_rgb[0][0][0], REF_W, REF_H,
+                                       &flat_len, &encode_error);
+  uint8_t *small_png = image_encode_png_rgba(
+      &mask_rgba[0][0][0], REF_W / 2, REF_H / 2, &small_len, &encode_error);
+  ImageInput ref_input = {.data = ref_png, .len = ref_len};
+
+  struct {
+    ImageInput mask;
+    int ref_count, width, height;
+    const char *message;
+  } mask_cases[] = {
+      {{mask_png, mask_len}, 0, REF_W, REF_H, "a mask needs an image"},
+      {{flat_png, flat_len}, 1, REF_W, REF_H, "no alpha channel"},
+      {{small_png, small_len}, 1, REF_W, REF_H, "the mask is 32x24"},
+      {{mask_png, mask_len}, 1, REF_W, REF_W, "keep the first image's 64x48"},
+  };
+
+  int masks_refused = 1;
+  for (size_t i = 0; i < sizeof mask_cases / sizeof mask_cases[0]; i++) {
+    ImageRequest masked = {.prompt = "edit",
+                           .width = mask_cases[i].width,
+                           .height = mask_cases[i].height,
+                           .format = IMAGE_FORMAT_PNG,
+                           .refs = &ref_input,
+                           .ref_count = mask_cases[i].ref_count,
+                           .mask = mask_cases[i].mask};
+    ImageResult refused = {0};
+    int ok = minimax_h3_image_ops.generate_image(&masked, NULL, NULL, &refused);
+    masks_refused &= !ok && refused.invalid_input &&
+                     strstr(refused.error, mask_cases[i].message) != NULL;
+  }
+  check(masks_refused, "a mask without an image, without alpha, of another "
+                       "size or with another output shape is invalid input");
+  ImageRequest fitting = {.prompt = "edit",
+                          .width = REF_W,
+                          .height = REF_H,
+                          .format = IMAGE_FORMAT_PNG,
+                          .refs = &ref_input,
+                          .ref_count = 1,
+                          .mask = {mask_png, mask_len}};
+  ImageResult unloaded = {0};
+  check(!minimax_h3_image_ops.generate_image(&fitting, NULL, NULL, &unloaded) &&
+            !unloaded.invalid_input,
+        "a fitting mask passes its checks, and then needs the model's weights");
+  free(ref_png);
+  free(mask_png);
+  free(flat_png);
+  free(small_png);
 
   // A staged request keeps at least the staged base reserved while it runs.
   memory_set_limit(mem, 50ull << 30);
