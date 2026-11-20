@@ -331,6 +331,26 @@ static void free_workspace(TextWorkspace *ws) {
   gpu_free(&ws->ids);
 }
 
+uint64_t minimax_h3_text_encoder_workspace_bytes(int seq_len,
+                                                 int visual_count) {
+  uint64_t padded_m =
+      ((uint64_t)seq_len + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
+  uint64_t padded_attn = ((uint64_t)seq_len + (uint64_t)ATTN_PAD - 1) /
+                         (uint64_t)ATTN_PAD * ATTN_PAD;
+  uint64_t bytes = 0;
+  bytes += (uint64_t)seq_len * sizeof(int);
+  bytes += (uint64_t)seq_len * 3u * sizeof(int);
+  bytes += (uint64_t)seq_len * (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+  bytes += padded_m * (uint64_t)QWEN_FFN_DIM * sizeof(uint16_t);
+  bytes += (uint64_t)seq_len * (uint64_t)QWEN_Q_WIDTH * sizeof(float);
+  bytes += 2u * (uint64_t)seq_len * (uint64_t)QWEN_KV_WIDTH * sizeof(float);
+  bytes += (uint64_t)(QWEN_HEADS + 2 * QWEN_KV_HEADS) * padded_attn *
+           (uint64_t)QWEN_HEAD_DIM * sizeof(uint16_t);
+  bytes += 2u * (uint64_t)seq_len * (uint64_t)QWEN_FFN_DIM * sizeof(float);
+  if (visual_count > 0) bytes += (uint64_t)visual_count * sizeof(int);
+  return bytes;
+}
+
 // Allocates transient GPU buffers for encoding seq_len tokens. Returns 0 if
 // memory does not fit.
 static int alloc_workspace(MinimaxH3TextEncoder *enc, int seq_len,

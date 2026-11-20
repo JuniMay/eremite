@@ -649,6 +649,27 @@ static void free_vae_workspace(VaeWorkspace *ws) {
   gpu_free(&ws->z_tile);
 }
 
+uint64_t minimax_h3_image_vae_workspace_bytes(void) {
+  int tile_cells = VAE_TILE_SIZE / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int max_patches = tile_cells * tile_cells;
+  int max_seq = max_patches + VAE_SUFFIX_TOKENS;
+  uint64_t max_padded =
+      ((uint64_t)max_seq + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
+  uint64_t bytes = 0;
+  bytes += (uint64_t)MINIMAX_H3_VAE_LATENT_CHANNELS * (uint64_t)max_patches *
+           sizeof(float);
+  bytes += 2u * (uint64_t)max_seq * (uint64_t)VAE_DIM * sizeof(float);
+  bytes += max_padded * (uint64_t)VAE_FFN_INNER * sizeof(uint16_t);
+  bytes += (uint64_t)max_seq * (uint64_t)VAE_QKV_WIDTH * sizeof(float);
+  bytes += (uint64_t)max_seq * (uint64_t)VAE_DIM * sizeof(float);
+  bytes += 3u * (uint64_t)VAE_HEADS * max_padded * (uint64_t)VAE_HEAD_DIM *
+           sizeof(uint16_t);
+  bytes += (uint64_t)max_seq * (uint64_t)VAE_W1_WIDTH * sizeof(float);
+  bytes += (uint64_t)max_seq * (uint64_t)VAE_FFN_INNER * sizeof(float);
+  bytes += (uint64_t)max_patches * (uint64_t)VAE_PATCH_OUT * sizeof(float);
+  return bytes;
+}
+
 // Allocates transient GPU buffers large enough for max_patches latent cells.
 static int alloc_vae_workspace(MinimaxH3ImageVae *vae, int max_patches,
                                VaeWorkspace *ws) {

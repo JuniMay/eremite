@@ -41,6 +41,12 @@ uint64_t minimax_h3_dit_required_bytes(const MinimaxH3Dit *dit);
 // Returns the GPU bytes currently resident for the DiT weights.
 uint64_t minimax_h3_dit_resident_bytes(const MinimaxH3Dit *dit);
 
+// Returns the GPU workspace bytes needed by one sampling call for text_len
+// prompt tokens, ref_patches reference patches and target_patches canvas
+// patches.
+uint64_t minimax_h3_dit_workspace_bytes(int text_len, int ref_patches,
+                                        int target_patches);
+
 // Returns the number of PDD sampling steps configured by the checkpoint.
 int minimax_h3_dit_pdd_steps(const MinimaxH3Dit *dit);
 

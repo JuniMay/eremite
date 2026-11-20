@@ -62,6 +62,9 @@ uint64_t minimax_h3_image_vae_required_bytes(const MinimaxH3ImageVae *vae);
 // Returns the GPU bytes currently resident for the VAE decoder weights.
 uint64_t minimax_h3_image_vae_resident_bytes(const MinimaxH3ImageVae *vae);
 
+// Returns the GPU workspace bytes needed to decode one full spatial tile.
+uint64_t minimax_h3_image_vae_workspace_bytes(void);
+
 // Loads the VAE decoder weights into GPU memory if not already resident.
 // Returns 1 on success or 0 if memory did not fit or shutdown interrupted.
 int minimax_h3_image_vae_load(MinimaxH3ImageVae *vae);

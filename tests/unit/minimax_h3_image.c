@@ -1,6 +1,9 @@
 #include "eremite.h"
+#include "model/minimax_h3/dit.h"
+#include "model/minimax_h3/image_vae.h"
 #include "model/minimax_h3/model.h"
 #include "model/minimax_h3/quant.h"
+#include "model/minimax_h3/text_encoder.h"
 #include "platform/image.h"
 #include <math.h>
 #include <stdio.h>
@@ -125,6 +128,20 @@ int main(void) {
             lim.inference_steps == MINIMAX_H3_IMAGE_STEPS &&
             lim.guidance_scale == MINIMAX_H3_IMAGE_GUIDANCE_SCALE,
         "eremite_image_model_limits exports exact C model limits");
+
+  // Workspace byte estimates scale monotonically with canvas and prompt sizes.
+  uint64_t dit_small = minimax_h3_dit_workspace_bytes(64, 0, 256);
+  uint64_t dit_default = minimax_h3_dit_workspace_bytes(
+      64, 0,
+      MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA /
+          (MINIMAX_H3_IMAGE_PATCH_PX * MINIMAX_H3_IMAGE_PATCH_PX));
+  uint64_t text_small = minimax_h3_text_encoder_workspace_bytes(64, 0);
+  uint64_t text_max = minimax_h3_text_encoder_workspace_bytes(
+      MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS, 0);
+  uint64_t vae_tile = minimax_h3_image_vae_workspace_bytes();
+  check(dit_small > 0 && dit_default > dit_small && text_small > 0 &&
+            text_max > text_small && vae_tile > 0,
+        "workspace size estimates are positive and grow with canvas/prompt");
 
   printf("minimax_h3_image unit checks: %d failures\n", failures);
   return failures != 0;

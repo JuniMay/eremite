@@ -27,10 +27,6 @@
 // Stack size in bytes for one MiniMax-H3-Image engine pass.
 static constexpr size_t PASS_STACK_BYTES = 1u << 20;
 
-// Minimum GPU workspace reserve in bytes held beside the three core weight
-// groups when admitting the model.
-static constexpr uint64_t WORKSPACE_RESERVE_BYTES = 1ull << 30;
-
 // Maximum path buffer length in bytes when resolving checkpoint files.
 static constexpr size_t PATH_CAP = 2048;
 
@@ -200,13 +196,23 @@ static int minimax_h3_image_load(Gpu *gpu, MemorySlot *work, const char *dir,
     uint64_t dit_req = minimax_h3_dit_required_bytes(dit);
     uint64_t vae_req = minimax_h3_image_vae_required_bytes(vae);
     uint64_t vae_enc_req = minimax_h3_image_vae_encoder_required_bytes(vae);
-    uint64_t encode_stage = text_req + vis_req + vae_enc_req;
-    uint64_t sample_stage = dit_req + vae_req;
-    uint64_t max_stage =
+    int default_canvas_patches =
+        MINIMAX_H3_IMAGE_DEFAULT_MIN_AREA /
+        (MINIMAX_H3_IMAGE_PATCH_PX * MINIMAX_H3_IMAGE_PATCH_PX);
+    uint64_t encode_ws = minimax_h3_text_encoder_workspace_bytes(
+                             MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS, 0) +
+                         (uint64_t)MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS *
+                             (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+    uint64_t dit_ws =
+        minimax_h3_dit_workspace_bytes(0, 0, default_canvas_patches);
+    uint64_t vae_ws = minimax_h3_image_vae_workspace_bytes();
+    uint64_t sample_ws = dit_ws > vae_ws ? dit_ws : vae_ws;
+    uint64_t peak_ws = sample_ws > encode_ws ? sample_ws : encode_ws;
+    uint64_t encode_stage = text_req + vis_req + vae_enc_req + encode_ws;
+    uint64_t sample_stage = dit_req + vae_req + sample_ws;
+    required_full_bytes = text_req + dit_req + vae_req + peak_ws;
+    required_staged_bytes =
         sample_stage > encode_stage ? sample_stage : encode_stage;
-    required_full_bytes =
-        text_req + dit_req + vae_req + WORKSPACE_RESERVE_BYTES;
-    required_staged_bytes = max_stage + WORKSPACE_RESERVE_BYTES;
   }
 
   // Primary mode: load and keep all three core T2I groups resident together.

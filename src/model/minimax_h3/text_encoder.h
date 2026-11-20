@@ -58,6 +58,10 @@ minimax_h3_text_encoder_required_bytes(const MinimaxH3TextEncoder *enc);
 uint64_t
 minimax_h3_text_encoder_resident_bytes(const MinimaxH3TextEncoder *enc);
 
+// Returns the GPU workspace bytes needed by one text-encoder pass over seq_len
+// tokens with visual_count DeepStack visual positions.
+uint64_t minimax_h3_text_encoder_workspace_bytes(int seq_len, int visual_count);
+
 // Loads the text encoder weights into GPU memory if not already resident.
 // Returns 1 on success or 0 if memory did not fit or shutdown interrupted.
 int minimax_h3_text_encoder_load(MinimaxH3TextEncoder *enc);

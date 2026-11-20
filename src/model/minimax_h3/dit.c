@@ -667,6 +667,36 @@ static void free_dit_workspace(DitWorkspace *ws) {
   gpu_free(&ws->text_refined);
 }
 
+uint64_t minimax_h3_dit_workspace_bytes(int text_len, int ref_patches,
+                                        int target_patches) {
+  int total_vis = ref_patches + target_patches;
+  int seq_len = text_len + total_vis;
+  uint64_t padded_seq =
+      ((uint64_t)seq_len + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
+  uint64_t padded_text =
+      ((uint64_t)text_len + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
+  uint64_t bytes = 0;
+  bytes += (uint64_t)text_len * (uint64_t)DIT_DIM * sizeof(float);
+  bytes += 2u * (uint64_t)seq_len * (uint64_t)DIT_DIM * sizeof(float);
+  bytes += padded_text * (uint64_t)DIT_FFN_DIM * sizeof(uint16_t);
+  bytes += padded_seq * (uint64_t)DIT_FFN_DIM;
+  bytes += (uint64_t)seq_len * sizeof(float);
+  bytes += (uint64_t)seq_len * (uint64_t)DIT_QKV_WIDTH * sizeof(float);
+  bytes += (uint64_t)seq_len * (uint64_t)DIT_INNER * sizeof(float);
+  bytes += 3u * (uint64_t)DIT_HEADS * padded_seq * (uint64_t)DIT_HEAD_DIM *
+           sizeof(uint16_t);
+  bytes += (uint64_t)seq_len * (uint64_t)DIT_FC1_WIDTH * sizeof(float);
+  bytes += (uint64_t)seq_len * (uint64_t)DIT_FFN_DIM * sizeof(float);
+  bytes += 2u * (uint64_t)DIT_ADALN_RANK * sizeof(float);
+  bytes += 2u * (uint64_t)DIT_ADALN_OUT * sizeof(float);
+  bytes += (uint64_t)seq_len * sizeof(uint32_t);
+  bytes += (uint64_t)target_patches * sizeof(uint32_t);
+  bytes += (uint64_t)seq_len * 3u * sizeof(float);
+  bytes += (uint64_t)total_vis * (uint64_t)DIT_PATCH_DIM * sizeof(float);
+  bytes += (uint64_t)target_patches * (uint64_t)DIT_PATCH_DIM * sizeof(float);
+  return bytes;
+}
+
 // Allocates transient sampling workspace buffers for the packed sequence.
 static int alloc_dit_workspace(MinimaxH3Dit *dit, int text_len, int total_vis,
                                int target_patches, int seq_len,
