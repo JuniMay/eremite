@@ -1245,6 +1245,14 @@ impl Model {
         unsafe { eremite_is_image_model(self.raw) != 0 }
     }
 
+    /// Returns this model's image generation limits, or None when the model
+    /// generates no images.
+    pub fn image_limits(&self) -> Option<ImageLimits> {
+        let mut out = ImageLimits::default();
+        let ok = unsafe { eremite_image_model_limits(self.raw, &mut out) };
+        (ok != 0).then_some(out)
+    }
+
     /// Makes a new state, or returns None when its memory does not fit.
     pub fn state_new(&self) -> Option<StateHandle> {
         let s = unsafe { eremite_state_new(self.raw) };
@@ -1724,14 +1732,6 @@ pub struct ImageLimits {
     pub inference_steps: c_int,
     /// Required guidance scale for CFG-free checkpoints.
     pub guidance_scale: f64,
-}
-
-/// Returns the default MiniMax-H3-Image limits defined by the C engine.
-pub fn default_image_limits() -> ImageLimits {
-    let mut out = ImageLimits::default();
-    let ok = unsafe { eremite_image_model_limits(ptr::null(), &mut out) };
-    debug_assert_ne!(ok, 0);
-    out
 }
 
 /// Running stage of an image generation call (EREMITE_IMAGE_STAGE_*).

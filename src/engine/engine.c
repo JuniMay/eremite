@@ -207,6 +207,13 @@ eremite_model *eremite_open(const eremite_config *c) {
                      .routes_fd = -1,
                      .quiet = 1,
                      .draft = d->draft};
+  ImageLimits img_limits = {0};
+  int has_image_limits = 0;
+  if (ops->read_image_limits) {
+    ops->read_image_limits(&img_limits);
+    has_image_limits = 1;
+    if (options.ctx == 0) options.ctx = img_limits.max_prompt_tokens;
+  }
   if (ops->generate_image) {
     options.minimax_h3_image = (MinimaxH3ImageOptions){
         .text_encoder = h3->text_encoder, .dit = h3->dit, .vae = h3->vae};
@@ -220,6 +227,8 @@ eremite_model *eremite_open(const eremite_config *c) {
   }
   const char *bad =
       options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
+      : has_image_limits && options.ctx > img_limits.max_prompt_tokens
+          ? "ctx exceeds this model's prompt token limit"
       : ops->decide && (options.draft || options.lookup || has_deepseek ||
                         has_minimax_h3)
           ? "a decision model takes no drafts, lookup, experts, "
@@ -395,10 +404,9 @@ int eremite_is_image_model(const eremite_model *m) {
 
 int eremite_image_model_limits(const eremite_model *m,
                                eremite_image_limits *out) {
-  const ModelOps *ops = m ? m->ops : &minimax_h3_image_ops;
-  if (!ops->read_image_limits) return 0;
+  if (!m || !out || !m->ops->read_image_limits) return 0;
   ImageLimits lim = {0};
-  ops->read_image_limits(&lim);
+  m->ops->read_image_limits(&lim);
   *out = (eremite_image_limits){
       .max_prompt_tokens = lim.max_prompt_tokens,
       .max_dim = lim.max_dim,

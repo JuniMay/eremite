@@ -318,9 +318,8 @@ typedef struct {
 
 // Returns whether the model is an image generation model.
 int eremite_is_image_model(const eremite_model *m);
-// Writes the image limits of m into out and returns 1, or returns 0 for a
-// model that generates no images. When m is null, writes the default
-// MiniMax-H3-Image limits and returns 1.
+// Writes the image limits of m into out and returns 1, or returns 0 when m is
+// null, out is null, or m generates no images.
 int eremite_image_model_limits(const eremite_model *m,
                                eremite_image_limits *out);
 // Runs one image generation or editing call synchronously and writes the

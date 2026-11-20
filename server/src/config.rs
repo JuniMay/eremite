@@ -109,10 +109,11 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// Fits the settings to an image generation model whose prompt limit is
-    /// `context` tokens. Rejects text-generation-only keys, requires
-    /// `text_encoder`, `dit` and `vae`, and disables context lookup.
-    pub fn fit_image_model(&mut self, context: i32) -> Result<(), String> {
+    /// Fits the settings to an image generation model. Rejects
+    /// text-generation-only keys, requires `text_encoder`, `dit` and `vae`,
+    /// leaves an omitted `ctx` as 0 so the engine uses the model's prompt
+    /// limit, and disables context lookup.
+    pub fn fit_image_model(&mut self) -> Result<(), String> {
         let model = &self.engine.model;
         if let Some(key) = self
             .keys
@@ -122,12 +123,7 @@ impl ModelConfig {
             return Err(format!("{model}: {key} is not a setting of an image model"));
         }
         if !self.keys.iter().any(|key| key == "ctx") {
-            self.engine.ctx = context;
-        } else if self.engine.ctx > context {
-            return Err(format!(
-                "{model}: ctx {} is more than the model's prompt limit of {context} tokens",
-                self.engine.ctx
-            ));
+            self.engine.ctx = 0;
         }
         let h3 = self.engine.minimax_h3();
         if h3.is_none_or(|o| o.text_encoder.is_none() || o.dit.is_none() || o.vae.is_none()) {
@@ -1166,7 +1162,7 @@ mod tests {
     fn an_image_model_requires_its_three_checkpoints_and_no_generating_keys() {
         let fit = |model: Value| {
             let mut model = parse(&json!({"models": [model]})).unwrap().models[0].clone();
-            model.fit_image_model(4096).map(|()| model)
+            model.fit_image_model().map(|()| model)
         };
         let model = fit(json!({
             "model": "/m/minimax-h3-image",
@@ -1179,24 +1175,27 @@ mod tests {
         .unwrap();
         assert_eq!(
             (model.engine.ctx, model.engine.lookup, model.engine.draft),
-            (4096, 0, 0)
+            (0, 0, 0)
         );
         let h3 = model.engine.minimax_h3().unwrap();
         assert_eq!(h3.text_encoder.as_deref(), Some("/m/te.safetensors"));
         assert_eq!(h3.dit.as_deref(), Some("/m/dit.safetensors"));
         assert_eq!(h3.vae.as_deref(), Some("/m/vae.safetensors"));
 
-        assert!(fit(json!({"model": "/m/h3", "text_encoder": "/m/te.st"})).is_err());
-        assert!(
+        assert_eq!(
             fit(json!({
                 "model": "/m/h3",
                 "text_encoder": "/m/te.st",
                 "dit": "/m/dit.st",
                 "vae": "/m/vae.st",
-                "ctx": 4097
+                "ctx": 2048
             }))
-            .is_err()
+            .unwrap()
+            .engine
+            .ctx,
+            2048
         );
+        assert!(fit(json!({"model": "/m/h3", "text_encoder": "/m/te.st"})).is_err());
         for key in ["draft", "lookup", "max_cached_states"] {
             assert!(
                 fit(json!({

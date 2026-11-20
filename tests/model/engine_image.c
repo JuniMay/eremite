@@ -74,17 +74,32 @@ int main(int argc, char **argv) {
   check(eremite_open(&bad_draft) == NULL,
         "eremite_open rejects image model with draft option");
 
+  eremite_config bad_ctx = {.abi = EREMITE_ABI,
+                            .model = model_dir,
+                            .ctx = 4097,
+                            .minimax_h3 = {.text_encoder = te_path,
+                                           .dit = dit_path,
+                                           .vae = vae_path}};
+  check(eremite_open(&bad_ctx) == NULL,
+        "eremite_open rejects image model ctx above max_prompt_tokens");
+
   eremite_config cfg = {.abi = EREMITE_ABI,
                         .model = model_dir,
-                        .ctx = 4096,
+                        .ctx = 0,
                         .minimax_h3 = {.text_encoder = te_path,
                                        .dit = dit_path,
                                        .vae = vae_path}};
   eremite_model *m = eremite_open(&cfg);
-  check(m != NULL, "eremite_open registers MiniMax-H3-Image");
+  check(m != NULL, "eremite_open registers MiniMax-H3-Image with default ctx");
   if (!m) return 1;
   check(eremite_is_image_model(m) == 1 && eremite_is_decision_model(m) == 0,
         "model reports image kind and not decision kind");
+  eremite_image_limits lim = {0};
+  check(eremite_image_model_limits(NULL, &lim) == 0 &&
+            eremite_image_model_limits(m, &lim) == 1 &&
+            lim.max_prompt_tokens == 4096 && lim.inference_steps == 6 &&
+            lim.max_request_pixels == (32ll << 20),
+        "eremite_image_model_limits requires an opened image model");
   check(eremite_is_loaded(m) == 0,
         "weights are not loaded before eremite_load");
   check(eremite_model_tokenizer(m) != NULL,

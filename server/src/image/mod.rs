@@ -157,9 +157,11 @@ fn read_optional_i64(
 }
 
 /// Parses and validates a JSON text-to-image request for POST
-/// /v1/images/generations.
-pub fn parse_generation_request(body: &[u8]) -> Result<ParsedRequest, chat::Error> {
-    let limits = engine::default_image_limits();
+/// /v1/images/generations against the resolved image model's `limits`.
+pub fn parse_generation_request(
+    body: &[u8],
+    limits: &engine::ImageLimits,
+) -> Result<ParsedRequest, chat::Error> {
     let root: Value = serde_json::from_slice(body)
         .map_err(|error| chat::Error::new_bad_request(format!("not valid JSON: {error}")))?;
     let object = root
@@ -174,11 +176,11 @@ pub fn parse_generation_request(body: &[u8]) -> Result<ParsedRequest, chat::Erro
         .to_string();
     let size_raw = read_optional_string(object, "size")?
         .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-    let (width, height) = parse_size(size_raw, &limits)?;
+    let (width, height) = parse_size(size_raw, limits)?;
 
     let count = read_optional_i64(object, "n", 1, limits.max_images_per_request as i64)?
         .unwrap_or(1) as usize;
-    validate_total_pixels(width, height, count, &limits)?;
+    validate_total_pixels(width, height, count, limits)?;
     let seed = match object.get("seed") {
         None | Some(Value::Null) => rand::random(),
         Some(value) => value
@@ -420,14 +422,19 @@ fn parse_form_i64(
     Ok(Some(n))
 }
 
-/// Parses and validates a multipart/form-data image editing request for POST
-/// /v1/images/edits. Reference images are collected from `image` and `image[]`
-/// parts in upload order (`<Picture 1>`, `<Picture 2>`, ...).
-pub fn parse_edit_request(
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Result<ParsedRequest, chat::Error> {
-    let limits = engine::default_image_limits();
+/// Unvalidated fields and image attachments parsed from a multipart edit body.
+pub struct EditForm {
+    /// Model name from the `model` field, or None when omitted.
+    pub model: Option<String>,
+    /// Non-image UTF-8 form fields.
+    fields: HashMap<String, String>,
+    /// Uploaded `image` and `image[]` parts in upload order.
+    references: Vec<Vec<u8>>,
+}
+
+/// Parses a multipart/form-data image editing body into fields and reference
+/// attachments before model-specific limit validation.
+pub fn parse_edit_form(content_type: Option<&str>, body: &[u8]) -> Result<EditForm, chat::Error> {
     let content_type = content_type.ok_or_else(|| {
         chat::Error::new_bad_request("Content-Type: multipart/form-data is required")
     })?;
@@ -449,119 +456,145 @@ pub fn parse_edit_request(
             fields.insert(part.name, text.to_string());
         }
     }
-    if references.is_empty() {
-        return Err(chat::Error::new_bad_request(
-            "at least one reference image is required",
-        ));
-    }
-    if references.len() > limits.max_references as usize {
-        return Err(chat::Error::new_bad_request(format!(
-            "at most {} reference images are supported",
-            limits.max_references
-        )));
-    }
-
     let model = fields
         .get("model")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let prompt = fields
-        .get("prompt")
-        .ok_or_else(|| chat::Error::new_bad_request("prompt is required"))?
-        .clone();
-    let size_raw = fields
-        .get("size")
-        .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
-    let (width, height) = parse_size(size_raw, &limits)?;
-
-    let count = parse_form_i64(&fields, "n", 1, limits.max_images_per_request as i64)?.unwrap_or(1)
-        as usize;
-    validate_total_pixels(width, height, count, &limits)?;
-    let seed = match fields
-        .get("seed")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        None => rand::random(),
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| chat::Error::new_bad_request("seed must be a nonnegative integer"))?,
-    };
-    parse_response_format(
-        fields
-            .get("response_format")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty()),
-    )?;
-    let format = parse_output_format(
-        fields
-            .get("output_format")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty()),
-    )?;
-    let quality = parse_form_i64(
-        &fields,
-        "output_compression",
-        limits.min_jpeg_quality as i64,
-        limits.max_jpeg_quality as i64,
-    )?
-    .unwrap_or(limits.default_jpeg_quality as i64) as i32;
-    let min_generation_area = parse_form_i64(
-        &fields,
-        "min_generation_area",
-        limits.min_generation_area as i64,
-        limits.max_generation_area as i64,
-    )?
-    .unwrap_or(limits.default_generation_area as i64) as i32;
-
-    if let Some(raw) = fields
-        .get("num_inference_steps")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        && raw.parse::<i64>().ok() != Some(limits.inference_steps as i64)
-    {
-        return Err(chat::Error::new_bad_request(format!(
-            "num_inference_steps must be omitted or {}",
-            limits.inference_steps
-        )));
-    }
-    if let Some(raw) = fields
-        .get("guidance_scale")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        let ok = raw
-            .parse::<f64>()
-            .ok()
-            .is_some_and(|scale| scale.is_finite() && (scale - limits.guidance_scale).abs() == 0.0);
-        if !ok {
-            return Err(chat::Error::new_bad_request(format!(
-                "guidance_scale must be omitted or {}",
-                limits.guidance_scale
-            )));
-        }
-    }
-    if let Some(neg) = fields.get("negative_prompt")
-        && !neg.is_empty()
-    {
-        return Err(chat::Error::new_bad_request(
-            "negative_prompt is not supported",
-        ));
-    }
-
-    Ok(ParsedRequest {
+    Ok(EditForm {
         model,
-        prompt,
-        width,
-        height,
-        count,
-        seed,
-        min_generation_area,
-        format,
-        quality,
+        fields,
         references,
     })
+}
+
+impl EditForm {
+    /// Validates the parsed multipart form against the target model's `limits`.
+    pub fn validate(self, limits: &engine::ImageLimits) -> Result<ParsedRequest, chat::Error> {
+        let EditForm {
+            model,
+            fields,
+            references,
+        } = self;
+        if references.is_empty() {
+            return Err(chat::Error::new_bad_request(
+                "at least one reference image is required",
+            ));
+        }
+        if references.len() > limits.max_references as usize {
+            return Err(chat::Error::new_bad_request(format!(
+                "at most {} reference images are supported",
+                limits.max_references
+            )));
+        }
+
+        let prompt = fields
+            .get("prompt")
+            .ok_or_else(|| chat::Error::new_bad_request("prompt is required"))?
+            .clone();
+        let size_raw = fields
+            .get("size")
+            .ok_or_else(|| chat::Error::new_bad_request("size is required (WIDTHxHEIGHT)"))?;
+        let (width, height) = parse_size(size_raw, limits)?;
+
+        let count = parse_form_i64(&fields, "n", 1, limits.max_images_per_request as i64)?
+            .unwrap_or(1) as usize;
+        validate_total_pixels(width, height, count, limits)?;
+        let seed = match fields
+            .get("seed")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            None => rand::random(),
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|_| chat::Error::new_bad_request("seed must be a nonnegative integer"))?,
+        };
+        parse_response_format(
+            fields
+                .get("response_format")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )?;
+        let format = parse_output_format(
+            fields
+                .get("output_format")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+        )?;
+        let quality = parse_form_i64(
+            &fields,
+            "output_compression",
+            limits.min_jpeg_quality as i64,
+            limits.max_jpeg_quality as i64,
+        )?
+        .unwrap_or(limits.default_jpeg_quality as i64) as i32;
+        let min_generation_area = parse_form_i64(
+            &fields,
+            "min_generation_area",
+            limits.min_generation_area as i64,
+            limits.max_generation_area as i64,
+        )?
+        .unwrap_or(limits.default_generation_area as i64) as i32;
+
+        if let Some(raw) = fields
+            .get("num_inference_steps")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            && raw.parse::<i64>().ok() != Some(limits.inference_steps as i64)
+        {
+            return Err(chat::Error::new_bad_request(format!(
+                "num_inference_steps must be omitted or {}",
+                limits.inference_steps
+            )));
+        }
+        if let Some(raw) = fields
+            .get("guidance_scale")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let ok = raw.parse::<f64>().ok().is_some_and(|scale| {
+                scale.is_finite() && (scale - limits.guidance_scale).abs() == 0.0
+            });
+            if !ok {
+                return Err(chat::Error::new_bad_request(format!(
+                    "guidance_scale must be omitted or {}",
+                    limits.guidance_scale
+                )));
+            }
+        }
+        if let Some(neg) = fields.get("negative_prompt")
+            && !neg.is_empty()
+        {
+            return Err(chat::Error::new_bad_request(
+                "negative_prompt is not supported",
+            ));
+        }
+
+        Ok(ParsedRequest {
+            model,
+            prompt,
+            width,
+            height,
+            count,
+            seed,
+            min_generation_area,
+            format,
+            quality,
+            references,
+        })
+    }
+}
+
+/// Parses and validates a multipart/form-data image editing request for POST
+/// /v1/images/edits against `limits`. Reference images are collected from
+/// `image` and `image[]` parts in upload order (`<Picture 1>`, `<Picture 2>`, ...).
+pub fn parse_edit_request(
+    content_type: Option<&str>,
+    body: &[u8],
+    limits: &engine::ImageLimits,
+) -> Result<ParsedRequest, chat::Error> {
+    parse_edit_form(content_type, body)?.validate(limits)
 }
 
 /// Encodes `bytes` into standard RFC 4648 base64 with `=` padding.
@@ -608,6 +641,26 @@ pub fn build_response(images: &[Vec<u8>]) -> Value {
 mod tests {
     use super::*;
 
+    /// Returns a representative image-model limits fixture for parser tests.
+    fn test_limits() -> engine::ImageLimits {
+        engine::ImageLimits {
+            max_prompt_tokens: 4096,
+            max_dim: 8192,
+            min_generation_area: 1024,
+            max_generation_area: 16_777_216,
+            default_generation_area: 4_194_304,
+            max_canvas_area: 24 * 1024 * 1024,
+            max_request_pixels: 32 * 1024 * 1024,
+            max_images_per_request: 16,
+            max_references: 16,
+            min_jpeg_quality: 1,
+            max_jpeg_quality: 100,
+            default_jpeg_quality: 95,
+            inference_steps: 6,
+            guidance_scale: 1.0,
+        }
+    }
+
     #[test]
     fn base64_matches_rfc_4648_test_vectors() {
         for (input, expected) in [
@@ -625,6 +678,7 @@ mod tests {
 
     #[test]
     fn generation_request_reads_valid_t2i_fields_and_defaults() {
+        let limits = test_limits();
         let body = serde_json::to_vec(&json!({
             "prompt": "A red ceramic mug on wood.",
             "size": "4736x3552",
@@ -636,13 +690,12 @@ mod tests {
             "guidance_scale": 1
         }))
         .unwrap();
-        let req = parse_generation_request(&body).unwrap();
+        let req = parse_generation_request(&body, &limits).unwrap();
         assert_eq!(req.model, None);
         assert_eq!(req.prompt, "A red ceramic mug on wood.");
         assert_eq!((req.width, req.height), (4736, 3552));
         assert_eq!(req.count, 1);
         assert_eq!(req.seed, 42);
-        let limits = engine::default_image_limits();
         assert_eq!(req.min_generation_area, limits.default_generation_area);
         assert_eq!(req.format, engine::ImageFormat::Png);
         assert_eq!(req.quality, limits.default_jpeg_quality);
@@ -659,17 +712,39 @@ mod tests {
             "min_generation_area": 1024
         }))
         .unwrap();
-        let req = parse_generation_request(&jpg_body).unwrap();
+        let req = parse_generation_request(&jpg_body, &limits).unwrap();
         assert_eq!(req.model.as_deref(), Some("minimax-h3-image"));
         assert_eq!((req.width, req.height), (512, 512));
         assert_eq!(req.count, 2);
         assert_eq!(req.format, engine::ImageFormat::Jpeg);
         assert_eq!(req.quality, 85);
         assert_eq!(req.min_generation_area, 1024);
+
+        // Validation follows the resolved model's limits rather than hardcoded values.
+        let custom = engine::ImageLimits {
+            max_dim: 1024,
+            inference_steps: 4,
+            ..limits
+        };
+        let custom_ok = serde_json::to_vec(&json!({
+            "prompt": "small",
+            "size": "1024x1024",
+            "num_inference_steps": 4
+        }))
+        .unwrap();
+        assert!(parse_generation_request(&custom_ok, &custom).is_ok());
+        assert!(parse_generation_request(&custom_ok, &limits).is_err());
+        let custom_big = serde_json::to_vec(&json!({
+            "prompt": "big",
+            "size": "2048x1024"
+        }))
+        .unwrap();
+        assert!(parse_generation_request(&custom_big, &custom).is_err());
     }
 
     #[test]
     fn generation_request_rejects_invalid_and_unsupported_parameters() {
+        let limits = test_limits();
         for bad in [
             json!({"size": "512x512"}),
             json!({"prompt": "hi"}),
@@ -691,7 +766,7 @@ mod tests {
         ] {
             let bytes = serde_json::to_vec(&bad).unwrap();
             assert!(
-                parse_generation_request(&bytes).is_err(),
+                parse_generation_request(&bytes, &limits).is_err(),
                 "expected err: {bad}"
             );
         }
@@ -699,6 +774,7 @@ mod tests {
 
     #[test]
     fn edit_request_parses_multipart_fields_and_preserves_image_order() {
+        let limits = test_limits();
         let boundary = "test-boundary-123";
         let mut body = Vec::new();
         for (name, val) in [
@@ -738,7 +814,7 @@ mod tests {
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         let ct = format!("multipart/form-data; boundary=\"{boundary}\"");
-        let req = parse_edit_request(Some(&ct), &body).unwrap();
+        let req = parse_edit_request(Some(&ct), &body, &limits).unwrap();
         assert_eq!(req.model.as_deref(), Some("minimax-h3-image"));
         assert_eq!(req.prompt, "Combine <Picture 1> and <Picture 2>.");
         assert_eq!((req.width, req.height), (1024, 1024));
@@ -749,6 +825,7 @@ mod tests {
 
     #[test]
     fn edit_request_rejects_missing_images_and_bad_steps() {
+        let limits = test_limits();
         let boundary = "b1";
         let body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
@@ -756,7 +833,7 @@ mod tests {
              --{boundary}--\r\n"
         );
         let ct = format!("multipart/form-data; boundary={boundary}");
-        assert!(parse_edit_request(Some(&ct), body.as_bytes()).is_err());
+        assert!(parse_edit_request(Some(&ct), body.as_bytes(), &limits).is_err());
 
         let bad_steps = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
@@ -765,7 +842,7 @@ mod tests {
              --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
              --{boundary}--\r\n"
         );
-        assert!(parse_edit_request(Some(&ct), bad_steps.as_bytes()).is_err());
+        assert!(parse_edit_request(Some(&ct), bad_steps.as_bytes(), &limits).is_err());
 
         let too_many_pixels = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
@@ -774,7 +851,7 @@ mod tests {
              --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
              --{boundary}--\r\n"
         );
-        assert!(parse_edit_request(Some(&ct), too_many_pixels.as_bytes()).is_err());
+        assert!(parse_edit_request(Some(&ct), too_many_pixels.as_bytes(), &limits).is_err());
     }
 
     #[test]

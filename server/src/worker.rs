@@ -525,6 +525,9 @@ pub struct SharedModel {
     pub settings: ModelSettings,
     /// The model's tokenizer.
     pub tokenizer: engine::Tokenizer,
+    /// Image generation limits reported by the opened model, or None for text
+    /// and decision models.
+    pub image_limits: Option<engine::ImageLimits>,
     /// The model's status. The worker updates it.
     status: Mutex<ModelStatus>,
 }
@@ -739,6 +742,12 @@ pub fn list_models() -> Vec<(String, engine::Tokenizer, ModelSettings)> {
         .collect()
 }
 
+/// Returns the image generation limits of the served model at `model_index`, or
+/// None when it generates no images.
+pub fn image_limits(model_index: usize) -> Option<engine::ImageLimits> {
+    clone_shared().models.get(model_index)?.image_limits
+}
+
 /// Starts the engine thread. The thread registers each model without loading
 /// its weights. `view` holds what the terminal UI asks of the worker. This call
 /// returns true once the worker takes requests. It returns false when the
@@ -774,9 +783,17 @@ pub fn start(
                     let _ = started_sender.send(false);
                     return;
                 };
+                let image_limits = model.image_limits();
+                let mut resolved = settings.clone();
+                if resolved.options.ctx == 0
+                    && let Some(lim) = image_limits
+                {
+                    resolved.options.ctx = lim.max_prompt_tokens;
+                }
                 models.push(SharedModel {
-                    settings: settings.clone(),
+                    settings: resolved,
                     tokenizer: model.tokenizer(),
+                    image_limits,
                     status: Mutex::new(ModelStatus {
                         stats: model.read_stats(),
                         drafts_per_pass: model.drafts_per_pass(),

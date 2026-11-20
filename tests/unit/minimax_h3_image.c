@@ -111,10 +111,14 @@ int main(void) {
   cancelled = 1;
   check(minimax_h3_should_stop(&hooks), "cancelled hooks request stop");
 
-  // Single-source image limits exported through eremite.h match model.h.
-  eremite_image_limits lim = {0};
-  check(eremite_image_model_limits(NULL, &lim) == 1 &&
-            lim.max_prompt_tokens == MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS &&
+  // Null model returns 0 (no hardcoded family fallback); MiniMax-H3's ops
+  // export the exact model.h limits directly.
+  eremite_image_limits api_lim = {0};
+  check(eremite_image_model_limits(NULL, &api_lim) == 0,
+        "eremite_image_model_limits rejects a null model");
+  ImageLimits lim = {0};
+  minimax_h3_image_ops.read_image_limits(&lim);
+  check(lim.max_prompt_tokens == MINIMAX_H3_IMAGE_MAX_PROMPT_TOKENS &&
             lim.max_dim == MINIMAX_H3_IMAGE_MAX_DIM &&
             lim.min_generation_area == MINIMAX_H3_IMAGE_MIN_AREA &&
             lim.max_generation_area == MINIMAX_H3_IMAGE_MAX_AREA &&
@@ -128,7 +132,7 @@ int main(void) {
             lim.default_jpeg_quality == MINIMAX_H3_IMAGE_DEFAULT_JPEG_QUALITY &&
             lim.inference_steps == MINIMAX_H3_IMAGE_STEPS &&
             lim.guidance_scale == MINIMAX_H3_IMAGE_GUIDANCE_SCALE,
-        "eremite_image_model_limits exports exact C model limits");
+        "MiniMax-H3 read_image_limits exports exact C model limits");
 
   // Workspace byte estimates scale monotonically with canvas and prompt sizes.
   uint64_t dit_small = minimax_h3_dit_workspace_bytes(64, 0, 256);

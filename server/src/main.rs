@@ -85,8 +85,9 @@ enum Format {
     /// d1's prompt (decision/d1.rs), with the checkpoint's d1 settings. A d1
     /// model is a decision model: it answers questions and generates no text.
     D1(d1::Checkpoint),
-    /// MiniMax-H3-Image: text-to-image generation and multi-reference editing.
-    MinimaxH3Image,
+    /// MiniMax-H3-Image: text-to-image generation and multi-reference editing,
+    /// with the input and output limits reported by the opened engine model.
+    MinimaxH3Image(engine::ImageLimits),
 }
 
 /// What the HTTP handlers share.
@@ -124,7 +125,7 @@ fn makes_decisions(model: &Served) -> bool {
 /// Returns whether `model` is an image model: whether it answers POST
 /// /v1/images/generations and POST /v1/images/edits.
 fn generates_images(model: &Served) -> bool {
-    matches!(model.format, Format::MinimaxH3Image)
+    matches!(model.format, Format::MinimaxH3Image(_))
 }
 
 /// Finds the index of the model named `name` (in any case). For an unknown
@@ -356,7 +357,7 @@ async fn list_codex_models(State(shared): App) -> Response {
                 context_window: model.ctx,
                 default_effort: defaults.is_thinking_on.then_some(defaults.effort),
             }),
-            Format::D1(_) | Format::MinimaxH3Image => None,
+            Format::D1(_) | Format::MinimaxH3Image(_) => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -492,7 +493,7 @@ async fn answer_decisions(
                 Format::DeepSeek(_) => {
                     format!("{} generates text: it makes no decisions", model.id)
                 }
-                Format::MinimaxH3Image => {
+                Format::MinimaxH3Image(_) => {
                     format!("{} is an image model: it makes no decisions", model.id)
                 }
                 Format::D1(_) => unreachable!(),
@@ -637,7 +638,7 @@ async fn answer_generation(
             "{} is a decision model: it answers questions and generates no text",
             handlers.models[index].id
         ))),
-        Format::MinimaxH3Image => Err(chat::Error::new_bad_request(format!(
+        Format::MinimaxH3Image(_) => Err(chat::Error::new_bad_request(format!(
             "{} is an image model: it generates images and generates no text",
             handlers.models[index].id
         ))),
@@ -666,8 +667,36 @@ enum Prepared {
     DeepSeek(deepseek::PreparedRequest),
 }
 
-/// Answers POST /v1/images/generations: parses a JSON text-to-image request,
-/// submits it to the served image model, and returns `data[i].b64_json`.
+/// Finds the served image model named `name` (or the default image model) and
+/// returns its index and engine-reported limits, or an HTTP status and message.
+fn resolve_image_model(
+    shared: &Shared,
+    name: Option<&str>,
+) -> Result<(usize, engine::ImageLimits), (StatusCode, String)> {
+    let index = find_model_index_by_name(shared, name, generates_images)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    let model = &shared.models[index];
+    let Format::MinimaxH3Image(limits) = model.format else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{} generates no images", model.id),
+        ));
+    };
+    Ok((index, limits))
+}
+
+/// Converts a `resolve_image_model` failure into an OpenAI-format HTTP error.
+fn refuse_image_model(peer: &str, status: StatusCode, message: String) -> Response {
+    if status == StatusCode::BAD_REQUEST {
+        refuse_request(peer, chat::Error::new_bad_request(message))
+    } else {
+        chat::build_error_response(status, "invalid_request_error", &message)
+    }
+}
+
+/// Answers POST /v1/images/generations: finds the target image model, validates
+/// the JSON text-to-image request against that model's limits, submits it to
+/// the worker, and returns `data[i].b64_json`.
 async fn answer_image_generations(
     State(shared): App,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -678,16 +707,35 @@ async fn answer_image_generations(
         Ok(body) => body,
         Err(error) => return refuse_request(&peer, error),
     };
-    let parsed = match image::parse_generation_request(&body) {
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
+    let index = match find_model_index(&shared, &body, generates_images) {
+        Ok(index) => index,
+        Err(message) => {
+            return refuse_image_model(&peer, StatusCode::NOT_FOUND, message);
+        }
+    };
+    let model = &shared.models[index];
+    let Format::MinimaxH3Image(limits) = model.format else {
+        return refuse_image_model(
+            &peer,
+            StatusCode::BAD_REQUEST,
+            format!("{} generates no images", model.id),
+        );
+    };
+    let parsed = match image::parse_generation_request(&body, &limits) {
         Ok(parsed) => parsed,
         Err(error) => return refuse_request(&peer, error),
     };
-    run_image_request(shared, peer, body.len(), parsed).await
+    run_image_request(index, arrival, peer, parsed).await
 }
 
-/// Answers POST /v1/images/edits: parses a multipart/form-data image editing
-/// request with one or more reference images, submits it to the served image
-/// model, and returns `data[i].b64_json`.
+/// Answers POST /v1/images/edits: parses the multipart/form-data body, finds
+/// the target image model, validates the form against that model's limits,
+/// submits it to the worker, and returns `data[i].b64_json`.
 async fn answer_image_edits(
     State(shared): App,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -703,45 +751,37 @@ async fn answer_image_edits(
         Ok(body) => body,
         Err(error) => return refuse_request(&peer, error),
     };
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let parsed = match image::parse_edit_request(content_type, &body) {
+    let form = match image::parse_edit_form(content_type, &body) {
+        Ok(form) => form,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let (index, limits) = match resolve_image_model(&shared, form.model.as_deref()) {
+        Ok(pair) => pair,
+        Err((status, message)) => return refuse_image_model(&peer, status, message),
+    };
+    let parsed = match form.validate(&limits) {
         Ok(parsed) => parsed,
         Err(error) => return refuse_request(&peer, error),
     };
-    run_image_request(shared, peer, body.len(), parsed).await
+    run_image_request(index, arrival, peer, parsed).await
 }
 
-/// Resolves the target image model for `parsed`, queues the worker request,
-/// and turns the worker's final event into an OpenAI Images API response.
+/// Queues the validated image request `parsed` for model `index` and turns the
+/// worker's final event into an OpenAI Images API response.
 async fn run_image_request(
-    shared: Arc<Shared>,
+    index: usize,
+    arrival: u64,
     peer: String,
-    body_bytes: usize,
     parsed: image::ParsedRequest,
 ) -> Response {
-    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
-    engine::log(&format!(
-        "http {arrival}: arrived from {peer}, {body_bytes} body bytes"
-    ));
-    let index = match find_model_index_by_name(&shared, parsed.model.as_deref(), generates_images) {
-        Ok(index) => index,
-        Err(message) => {
-            return chat::build_error_response(
-                StatusCode::NOT_FOUND,
-                "invalid_request_error",
-                &message,
-            );
-        }
-    };
-    let model = &shared.models[index];
-    if !generates_images(model) {
-        return refuse_request(
-            &peer,
-            chat::Error::new_bad_request(format!("{} generates no images", model.id)),
-        );
-    }
     let note = format!(
         "http {arrival} from {peer}: image {}x{}, n={}, refs={}",
         parsed.width,
@@ -868,9 +908,7 @@ fn main() {
                 .fit_decision_model(context)
                 .unwrap_or_else(|error| die(&error));
         } else if family == Family::MinimaxH3Image {
-            model
-                .fit_image_model(engine::default_image_limits().max_prompt_tokens)
-                .unwrap_or_else(|error| die(&error));
+            model.fit_image_model().unwrap_or_else(|error| die(&error));
         }
         let mut options = model.engine.clone();
         options
@@ -966,16 +1004,19 @@ fn main() {
     }
     let loaded = worker::list_models();
     let mut served_models = Vec::new();
-    for (settings, family) in served.iter().zip(&families) {
+    for (index, ((_, tokenizer, settings), family)) in loaded.iter().zip(&families).enumerate() {
         let (ctx, id) = (settings.options.ctx as usize, settings.id.clone());
-        let tokenizer = loaded[served_models.len()].1;
+        let tokenizer = *tokenizer;
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults::new(id.clone())),
             Family::D1 => Format::D1(
                 d1::Checkpoint::read(&settings.options.model, tokenizer)
                     .unwrap_or_else(|error| die(&error)),
             ),
-            Family::MinimaxH3Image => Format::MinimaxH3Image,
+            Family::MinimaxH3Image => Format::MinimaxH3Image(
+                worker::image_limits(index)
+                    .unwrap_or_else(|| die(&format!("{id}: image model reported no limits"))),
+            ),
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
