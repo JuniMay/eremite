@@ -789,6 +789,7 @@ async fn run_image_request(
         parsed.references.len()
     );
     let format = parsed.format;
+    let background = parsed.background;
     let (_cancel, mut events) = match worker::submit_image(worker::ImageRequest {
         model_index: index,
         prompt: parsed.prompt,
@@ -798,6 +799,7 @@ async fn run_image_request(
         min_generation_area: parsed.min_generation_area,
         format: parsed.format,
         quality: parsed.quality,
+        background: parsed.background,
         references: parsed.references,
         mask: parsed.mask,
         note,
@@ -813,7 +815,8 @@ async fn run_image_request(
             width,
             height,
         }) => {
-            build_json_response(image::build_response(&images, width, height, format).to_string())
+            let response = image::build_response(&images, width, height, format, background);
+            build_json_response(response.to_string())
         }
         Some(worker::Event::Refused(message)) => {
             refuse_request(&peer, chat::Error::new_bad_request(message))

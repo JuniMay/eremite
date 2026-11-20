@@ -41,9 +41,9 @@ use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
 use crate::decision::d1;
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
-    self, CacheCounts, DraftChoice, ExpandError, ImageCallParams, ImageError, ImageFormat,
-    ImageInputs, Logits, Lookup, Media, Model, PrefillInfo, Sampler, SnapshotHandle, StateHandle,
-    Stream,
+    self, CacheCounts, DraftChoice, ExpandError, ImageBackground, ImageCallParams, ImageError,
+    ImageFormat, ImageInputs, Logits, Lookup, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
+    StateHandle, Stream,
 };
 use crate::state_cache::{
     self, Cache, Entry, Evicted, ModelLimits, Plan, PlanLimits, Snapshot, SnapshotKind,
@@ -227,6 +227,8 @@ pub struct ImageRequest {
     pub format: ImageFormat,
     /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
+    /// Output background.
+    pub background: ImageBackground,
     /// Optional reference image bytes in upload order (`<Picture 1>`, ...).
     pub references: Vec<Vec<u8>>,
     /// An edit's mask image bytes, whose alpha marks what changes; None for
@@ -5005,6 +5007,7 @@ impl WorkerModel {
                 min_generation_area: req.min_generation_area,
                 format: req.format,
                 quality: req.quality,
+                background: req.background,
                 seed: req.seed.wrapping_add(index),
             },
         );
@@ -5338,6 +5341,7 @@ mod tests {
                 min_generation_area: 1024,
                 format: engine::ImageFormat::Png,
                 quality: 0,
+                background: engine::ImageBackground::Auto,
                 references: Vec::new(),
                 mask: None,
                 note: String::new(),

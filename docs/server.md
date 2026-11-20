@@ -140,8 +140,9 @@ An image model serves `POST /v1/images/generations` (JSON) and
 `POST /v1/images/edits` (JSON or `multipart/form-data`, up to 128 MiB). The chat and
 decision endpoints refuse it, and Codex's catalog leaves it out. Both endpoints
 return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT",
-"output_format": "png"}`, where `size` is the size of the returned images and
-`output_format` is their format:
+"output_format": "png", "background": "opaque"}`, where `size` is the size of
+the returned images, `output_format` is their format, and `background` is
+`transparent` or `opaque`:
 
 - `prompt`: required string, passed verbatim and truncated to 4096 tokens.
 - `size`: `auto` (the default) or `WIDTHxHEIGHT` (each 1 to 8192). The
@@ -173,6 +174,16 @@ return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT",
   Other formats, such as `"gif"`, get HTTP 400.
 - `output_compression`: optional JPEG or WebP quality, 0 to 100 (default
   100, as in OpenAI's API). PNG ignores it.
+- `background`: `"auto"` (default), `"opaque"` or `"transparent"`.
+  MiniMax-H3-Image draws no alpha, so `auto` gives an opaque background. For
+  `transparent`, eremite adds a sentence to the prompt that asks for a flat
+  pure green (#00FF00) background, and then makes that background clear. The
+  key is the median color of the image's border, and a pixel's alpha comes
+  from how far its green leads its red and blue, measured against the
+  border's own spread. This is an approximation: the edges of hair, glass,
+  smoke and soft shadows suffer, and green parts of the subject turn clear.
+  An image whose border has no green key fails with HTTP 503. A transparent
+  background needs `output_format` `"png"` or `"webp"`; JPEG gets HTTP 400.
 - `min_generation_area`: optional integer from 1024 to 16777216 (default
   4194304, 2048 x 2048). When `size` has fewer pixels, the model generates on a
   larger 32-pixel-aligned canvas with the same aspect ratio and resizes back

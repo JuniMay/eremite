@@ -1,8 +1,8 @@
 //! Image generation and editing API (POST /v1/images/generations and POST
 //! /v1/images/edits) for MiniMax-H3-Image. Parses JSON text-to-image requests
 //! and multipart/form-data image editing requests, validates MiniMax-H3-Image
-//! parameters, encodes generated PNG/JPEG bytes as base64, and formats OpenAI
-//! image responses.
+//! parameters, encodes generated PNG, JPEG or WebP bytes as base64, and formats
+//! OpenAI image responses.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -47,6 +47,8 @@ pub struct ParsedRequest {
     pub format: engine::ImageFormat,
     /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
+    /// Output background.
+    pub background: engine::ImageBackground,
     /// Reference image bytes in upload order (empty for text-to-image).
     pub references: Vec<Vec<u8>>,
     /// An edit's mask image bytes, whose alpha marks what changes; None for
@@ -125,6 +127,34 @@ fn parse_output_format(value: Option<&str>) -> Result<engine::ImageFormat, chat:
             "output_format {other:?} is not supported; use \"png\", \"jpeg\" or \"webp\""
         ))),
     }
+}
+
+/// Validates and parses the `background` value (`auto`, `opaque` or
+/// `transparent`) of a request whose output is `format`; a transparent
+/// background needs a format with alpha.
+fn parse_background(
+    value: Option<&str>,
+    format: engine::ImageFormat,
+) -> Result<engine::ImageBackground, chat::Error> {
+    let background = match value {
+        None => engine::ImageBackground::Auto,
+        Some(raw) if raw.eq_ignore_ascii_case("auto") => engine::ImageBackground::Auto,
+        Some(raw) if raw.eq_ignore_ascii_case("opaque") => engine::ImageBackground::Opaque,
+        Some(raw) if raw.eq_ignore_ascii_case("transparent") => {
+            engine::ImageBackground::Transparent
+        }
+        Some(other) => {
+            return Err(chat::Error::new_bad_request(format!(
+                "background {other:?} is not supported; use \"auto\", \"opaque\" or \"transparent\""
+            )));
+        }
+    };
+    if background == engine::ImageBackground::Transparent && format == engine::ImageFormat::Jpeg {
+        return Err(chat::Error::new_bad_request(
+            "a transparent background needs output_format png or webp",
+        ));
+    }
+    Ok(background)
 }
 
 /// Reads an optional string field from a JSON object, rejecting non-strings.
@@ -213,6 +243,7 @@ fn read_json_request(
     let _generator_device = read_optional_string(object, "generator_device")?;
     parse_response_format(read_optional_string(object, "response_format")?)?;
     let format = parse_output_format(read_optional_string(object, "output_format")?)?;
+    let background = parse_background(read_optional_string(object, "background")?, format)?;
     let quality = read_optional_i64(
         object,
         "output_compression",
@@ -267,6 +298,7 @@ fn read_json_request(
         min_generation_area,
         format,
         quality,
+        background,
         references: Vec::new(),
         mask: None,
     })
@@ -548,6 +580,13 @@ impl EditForm {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty()),
         )?;
+        let background = parse_background(
+            fields
+                .get("background")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty()),
+            format,
+        )?;
         let quality = parse_form_i64(
             &fields,
             "output_compression",
@@ -606,6 +645,7 @@ impl EditForm {
             min_generation_area,
             format,
             quality,
+            background,
             references,
             mask,
         })
@@ -777,12 +817,14 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// Builds an OpenAI Images API JSON response containing `images` as base64
-/// `b64_json` items, with their `width` by `height` size and their `format`.
+/// `b64_json` items, with their `width` by `height` size, their `format` and
+/// their `background`.
 pub fn build_response(
     images: &[Vec<u8>],
     width: i32,
     height: i32,
     format: engine::ImageFormat,
+    background: engine::ImageBackground,
 ) -> Value {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -796,6 +838,7 @@ pub fn build_response(
         "data": data,
         "size": format!("{width}x{height}"),
         "output_format": format.name(),
+        "background": background.response_name(),
     })
 }
 
@@ -1084,6 +1127,7 @@ mod tests {
         assert_eq!(req.references, vec![b"first".to_vec(), b"second".to_vec()]);
         assert_eq!(req.mask.as_deref(), Some(&b"mask"[..]));
         assert_eq!(req.size, ImageSize::Auto);
+        assert_eq!(req.background, engine::ImageBackground::Opaque);
         assert_eq!(req.prompt, "Combine <Picture 1> and <Picture 2>.");
     }
 
@@ -1149,16 +1193,87 @@ mod tests {
     }
 
     #[test]
+    fn generation_request_reads_background() {
+        let limits = test_limits();
+        let parse = |body: Value| {
+            parse_generation_request(&serde_json::to_vec(&body).unwrap(), &limits)
+                .map(|req| req.background)
+        };
+        assert_eq!(
+            parse(json!({"prompt": "p"})).unwrap(),
+            engine::ImageBackground::Auto
+        );
+        assert_eq!(
+            parse(json!({"prompt": "p", "background": "opaque", "output_format": "jpeg"})).unwrap(),
+            engine::ImageBackground::Opaque
+        );
+        for format in ["png", "webp"] {
+            assert_eq!(
+                parse(json!({"prompt": "p", "background": "transparent", "output_format": format}))
+                    .unwrap(),
+                engine::ImageBackground::Transparent
+            );
+        }
+        for (bad, message) in [
+            (
+                json!({"prompt": "p", "background": "transparent", "output_format": "jpeg"}),
+                "needs output_format png or webp",
+            ),
+            (
+                json!({"prompt": "p", "background": "clear"}),
+                "background \"clear\" is not supported",
+            ),
+            (
+                json!({"prompt": "p", "background": 1}),
+                "background must be a string",
+            ),
+        ] {
+            let error = parse(bad.clone()).expect_err("refused");
+            assert!(error.message.contains(message), "{bad}: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn edit_form_reads_a_background() {
+        let boundary = "b3";
+        let form = |background: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"background\"\r\n\r\n{background}\r\n\
+                 --{boundary}--\r\n"
+            )
+        };
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let req = parse_edit_request(Some(&ct), form("transparent").as_bytes(), &test_limits());
+        assert_eq!(
+            req.unwrap().background,
+            engine::ImageBackground::Transparent
+        );
+        assert!(parse_edit_request(Some(&ct), form("clear").as_bytes(), &test_limits()).is_err());
+    }
+
+    #[test]
     fn response_formats_b64_json_items() {
         let resp = build_response(
             &[b"foo".to_vec(), b"bar".to_vec()],
             512,
             384,
             engine::ImageFormat::Webp,
+            engine::ImageBackground::Transparent,
         );
         assert!(resp["created"].is_u64());
         assert_eq!(resp["size"], "512x384");
         assert_eq!(resp["output_format"], "webp");
+        assert_eq!(resp["background"], "transparent");
+        let auto = build_response(
+            &[],
+            512,
+            384,
+            engine::ImageFormat::Png,
+            engine::ImageBackground::Auto,
+        );
+        assert_eq!(auto["background"], "opaque");
         let data = resp["data"].as_array().unwrap();
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["b64_json"], "Zm9v");

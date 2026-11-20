@@ -1836,7 +1836,7 @@ impl ImageStage {
 /// Output bytes and per-stage measurements from one image generation call.
 #[derive(Clone, Debug)]
 pub struct ImageCallOutput {
-    /// Encoded PNG or JPEG image bytes.
+    /// Encoded PNG, JPEG or WebP image bytes.
     pub bytes: Vec<u8>,
     /// Encoded prompt tokens processed by the text encoder, including
     /// reference image tokens.
@@ -1869,6 +1869,30 @@ impl ImageFormat {
     }
 }
 
+/// The background of an image generation model's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageBackground {
+    /// The model's own background, which is opaque
+    /// (EREMITE_IMAGE_BACKGROUND_AUTO).
+    Auto = 0,
+    /// An opaque background (EREMITE_IMAGE_BACKGROUND_OPAQUE).
+    Opaque = 1,
+    /// A transparent background, made from a flat key-colored one
+    /// (EREMITE_IMAGE_BACKGROUND_TRANSPARENT).
+    Transparent = 2,
+}
+
+impl ImageBackground {
+    /// Returns the background's name in OpenAI's response: transparent, or
+    /// opaque for auto and opaque.
+    pub fn response_name(self) -> &'static str {
+        match self {
+            ImageBackground::Transparent => "transparent",
+            ImageBackground::Auto | ImageBackground::Opaque => "opaque",
+        }
+    }
+}
+
 /// Scalar parameters of one image generation or editing call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageCallParams {
@@ -1882,6 +1906,8 @@ pub struct ImageCallParams {
     pub format: ImageFormat,
     /// JPEG or WebP quality in 0..=100; PNG ignores it.
     pub quality: i32,
+    /// Output background.
+    pub background: ImageBackground,
     /// Deterministic RNG seed for initial latent noise.
     pub seed: u64,
 }
@@ -2069,7 +2095,7 @@ impl Stream {
             min_generation_area: params.min_generation_area as c_int,
             format: params.format as c_int,
             quality: params.quality as c_int,
-            background: 0,
+            background: params.background as c_int,
             seed: params.seed,
             refs: if inputs.raw_refs.is_empty() {
                 ptr::null()

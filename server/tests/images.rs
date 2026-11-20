@@ -2,7 +2,8 @@
 //! POST /v1/images/edits (JSON or multipart/form-data). Verifies model
 //! listing, Codex catalog exclusion, chat and decision refusals, HTTP 400
 //! validation errors, exact and auto output sizes (including non-32
-//! resizing), PNG and JPEG encoding, and reference image editing.
+//! resizing), PNG, JPEG and WebP encoding, transparent backgrounds, and
+//! reference image editing.
 //!
 //! Set EREMITE_MINIMAX_H3_MODEL_DIR, EREMITE_MINIMAX_H3_TEXT_ENCODER,
 //! EREMITE_MINIMAX_H3_DIT, EREMITE_MINIMAX_H3_VAE, and optionally
@@ -119,6 +120,20 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     Some((w, h))
+}
+
+/// The offset of a PNG file's color type: after its signature, its IHDR
+/// chunk's length and type, and the header's width, height and bit depth.
+const PNG_COLOR_TYPE_OFFSET: usize = 25;
+/// The bit of a PNG color type that gives the image an alpha channel.
+const PNG_ALPHA_BIT: u8 = 4;
+
+/// Returns whether a PNG file's color type gives it an alpha channel.
+fn png_has_alpha(bytes: &[u8]) -> bool {
+    png_dimensions(bytes).is_some()
+        && bytes
+            .get(PNG_COLOR_TYPE_OFFSET)
+            .is_some_and(|color_type| color_type & PNG_ALPHA_BIT != 0)
 }
 
 /// The most bytes in one stored, uncompressed deflate block.
@@ -256,6 +271,8 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         json!({"prompt": "a cat", "size": "512x512", "guidance_scale": 5.0}),
         json!({"prompt": "a cat", "size": "512x512", "negative_prompt": "ugly"}),
         json!({"prompt": "a cat", "size": "512x512", "response_format": "url"}),
+        json!({"prompt": "a cat", "size": "512x512", "background": "clear"}),
+        json!({"prompt": "a cat", "size": "512x512", "background": "transparent", "output_format": "jpeg"}),
     ] {
         let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&bad));
         assert_eq!(code, 400, "bad={bad} -> {answer}");
@@ -280,6 +297,7 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let png_bytes = decode_base64(png_b64);
     assert_eq!(png_dimensions(&png_bytes), Some((500, 500)));
     assert_eq!(answer["size"], "500x500", "{answer}");
+    assert_eq!(answer["background"], "opaque", "{answer}");
 
     // 4. Text-to-image JPEG with model omitted (default single image model).
     let jpg_req = json!({
@@ -326,6 +344,24 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     assert_eq!(answer["size"], "2048x2048", "{answer}");
     let auto_png = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
     assert_eq!(png_dimensions(&auto_png), Some((2048, 2048)));
+
+    // 4c. Text-to-image with a transparent background gives a PNG with alpha.
+    let clear_req = json!({
+        "prompt": "A red paper lantern.",
+        "size": "512x512",
+        "seed": 5,
+        "background": "transparent",
+        "min_generation_area": 1024
+    });
+    let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&clear_req));
+    assert_eq!(code, 200, "transparent t2i failed: {answer}");
+    assert_eq!(answer["background"], "transparent", "{answer}");
+    let clear_png = decode_base64(answer["data"][0]["b64_json"].as_str().expect("b64_json"));
+    assert_eq!(png_dimensions(&clear_png), Some((512, 512)));
+    assert!(
+        png_has_alpha(&clear_png),
+        "a transparent PNG has an alpha channel"
+    );
 
     // 5. Reference image editing via multipart/form-data on /v1/images/edits.
     let ref_bytes = if let Ok(ref_path) = std::env::var("EREMITE_MINIMAX_H3_REF_IMAGE") {
