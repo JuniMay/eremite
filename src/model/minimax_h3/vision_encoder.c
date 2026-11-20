@@ -366,6 +366,9 @@ minimax_h3_vision_encoder_open(MinimaxH3TextEncoder *text_enc,
   vis->account = account;
   memory_slot_init(&vis->workspace_slot, account, MEMORY_MODEL, NULL,
                    "minimax-h3-vision-workspace", NULL, NULL);
+  // The workspace counts only its buffers in use, so freed buffers stop
+  // counting at once.
+  vis->workspace_slot.automatic = 1;
   vis->weights = weight_group_new(vis->gpu, account, "minimax-h3-qwen-vision");
 
   vis->k_x_bf16 = gpu_find_kernel(vis->gpu, "minimax_h3_x_bf16");

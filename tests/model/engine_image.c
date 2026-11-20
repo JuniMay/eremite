@@ -226,6 +226,15 @@ int main(int argc, char **argv) {
         "cancelled image stream returns cleanly without invalid_input");
   eremite_image_result_free(&res);
 
+  // Between calls the model counts its weights only: each call's workspace
+  // buffers stop counting when they are freed.
+  eremite_refresh_stats();
+  eremite_read_stats(m, &st);
+  printf("idle workspace after the calls: %.2f MiB\n",
+         (double)st.model_workspace / (double)(1ull << 20));
+  check(st.model_workspace == 0,
+        "an idle image model counts no workspace after its calls");
+
   // 6. Optional reference image editing through stream API.
   if (ref_path) {
     size_t rlen = 0;
@@ -244,8 +253,8 @@ int main(int argc, char **argv) {
     double t3 = now();
     int done_e = eremite_run_streams(&stream, 1);
     int ok_e = eremite_stream_image_result(stream, &res);
-    printf("stream edit 512x512 PNG: done=%d ok=%d len=%zu in %.2f s\n", done_e,
-           ok_e, res.len, now() - t3);
+    printf("stream edit 512x512 PNG: done=%d ok=%d len=%zu in %.2f s%s%s\n",
+           done_e, ok_e, res.len, now() - t3, ok_e ? "" : ": ", res.error);
     dec_w = dec_h = 0;
     derr = NULL;
     dec = ok_e ? image_decode_rgb(res.data, res.len, &dec_w, &dec_h, &derr)

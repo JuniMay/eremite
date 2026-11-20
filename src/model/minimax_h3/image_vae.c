@@ -447,6 +447,9 @@ MinimaxH3ImageVae *minimax_h3_image_vae_open(Gpu *gpu, MemoryAccount *account,
   vae->account = account;
   memory_slot_init(&vae->workspace_slot, account, MEMORY_MODEL, NULL,
                    "minimax-h3-vae-workspace", NULL, NULL);
+  // The workspace counts only its buffers in use, so freed buffers stop
+  // counting at once.
+  vae->workspace_slot.automatic = 1;
   vae->tensors = tensor_index_open_file(weights_path);
   vae->weights = weight_group_new(gpu, account, "minimax-h3-image-vae-decoder");
   vae->enc_weights =

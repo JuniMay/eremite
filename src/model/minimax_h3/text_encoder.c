@@ -182,6 +182,9 @@ MinimaxH3TextEncoder *minimax_h3_text_encoder_open(Gpu *gpu,
   enc->account = account;
   memory_slot_init(&enc->workspace_slot, account, MEMORY_MODEL, NULL,
                    "minimax-h3-text-workspace", NULL, NULL);
+  // The workspace counts only its buffers in use, so freed buffers stop
+  // counting at once.
+  enc->workspace_slot.automatic = 1;
   enc->tensors = tensor_index_open_file(weights_path);
   enc->tokenizer = tokenizer_open(tokenizer_dir, NULL);
   enc->weights = weight_group_new(gpu, account, "minimax-h3-text-encoder");

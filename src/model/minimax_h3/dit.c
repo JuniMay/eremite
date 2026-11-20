@@ -357,6 +357,9 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
   dit->account = account;
   memory_slot_init(&dit->workspace_slot, account, MEMORY_MODEL, NULL,
                    "minimax-h3-dit-workspace", NULL, NULL);
+  // The workspace counts only its buffers in use, so freed buffers stop
+  // counting at once.
+  dit->workspace_slot.automatic = 1;
   dit->tensors = tensor_index_open_file(weights_path);
   parse_pdd_config(dit);
   dit->weights = weight_group_new(gpu, account, "minimax-h3-image-dit");
