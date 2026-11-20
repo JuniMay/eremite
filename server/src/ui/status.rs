@@ -16,6 +16,8 @@ pub enum Phase {
     Prefill,
     /// Requests decode, and no prompt prefills.
     Decode,
+    /// An image model denoises or decodes an image.
+    Generating,
     /// A yield holds the model: the server yields, has yielded, or resumes.
     #[serde(alias = "yielding", alias = "yielded", alias = "resuming")]
     Held,
@@ -36,6 +38,8 @@ pub enum Activity {
     Prefill,
     /// It decodes its reply.
     Decoding,
+    /// It denoises or decodes an image.
+    Generating,
 }
 
 /// A model's status.
@@ -96,6 +100,11 @@ pub struct Request {
     pub reused_tokens: u64,
     /// The tokens that its reply generated.
     pub generated_tokens: u64,
+    /// The images requested by an image request; 0 for text and decision
+    /// requests.
+    pub images_requested: u64,
+    /// The images finished so far for an image request.
+    pub generated_images: u64,
     /// The experts of its latest tokens, the oldest first.
     pub routes: Vec<Route>,
 }
@@ -185,6 +194,11 @@ pub struct Totals {
     pub prefilled_tokens: u64,
     /// The seconds that the ended prefills took.
     pub prefill_seconds: f64,
+    /// The images that the ended requests generated.
+    pub generated_images: u64,
+    /// The seconds that the ended requests spent denoising, decoding and
+    /// encoding images.
+    pub image_seconds: f64,
 }
 
 /// A model's decoding counters since the start.
@@ -227,6 +241,18 @@ pub struct Counters {
     pub prefill_layer: u64,
     /// The running prefill's rows.
     pub prefill_rows_now: u64,
+    /// Images generated since the model opened.
+    pub generated_images: u64,
+    /// Denoising steps finished since the model opened.
+    pub image_steps: u64,
+    /// Seconds spent denoising, decoding and encoding images.
+    pub image_seconds: f64,
+    /// Active image generation stage (0 none, 1 prefill, 2 generating).
+    pub image_stage: u64,
+    /// Active 1-based denoising step, or 0 outside denoising.
+    pub image_step: u64,
+    /// Total denoising steps in the active image call, or 0 outside denoising.
+    pub image_steps_total: u64,
     /// The bytes of experts read since the start, counted as each read ends.
     pub expert_read_bytes: u64,
     /// The bytes of the experts mapped for the GPU.
@@ -365,6 +391,7 @@ mod tests {
         assert_eq!(status.count_prompt_rows(), 0.0);
         for (phase, read) in [
             ("loading", Phase::Loading),
+            ("generating", Phase::Generating),
             ("yielded", Phase::Held),
             ("resuming", Phase::Held),
         ] {

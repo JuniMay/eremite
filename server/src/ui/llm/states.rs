@@ -198,6 +198,7 @@ fn describe_session(theme: &Theme, status: &ModelStatus, index: usize) -> Vec<Sp
         Some(request) => {
             let what = match request.status {
                 Activity::Prefill => "prefill",
+                Activity::Generating => "generating",
                 Activity::Decoding | Activity::Waiting => "decoding",
             };
             spans.push(colored(

@@ -351,7 +351,7 @@ struct ModelStatus {
     loaded: bool,
     /// The drafts per pass that the model makes itself.
     drafts_per_pass: usize,
-    /// What the model does now: idle, loading, prefill or decode.
+    /// What the model does now: idle, loading, prefill, decode or generating.
     phase: &'static str,
     /// When the model started its phase.
     phase_since: Option<Instant>,
@@ -376,10 +376,15 @@ struct ModelStatus {
     /// The number of prompt tokens of the ended requests that came from the
     /// state cache.
     total_reused_tokens: u64,
-    /// The number of prompt tokens that the ended prefills computed.
+    /// The prompt tokens that the ended prefills computed.
     total_prefilled_tokens: u64,
     /// The seconds that the ended prefills took.
     total_prefill_seconds: f64,
+    /// The number of images that the ended requests generated.
+    total_generated_images: u64,
+    /// The seconds that the ended requests spent denoising, decoding and
+    /// encoding images.
+    total_image_seconds: f64,
     /// The number of requests that started with each kind of plan, by the
     /// plan's word in the log.
     plan_counts: HashMap<&'static str, u64>,
@@ -407,7 +412,7 @@ struct ModelStatus {
 struct RequestStatus {
     /// The request's id: its number in the log.
     id: u64,
-    /// What the request does: "waiting", "prefill" or "decoding".
+    /// What the request does: "waiting", "prefill", "decoding" or "generating".
     status: &'static str,
     /// The number of the session whose state the request uses. None while the
     /// request waits.
@@ -419,6 +424,11 @@ struct RequestStatus {
     reused_tokens: usize,
     /// The number of tokens that the reply generated.
     generated_tokens: usize,
+    /// The images requested by an image request; 0 for text and decision
+    /// requests.
+    images_requested: usize,
+    /// The images finished so far for an image request.
+    generated_images: usize,
     /// The experts of the request's latest tokens, the oldest first.
     routes: Vec<Route>,
 }
@@ -444,19 +454,29 @@ impl RequestStatus {
             prompt_tokens: job.request.count_tokens(),
             reused_tokens: 0,
             generated_tokens: 0,
+            images_requested: 0,
+            generated_images: 0,
             routes: Vec::new(),
         }
     }
 
-    /// Returns the status of an image request `job`.
-    fn for_image(job: &Job<ImageRequest>, status: &'static str, generated: usize) -> RequestStatus {
+    /// Returns the status of an image request `job` with `prompt_tokens`
+    /// encoded prompt tokens and `generated_images` finished outputs.
+    fn for_image(
+        job: &Job<ImageRequest>,
+        status: &'static str,
+        prompt_tokens: usize,
+        generated_images: usize,
+    ) -> RequestStatus {
         RequestStatus {
             id: job.id,
             status,
             session: None,
-            prompt_tokens: job.request.count,
+            prompt_tokens,
             reused_tokens: 0,
-            generated_tokens: generated,
+            generated_tokens: 0,
+            images_requested: job.request.count,
+            generated_images,
             routes: Vec::new(),
         }
     }
@@ -470,6 +490,8 @@ impl RequestStatus {
             prompt_tokens: job.request.prompt.len(),
             reused_tokens: 0,
             generated_tokens: 0,
+            images_requested: 0,
+            generated_images: 0,
             routes: Vec::new(),
         }
     }
@@ -1035,12 +1057,18 @@ pub fn build_model_status_json(model_index: usize) -> Value {
         let queued: Vec<RequestStatus> = queue.waiting[model_index]
             .iter()
             .map(RequestStatus::for_waiting_job)
+            .chain(
+                queue.decisions[model_index]
+                    .iter()
+                    .map(|job| RequestStatus::for_decision(job, "waiting")),
+            )
+            .chain(
+                queue.images[model_index]
+                    .iter()
+                    .map(|job| RequestStatus::for_image(job, "waiting", 0, 0)),
+            )
             .collect();
-        (
-            queue.waiting[model_index].len(),
-            queue.control.phase,
-            queued,
-        )
+        (queued.len(), queue.control.phase, queued)
     };
     let stats = lock(&shared_model.status).stats;
     let allocations = build_model_memory_json(&shared);
@@ -1117,6 +1145,8 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "reused_tokens": status.total_reused_tokens,
             "prefilled_tokens": status.total_prefilled_tokens,
             "prefill_seconds": status.total_prefill_seconds,
+            "generated_images": status.total_generated_images,
+            "image_seconds": status.total_image_seconds,
         },
         "plans": status.plan_counts,
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
@@ -1171,6 +1201,8 @@ fn build_requests_json(requests: &[RequestStatus]) -> Value {
                 "prompt_tokens": request.prompt_tokens,
                 "reused_tokens": request.reused_tokens,
                 "generated_tokens": request.generated_tokens,
+                "images_requested": request.images_requested,
+                "generated_images": request.generated_images,
                 "routes": request
                     .routes
                     .iter()
@@ -1206,6 +1238,12 @@ fn build_engine_counters_json(stats: &engine::Stats) -> Value {
         "prefill_read_bytes": stats.prefill.bytes,
         "prefill_layer": stats.prefill_layer,
         "prefill_rows_now": stats.prefill_rows_now,
+        "generated_images": stats.generated_images,
+        "image_steps": stats.image_steps,
+        "image_seconds": stats.image_seconds,
+        "image_stage": stats.image_stage,
+        "image_step": stats.image_step,
+        "image_steps_total": stats.image_steps_total,
         "expert_read_bytes": stats.cache.bytes,
         "mapped_expert_bytes": stats.mapped.max(0) as u64 * stats.slot_bytes,
         "memory": {
@@ -1401,6 +1439,17 @@ struct ImageTask {
     inputs: ImageInputs,
     /// Encoded PNG/JPEG images generated so far.
     outputs: Vec<Vec<u8>>,
+    /// Encoded prompt tokens of this request, including reference image tokens.
+    prompt_tokens: usize,
+    /// Engine prefill_rows counter when the active image pass started.
+    pass_start_prefill_rows: u64,
+    /// Sum of prompt tokens encoded across completed passes of this request.
+    prefilled_tokens: u64,
+    /// Seconds spent in the prompt encoder across completed passes.
+    prefill_seconds: f64,
+    /// Seconds spent denoising, decoding and encoding images across completed
+    /// passes.
+    image_seconds: f64,
     /// Error from the last failed call, if any.
     failure: Option<ImageError>,
     /// Whether an image generation call is currently running on a stream.
@@ -2154,9 +2203,27 @@ impl Worker {
     fn publish_counters(&self) {
         for worker_model in &self.models {
             let mut status = lock(&self.shared.models[worker_model.model_index].status);
-            status.stats = worker_model.model.read_stats();
+            let stats = worker_model.model.read_stats();
+            status.stats = stats;
             status.loaded = worker_model.model.is_loaded();
             status.drafts_per_pass = worker_model.model.drafts_per_pass();
+            if let Some(image) = &worker_model.image {
+                let live_phase = WorkerModel::active_image_phase(&stats);
+                let live_prompt = WorkerModel::live_image_prompt_tokens(image, &stats);
+                if status.phase != "loading" {
+                    if status.phase != live_phase || status.phase_since.is_none() {
+                        status.phase_since = Some(Instant::now());
+                    }
+                    status.phase = live_phase;
+                }
+                status.shown_prompt_tokens = live_prompt;
+                status.shown_generated_tokens = 0;
+                if let Some(request) = status.requests.iter_mut().find(|r| r.id == image.job.id) {
+                    request.status = live_phase;
+                    request.prompt_tokens = live_prompt;
+                    request.generated_images = image.outputs.len();
+                }
+            }
         }
         let memory_in_use = engine::read_memory();
         lock(&self.shared.queue).control.retained = control::MemoryBytes {
@@ -2931,6 +2998,7 @@ impl WorkerModel {
             .iter()
             .find(|generation| !generation.is_decoding())
             .or(self.generations.first());
+        let image_stats = self.image.as_ref().map(|_| self.model.read_stats());
         (
             status.shown_request_id,
             status.shown_prompt_tokens,
@@ -2948,48 +3016,56 @@ impl WorkerModel {
             }
             (None, None, Some(image)) => (
                 image.job.id,
-                image.job.request.count,
+                Self::live_image_prompt_tokens(image, image_stats.as_ref().unwrap()),
                 0,
-                image.outputs.len(),
+                0,
             ),
             (None, None, None) => (0, 0, 0, 0),
         };
-        status.requests =
-            self.generations
-                .iter()
-                .map(|generation| RequestStatus {
-                    id: generation.job.id,
-                    status: if generation.is_decoding() {
-                        "decoding"
-                    } else {
-                        "prefill"
-                    },
-                    session: Some(generation.session),
-                    prompt_tokens: generation.prompt_tokens,
-                    reused_tokens: generation.reused_tokens,
-                    generated_tokens: generation.generated,
-                    routes: generation.routes.iter().cloned().collect(),
-                })
-                .chain(
-                    self.decision
-                        .iter()
-                        .map(|decision| RequestStatus::for_decision(&decision.job, "prefill")),
+        status.requests = self
+            .generations
+            .iter()
+            .map(|generation| RequestStatus {
+                id: generation.job.id,
+                status: if generation.is_decoding() {
+                    "decoding"
+                } else {
+                    "prefill"
+                },
+                session: Some(generation.session),
+                prompt_tokens: generation.prompt_tokens,
+                reused_tokens: generation.reused_tokens,
+                generated_tokens: generation.generated,
+                images_requested: 0,
+                generated_images: 0,
+                routes: generation.routes.iter().cloned().collect(),
+            })
+            .chain(
+                self.decision
+                    .iter()
+                    .map(|decision| RequestStatus::for_decision(&decision.job, "prefill")),
+            )
+            .chain(self.image.iter().map(|image| {
+                let stats = image_stats.as_ref().unwrap();
+                RequestStatus::for_image(
+                    &image.job,
+                    Self::active_image_phase(stats),
+                    Self::live_image_prompt_tokens(image, stats),
+                    image.outputs.len(),
                 )
-                .chain(self.image.iter().map(|image| {
-                    RequestStatus::for_image(&image.job, "prefill", image.outputs.len())
-                }))
-                .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
-                .chain(
-                    self.admitted_decisions
-                        .iter()
-                        .map(|job| RequestStatus::for_decision(job, "waiting")),
-                )
-                .chain(
-                    self.admitted_images
-                        .iter()
-                        .map(|job| RequestStatus::for_image(job, "waiting", 0)),
-                )
-                .collect();
+            }))
+            .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
+            .chain(
+                self.admitted_decisions
+                    .iter()
+                    .map(|job| RequestStatus::for_decision(job, "waiting")),
+            )
+            .chain(
+                self.admitted_images
+                    .iter()
+                    .map(|job| RequestStatus::for_image(job, "waiting", 0, 0)),
+            )
+            .collect();
     }
 
     /// Starts an admitted request. It checks the request's media and prompt. It
@@ -4646,6 +4722,29 @@ impl WorkerModel {
 
     // ---- an image model's requests ----
 
+    /// Returns the status phase for a running image request from engine stats:
+    /// "prefill" only while the prompt encoder runs, and "generating" while
+    /// denoising, decoding or preparing the image.
+    fn active_image_phase(stats: &engine::Stats) -> &'static str {
+        if engine::ImageStage::from_raw(stats.image_stage) == engine::ImageStage::Prefill {
+            "prefill"
+        } else {
+            "generating"
+        }
+    }
+
+    /// Returns the encoded prompt token count for an active image task, using
+    /// live engine counters while the first pass is still in flight.
+    fn live_image_prompt_tokens(task: &ImageTask, stats: &engine::Stats) -> usize {
+        if stats.prefill_rows_now > 0 {
+            stats.prefill_rows_now as usize
+        } else if stats.prefill_rows > task.pass_start_prefill_rows {
+            (stats.prefill_rows - task.pass_start_prefill_rows) as usize
+        } else {
+            task.prompt_tokens
+        }
+    }
+
     /// Runs one step of an image generation model. Refuses chat and decision
     /// requests, queues admitted image jobs, advances any running image task,
     /// and starts the next waiting image job when idle.
@@ -4673,7 +4772,7 @@ impl WorkerModel {
             self.start_image(shared, job);
         }
         let phase = if self.image.is_some() {
-            "prefill"
+            Self::active_image_phase(&self.model.read_stats())
         } else {
             "idle"
         };
@@ -4739,6 +4838,11 @@ impl WorkerModel {
             job,
             inputs,
             outputs: Vec::new(),
+            prompt_tokens: 0,
+            pass_start_prefill_rows: 0,
+            prefilled_tokens: 0,
+            prefill_seconds: 0.0,
+            image_seconds: 0.0,
             failure: None,
             in_call: false,
             started_at: Instant::now(),
@@ -4752,6 +4856,7 @@ impl WorkerModel {
     /// Posts the next image generation pass of `task` on a new engine stream.
     fn start_image_pass(&mut self, mut task: ImageTask) {
         let index = task.outputs.len() as u64;
+        task.pass_start_prefill_rows = self.model.read_stats().prefill_rows;
         let req = &task.job.request;
         let stream = Stream::new(&self.model);
         stream.generate_image(
@@ -4783,7 +4888,13 @@ impl WorkerModel {
         };
         task.in_call = false;
         match stream.take_image_result() {
-            Ok(output) => task.outputs.push(output.bytes),
+            Ok(output) => {
+                task.prompt_tokens = output.prompt_tokens;
+                task.prefilled_tokens += output.prompt_tokens as u64;
+                task.prefill_seconds += output.prefill_seconds;
+                task.image_seconds += output.image_seconds;
+                task.outputs.push(output.bytes);
+            }
             Err(error) => {
                 if !task.job.flags.cancelled.load(Ordering::SeqCst) && !engine::is_stopping() {
                     task.failure = Some(error);
@@ -4837,7 +4948,11 @@ impl WorkerModel {
         ));
         let mut status = lock(&shared.models[self.model_index].status);
         status.total_requests += 1;
-        status.total_prefill_seconds += seconds;
+        status.total_prompt_tokens += task.prompt_tokens as u64;
+        status.total_prefilled_tokens += task.prefilled_tokens;
+        status.total_prefill_seconds += task.prefill_seconds;
+        status.total_generated_images += done as u64;
+        status.total_image_seconds += task.image_seconds;
         drop(status);
         task.job.send_last_event(event);
     }
@@ -5061,20 +5176,52 @@ mod tests {
             prompt_tokens: 23,
             reused_tokens: 2,
             generated_tokens: 516,
+            images_requested: 0,
+            generated_images: 0,
             routes: vec![Route {
                 experts: vec![17, 300],
                 sources: vec![0, 4],
             }],
         };
-        let requests = [decoding, RequestStatus::for_waiting_job(&job)];
+        let (image_events, _image_rx) = mpsc::unbounded_channel();
+        let image_job = Job {
+            id: 8,
+            request: ImageRequest {
+                model_index: 0,
+                prompt: "red mug".into(),
+                width: 512,
+                height: 512,
+                count: 4,
+                seed: 1,
+                min_generation_area: 1024,
+                format: engine::ImageFormat::Png,
+                quality: 0,
+                references: Vec::new(),
+                note: String::new(),
+            },
+            events: image_events,
+            flags: Arc::default(),
+            queued_at: Instant::now(),
+        };
+        let requests = [
+            decoding,
+            RequestStatus::for_waiting_job(&job),
+            RequestStatus::for_image(&image_job, "generating", 19, 2),
+        ];
         assert_eq!(
             build_requests_json(&requests),
             json!([
                 {"request": 5, "status": "decoding", "session": 5,
                  "prompt_tokens": 23, "reused_tokens": 2, "generated_tokens": 516,
+                 "images_requested": 0, "generated_images": 0,
                  "routes": [{"experts": [17, 300], "sources": [0, 4]}]},
                 {"request": 7, "status": "waiting", "session": null,
                  "prompt_tokens": 3, "reused_tokens": 0, "generated_tokens": 0,
+                 "images_requested": 0, "generated_images": 0,
+                 "routes": []},
+                {"request": 8, "status": "generating", "session": null,
+                 "prompt_tokens": 19, "reused_tokens": 0, "generated_tokens": 0,
+                 "images_requested": 4, "generated_images": 2,
                  "routes": []},
             ])
         );

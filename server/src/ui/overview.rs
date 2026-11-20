@@ -168,13 +168,26 @@ fn build_request_lines(screen: &Screen, width: usize, rows: usize) -> Vec<Line<'
                     .map(|speed| format!("{} tok/s", format_count(speed))),
                 request.prompt_tokens,
             ),
-            Activity::Waiting => (None, request.prompt_tokens),
+            Activity::Generating | Activity::Waiting => (None, request.prompt_tokens),
         };
         spans.push(plain(format!(
             "{:<SPEED_COLUMNS$}",
             speed.unwrap_or_default()
         )));
-        spans.push(plain(format!("{} tokens", format_count(tokens as f64))));
+        let amount = if request.images_requested > 0 {
+            let unit = if request.images_requested == 1 {
+                "image"
+            } else {
+                "images"
+            };
+            format!(
+                "{} of {} {unit}",
+                request.generated_images, request.images_requested
+            )
+        } else {
+            format!("{} tokens", format_count(tokens as f64))
+        };
+        spans.push(plain(amount));
         lines.push(Line::from(spans));
     }
     if fit < requests.len() {
@@ -185,8 +198,8 @@ fn build_request_lines(screen: &Screen, width: usize, rows: usize) -> Vec<Line<'
 }
 
 /// Describes what `request`, a request of the model of `status`, does: it
-/// waits in amber, decodes in the accent, or prefills in the prefill color
-/// with the layer that its prefill has reached.
+/// waits in amber, decodes in the accent, prefills in the prefill color with
+/// the layer reached, or generates images in green with the denoising step.
 fn describe_activity(theme: &Theme, status: &ModelStatus, request: &Request) -> Vec<Span<'static>> {
     let counters = &status.engine_counters;
     match request.status {
@@ -200,6 +213,14 @@ fn describe_activity(theme: &Theme, status: &ModelStatus, request: &Request) -> 
             plain(counters.layers.to_string()),
         ],
         Activity::Prefill => vec![colored(theme, theme.prefill, "prefill")],
+        Activity::Generating if counters.image_step > 0 && counters.image_steps_total > 0 => vec![
+            colored(theme, theme.green, "generating"),
+            label(theme, ", step "),
+            plain(counters.image_step.to_string()),
+            label(theme, " of "),
+            plain(counters.image_steps_total.to_string()),
+        ],
+        Activity::Generating => vec![colored(theme, theme.green, "generating")],
     }
 }
 
@@ -714,5 +735,64 @@ mod tests {
             .collect();
         assert_eq!(text.len(), 4, "{text:?}");
         assert_eq!(text[3], " … 2 more");
+    }
+
+    #[test]
+    fn image_requests_show_generating_step_and_image_progress_not_tokens() {
+        let models = [ModelInfo {
+            name: "minimax-h3-image".into(),
+            kind: Kind::Image,
+        }];
+        let status: ModelStatus = serde_json::from_str(
+            r#"{
+                "loaded": true,
+                "phase": "generating",
+                "requests": [{
+                    "request": 9,
+                    "status": "generating",
+                    "session": null,
+                    "prompt_tokens": 24,
+                    "reused_tokens": 0,
+                    "generated_tokens": 0,
+                    "images_requested": 4,
+                    "generated_images": 2,
+                    "routes": []
+                }],
+                "engine_counters": {
+                    "layers": 50,
+                    "image_stage": 2,
+                    "image_step": 3,
+                    "image_steps_total": 6
+                }
+            }"#,
+        )
+        .expect("image model status JSON");
+        let statuses = [status];
+        let mut samples = Samples::new(WINDOWS);
+        samples.add_sample(0.0, &statuses);
+        samples.add_sample(0.5, &statuses);
+        let latest = samples.samples.back().unwrap();
+        assert_eq!(latest.models[0].decoding, None);
+        assert_eq!(latest.models[0].prefill, None);
+        let screen = Screen {
+            theme: &DARK,
+            address: "127.0.0.1:8008",
+            uptime_seconds: 12.0,
+            models: &models,
+            statuses: &statuses,
+            samples: &samples,
+            home: "",
+            session_text: None,
+        };
+        let lines = build_request_lines(&screen, 140, 10);
+        let row: String = lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(row.contains("generating, step 3 of 6"), "{row}");
+        assert!(row.contains("2 of 4 images"), "{row}");
+        assert!(!row.contains("tok/s"), "{row}");
+        assert!(!row.contains("tokens"), "{row}");
     }
 }

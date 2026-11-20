@@ -311,7 +311,7 @@ fn draw_charts(buf: &mut Buffer, area: Rect, screen: &Screen) {
         for column in 0..width as usize {
             let color = match sample_at(column).and_then(activity_at) {
                 Some(Activity::Prefill) => theme.prefill,
-                Some(Activity::Decoding) => tone,
+                Some(Activity::Decoding | Activity::Generating) => tone,
                 Some(Activity::Waiting) | None => continue,
             };
             buf[(chart_x + column as u16, row_y)]
@@ -321,6 +321,7 @@ fn draw_charts(buf: &mut Buffer, area: Rect, screen: &Screen) {
         let now = match latest.and_then(|sample| activity_at(sample)) {
             Some(Activity::Prefill) => "prefill",
             Some(Activity::Decoding) => "decoding",
+            Some(Activity::Generating) => "generating",
             Some(Activity::Waiting) | None => "done",
         };
         buf.set_string(right, row_y, now, Style::new().fg(theme.color(theme.label)));

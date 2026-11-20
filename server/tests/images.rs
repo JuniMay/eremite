@@ -257,10 +257,29 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let edit_bytes = decode_base64(edit_b64);
     assert_eq!(png_dimensions(&edit_bytes), Some((512, 512)));
 
-    // 6. Status endpoint reports loaded image model.
+    // 6. Status endpoint reports loaded image model with separated counters.
     let (code, status) = ask(&server, "GET", "/v1/models/minimax-h3-image", None);
     assert_eq!(code, 200, "{status}");
-    assert_eq!(status["status"]["loaded"], json!(true));
+    let st = &status["status"];
+    assert_eq!(st["loaded"], json!(true));
+    assert_eq!(st["phase"], json!("idle"));
+    assert_eq!(st["totals"]["generated_images"], json!(3));
+    assert_eq!(st["totals"]["generated_tokens"], json!(0));
+    assert!(
+        st["totals"]["prefilled_tokens"].as_u64().unwrap_or(0) > 0,
+        "{st}"
+    );
+    assert!(
+        st["totals"]["prefill_seconds"].as_f64().unwrap_or(0.0) > 0.0,
+        "{st}"
+    );
+    assert!(
+        st["totals"]["image_seconds"].as_f64().unwrap_or(0.0) > 0.0,
+        "{st}"
+    );
+    assert_eq!(st["engine_counters"]["generated_images"], json!(3));
+    assert_eq!(st["engine_counters"]["image_steps"], json!(18));
+    assert_eq!(st["engine_counters"]["image_stage"], json!(0));
 
     server.stop();
 }
