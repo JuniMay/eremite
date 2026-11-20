@@ -16,6 +16,8 @@ static const char source[] = {
 #embed "lfm3_vision.metal"
     , '\n',
 #embed "lfm3_projector.metal"
+    , '\n',
+#embed "minimax_h3_quant.metal"
 };
 
 const char *kernel_library_source(size_t *length) {
