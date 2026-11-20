@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 6
+#define EREMITE_ABI 7
 
 // ---- the process ----
 
@@ -223,6 +223,16 @@ const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
 // eremite_config takes minimax_h3 checkpoint paths and no drafts, lookup or
 // DeepSeek options.
 
+// Running stage of an image generation call.
+enum {
+  // No image call is running.
+  EREMITE_IMAGE_STAGE_NONE = 0,
+  // The prompt encoder runs over text and reference media tokens.
+  EREMITE_IMAGE_STAGE_PREFILL = 1,
+  // The denoiser and image decoder generate pixels.
+  EREMITE_IMAGE_STAGE_GENERATING = 2
+};
+
 // Output image encoding format.
 enum {
   // Lossless PNG encoding.
@@ -271,6 +281,13 @@ typedef struct {
   // Nonzero when the request inputs were invalid; zero for load, memory or
   // stop failures.
   int invalid_input;
+  // Encoded prompt tokens processed by the text encoder, including reference
+  // image tokens.
+  int prompt_tokens;
+  // Seconds spent in the prompt encoder stage.
+  double prefill_seconds;
+  // Seconds spent denoising, decoding and encoding the output image.
+  double image_seconds;
 } eremite_image_result;
 
 // Returns whether the model is an image generation model.
@@ -588,6 +605,16 @@ typedef struct {
   double decode_seconds, decode_gpu_seconds;
   // The prefill running: its layer (0: none) and rows.
   int prefill_layer, prefill_rows_now;
+  // Images generated and denoising steps finished since the model opened.
+  uint64_t generated_images, image_steps;
+  // Seconds spent denoising, decoding and encoding images.
+  double image_seconds;
+  // Active image generation stage (EREMITE_IMAGE_STAGE_*).
+  int image_stage;
+  // Active 1-based denoising step, or 0 outside denoising.
+  int image_step;
+  // Total denoising steps in the active image call, or 0 outside denoising.
+  int image_steps_total;
   // The expert cache's slots, and experts on the SSD only.
   int slots, mapped, cap, max_slots, experts, uncached;
   uint64_t slot_bytes, uncached_bytes, cache_bytes, dense_bytes;

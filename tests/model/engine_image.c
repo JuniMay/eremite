@@ -125,10 +125,22 @@ int main(int argc, char **argv) {
   uint8_t *dec =
       ok_png ? image_decode_rgb(res.data, res.len, &dec_w, &dec_h, &derr)
              : NULL;
-  check(ok_png && dec != NULL && dec_w == 500 && dec_h == 500,
-        "sync T2I PNG decodes to exact requested 500x500 dimensions");
+  check(ok_png && dec != NULL && dec_w == 500 && dec_h == 500 &&
+            res.prompt_tokens > 0 && res.prefill_seconds > 0.0 &&
+            res.image_seconds > 0.0,
+        "sync T2I PNG decodes to exact 500x500 with prompt tokens and timings");
+  int first_prompt_tokens = res.prompt_tokens;
   free(dec);
   eremite_image_result_free(&res);
+
+  eremite_refresh_stats();
+  eremite_read_stats(m, &st);
+  check(st.prefill_rows == (uint64_t)first_prompt_tokens &&
+            st.generated_images == 1 && st.image_steps == 6 &&
+            st.image_seconds > 0.0 &&
+            st.image_stage == EREMITE_IMAGE_STAGE_NONE &&
+            st.prefill_layer == 0 && st.image_step == 0 && st.decode_rows == 0,
+        "stats separate prompt prefill tokens from image counts and steps");
 
   // 2. Stream T2I at 512x512 JPEG (quality 90).
   eremite_stream *stream = eremite_stream_new(m);
@@ -223,18 +235,26 @@ int main(int argc, char **argv) {
     derr = NULL;
     dec = ok_e ? image_decode_rgb(res.data, res.len, &dec_w, &dec_h, &derr)
                : NULL;
-    check(done_e == 0 && ok_e && dec != NULL && dec_w == 512 && dec_h == 512,
-          "stream reference edit produces valid 512x512 PNG");
+    check(
+        done_e == 0 && ok_e && dec != NULL && dec_w == 512 && dec_h == 512 &&
+            res.prompt_tokens > 256 && res.prefill_seconds > 0.0 &&
+            res.image_seconds > 0.0,
+        "stream edit produces 512x512 PNG and counts reference vision tokens");
     free(dec);
     eremite_image_result_free(&res);
     free(rdata);
 
     eremite_refresh_stats();
     eremite_read_stats(m, &st);
-    printf("after edit dense=%.2f GiB\n",
-           (double)st.dense_bytes / (double)(1ull << 30));
-    check(st.dense_bytes > (20ull << 30),
-          "stats report > 20 GiB resident weights after reference edit");
+    printf("after edit dense=%.2f GiB prefill_rows=%llu images=%llu "
+           "steps=%llu\n",
+           (double)st.dense_bytes / (double)(1ull << 30),
+           (unsigned long long)st.prefill_rows,
+           (unsigned long long)st.generated_images,
+           (unsigned long long)st.image_steps);
+    check(st.dense_bytes > (20ull << 30) && st.generated_images == 4 &&
+              st.image_steps == 24 && st.decode_rows == 0,
+          "stats report edit weights, 4 images, 24 steps and 0 decode rows");
   }
 
   eremite_stream_free(stream);

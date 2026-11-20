@@ -499,12 +499,14 @@ int minimax_h3_text_encoder_encode_tokens(
   uint64_t prev_cmd = cmd.number;
 
   // Run layers 0 through 49, yielding cooperatively between layers.
+  if (hooks && hooks->prefill_rows_now) *hooks->prefill_rows_now = seq_len;
   int stopped = 0;
   for (int i = 0; i < MINIMAX_H3_TEXT_LAYERS; i++) {
     if (minimax_h3_should_stop(hooks)) {
       stopped = 1;
       break;
     }
+    if (hooks && hooks->prefill_layer) *hooks->prefill_layer = i + 1;
     const QwenLayer *l = &enc->layers[i];
     cmd = gpu_begin(enc->gpu);
 
@@ -583,6 +585,10 @@ int minimax_h3_text_encoder_encode_tokens(
   }
 
   minimax_h3_gpu_wait(enc->gpu, prev_cmd);
+  if (!stopped && hooks && hooks->prefill_rows_total)
+    *hooks->prefill_rows_total += (uint64_t)seq_len;
+  if (hooks && hooks->prefill_layer) *hooks->prefill_layer = 0;
+  if (hooks && hooks->prefill_rows_now) *hooks->prefill_rows_now = 0;
   free_workspace(&ws);
   memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);

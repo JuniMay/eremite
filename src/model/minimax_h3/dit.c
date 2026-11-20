@@ -999,12 +999,15 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
       (size_t)(text_len + ref_patches) * (size_t)DIT_DIM * sizeof(float);
 
   // 6-step PDD Euler flow-matching loop.
+  if (hooks && hooks->image_steps_total)
+    *hooks->image_steps_total = dit->pdd_steps;
   int stopped = 0;
   for (int step = 0; step < dit->pdd_steps && !stopped; step++) {
     if (minimax_h3_should_stop(hooks)) {
       stopped = 1;
       break;
     }
+    if (hooks && hooks->image_step) *hooks->image_step = step + 1;
     double sigma = dit->pdd_sigmas[step];
     double sigma_next = dit->pdd_sigmas[step + 1];
     double t_main = 1.0 - sigma;
@@ -1190,8 +1193,12 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
     float dt = (float)(sigma - sigma_next);
     unpatchify_euler_step((const float *)ws.patch_out.ptr, h_lat, w_lat, lat_h,
                           lat_w, dt, out_latents);
+    if (hooks && hooks->image_steps_completed)
+      (*hooks->image_steps_completed)++;
   }
 
+  if (hooks && hooks->image_step) *hooks->image_step = 0;
+  if (hooks && hooks->image_steps_total) *hooks->image_steps_total = 0;
   free_dit_workspace(&ws);
   memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);

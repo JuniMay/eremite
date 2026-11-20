@@ -416,6 +416,9 @@ static int run_image_generation(eremite_model *m,
   out->len = res.len;
   memcpy(out->error, res.error, sizeof out->error);
   out->invalid_input = res.invalid_input;
+  out->prompt_tokens = res.prompt_tokens;
+  out->prefill_seconds = res.prefill_seconds;
+  out->image_seconds = res.image_seconds;
   return ok;
 }
 
@@ -1255,6 +1258,12 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->decode_gpu_seconds = model.decode_gpu_seconds;
   s->prefill_layer = model.prefill_layer;
   s->prefill_rows_now = model.prefill_rows_now;
+  s->generated_images = c.generated_images;
+  s->image_steps = c.image_steps;
+  s->image_seconds = c.image_seconds;
+  s->image_stage = c.image_stage;
+  s->image_step = c.image_step;
+  s->image_steps_total = c.image_steps_total;
   s->dense_bytes = model.dense_bytes;
   s->layers = model.layers;
   s->experts_per_row = model.experts_per_row;

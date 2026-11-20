@@ -4783,7 +4783,7 @@ impl WorkerModel {
         };
         task.in_call = false;
         match stream.take_image_result() {
-            Ok(bytes) => task.outputs.push(bytes),
+            Ok(output) => task.outputs.push(output.bytes),
             Err(error) => {
                 if !task.job.flags.cancelled.load(Ordering::SeqCst) && !engine::is_stopping() {
                     task.failure = Some(error);

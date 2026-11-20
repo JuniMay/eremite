@@ -36,12 +36,26 @@ float minimax_h3_read_scalar_f32(Tensor tensor);
 void minimax_h3_nvfp4_scales_add(WeightGroup *group, Buf *target, Tensor tensor,
                                  int rows, int cols);
 
-// Cooperative scheduling and cancellation hooks for MiniMax-H3 GPU loops.
+// Cooperative scheduling, cancellation and progress hooks for MiniMax-H3 GPU
+// loops.
 typedef struct {
   // Optional wait checked between GPU layers to let decoding calls run first.
   const PassWait *yield_wait;
   // Optional pointer to a nonzero flag set on the engine thread to cancel.
   const int *cancelled;
+  // Optional pointer updated with the running 1-based text-encoder layer.
+  int *prefill_layer;
+  // Optional pointer updated with the running text-encoder token count.
+  int *prefill_rows_now;
+  // Optional counter increased by the encoded tokens after the text encoder
+  // finishes.
+  uint64_t *prefill_rows_total;
+  // Optional pointer updated with the running 1-based denoising step.
+  int *image_step;
+  // Optional pointer updated with the active denoising step count.
+  int *image_steps_total;
+  // Optional counter increased after each finished denoising step.
+  uint64_t *image_steps_completed;
 } MinimaxH3RunHooks;
 
 // Returns nonzero when process shutdown was requested or hooks request cancel.

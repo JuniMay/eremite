@@ -112,6 +112,16 @@ static inline void regions_copy(const StateRegion *dst, const StateRegion *src,
            (size_t)region_rows(&src[i], positions) * src[i].unit);
 }
 
+// Running stage of an image generation call.
+typedef enum {
+  // No image call is running.
+  IMAGE_STAGE_NONE = 0,
+  // The prompt encoder runs over text and reference media tokens.
+  IMAGE_STAGE_PREFILL = 1,
+  // The denoiser and image decoder generate pixels.
+  IMAGE_STAGE_GENERATING = 2
+} ImageStage;
+
 // A model's counters since it loaded, for the server's status. Only a model
 // with routed experts (experts_per_row > 0) has the expert cache's.
 typedef struct {
@@ -120,6 +130,16 @@ typedef struct {
   double decode_seconds, decode_gpu_seconds;
   // The prompt pass running: its layer (0: none) and rows.
   int prefill_layer, prefill_rows_now;
+  // Images generated and denoising steps finished since the model opened.
+  uint64_t generated_images, image_steps;
+  // Seconds spent denoising, decoding and encoding images.
+  double image_seconds;
+  // Active image generation stage (ImageStage).
+  int image_stage;
+  // Active 1-based denoising step, or 0 outside denoising.
+  int image_step;
+  // Total denoising steps in the active image call, or 0 outside denoising.
+  int image_steps_total;
   // The layers, and the experts a row chooses: 0 without routed experts.
   int layers, experts_per_row;
   // The layers with routed experts, and each one's experts.
@@ -191,6 +211,13 @@ typedef struct {
   // Nonzero when the failure was a client input error; zero for load, memory
   // or stop failures.
   int invalid_input;
+  // Encoded prompt tokens processed by the text encoder, including reference
+  // image tokens.
+  int prompt_tokens;
+  // Seconds spent in the prompt encoder stage.
+  double prefill_seconds;
+  // Seconds spent denoising, decoding and encoding the output image.
+  double image_seconds;
 } ImageResult;
 
 typedef struct {

@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 6;
+const ABI: c_int = 7;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -168,6 +168,13 @@ struct RawImageResult {
     error: [c_char; IMAGE_ERROR_BYTES],
     /// Nonzero when the failure came from invalid caller input.
     invalid_input: c_int,
+    /// Encoded prompt tokens processed by the text encoder, including
+    /// reference image tokens.
+    prompt_tokens: c_int,
+    /// Seconds spent in the prompt encoder stage.
+    prefill_seconds: f64,
+    /// Seconds spent denoising, decoding and encoding the output image.
+    image_seconds: f64,
 }
 
 /// What a prefill ran (eremite_prefill_info).
@@ -253,6 +260,18 @@ pub struct Stats {
     pub prefill_layer: c_int,
     /// The running prefill's rows.
     pub prefill_rows_now: c_int,
+    /// Images generated since the model opened.
+    pub generated_images: u64,
+    /// Denoising steps finished since the model opened.
+    pub image_steps: u64,
+    /// Seconds spent denoising, decoding and encoding images.
+    pub image_seconds: f64,
+    /// Active image generation stage (EREMITE_IMAGE_STAGE_*).
+    pub image_stage: c_int,
+    /// Active 1-based denoising step, or 0 outside denoising.
+    pub image_step: c_int,
+    /// Total denoising steps in the active image call, or 0 outside denoising.
+    pub image_steps_total: c_int,
     /// The expert cache's slots.
     pub slots: c_int,
     /// The slots that hold an expert.
@@ -1672,6 +1691,42 @@ impl Drop for Media {
     }
 }
 
+/// Running stage of an image generation call (EREMITE_IMAGE_STAGE_*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageStage {
+    /// No image call is running.
+    None = 0,
+    /// The prompt encoder runs over text and reference media tokens.
+    Prefill = 1,
+    /// The denoiser and image decoder generate pixels.
+    Generating = 2,
+}
+
+impl ImageStage {
+    /// Converts a raw C stage code from `Stats::image_stage`.
+    pub fn from_raw(raw: c_int) -> ImageStage {
+        match raw {
+            1 => ImageStage::Prefill,
+            2 => ImageStage::Generating,
+            _ => ImageStage::None,
+        }
+    }
+}
+
+/// Output bytes and per-stage measurements from one image generation call.
+#[derive(Clone, Debug)]
+pub struct ImageCallOutput {
+    /// Encoded PNG or JPEG image bytes.
+    pub bytes: Vec<u8>,
+    /// Encoded prompt tokens processed by the text encoder, including
+    /// reference image tokens.
+    pub prompt_tokens: usize,
+    /// Seconds spent in the prompt encoder stage.
+    pub prefill_seconds: f64,
+    /// Seconds spent denoising, decoding and encoding the output image.
+    pub image_seconds: f64,
+}
+
 /// Encoded image output format for image generation models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -1887,18 +1942,26 @@ impl Stream {
         unsafe { eremite_stream_cancel(self.0) }
     }
 
-    /// Takes the finished image call's encoded bytes, or its error.
-    pub fn take_image_result(&self) -> Result<Vec<u8>, ImageError> {
+    /// Takes the finished image call's encoded bytes and timings, or its error.
+    pub fn take_image_result(&self) -> Result<ImageCallOutput, ImageError> {
         let mut raw = RawImageResult {
             data: ptr::null_mut(),
             len: 0,
             error: [0; IMAGE_ERROR_BYTES],
             invalid_input: 0,
+            prompt_tokens: 0,
+            prefill_seconds: 0.0,
+            image_seconds: 0.0,
         };
         let ok = unsafe { eremite_stream_image_result(self.0, &mut raw) != 0 };
         let result = if ok && !raw.data.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(raw.data, raw.len) }.to_vec();
-            Ok(bytes)
+            Ok(ImageCallOutput {
+                bytes,
+                prompt_tokens: raw.prompt_tokens.max(0) as usize,
+                prefill_seconds: raw.prefill_seconds.max(0.0),
+                image_seconds: raw.image_seconds.max(0.0),
+            })
         } else {
             let message = unsafe { std::ffi::CStr::from_ptr(raw.error.as_ptr()) }
                 .to_string_lossy()

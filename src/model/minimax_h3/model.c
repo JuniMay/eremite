@@ -1,4 +1,5 @@
 #include "model/minimax_h3/model.h"
+#include "base/clock.h"
 #include "base/error.h"
 #include "base/log.h"
 #include "base/shutdown.h"
@@ -52,8 +53,27 @@ static uint64_t required_full_bytes, required_staged_bytes;
 // Nonzero when all three core T2I weight groups fit resident together.
 static int full_resident;
 
-// Total images produced since the model opened.
-static uint64_t generated_images;
+// Total prompt tokens encoded, images produced and denoising steps completed
+// since the model opened.
+static uint64_t total_prefill_rows, generated_images, total_image_steps;
+
+// Total seconds spent denoising, decoding and encoding images since open.
+static double total_image_seconds;
+
+// Live prompt-encoder layer (1-based) and token count while prefilling.
+static int active_prefill_layer, active_prefill_rows;
+
+// Live image generation stage, 1-based denoising step and total step count.
+static int active_image_stage, active_image_step, active_image_steps_total;
+
+// Clears live per-call progress indicators back to idle.
+static void clear_active_progress(void) {
+  active_image_stage = IMAGE_STAGE_NONE;
+  active_prefill_layer = 0;
+  active_prefill_rows = 0;
+  active_image_step = 0;
+  active_image_steps_total = 0;
+}
 
 // Writes message into dst (when non-null and non-empty).
 static void write_error(char *dst, size_t cap, const char *message) {
@@ -253,7 +273,15 @@ static void minimax_h3_image_read_counters(ModelCounters *c) {
     resident += minimax_h3_image_vae_resident_bytes(vae);
     resident += minimax_h3_image_vae_encoder_resident_bytes(vae);
   }
-  *c = (ModelCounters){.prefill_rows = generated_images,
+  *c = (ModelCounters){.prefill_rows = total_prefill_rows,
+                       .prefill_layer = active_prefill_layer,
+                       .prefill_rows_now = active_prefill_rows,
+                       .generated_images = generated_images,
+                       .image_steps = total_image_steps,
+                       .image_seconds = total_image_seconds,
+                       .image_stage = active_image_stage,
+                       .image_step = active_image_step,
+                       .image_steps_total = active_image_steps_total,
                        .layers = MINIMAX_H3_TEXT_LAYERS,
                        .dense_bytes = resident,
                        .required_bytes = required_staged_bytes};
@@ -348,7 +376,14 @@ static int minimax_h3_image_generate(const ImageRequest *req,
         (MinimaxH3RefImage){.rgb = decoded_rgb[i], .width = rw, .height = rh};
   }
 
-  MinimaxH3RunHooks hooks = {.yield_wait = wait, .cancelled = cancelled};
+  MinimaxH3RunHooks hooks = {.yield_wait = wait,
+                             .cancelled = cancelled,
+                             .prefill_layer = &active_prefill_layer,
+                             .prefill_rows_now = &active_prefill_rows,
+                             .prefill_rows_total = &total_prefill_rows,
+                             .image_step = &active_image_step,
+                             .image_steps_total = &active_image_steps_total,
+                             .image_steps_completed = &total_image_steps};
   if (minimax_h3_should_stop(&hooks) || !text_enc || !dit || !vae) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
     set_runtime_error(out, &hooks);
@@ -369,9 +404,11 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   MemorySlot *vae_slot = weight_group_slot(minimax_h3_image_vae_weights(vae));
   int ok = 1;
 
-  // Stage 1: prompt (+ vision tower and reference VAE encoder when editing).
+  // Stage 1 (prefill): prompt text and reference vision encoding.
   // In full-residence mode all three core groups remain pinned; in staged mode
   // each stage pins only its own weights so Memory can swap if room is tight.
+  active_image_stage = IMAGE_STAGE_PREFILL;
+  double prefill_start = now();
   memory_pin(text_slot, 1);
   if (!minimax_h3_text_encoder_load(text_enc)) ok = 0;
   if (ok && req->ref_count > 0) {
@@ -385,6 +422,15 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     ok = minimax_h3_encode_multimodal_prompt(
         text_enc, vision_enc, req->prompt, req->ref_count ? ref_images : NULL,
         req->ref_count, work_slot, &text_hidden, &text_len, &text_tags, &hooks);
+  }
+  double prefill_s = now() - prefill_start;
+
+  // Transition from prompt prefill to image generation for reference VAE
+  // encoding, DiT denoising, VAE decoding and output encoding.
+  double gen_start = 0.0;
+  if (ok) {
+    active_image_stage = IMAGE_STAGE_GENERATING;
+    gen_start = now();
   }
 
   for (int i = 0; ok && i < req->ref_count; i++) {
@@ -458,6 +504,8 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   out_lat = NULL;
 
   if (!ok) {
+    if (gen_start > 0.0) total_image_seconds += now() - gen_start;
+    clear_active_progress();
     free(canvas_rgb);
     set_runtime_error(out, &hooks);
     return 0;
@@ -482,11 +530,18 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   free(canvas_rgb);
   free(final_rgb);
 
+  double gen_s = now() - gen_start;
+  total_image_seconds += gen_s;
+  clear_active_progress();
+
   if (!out->data) {
     snprintf(out->error, sizeof out->error, "failed to encode output image: %s",
              enc_err ? enc_err : "unknown error");
     return 0;
   }
+  out->prompt_tokens = text_len;
+  out->prefill_seconds = prefill_s;
+  out->image_seconds = gen_s;
   generated_images++;
   return 1;
 }
