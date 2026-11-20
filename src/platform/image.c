@@ -389,8 +389,11 @@ uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,
   return file;
 }
 
-uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
-                           int quality, size_t *length, const char **err) {
+// Encodes width by height pixels as a lossy WebP file: RGB, or RGBA with
+// straight alpha when alpha is set.
+static uint8_t *encode_webp(const uint8_t *pixels, int width, int height,
+                            int alpha, int quality, size_t *length,
+                            const char **err) {
   *length = 0;
   *err = 0;
   if (!check_encode_input(pixels, width, height, err)) return 0;
@@ -403,8 +406,11 @@ uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
     return 0;
   }
   uint8_t *encoded = 0;
-  size_t n = WebPEncodeRGB(pixels, width, height, width * (int)RGB_CHANNELS,
-                           (float)quality, &encoded);
+  size_t n =
+      alpha ? WebPEncodeRGBA(pixels, width, height, width * (int)RGBA_CHANNELS,
+                             (float)quality, &encoded)
+            : WebPEncodeRGB(pixels, width, height, width * (int)RGB_CHANNELS,
+                            (float)quality, &encoded);
   uint8_t *out = 0;
   if (n) {
     out = xmalloc(n);
@@ -415,4 +421,14 @@ uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
   }
   WebPFree(encoded);
   return out;
+}
+
+uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
+                           int quality, size_t *length, const char **err) {
+  return encode_webp(pixels, width, height, 0, quality, length, err);
+}
+
+uint8_t *image_encode_webp_rgba(const uint8_t *pixels, int width, int height,
+                                int quality, size_t *length, const char **err) {
+  return encode_webp(pixels, width, height, 1, quality, length, err);
 }

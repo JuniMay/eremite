@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 10;
+const ABI: c_int = 11;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -147,8 +147,10 @@ struct RawImageRequest {
     min_generation_area: c_int,
     /// Encoded output format code.
     format: c_int,
-    /// JPEG compression quality in 1..=100.
+    /// JPEG or WebP quality in 0..=100.
     quality: c_int,
+    /// Output background code (EREMITE_IMAGE_BACKGROUND_*).
+    background: c_int,
     /// Deterministic RNG seed.
     seed: u64,
     /// Array of encoded reference image descriptors, or null for text-to-image.
@@ -2067,6 +2069,7 @@ impl Stream {
             min_generation_area: params.min_generation_area as c_int,
             format: params.format as c_int,
             quality: params.quality as c_int,
+            background: 0,
             seed: params.seed,
             refs: if inputs.raw_refs.is_empty() {
                 ptr::null()

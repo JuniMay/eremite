@@ -174,6 +174,17 @@ typedef enum {
   IMAGE_FORMAT_WEBP = 2
 } ImageFormat;
 
+// Output image background.
+typedef enum {
+  // The model's own background, which is opaque.
+  IMAGE_BACKGROUND_AUTO = 0,
+  // An opaque background.
+  IMAGE_BACKGROUND_OPAQUE = 1,
+  // A transparent background, made from a flat key-colored one. It needs PNG
+  // or WebP.
+  IMAGE_BACKGROUND_TRANSPARENT = 2
+} ImageBackground;
+
 // One encoded input image passed for reference-based image editing.
 typedef struct {
   // Encoded image file bytes (PNG, JPEG or another format ImageIO decodes).
@@ -194,6 +205,8 @@ typedef struct {
   ImageFormat format;
   // JPEG or WebP quality in 0 to 100; PNG ignores it.
   int quality;
+  // Output background.
+  ImageBackground background;
   // Deterministic RNG seed for initial latent noise.
   uint64_t seed;
   // Optional reference images; null when ref_count is 0.

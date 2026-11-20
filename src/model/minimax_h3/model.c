@@ -497,6 +497,26 @@ static void set_runtime_error(ImageResult *out,
                 "image generation failed: memory is short");
 }
 
+// The key color of a transparent request's background: pure green, the key
+// that Codex's imagegen skill uses.
+static const uint8_t KEY_COLOR[MINIMAX_H3_RGB_CHANNELS] = {0, 255, 0};
+
+// The sentence that a transparent request adds to its prompt: a flat
+// background of the key color, which then becomes transparent.
+static const char KEY_BACKGROUND[] =
+    " The background is one flat, uniform pure green (#00FF00) color that "
+    "fills the frame from edge to edge, with no texture, gradient, shadows or "
+    "reflections.";
+
+// Returns a new string: prompt followed by KEY_BACKGROUND.
+static char *add_key_background(const char *prompt) {
+  size_t prompt_len = strlen(prompt), key_len = strlen(KEY_BACKGROUND);
+  char *joined = xmalloc(prompt_len + key_len + 1);
+  memcpy(joined, prompt, prompt_len);
+  memcpy(joined + prompt_len, KEY_BACKGROUND, key_len + 1);
+  return joined;
+}
+
 // Returns whether a width by height output has the shape of a source_w by
 // source_h image, within the pixel that scaling a size down rounds off.
 static int keeps_shape(int width, int height, int source_w, int source_h) {
@@ -571,6 +591,21 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     snprintf(out->error, sizeof out->error,
              "output_compression must be between %d and %d", IMAGE_QUALITY_MIN,
              IMAGE_QUALITY_MAX);
+    out->invalid_input = 1;
+    return 0;
+  }
+  if (req->background != IMAGE_BACKGROUND_AUTO &&
+      req->background != IMAGE_BACKGROUND_OPAQUE &&
+      req->background != IMAGE_BACKGROUND_TRANSPARENT) {
+    write_error(out->error, sizeof out->error,
+                "background must be auto, opaque or transparent");
+    out->invalid_input = 1;
+    return 0;
+  }
+  int transparent = req->background == IMAGE_BACKGROUND_TRANSPARENT;
+  if (transparent && req->format == IMAGE_FORMAT_JPEG) {
+    write_error(out->error, sizeof out->error,
+                "a transparent background needs output_format png or webp");
     out->invalid_input = 1;
     return 0;
   }
@@ -666,8 +701,11 @@ static int minimax_h3_image_generate(const ImageRequest *req,
         minimax_h3_image_ref_sizes(ref_images[i].width, ref_images[i].height);
     ref_tokens[i] = ref_sizes[i].vision;
   }
+  // A transparent request asks the model for a flat key-colored background.
+  char *keyed_prompt = transparent ? add_key_background(req->prompt) : NULL;
+  const char *prompt = keyed_prompt ? keyed_prompt : req->prompt;
   int planned_seq_len = minimax_h3_multimodal_prompt_tokens(
-      text_enc, req->prompt, ref_tokens, req->ref_count);
+      text_enc, prompt, ref_tokens, req->ref_count);
   MinimaxH3RequestMemory req_mem = minimax_h3_image_plan_request_memory(
       read_weight_bytes(text_enc, vision_enc, dit, vae),
       minimax_h3_image_stage_bytes(planned_seq_len, ref_sizes, req->ref_count,
@@ -680,6 +718,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   if (admission != MINIMAX_H3_ADMITTED) {
     for (int i = 0; i < req->ref_count; i++) free(decoded_rgb[i]);
     free(mask_alpha);
+    free(keyed_prompt);
     if (minimax_h3_should_stop(&hooks)) set_runtime_error(out, &hooks);
     out->invalid_input = admission == MINIMAX_H3_NEVER_FITS;
     return 0;
@@ -716,7 +755,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
 
   if (ok) {
     ok = minimax_h3_encode_multimodal_prompt(
-        text_enc, vision_enc, req->prompt, req->ref_count ? ref_images : NULL,
+        text_enc, vision_enc, prompt, req->ref_count ? ref_images : NULL,
         req->ref_count, work_slot, &text_hidden, &text_len, &text_tags, &hooks);
     if (ok && text_len != planned_seq_len)
       die("MiniMax-H3-Image: the prompt has %d tokens, but its memory plan "
@@ -823,6 +862,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     free(canvas_rgb);
     free(original);
     free(mask_alpha);
+    free(keyed_prompt);
     set_runtime_error(out, &hooks);
     return 0;
   }
@@ -840,10 +880,35 @@ static int minimax_h3_image_generate(const ImageRequest *req,
                          mask_alpha, ref_images[0].width, ref_images[0].height);
   free(original);
   free(mask_alpha);
+  free(keyed_prompt);
   const uint8_t *encode_src = output_rgb;
 
+  // A transparent request turns its key-colored background into alpha.
+  uint8_t *rgba = NULL;
+  if (transparent) {
+    rgba = xmalloc((size_t)req->width * (size_t)req->height *
+                   (MINIMAX_H3_RGB_CHANNELS + 1));
+    if (!matte_remove_key(encode_src, req->width, req->height, KEY_COLOR,
+                          rgba)) {
+      free(rgba);
+      free(canvas_rgb);
+      free(final_rgb);
+      clear_active_progress();
+      write_error(out->error, sizeof out->error,
+                  "the image came back without a flat key-colored "
+                  "background, so no part of it could be made transparent");
+      return 0;
+    }
+  }
+
   const char *enc_err = NULL;
-  if (req->format == IMAGE_FORMAT_PNG)
+  if (rgba && req->format == IMAGE_FORMAT_PNG)
+    out->data = image_encode_png_rgba(rgba, req->width, req->height, &out->len,
+                                      &enc_err);
+  else if (rgba)
+    out->data = image_encode_webp_rgba(rgba, req->width, req->height,
+                                       req->quality, &out->len, &enc_err);
+  else if (req->format == IMAGE_FORMAT_PNG)
     out->data = image_encode_png(encode_src, req->width, req->height, &out->len,
                                  &enc_err);
   else if (req->format == IMAGE_FORMAT_JPEG)
@@ -852,6 +917,7 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   else
     out->data = image_encode_webp(encode_src, req->width, req->height,
                                   req->quality, &out->len, &enc_err);
+  free(rgba);
   free(canvas_rgb);
   free(final_rgb);
 

@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 10
+#define EREMITE_ABI 11
 
 // ---- the process ----
 
@@ -243,6 +243,17 @@ enum {
   EREMITE_IMAGE_WEBP = 2
 };
 
+// Output image background.
+enum {
+  // The model's own background, which is opaque.
+  EREMITE_IMAGE_BACKGROUND_AUTO = 0,
+  // An opaque background.
+  EREMITE_IMAGE_BACKGROUND_OPAQUE = 1,
+  // A transparent background, made from a flat key-colored one. It needs
+  // EREMITE_IMAGE_PNG or EREMITE_IMAGE_WEBP.
+  EREMITE_IMAGE_BACKGROUND_TRANSPARENT = 2
+};
+
 // Capacity in bytes of eremite_image_result.error, including its NUL
 // terminator.
 enum { EREMITE_IMAGE_ERROR_BYTES = 256 };
@@ -268,6 +279,8 @@ typedef struct {
   int format;
   // JPEG or WebP quality in 0 to 100; PNG ignores it.
   int quality;
+  // Output background: one of EREMITE_IMAGE_BACKGROUND_*.
+  int background;
   // Deterministic RNG seed for initial latent noise.
   uint64_t seed;
   // Optional reference images; null when ref_count is 0.

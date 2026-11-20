@@ -47,4 +47,11 @@ uint8_t *image_encode_jpeg(const uint8_t *pixels, int width, int height,
 uint8_t *image_encode_webp(const uint8_t *pixels, int width, int height,
                            int quality, size_t *length, const char **error);
 
+// Encodes width by height rows of 8-bit RGBA pixels with straight alpha as a
+// lossy WebP file at quality (IMAGE_QUALITY_MIN to IMAGE_QUALITY_MAX) in a new
+// buffer and sets *length; returns null with *error set when it cannot.
+uint8_t *image_encode_webp_rgba(const uint8_t *pixels, int width, int height,
+                                int quality, size_t *length,
+                                const char **error);
+
 #endif

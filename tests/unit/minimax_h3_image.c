@@ -353,6 +353,30 @@ int main(void) {
   free(flat_png);
   free(small_png);
 
+  // A transparent background needs a format with alpha, and the background
+  // takes one of its three values. Both checks run without the weights.
+  ImageRequest keyed_jpeg = {.prompt = "a cat",
+                             .width = REF_W,
+                             .height = REF_H,
+                             .format = IMAGE_FORMAT_JPEG,
+                             .quality = IMAGE_QUALITY_MAX,
+                             .background = IMAGE_BACKGROUND_TRANSPARENT};
+  ImageResult keyed_result = {0};
+  check(!minimax_h3_image_ops.generate_image(&keyed_jpeg, NULL, NULL,
+                                             &keyed_result) &&
+            keyed_result.invalid_input &&
+            strstr(keyed_result.error, "png or webp") != NULL,
+        "a transparent background needs PNG or WebP");
+  ImageRequest odd_background = keyed_jpeg;
+  odd_background.format = IMAGE_FORMAT_PNG;
+  odd_background.background =
+      (ImageBackground)(IMAGE_BACKGROUND_TRANSPARENT + 1);
+  ImageResult odd_result = {0};
+  check(!minimax_h3_image_ops.generate_image(&odd_background, NULL, NULL,
+                                             &odd_result) &&
+            odd_result.invalid_input,
+        "an unknown background is invalid input");
+
   // A staged request keeps at least the staged base reserved while it runs.
   memory_set_limit(mem, 50ull << 30);
   uint64_t staged_base = mem_default.staged_bytes + (1ull << 30);

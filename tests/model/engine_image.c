@@ -336,6 +336,36 @@ int main(int argc, char **argv) {
     eremite_image_result_free(&res);
   }
 
+  // A transparent background: the key-colored background turns clear, so the
+  // corners have alpha 0 and some pixels stay opaque.
+  eremite_image_request req_clear = {.prompt = "A red apple in the middle of "
+                                               "the frame.",
+                                     .width = 512,
+                                     .height = 512,
+                                     .min_generation_area = 1024,
+                                     .format = EREMITE_IMAGE_PNG,
+                                     .background =
+                                         EREMITE_IMAGE_BACKGROUND_TRANSPARENT,
+                                     .seed = 21};
+  int ok_clear = eremite_generate_image(m, &req_clear, &res);
+  int clear_w = 0, clear_h = 0;
+  const char *clear_error = NULL;
+  uint8_t *clear_alpha = ok_clear
+                             ? image_decode_alpha(res.data, res.len, &clear_w,
+                                                  &clear_h, &clear_error)
+                             : NULL;
+  size_t opaque_pixels = 0;
+  for (int i = 0; clear_alpha && i < clear_w * clear_h; i++)
+    opaque_pixels += clear_alpha[i] == 255;
+  printf("transparent 512x512: ok=%d opaque pixels %zu %s\n", ok_clear,
+         opaque_pixels, ok_clear ? "" : res.error);
+  check(clear_alpha && clear_w == 512 && clear_h == 512 && !clear_alpha[0] &&
+            !clear_alpha[511] && !clear_alpha[511 * 512] &&
+            !clear_alpha[512 * 512 - 1] && opaque_pixels > 0,
+        "a transparent background clears the corners and keeps the subject");
+  free(clear_alpha);
+  eremite_image_result_free(&res);
+
   eremite_stream_free(stream);
 
   // 7. Idle unload frees all resident weight groups and clears is_loaded.

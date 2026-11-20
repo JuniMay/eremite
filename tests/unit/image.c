@@ -320,6 +320,18 @@ int main(void) {
                         IMAGE_QUALITY_MAX + 1, &encoded_length, &error);
   check(!encoded_webp && !encoded_length && error,
         "encoding a WebP with quality outside 0 to 100 gives an error");
+  error = "unset";
+  encoded_webp =
+      image_encode_webp_rgba(&rgba[0][0][0], WIDTH, HEIGHT, IMAGE_QUALITY_MAX,
+                             &encoded_length, &error);
+  alpha = encoded_webp ? image_decode_alpha(encoded_webp, encoded_length,
+                                            &alpha_w, &alpha_h, &alpha_error)
+                       : 0;
+  check(encoded_webp && !error && alpha && alpha_w == WIDTH &&
+            alpha_h == HEIGHT,
+        "an RGBA WebP file keeps an alpha channel of its size");
+  free(alpha);
+  free(encoded_webp);
 
   CGColorSpaceRelease(gray_space);
   CGColorSpaceRelease(srgb);
