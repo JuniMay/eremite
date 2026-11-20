@@ -162,11 +162,32 @@ struct RawImageRequest {
     mask: RawImageInput,
     /// Partial images to send while the image generates; 0 sends none.
     partial_images: c_int,
-    /// Receives each partial image: its encoded bytes and length, and its
-    /// 0-based index (eremite_partial_image_fn); None for none.
-    on_partial_image: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, c_int)>,
+    /// Receives each partial image; None for none.
+    on_partial_image: Option<PartialImageFn>,
     /// The context passed to `on_partial_image`.
     partial_image_context: *mut c_void,
+}
+
+/// Receives one partial image from C: the context, the encoded bytes and
+/// their length, and the 0-based index (eremite_partial_image_fn).
+type PartialImageFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, c_int);
+
+/// Receives each partial image of an image call: its encoded bytes and its
+/// 0-based index. It runs inside the call, on the thread that runs the
+/// streams.
+pub type PartialImageReceiver = Box<dyn Fn(&[u8], usize) + Send>;
+
+/// Passes one partial image from the engine to the call's receiver, which
+/// `context` points to.
+unsafe extern "C" fn receive_partial_image(
+    context: *mut c_void,
+    data: *const u8,
+    len: usize,
+    index: c_int,
+) {
+    let receiver = unsafe { &*(context as *const PartialImageReceiver) };
+    let image = unsafe { std::slice::from_raw_parts(data, len) };
+    receiver(image, index as usize);
 }
 
 /// Output of one image generation or editing call (eremite_image_result).
@@ -1917,6 +1938,8 @@ pub struct ImageCallParams {
     pub background: ImageBackground,
     /// Deterministic RNG seed for initial latent noise.
     pub seed: u64,
+    /// Partial images to send while the image generates; 0 sends none.
+    pub partial_images: usize,
 }
 
 /// Error returned when an image generation call fails.
@@ -1942,12 +1965,20 @@ pub struct ImageInputs {
     _mask: Option<Vec<u8>>,
     /// The mask's C descriptor, with null data for no mask.
     raw_mask: RawImageInput,
+    /// Receives the calls' partial images, boxed again so that C holds a
+    /// thin pointer to it; None when the calls ask for none.
+    partial_receiver: Option<Box<PartialImageReceiver>>,
 }
 
 impl ImageInputs {
-    /// Packages `prompt`, `references` and an edit's `mask` into stable memory
-    /// for C FFI.
-    pub fn new(prompt: &str, references: Vec<Vec<u8>>, mask: Option<Vec<u8>>) -> ImageInputs {
+    /// Packages `prompt`, `references`, an edit's `mask` and the receiver of
+    /// partial images into stable memory for C FFI.
+    pub fn new(
+        prompt: &str,
+        references: Vec<Vec<u8>>,
+        mask: Option<Vec<u8>>,
+        partial_receiver: Option<PartialImageReceiver>,
+    ) -> ImageInputs {
         let raw_refs: Vec<RawImageInput> = references
             .iter()
             .map(|bytes| RawImageInput {
@@ -1965,6 +1996,7 @@ impl ImageInputs {
             raw_refs: raw_refs.into_boxed_slice(),
             _mask: mask,
             raw_mask,
+            partial_receiver: partial_receiver.map(Box::new),
         }
     }
 }
@@ -2111,9 +2143,17 @@ impl Stream {
             },
             ref_count: inputs.raw_refs.len() as c_int,
             mask: inputs.raw_mask,
-            partial_images: 0,
-            on_partial_image: None,
-            partial_image_context: ptr::null_mut(),
+            partial_images: params.partial_images as c_int,
+            on_partial_image: inputs
+                .partial_receiver
+                .is_some()
+                .then_some(receive_partial_image as PartialImageFn),
+            partial_image_context: inputs
+                .partial_receiver
+                .as_deref()
+                .map_or(ptr::null_mut(), |receiver| {
+                    receiver as *const PartialImageReceiver as *mut c_void
+                }),
         };
         unsafe { eremite_stream_generate_image(self.0, &req) }
     }

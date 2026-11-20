@@ -745,7 +745,9 @@ fn convert_events_to_inference_chunks(
                 | Event::Refused(_)
                 | Event::Failed(_)
                 | Event::Decided { .. }
-                | Event::Images { .. } => {
+                | Event::PartialImage { .. }
+                | Event::Image { .. }
+                | Event::ImagesDone => {
                     break;
                 }
             }

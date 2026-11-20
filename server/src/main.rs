@@ -775,7 +775,7 @@ async fn answer_image_edits(
 }
 
 /// Queues the validated image request `parsed` for model `index` and turns the
-/// worker's final event into an OpenAI Images API response.
+/// worker's events into an OpenAI Images API response.
 async fn run_image_request(
     index: usize,
     arrival: u64,
@@ -790,7 +790,7 @@ async fn run_image_request(
     );
     let format = parsed.format;
     let background = parsed.background;
-    let (_cancel, mut events) = match worker::submit_image(worker::ImageRequest {
+    let (cancel, events) = match worker::submit_image(worker::ImageRequest {
         model_index: index,
         prompt: parsed.prompt,
         size: parsed.size,
@@ -800,6 +800,7 @@ async fn run_image_request(
         format: parsed.format,
         quality: parsed.quality,
         background: parsed.background,
+        partial_images: 0,
         references: parsed.references,
         mask: parsed.mask,
         note,
@@ -809,26 +810,54 @@ async fn run_image_request(
         Ok(pair) => pair,
         Err(error) => return refuse_request(&peer, error),
     };
-    match events.recv().await {
-        Some(worker::Event::Images {
-            images,
-            width,
-            height,
-        }) => {
-            let response = image::build_response(&images, width, height, format, background);
-            build_json_response(response.to_string())
+    let response = collect_image_response(&peer, format, background, events).await;
+    drop(cancel);
+    response
+}
+
+/// Collects an image request's images from its `events` and answers with
+/// one JSON object, with the images' `format` and `background`.
+async fn collect_image_response(
+    peer: &str,
+    format: engine::ImageFormat,
+    background: engine::ImageBackground,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<worker::Event>,
+) -> Response {
+    let mut images = Vec::new();
+    let (mut width, mut height) = (0, 0);
+    loop {
+        match events.recv().await {
+            Some(worker::Event::Image {
+                image,
+                width: image_width,
+                height: image_height,
+            }) => {
+                images.push(image);
+                (width, height) = (image_width, image_height);
+            }
+            Some(worker::Event::PartialImage { .. }) => {}
+            Some(worker::Event::ImagesDone) => {
+                let response = image::build_response(&images, width, height, format, background);
+                return build_json_response(response.to_string());
+            }
+            Some(worker::Event::Refused(message)) => {
+                return refuse_request(peer, chat::Error::new_bad_request(message));
+            }
+            Some(worker::Event::Failed(message)) => {
+                return chat::build_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    &message,
+                );
+            }
+            _ => {
+                return chat::build_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "the server is stopping",
+                );
+            }
         }
-        Some(worker::Event::Refused(message)) => {
-            refuse_request(&peer, chat::Error::new_bad_request(message))
-        }
-        Some(worker::Event::Failed(message)) => {
-            chat::build_error_response(StatusCode::SERVICE_UNAVAILABLE, "server_error", &message)
-        }
-        _ => chat::build_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "the server is stopping",
-        ),
     }
 }
 

@@ -42,8 +42,8 @@ use crate::decision::d1;
 use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
     self, CacheCounts, DraftChoice, ExpandError, ImageBackground, ImageCallParams, ImageError,
-    ImageFormat, ImageInputs, Logits, Lookup, Media, Model, PrefillInfo, Sampler, SnapshotHandle,
-    StateHandle, Stream,
+    ImageFormat, ImageInputs, Logits, Lookup, Media, Model, PartialImageReceiver, PrefillInfo,
+    Sampler, SnapshotHandle, StateHandle, Stream,
 };
 use crate::state_cache::{
     self, Cache, Entry, Evicted, ModelLimits, Plan, PlanLimits, Snapshot, SnapshotKind,
@@ -108,14 +108,25 @@ pub enum Event {
         logits: Vec<Vec<f32>>,
         tokens: usize,
     },
-    /// An image generation or editing request finished: the encoded PNG or
-    /// JPEG bytes of each produced image, and their width and height. This is
-    /// the last event.
-    Images {
-        images: Vec<Vec<u8>>,
+    /// An early estimate of the image that an image request generates now,
+    /// encoded like its images: its width and height, and its 0-based index
+    /// among that image's partial images.
+    PartialImage {
+        image: Vec<u8>,
+        width: i32,
+        height: i32,
+        index: usize,
+    },
+    /// One of an image request's images, encoded, with its width and height.
+    /// The images come in order.
+    Image {
+        image: Vec<u8>,
         width: i32,
         height: i32,
     },
+    /// An image request finished: all its images came in Image events. This
+    /// is the last event.
+    ImagesDone,
 }
 
 /// How a request samples its tokens.
@@ -229,6 +240,8 @@ pub struct ImageRequest {
     pub quality: i32,
     /// Output background.
     pub background: ImageBackground,
+    /// Partial images to send before each image; 0 sends none.
+    pub partial_images: usize,
     /// Optional reference image bytes in upload order (`<Picture 1>`, ...).
     pub references: Vec<Vec<u8>>,
     /// An edit's mask image bytes, whose alpha marks what changes; None for
@@ -1514,6 +1527,23 @@ struct Decision {
     started_at: Instant,
 }
 
+/// Returns a receiver that sends each partial image of a `width` by `height`
+/// image request to the request's `events`.
+fn send_partial_images(
+    events: mpsc::UnboundedSender<Event>,
+    width: i32,
+    height: i32,
+) -> PartialImageReceiver {
+    Box::new(move |image, index| {
+        let _ = events.send(Event::PartialImage {
+            image: image.to_vec(),
+            width,
+            height,
+            index,
+        });
+    })
+}
+
 /// An image generation or editing request from its first image to its last.
 struct ImageTask {
     /// The submitted image request.
@@ -1523,8 +1553,8 @@ struct ImageTask {
     height: i32,
     /// Prompt C string and reference bytes kept alive across stream calls.
     inputs: ImageInputs,
-    /// Encoded PNG/JPEG images generated so far.
-    outputs: Vec<Vec<u8>>,
+    /// Images generated so far, each sent in an Image event.
+    done: usize,
     /// Encoded prompt tokens of this request, including reference image tokens.
     prompt_tokens: usize,
     /// Engine prefill_rows counter when the active image pass started.
@@ -2307,7 +2337,7 @@ impl Worker {
                 if let Some(request) = status.requests.iter_mut().find(|r| r.id == image.job.id) {
                     request.status = live_phase;
                     request.prompt_tokens = live_prompt;
-                    request.generated_images = image.outputs.len();
+                    request.generated_images = image.done;
                 }
             }
         }
@@ -3137,7 +3167,7 @@ impl WorkerModel {
                     &image.job,
                     Self::active_image_phase(stats),
                     Self::live_image_prompt_tokens(image, stats),
-                    image.outputs.len(),
+                    image.done,
                 )
             }))
             .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
@@ -4881,7 +4911,7 @@ impl WorkerModel {
             }
             self.image = Some(image);
         } else if image.failure.is_some()
-            || image.outputs.len() == image.job.request.count
+            || image.done == image.job.request.count
             || engine::is_stopping()
             || image.job.flags.cancelled.load(Ordering::SeqCst)
         {
@@ -4928,13 +4958,15 @@ impl WorkerModel {
         self.last_used_at = Instant::now();
         let refs = std::mem::take(&mut job.request.references);
         let mask = job.request.mask.take();
-        let inputs = ImageInputs::new(&job.request.prompt, refs, mask);
+        let partial_receiver = (job.request.partial_images > 0)
+            .then(|| send_partial_images(job.events.clone(), width, height));
+        let inputs = ImageInputs::new(&job.request.prompt, refs, mask, partial_receiver);
         let task = ImageTask {
             job,
             width,
             height,
             inputs,
-            outputs: Vec::new(),
+            done: 0,
             prompt_tokens: 0,
             pass_start_prefill_rows: 0,
             prefilled_tokens: 0,
@@ -4995,7 +5027,7 @@ impl WorkerModel {
 
     /// Posts the next image generation pass of `task` on a new engine stream.
     fn start_image_pass(&mut self, mut task: ImageTask) {
-        let index = task.outputs.len() as u64;
+        let index = task.done as u64;
         task.pass_start_prefill_rows = self.model.read_stats().prefill_rows;
         let req = &task.job.request;
         let stream = Stream::new(&self.model);
@@ -5009,6 +5041,7 @@ impl WorkerModel {
                 quality: req.quality,
                 background: req.background,
                 seed: req.seed.wrapping_add(index),
+                partial_images: req.partial_images,
             },
         );
         task.in_call = true;
@@ -5034,7 +5067,12 @@ impl WorkerModel {
                 task.prefilled_tokens += output.prompt_tokens as u64;
                 task.prefill_seconds += output.prefill_seconds;
                 task.image_seconds += output.image_seconds;
-                task.outputs.push(output.bytes);
+                task.done += 1;
+                let _ = task.job.events.send(Event::Image {
+                    image: output.bytes,
+                    width: task.width,
+                    height: task.height,
+                });
             }
             Err(error) => {
                 if !task.job.flags.cancelled.load(Ordering::SeqCst) && !engine::is_stopping() {
@@ -5046,7 +5084,7 @@ impl WorkerModel {
 
     /// Ends `task`, logging elapsed time and sending the final worker event.
     fn end_image(&mut self, shared: &Shared, task: ImageTask) {
-        let done = task.outputs.len();
+        let done = task.done;
         let count = task.job.request.count;
         let seconds = task.started_at.elapsed().as_secs_f64();
         let (how, event) = if let Some(error) = task.failure {
@@ -5062,14 +5100,7 @@ impl WorkerModel {
                 )
             }
         } else if done == count {
-            (
-                "generated".to_string(),
-                Event::Images {
-                    images: task.outputs,
-                    width: task.width,
-                    height: task.height,
-                },
-            )
+            ("generated".to_string(), Event::ImagesDone)
         } else if task.job.flags.cancelled.load(Ordering::SeqCst) {
             (
                 "client gone".to_string(),
@@ -5342,6 +5373,7 @@ mod tests {
                 format: engine::ImageFormat::Png,
                 quality: 0,
                 background: engine::ImageBackground::Auto,
+                partial_images: 0,
                 references: Vec::new(),
                 mask: None,
                 note: String::new(),
