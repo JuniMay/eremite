@@ -24,6 +24,8 @@ static const char source[] = {
 #embed "minimax_h3_vae.metal"
     , '\n',
 #embed "minimax_h3_dit.metal"
+    , '\n',
+#embed "minimax_h3_vision.metal"
 };
 
 const char *kernel_library_source(size_t *length) {
