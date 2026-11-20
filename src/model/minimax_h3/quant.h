@@ -1,5 +1,6 @@
 #ifndef EREMITE_MODEL_MINIMAX_H3_QUANT_H
 #define EREMITE_MODEL_MINIMAX_H3_QUANT_H
+#include "engine/pass.h"
 #include "engine/safetensors.h"
 #include "engine/weights.h"
 #include <stdint.h>
@@ -35,8 +36,24 @@ float minimax_h3_read_scalar_f32(Tensor tensor);
 void minimax_h3_nvfp4_scales_add(WeightGroup *group, Buf *target, Tensor tensor,
                                  int rows, int cols);
 
+// Cooperative scheduling and cancellation hooks for MiniMax-H3 GPU loops.
+typedef struct {
+  // Optional wait checked between GPU layers to let decoding calls run first.
+  const PassWait *yield_wait;
+  // Optional pointer to a nonzero flag set on the engine thread to cancel.
+  const int *cancelled;
+} MinimaxH3RunHooks;
+
+// Returns nonzero when process shutdown was requested or hooks request cancel.
+int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks);
+
 // Waits for the GPU command buffer numbered number to finish, yielding when
 // called inside a cooperative engine pass.
 void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number);
+
+// Waits for command buffer number to finish and then yields to
+// hooks->yield_wait when running inside an engine pass without a stop request.
+void minimax_h3_gpu_wait_hooks(Gpu *gpu, uint64_t number,
+                               const MinimaxH3RunHooks *hooks);
 
 #endif

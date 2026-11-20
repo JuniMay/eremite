@@ -60,12 +60,12 @@ int minimax_h3_vision_encoder_load(MinimaxH3VisionEncoder *vis);
 // through the 27-layer vision tower, main merger and 3 DeepStack mergers.
 // Allocates out_merged and out_deepstack[0..2] (each n_merged by 5120 FP32) in
 // out_slot and sets *out_grid_h = height / 16, *out_grid_w = width / 16.
-// Returns 1 on success or 0 on allocation/load failure.
+// hooks may be null. Returns 1 on success or 0 on failure or stop.
 int minimax_h3_vision_encoder_encode_image(
     MinimaxH3VisionEncoder *vis, const uint8_t *rgb, int width, int height,
     MemorySlot *out_slot, Buf *out_merged,
     Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
-    int *out_grid_w);
+    int *out_grid_w, const MinimaxH3RunHooks *hooks);
 
 // Encodes a MiniMax-H3-Image prompt with zero or more reference images:
 // resizes each reference image to Qwen3-VL vision size, runs the vision tower,
@@ -75,10 +75,11 @@ int minimax_h3_vision_encoder_encode_image(
 // and runs Qwen3-VL layers 0..49.
 // Allocates out_hidden in out_slot and a heap array in *out_tags (caller frees
 // *out_tags with free() and out_hidden with gpu_free()).
-// Returns 1 on success or 0 on failure.
+// hooks may be null. Returns 1 on success or 0 on failure or stop.
 int minimax_h3_encode_multimodal_prompt(
     MinimaxH3TextEncoder *text_enc, MinimaxH3VisionEncoder *vis,
     const char *prompt, const MinimaxH3RefImage *refs, int ref_count,
-    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags);
+    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags,
+    const MinimaxH3RunHooks *hooks);
 
 #endif

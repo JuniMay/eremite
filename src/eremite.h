@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 5
+#define EREMITE_ABI 6
 
 // ---- the process ----
 
@@ -109,7 +109,17 @@ typedef struct {
   int packed_state_rows;
 } eremite_deepseek_config;
 
-// Common settings and DeepSeek's options.
+// MiniMax-H3-Image checkpoint files.
+typedef struct {
+  // Safetensors file of the Qwen3-VL text and vision encoder.
+  const char *text_encoder;
+  // Safetensors file of the pruned INT8-ConvRot DiT.
+  const char *dit;
+  // Safetensors file of the FP16 image VAE.
+  const char *vae;
+} eremite_minimax_h3_config;
+
+// Common settings and family-specific options.
 typedef struct {
   int abi;
   const char *model;
@@ -119,6 +129,7 @@ typedef struct {
   // workspaces and states; 0: none of its own.
   double memory_gb;
   eremite_deepseek_config deepseek;
+  eremite_minimax_h3_config minimax_h3;
 } eremite_config;
 
 typedef struct eremite_model eremite_model;
@@ -202,6 +213,76 @@ const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
                             int questions, const int32_t *rows,
                             const int32_t *ids, int count,
                             const eremite_media *images);
+
+// ---- image models ----
+
+// An image model, such as MiniMax-H3-Image, generates or edits one image per
+// call from a text prompt and optional reference images, and keeps no
+// attention states between calls. It runs no states, snapshots, prefills,
+// decoding, drafts or decisions: those calls end the program. Its
+// eremite_config takes minimax_h3 checkpoint paths and no drafts, lookup or
+// DeepSeek options.
+
+// Output image encoding format.
+enum {
+  // Lossless PNG encoding.
+  EREMITE_IMAGE_PNG = 0,
+  // Lossy JPEG encoding.
+  EREMITE_IMAGE_JPEG = 1
+};
+
+// One encoded input image passed for image editing.
+typedef struct {
+  // Encoded image bytes (PNG, JPEG or another format macOS decodes).
+  const uint8_t *data;
+  // Byte length of data.
+  size_t len;
+} eremite_image_input;
+
+// Parameters of one image generation or editing call.
+typedef struct {
+  // Prompt text (UTF-8, NUL-terminated).
+  const char *prompt;
+  // Exact requested output width and height in pixels.
+  int width, height;
+  // Minimum generation canvas area in pixels (1024 to 16777216; 0 uses
+  // 4194304).
+  int min_generation_area;
+  // Output format: EREMITE_IMAGE_PNG or EREMITE_IMAGE_JPEG.
+  int format;
+  // JPEG quality in 1 to 100 when format is EREMITE_IMAGE_JPEG; 0 uses 95.
+  int quality;
+  // Deterministic RNG seed for initial latent noise.
+  uint64_t seed;
+  // Optional reference images; null when ref_count is 0.
+  const eremite_image_input *refs;
+  // Number of reference images (0 for text-to-image, 1 to 16 for editing).
+  int ref_count;
+} eremite_image_request;
+
+// Output of one image generation or editing call.
+typedef struct {
+  // Heap-allocated PNG or JPEG bytes; null on failure.
+  uint8_t *data;
+  // Byte length of data.
+  size_t len;
+  // Error message when data is null; empty on success.
+  char error[256];
+  // Nonzero when the request inputs were invalid; zero for load, memory or
+  // stop failures.
+  int invalid_input;
+} eremite_image_result;
+
+// Returns whether the model is an image generation model.
+int eremite_is_image_model(const eremite_model *m);
+// Runs one image generation or editing call synchronously and writes the
+// result into out. Caller releases out->data with eremite_image_result_free.
+// Returns 1 on success or 0 on failure.
+int eremite_generate_image(eremite_model *m,
+                           const eremite_image_request *request,
+                           eremite_image_result *out);
+// Frees the encoded image buffer held by result and clears its fields.
+void eremite_image_result_free(eremite_image_result *result);
 
 // ---- attention states and snapshots ----
 
@@ -388,6 +469,14 @@ void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
                            int questions, const int32_t *rows,
                            const int32_t *ids, int count,
                            const eremite_media *images);
+// Posts an image model's generation or editing call (eremite_generate_image).
+// Pointers in request stay valid until the call finishes. Its result comes
+// from eremite_stream_image_result.
+void eremite_stream_generate_image(eremite_stream *x,
+                                   const eremite_image_request *request);
+// Requests cooperative cancellation of a running stream call at its next
+// layer boundary.
+void eremite_stream_cancel(eremite_stream *x);
 // Advances the streams until a call finishes, and returns that stream's index.
 // It returns -1 when no stream has a call posted, and when eremite_wake asks it
 // to. Only this function runs the streams. A prefill lets decoding calls
@@ -411,6 +500,9 @@ void eremite_stream_prefill_info(const eremite_stream *x,
 // For a verify call: returns the next token, and sets *accepted to the drafts
 // kept.
 int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted);
+// Moves the finished image call's result into out. Caller releases out->data
+// with eremite_image_result_free. Returns 1 when out->data is non-null.
+int eremite_stream_image_result(eremite_stream *x, eremite_image_result *out);
 
 // ---- sampling ----
 

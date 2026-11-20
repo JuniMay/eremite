@@ -545,11 +545,12 @@ int minimax_h3_vision_encoder_encode_image(
     MinimaxH3VisionEncoder *vis, const uint8_t *rgb, int width, int height,
     MemorySlot *out_slot, Buf *out_merged,
     Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
-    int *out_grid_w) {
+    int *out_grid_w, const MinimaxH3RunHooks *hooks) {
   if (!vis || !rgb || width <= 0 || height <= 0 ||
       width % REF_GRID_MULTIPLE != 0 || height % REF_GRID_MULTIPLE != 0 ||
       !out_merged || !out_deepstack || !out_grid_h || !out_grid_w)
     die("invalid vision encoder arguments");
+  if (minimax_h3_should_stop(hooks)) return 0;
   if (!minimax_h3_vision_encoder_load(vis)) return 0;
 
   int grid_h = height / VIS_PATCH_SIDE, grid_w = width / VIS_PATCH_SIDE;
@@ -559,10 +560,11 @@ int minimax_h3_vision_encoder_encode_image(
   uint32_t padded = ((uint32_t)num_patches + TILE_M - 1) / TILE_M * TILE_M;
 
   MemorySlot *wslot = weight_group_slot(vis->weights);
+  unsigned was_pinned = wslot->pins;
   memory_pin(wslot, 1);
   VisWorkspace ws;
   if (!alloc_vis_workspace(vis, num_patches, &ws)) {
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -577,7 +579,7 @@ int minimax_h3_vision_encoder_encode_image(
     for (int i = 0; i < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; i++)
       gpu_free(&out_deepstack[i]);
     free_vis_workspace(&ws);
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -631,7 +633,12 @@ int minimax_h3_vision_encoder_encode_image(
   uint32_t h_count = (uint32_t)num_patches * (uint32_t)VIS_DIM;
   uint32_t mlp_count = (uint32_t)num_patches * (uint32_t)VIS_MLP_PAD;
 
+  int stopped = 0;
   for (int i = 0; i < VIS_LAYERS; i++) {
+    if (minimax_h3_should_stop(hooks)) {
+      stopped = 1;
+      break;
+    }
     const VisBlock *b = &vis->blocks[i];
     cmd = gpu_begin(vis->gpu);
 
@@ -712,8 +719,18 @@ int minimax_h3_vision_encoder_encode_image(
     }
 
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait(vis->gpu, prev_cmd);
+    minimax_h3_gpu_wait_hooks(vis->gpu, prev_cmd, hooks);
     prev_cmd = cmd.number;
+  }
+
+  if (stopped) {
+    minimax_h3_gpu_wait(vis->gpu, prev_cmd);
+    gpu_free(out_merged);
+    for (int i = 0; i < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; i++)
+      gpu_free(&out_deepstack[i]);
+    free_vis_workspace(&ws);
+    memory_pin(wslot, (int)was_pinned);
+    return 0;
   }
 
   // Final pre-norm patch merger.
@@ -721,10 +738,10 @@ int minimax_h3_vision_encoder_encode_image(
   run_vis_merger(vis, &cmd, &ws, &vis->merger, num_patches, out_merged);
   gpu_commit(&cmd);
   minimax_h3_gpu_wait(vis->gpu, prev_cmd);
-  minimax_h3_gpu_wait(vis->gpu, cmd.number);
+  minimax_h3_gpu_wait_hooks(vis->gpu, cmd.number, hooks);
 
   free_vis_workspace(&ws);
-  memory_pin(wslot, 0);
+  memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);
   *out_grid_h = grid_h;
   *out_grid_w = grid_w;
@@ -746,7 +763,8 @@ typedef struct {
 int minimax_h3_encode_multimodal_prompt(
     MinimaxH3TextEncoder *text_enc, MinimaxH3VisionEncoder *vis,
     const char *prompt, const MinimaxH3RefImage *refs, int ref_count,
-    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags) {
+    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags,
+    const MinimaxH3RunHooks *hooks) {
   if (!text_enc || ref_count < 0 || (ref_count > 0 && (!vis || !refs)) ||
       !out_hidden || !out_seq_len || !out_tags)
     die("invalid multimodal prompt encoding arguments");
@@ -754,8 +772,9 @@ int minimax_h3_encode_multimodal_prompt(
 
   // Fast path for text-only generation: no vision tower load needed.
   if (ref_count == 0) {
-    if (!minimax_h3_text_encoder_encode_prompt(
-            text_enc, prompt ? prompt : "", out_slot, out_hidden, out_seq_len))
+    if (!minimax_h3_text_encoder_encode_prompt(text_enc, prompt ? prompt : "",
+                                               out_slot, out_hidden,
+                                               out_seq_len, hooks))
       return 0;
     int *tags = xmalloc((size_t)(*out_seq_len) * sizeof(int));
     for (int i = 0; i < *out_seq_len; i++) tags[i] = TAG_TEXT;
@@ -789,7 +808,7 @@ int minimax_h3_encode_multimodal_prompt(
 
     int ok = minimax_h3_vision_encoder_encode_image(
         vis, src_rgb, vis_w, vis_h, out_slot, &enc_refs[i].merged,
-        enc_refs[i].deepstack, &enc_refs[i].grid_h, &enc_refs[i].grid_w);
+        enc_refs[i].deepstack, &enc_refs[i].grid_h, &enc_refs[i].grid_w, hooks);
     free(tmp2);
     free(tmp1);
     if (!ok) {
@@ -927,7 +946,7 @@ int minimax_h3_encode_multimodal_prompt(
         &cat_ds[0], &cat_ds[1], &cat_ds[2]};
     ok = minimax_h3_text_encoder_encode_tokens(
         text_enc, ids, pos_ids, &embeds_override, ds_ptrs, vis_indices,
-        total_vis, seq_len, out_hidden);
+        total_vis, seq_len, out_hidden, hooks);
   }
 
   for (int d = 0; d < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; d++)

@@ -3,6 +3,7 @@
 #include "engine/memory.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
+#include "model/minimax_h3/quant.h"
 #include <stdint.h>
 
 // MiniMax-H3-Image DiT: a 50-layer INT8-ConvRot single-stream transformer with
@@ -55,11 +56,12 @@ int minimax_h3_dit_load(MinimaxH3Dit *dit);
 //   when null, all text tokens receive tag 1.
 // - refs: optional array of ref_count encoded reference image latents.
 // - seed: deterministic RNG seed for initial latent noise (and ref noise aug).
-// Returns 1 on success or 0 if loading or workspace allocation fails.
+// - hooks: optional cooperative yield and cancellation hooks; may be null.
+// Returns 1 on success or 0 if loading, workspace allocation or stop fails.
 int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
                           int text_len, const int *text_tags,
                           const MinimaxH3RefLatent *refs, int ref_count,
                           int h_lat, int w_lat, uint64_t seed,
-                          float *out_latents);
+                          float *out_latents, const MinimaxH3RunHooks *hooks);
 
 #endif

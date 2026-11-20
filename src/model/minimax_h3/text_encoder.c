@@ -296,9 +296,17 @@ int minimax_h3_text_encoder_tokenize(const MinimaxH3TextEncoder *enc,
                                      const char *prompt, int *ids,
                                      int max_ids) {
   if (max_ids <= 0) return 0;
-  int n = prompt && prompt[0]
-              ? tokenizer_encode_text(enc->tokenizer, prompt, ids, max_ids)
-              : 0;
+  int n = 0;
+  if (prompt && prompt[0]) {
+    size_t len = strlen(prompt);
+    int cap = (int)len + 2;
+    int *tmp = xmalloc((size_t)cap * sizeof *tmp);
+    int total = tokenizer_encode_bytes(enc->tokenizer, prompt, len,
+                                       TOKENIZE_TEXT, tmp, cap);
+    n = total > max_ids ? max_ids : total;
+    if (n > 0) memcpy(ids, tmp, (size_t)n * sizeof *ids);
+    free(tmp);
+  }
   if (n == 0) {
     ids[0] = MINIMAX_H3_TEXT_PAD_TOKEN;
     n = 1;
@@ -435,19 +443,22 @@ int minimax_h3_text_encoder_encode_tokens(
     MinimaxH3TextEncoder *enc, const int *ids, const int *pos_ids,
     const Buf *embeds_override,
     const Buf *const deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS],
-    const int *visual_indices, int visual_count, int seq_len, Buf *out_hidden) {
+    const int *visual_indices, int visual_count, int seq_len, Buf *out_hidden,
+    const MinimaxH3RunHooks *hooks) {
   if (seq_len <= 0) die("text encoder requires at least one token");
   size_t hidden_bytes =
       (size_t)seq_len * (size_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
   if (!out_hidden || out_hidden->size < hidden_bytes)
     die("text encoder output buffer is too small");
+  if (minimax_h3_should_stop(hooks)) return 0;
   if (!minimax_h3_text_encoder_load(enc)) return 0;
 
   MemorySlot *wslot = weight_group_slot(enc->weights);
+  unsigned was_pinned = wslot->pins;
   memory_pin(wslot, 1);
   TextWorkspace ws;
   if (!alloc_workspace(enc, seq_len, visual_count, &ws)) {
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -488,7 +499,12 @@ int minimax_h3_text_encoder_encode_tokens(
   uint64_t prev_cmd = cmd.number;
 
   // Run layers 0 through 49, yielding cooperatively between layers.
+  int stopped = 0;
   for (int i = 0; i < MINIMAX_H3_TEXT_LAYERS; i++) {
+    if (minimax_h3_should_stop(hooks)) {
+      stopped = 1;
+      break;
+    }
     const QwenLayer *l = &enc->layers[i];
     cmd = gpu_begin(enc->gpu);
 
@@ -562,21 +578,22 @@ int minimax_h3_text_encoder_encode_tokens(
     }
 
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait(enc->gpu, prev_cmd);
+    minimax_h3_gpu_wait_hooks(enc->gpu, prev_cmd, hooks);
     prev_cmd = cmd.number;
   }
 
   minimax_h3_gpu_wait(enc->gpu, prev_cmd);
   free_workspace(&ws);
-  memory_pin(wslot, 0);
+  memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);
-  return 1;
+  return !stopped;
 }
 
 int minimax_h3_text_encoder_encode_prompt(MinimaxH3TextEncoder *enc,
                                           const char *prompt,
                                           MemorySlot *out_slot, Buf *out_hidden,
-                                          int *out_seq_len) {
+                                          int *out_seq_len,
+                                          const MinimaxH3RunHooks *hooks) {
   int ids[QWEN_MAX_PROMPT_TOKENS];
   int seq_len = minimax_h3_text_encoder_tokenize(enc, prompt, ids,
                                                  QWEN_MAX_PROMPT_TOKENS);
@@ -584,7 +601,7 @@ int minimax_h3_text_encoder_encode_prompt(MinimaxH3TextEncoder *enc,
   Buf hidden = gpu_try_alloc_required(enc->gpu, out_slot, bytes);
   if (!hidden.obj) return 0;
   if (!minimax_h3_text_encoder_encode_tokens(enc, ids, NULL, NULL, NULL, NULL,
-                                             0, seq_len, &hidden)) {
+                                             0, seq_len, &hidden, hooks)) {
     gpu_free(&hidden);
     return 0;
   }

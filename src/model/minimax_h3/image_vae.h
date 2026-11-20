@@ -4,6 +4,7 @@
 #include "engine/safetensors.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
+#include "model/minimax_h3/quant.h"
 #include <stdint.h>
 
 // MiniMax-H3-Image VAE: a 24-channel spatial-16x VAE with a 24-layer FP16 2D
@@ -83,15 +84,17 @@ int minimax_h3_image_vae_load_encoder(MinimaxH3ImageVae *vae);
 // Encodes interleaved 8-bit sRGB pixels [height, width, 3] (both positive
 // multiples of 16) into normalized channel-first FP32 latents
 // [24, height / 16, width / 16] in out_latents using spatial tiling and
-// deterministic posterior sampling (seed 42).
-// Returns 1 on success or 0 if loading or workspace allocation fails.
+// deterministic posterior sampling (seed 42). hooks may be null.
+// Returns 1 on success or 0 if loading, workspace allocation or stop fails.
 int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
-                                int width, int height, float *out_latents);
+                                int width, int height, float *out_latents,
+                                const MinimaxH3RunHooks *hooks);
 
 // Decodes normalized channel-first FP32 latents [24, h_lat, w_lat] into
 // interleaved 8-bit sRGB pixels [h_lat * 16, w_lat * 16, 3] in out_rgb.
-// Returns 1 on success or 0 if loading or workspace allocation fails.
+// hooks may be null. Returns 1 on success or 0 on failure or stop.
 int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
-                                int h_lat, int w_lat, uint8_t *out_rgb);
+                                int h_lat, int w_lat, uint8_t *out_rgb,
+                                const MinimaxH3RunHooks *hooks);
 
 #endif

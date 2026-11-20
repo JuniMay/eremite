@@ -35,6 +35,16 @@ typedef struct {
   int packed_state_rows;
 } DeepSeekOptions;
 
+// MiniMax-H3-Image's checkpoint files.
+typedef struct {
+  // Safetensors file of the Qwen3-VL text and vision encoder.
+  const char *text_encoder;
+  // Safetensors file of the pruned INT8-ConvRot DiT.
+  const char *dit;
+  // Safetensors file of the FP16 image VAE.
+  const char *vae;
+} MinimaxH3ImageOptions;
+
 // Common execution settings and family-specific options.
 typedef struct {
   // Capacity in tokens.
@@ -54,6 +64,7 @@ typedef struct {
 
   union {
     DeepSeekOptions deepseek;
+    MinimaxH3ImageOptions minimax_h3_image;
   };
 } Options;
 
@@ -133,6 +144,55 @@ typedef struct {
   int chunks, tokens, decoder_tokens, ced_applied, prune_applied, prefix_tokens;
 } ModelPlan;
 
+// Output image encoding format.
+typedef enum {
+  // Lossless PNG image.
+  IMAGE_FORMAT_PNG = 0,
+  // Lossy JPEG image.
+  IMAGE_FORMAT_JPEG = 1
+} ImageFormat;
+
+// One encoded input image passed for reference-based image editing.
+typedef struct {
+  // Encoded image file bytes (PNG, JPEG or another format ImageIO decodes).
+  const uint8_t *data;
+  // Byte length of data.
+  size_t len;
+} ImageInput;
+
+// Parameters of one image generation or editing pass.
+typedef struct {
+  // Prompt text (UTF-8, NUL-terminated).
+  const char *prompt;
+  // Exact requested output width and height in pixels.
+  int width, height;
+  // Minimum generation canvas area in pixels; 0 uses the model default.
+  int min_generation_area;
+  // Output image encoding format.
+  ImageFormat format;
+  // JPEG quality in 1 to 100 when format is IMAGE_FORMAT_JPEG; 0 uses 95.
+  int quality;
+  // Deterministic RNG seed for initial latent noise.
+  uint64_t seed;
+  // Optional reference images; null when ref_count is 0.
+  const ImageInput *refs;
+  // Number of reference images (0 for text-to-image).
+  int ref_count;
+} ImageRequest;
+
+// Output of one image generation or editing pass.
+typedef struct {
+  // Heap-allocated PNG or JPEG bytes; null on failure.
+  uint8_t *data;
+  // Byte length of data.
+  size_t len;
+  // Error message when data is null; empty on success.
+  char error[256];
+  // Nonzero when the failure was a client input error; zero for load, memory
+  // or stop failures.
+  int invalid_input;
+} ImageResult;
+
 typedef struct {
   // The family's name, for the log.
   const char *family;
@@ -145,6 +205,9 @@ typedef struct {
   // Returns the slot of its dense weights, which it loads again after an
   // eviction.
   MemorySlot *(*dense_weight_slot)(void);
+  // Returns whether every required weight group is resident. Null checks
+  // dense_weight_slot alone.
+  int (*is_loaded)(void);
   // Sets whether a request runs. While one runs, the model keeps what the
   // request may still use, such as its expert slots.
   void (*set_request_running)(int running);
@@ -240,6 +303,12 @@ typedef struct {
                          const int *question_ends, int questions,
                          const int *rows, const int *ids, int count,
                          const Media *media, int nmedia, const PassWait *wait);
+  // Generates or edits one image from request, writing the encoded bytes or
+  // error message into out. wait yields between layers to decoding calls, and
+  // *cancelled requests early stop when nonzero; either may be null. Returns 1
+  // on success or 0 on failure. Null for a model that generates no images.
+  int (*generate_image)(const ImageRequest *request, const PassWait *wait,
+                        const int *cancelled, ImageResult *out);
   // Drafts. propose_drafts writes up to drafts_per_pass() drafts after token
   // at pos, once every position before it has run. It returns the sampled
   // proposals' probabilities, n vocabulary rows, or null for proposals without
@@ -311,6 +380,6 @@ int model_load(Model *model, const Options *options);
 void model_set_request_running(Model *model, int active);
 Model *model_open(Memory *memory, Gpu *gpu, const char *dir, const Options *o);
 
-extern const ModelOps deepseek_ops, lfm3_ops;
+extern const ModelOps deepseek_ops, lfm3_ops, minimax_h3_image_ops;
 
 #endif

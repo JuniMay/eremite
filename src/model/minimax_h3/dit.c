@@ -892,11 +892,12 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
                           int text_len, const int *text_tags,
                           const MinimaxH3RefLatent *refs, int ref_count,
                           int h_lat, int w_lat, uint64_t seed,
-                          float *out_latents) {
+                          float *out_latents, const MinimaxH3RunHooks *hooks) {
   if (text_len <= 0 || h_lat <= 0 || w_lat <= 0 || !text_hidden || !out_latents)
     die("invalid DiT sampling arguments");
   if (ref_count < 0 || (ref_count > 0 && !refs))
     die("invalid reference image list");
+  if (minimax_h3_should_stop(hooks)) return 0;
   if (!minimax_h3_dit_load(dit)) return 0;
 
   int lat_h = (h_lat + 1) / 2 * 2;
@@ -913,11 +914,12 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   int seq_len = text_len + total_vis;
 
   MemorySlot *wslot = weight_group_slot(dit->weights);
+  unsigned was_pinned = wslot->pins;
   memory_pin(wslot, 1);
   DitWorkspace ws;
   if (!alloc_dit_workspace(dit, text_len, total_vis, target_patches, seq_len,
                            &ws)) {
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -997,7 +999,12 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
       (size_t)(text_len + ref_patches) * (size_t)DIT_DIM * sizeof(float);
 
   // 6-step PDD Euler flow-matching loop.
-  for (int step = 0; step < dit->pdd_steps; step++) {
+  int stopped = 0;
+  for (int step = 0; step < dit->pdd_steps && !stopped; step++) {
+    if (minimax_h3_should_stop(hooks)) {
+      stopped = 1;
+      break;
+    }
     double sigma = dit->pdd_sigmas[step];
     double sigma_next = dit->pdd_sigmas[step + 1];
     double t_main = 1.0 - sigma;
@@ -1029,6 +1036,10 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
 
     // 50 INT8-ConvRot DiT blocks, yielding cooperatively between blocks.
     for (int i = 0; i < DIT_LAYERS; i++) {
+      if (minimax_h3_should_stop(hooks)) {
+        stopped = 1;
+        break;
+      }
       const DitBlock *b = &dit->blocks[i];
       cmd = gpu_begin(dit->gpu);
 
@@ -1126,8 +1137,13 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
                      (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
 
       gpu_commit(&cmd);
-      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      minimax_h3_gpu_wait_hooks(dit->gpu, prev_cmd, hooks);
       prev_cmd = cmd.number;
+    }
+
+    if (stopped) {
+      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      break;
     }
 
     // FinalLayer on target image slice using PDD head for step.
@@ -1167,7 +1183,7 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
 
     gpu_commit(&cmd);
     minimax_h3_gpu_wait(dit->gpu, prev_cmd);
-    minimax_h3_gpu_wait(dit->gpu, cmd.number);
+    minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
 
     // Flow-matching Euler step: model predicts v = x_data - noise, so
     // x_next = x + (sigma - sigma_next) * v.
@@ -1177,7 +1193,7 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   }
 
   free_dit_workspace(&ws);
-  memory_pin(wslot, 0);
+  memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);
-  return 1;
+  return !stopped;
 }

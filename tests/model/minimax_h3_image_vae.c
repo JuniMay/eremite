@@ -100,9 +100,9 @@ int main(int argc, char **argv) {
   size_t rgb1_bytes = (size_t)(h1 * 16) * (size_t)(w1 * 16) * 3;
   uint8_t *rgb1 = xmalloc(rgb1_bytes), *rgb1b = xmalloc(rgb1_bytes);
   double t1 = now();
-  int ok1 = minimax_h3_image_vae_decode(vae, z1, h1, w1, rgb1);
+  int ok1 = minimax_h3_image_vae_decode(vae, z1, h1, w1, rgb1, NULL);
   printf("decoded 256x256 (1 tile) in %.1f ms\n", (now() - t1) * 1000.0);
-  int ok1b = minimax_h3_image_vae_decode(vae, z1, h1, w1, rgb1b);
+  int ok1b = minimax_h3_image_vae_decode(vae, z1, h1, w1, rgb1b, NULL);
   int min_v = 255, max_v = 0;
   for (size_t i = 0; i < rgb1_bytes; i++) {
     if (rgb1[i] < min_v) min_v = rgb1[i];
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
          (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * (size_t)h2 * (size_t)w2 *
              sizeof(float));
   double t2 = now();
-  int ok2 = minimax_h3_image_vae_decode(vae, z2, h2, w2, rgb2);
+  int ok2 = minimax_h3_image_vae_decode(vae, z2, h2, w2, rgb2, NULL);
   printf("decoded 1024x1024 (25 tiles) in %.1f ms\n", (now() - t2) * 1000.0);
   int width2 = w2 * 16, height2 = h2 * 16;
   static const int cols[] = {185, 191, 224, 255, 511};
@@ -183,10 +183,11 @@ int main(int argc, char **argv) {
   fill_test_image(rt_in, rt_w, rt_h);
 
   double te1 = now();
-  int ok_e1 = minimax_h3_image_vae_encode(vae, rt_in, rt_w, rt_h, rt_z1);
+  int ok_e1 = minimax_h3_image_vae_encode(vae, rt_in, rt_w, rt_h, rt_z1, NULL);
   printf("encoded 512x512 (9 tiles) in %.1f ms\n", (now() - te1) * 1000.0);
-  int ok_e2 = minimax_h3_image_vae_encode(vae, rt_in, rt_w, rt_h, rt_z2);
-  int ok_rt_dec = minimax_h3_image_vae_decode(vae, rt_z1, rt_lh, rt_lw, rt_out);
+  int ok_e2 = minimax_h3_image_vae_encode(vae, rt_in, rt_w, rt_h, rt_z2, NULL);
+  int ok_rt_dec =
+      minimax_h3_image_vae_decode(vae, rt_z1, rt_lh, rt_lw, rt_out, NULL);
   double psnr = rgb_psnr(rt_in, rt_out, rt_rgb_bytes);
   printf("512x512 synthetic encode->decode PSNR: %.2f dB\n", psnr);
   check(ok_e1 && ok_e2 && !memcmp(rt_z1, rt_z2, rt_lat_floats * sizeof(float)),
@@ -225,10 +226,10 @@ int main(int argc, char **argv) {
                           (size_t)rlw * sizeof(float));
       uint8_t *recon = xmalloc((size_t)rw * (size_t)rh * 3u);
       double te_r = now();
-      int ok_re = minimax_h3_image_vae_encode(vae, resized, rw, rh, rz);
+      int ok_re = minimax_h3_image_vae_encode(vae, resized, rw, rh, rz, NULL);
       printf("encoded %dx%d reference image in %.1f ms\n", rw, rh,
              (now() - te_r) * 1000.0);
-      int ok_rd = minimax_h3_image_vae_decode(vae, rz, rlh, rlw, recon);
+      int ok_rd = minimax_h3_image_vae_decode(vae, rz, rlh, rlw, recon, NULL);
       double r_psnr = rgb_psnr(resized, recon, (size_t)rw * (size_t)rh * 3u);
       printf("reference image (%dx%d) encode->decode PSNR: %.2f dB\n", rw, rh,
              r_psnr);

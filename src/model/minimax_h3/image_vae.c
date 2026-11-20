@@ -722,7 +722,8 @@ static void run_f16_linear(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
 // and unpatchifies the result into channel-first FP32 tile_out [3, tile_h,
 // tile_w].
 static void decode_one_tile(MinimaxH3ImageVae *vae, const VaeWorkspace *ws,
-                            int h_lat, int w_lat, float *tile_out) {
+                            int h_lat, int w_lat, float *tile_out,
+                            const MinimaxH3RunHooks *hooks) {
   int patches = h_lat * w_lat;
   int seq = patches + VAE_SUFFIX_TOKENS;
   uint32_t padded = ((uint32_t)seq + TILE_M - 1) / TILE_M * TILE_M;
@@ -833,7 +834,7 @@ static void decode_one_tile(MinimaxH3ImageVae *vae, const VaeWorkspace *ws,
                  patches);
 
   gpu_commit(&cmd);
-  minimax_h3_gpu_wait(vae->gpu, cmd.number);
+  minimax_h3_gpu_wait_hooks(vae->gpu, cmd.number, hooks);
 
   // Unpatchify [h_lat * w_lat, 3 * 16 * 16] -> [3, h_lat * 16, w_lat * 16].
   const float *src = (const float *)ws->proj_out.ptr;
@@ -858,9 +859,11 @@ static void decode_one_tile(MinimaxH3ImageVae *vae, const VaeWorkspace *ws,
 }
 
 int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
-                                int h_lat, int w_lat, uint8_t *out_rgb) {
+                                int h_lat, int w_lat, uint8_t *out_rgb,
+                                const MinimaxH3RunHooks *hooks) {
   if (h_lat <= 0 || w_lat <= 0 || !latents || !out_rgb)
     die("invalid VAE decode arguments");
+  if (minimax_h3_should_stop(hooks)) return 0;
   if (!minimax_h3_image_vae_load(vae)) return 0;
 
   int height = h_lat * MINIMAX_H3_VAE_SPATIAL_RATIO;
@@ -879,10 +882,11 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
   }
 
   MemorySlot *wslot = weight_group_slot(vae->weights);
+  unsigned was_pinned = wslot->pins;
   memory_pin(wslot, 1);
   VaeWorkspace ws;
   if (!alloc_vae_workspace(vae, max_tile_h_lat * max_tile_w_lat, &ws)) {
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -894,9 +898,9 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
   float *tile = xmalloc(3 * max_tile_px * sizeof(float));
   float *strip = NULL, *left_tail = NULL;
 
-  int out_y = 0;
+  int out_y = 0, stopped = 0;
   size_t lat_plane = (size_t)h_lat * (size_t)w_lat;
-  for (int i = 0; i < y_plan.count; i++) {
+  for (int i = 0; i < y_plan.count && !stopped; i++) {
     int ty_lat = y_plan.start[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
     int th_lat = y_plan.len[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
     int tile_h = y_plan.len[i];
@@ -909,6 +913,10 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
     int out_x = 0;
     int keep_h = tile_h - ov_bot;
     for (int j = 0; j < x_plan.count; j++) {
+      if (minimax_h3_should_stop(hooks)) {
+        stopped = 1;
+        break;
+      }
       int tx_lat = x_plan.start[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
       int tw_lat = x_plan.len[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
       int tile_w = x_plan.len[j];
@@ -930,7 +938,7 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
         }
       }
 
-      decode_one_tile(vae, &ws, th_lat, tw_lat, tile);
+      decode_one_tile(vae, &ws, th_lat, tw_lat, tile, hooks);
 
       size_t tile_plane = (size_t)tile_h * (size_t)tile_w;
       // Vertical linear ramp blend with the previous tile row's bottom strip.
@@ -1017,8 +1025,12 @@ int minimax_h3_image_vae_decode(MinimaxH3ImageVae *vae, const float *latents,
   free(strip);
   free(tile);
   free_vae_workspace(&ws);
-  memory_pin(wslot, 0);
+  memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);
+  if (stopped) {
+    free(canvas);
+    return 0;
+  }
 
   // Finalize ImageNet-normalized FP32 canvas to 8-bit interleaved RGB pixels.
   for (int y = 0; y < height; y++) {
@@ -1175,9 +1187,10 @@ static void run_enc_add(const MinimaxH3ImageVae *vae, GpuCommandBuffer *cmd,
 
 // Runs the single-frame 3D causal CNN encoder + quant_conv on one RGB tile
 // [tile_h, tile_w, 3] and writes channel-first FP32 moments [48, h_lat, w_lat].
-static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
-                            const uint8_t *rgb, int full_w, int y0, int x0,
-                            int tile_h, int tile_w, float *out_moments) {
+static int encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
+                           const uint8_t *rgb, int full_w, int y0, int x0,
+                           int tile_h, int tile_w, float *out_moments,
+                           const MinimaxH3RunHooks *hooks) {
   // Normalize tile RGB pixels into NHWC FP32 in ws->b.
   float *in_px = (float *)ws->b.ptr;
   for (int y = 0; y < tile_h; y++) {
@@ -1200,6 +1213,10 @@ static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
   uint64_t prev_cmd = cmd.number;
 
   for (int lv = 0; lv < ENC_LEVELS; lv++) {
+    if (minimax_h3_should_stop(hooks)) {
+      minimax_h3_gpu_wait(vae->gpu, prev_cmd);
+      return 0;
+    }
     const EncLevel *el = &vae->enc_levels[lv];
     cmd = gpu_begin(vae->gpu);
     for (int bi = 0; bi < ENC_BLOCKS_PER_LEVEL; bi++) {
@@ -1234,7 +1251,7 @@ static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
       alt = swap;
     }
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait(vae->gpu, prev_cmd);
+    minimax_h3_gpu_wait_hooks(vae->gpu, prev_cmd, hooks);
     prev_cmd = cmd.number;
   }
 
@@ -1245,7 +1262,7 @@ static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
   run_enc_conv(vae, &cmd, ws, alt, &vae->enc_quant_conv, cur, h, w);
   gpu_commit(&cmd);
   minimax_h3_gpu_wait(vae->gpu, prev_cmd);
-  minimax_h3_gpu_wait(vae->gpu, cmd.number);
+  minimax_h3_gpu_wait_hooks(vae->gpu, cmd.number, hooks);
 
   // Transpose NHWC [h * w, 48] -> channel-first [48, h, w].
   const float *src = (const float *)cur->ptr;
@@ -1255,13 +1272,16 @@ static void encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
     for (int c = 0; c < ENC_MOMENT_CH; c++)
       out_moments[(size_t)c * plane + p] = pix[c];
   }
+  return 1;
 }
 
 int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
-                                int width, int height, float *out_latents) {
+                                int width, int height, float *out_latents,
+                                const MinimaxH3RunHooks *hooks) {
   if (width <= 0 || height <= 0 || width % MINIMAX_H3_VAE_SPATIAL_RATIO != 0 ||
       height % MINIMAX_H3_VAE_SPATIAL_RATIO != 0 || !rgb || !out_latents)
     die("invalid VAE encode arguments");
+  if (minimax_h3_should_stop(hooks)) return 0;
   if (!minimax_h3_image_vae_load_encoder(vae)) return 0;
 
   MinimaxH3VaeTilePlan y_plan = minimax_h3_image_vae_split_tiles(height);
@@ -1273,10 +1293,11 @@ int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
     if (x_plan.len[j] > max_tile_w) max_tile_w = x_plan.len[j];
 
   MemorySlot *wslot = weight_group_slot(vae->enc_weights);
+  unsigned was_pinned = wslot->pins;
   memory_pin(wslot, 1);
   EncWorkspace ws;
   if (!alloc_enc_workspace(vae, max_tile_h, max_tile_w, &ws)) {
-    memory_pin(wslot, 0);
+    memory_pin(wslot, (int)was_pinned);
     return 0;
   }
 
@@ -1284,21 +1305,33 @@ int minimax_h3_image_vae_encode(MinimaxH3ImageVae *vae, const uint8_t *rgb,
   // tiled_encode's raw-neighbor blend order.
   int total_tiles = y_plan.count * x_plan.count;
   float **raw_tiles = xmalloc((size_t)total_tiles * sizeof *raw_tiles);
-  for (int i = 0; i < y_plan.count; i++) {
+  memset(raw_tiles, 0, (size_t)total_tiles * sizeof *raw_tiles);
+  int stopped = 0;
+  for (int i = 0; i < y_plan.count && !stopped; i++) {
     int th_lat = y_plan.len[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
     for (int j = 0; j < x_plan.count; j++) {
       int tw_lat = x_plan.len[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
       size_t floats = (size_t)ENC_MOMENT_CH * (size_t)th_lat * (size_t)tw_lat;
       float *buf = xmalloc(floats * sizeof(float));
-      encode_one_tile(vae, &ws, rgb, width, y_plan.start[i], x_plan.start[j],
-                      y_plan.len[i], x_plan.len[j], buf);
+      if (!encode_one_tile(vae, &ws, rgb, width, y_plan.start[i],
+                           x_plan.start[j], y_plan.len[i], x_plan.len[j], buf,
+                           hooks)) {
+        free(buf);
+        stopped = 1;
+        break;
+      }
       raw_tiles[i * x_plan.count + j] = buf;
     }
   }
 
   free_enc_workspace(&ws);
-  memory_pin(wslot, 0);
+  memory_pin(wslot, (int)was_pinned);
   memory_touch(wslot);
+  if (stopped) {
+    for (int t = 0; t < total_tiles; t++) free(raw_tiles[t]);
+    free(raw_tiles);
+    return 0;
+  }
 
   // Blend tile overlaps along height then width, trim trailing overlaps, and
   // assemble full moments [48, h_lat, w_lat].

@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // The engine behind the C ABI of eremite.h: the process's log and stop, and
 // for each model its loading, its work on states and snapshots, sampling,
@@ -182,32 +183,61 @@ void eremite_request_stop(void) { shutdown_request(); }
 
 static char *copy(const char *s) { return s ? strdup(s) : 0; }
 
+// Resolves dir or dir/tokenizer for a model whose tokenizer.json sits in a
+// tokenizer subfolder.
+static Tokenizer *open_model_tokenizer(const char *dir, const char *media) {
+  char path[2048];
+  snprintf(path, sizeof path, "%s/tokenizer.json", dir);
+  if (access(path, R_OK) == 0) return tokenizer_open(dir, media);
+  snprintf(path, sizeof path, "%s/tokenizer", dir);
+  return tokenizer_open(path, media);
+}
+
 eremite_model *eremite_open(const eremite_config *c) {
   if (!initialized || !c || c->abi != EREMITE_ABI || !c->model) return NULL;
   const ModelOps *ops = model_find_family(c->model);
   const eremite_deepseek_config *d = &c->deepseek;
+  const eremite_minimax_h3_config *h3 = &c->minimax_h3;
+  int has_deepseek =
+      d->experts || d->ced || d->substitute != 0 || d->packed_state_rows;
+  int has_minimax_h3 = h3->text_encoder || h3->dit || h3->vae;
   Options options = {.ctx = c->ctx,
                      .lookup = c->lookup,
                      .dump_fd = -1,
                      .routes_fd = -1,
                      .quiet = 1,
-                     .draft = d->draft,
-                     .deepseek.substitute = d->substitute,
-                     .deepseek.experts = d->experts,
-                     .deepseek.ced = d->ced,
-                     .deepseek.prefill_prune = d->prefill_prune,
-                     .deepseek.packed_state_rows = d->packed_state_rows};
+                     .draft = d->draft};
+  if (ops->generate_image) {
+    options.minimax_h3_image = (MinimaxH3ImageOptions){
+        .text_encoder = h3->text_encoder, .dit = h3->dit, .vae = h3->vae};
+  } else {
+    options.deepseek =
+        (DeepSeekOptions){.substitute = d->substitute,
+                          .experts = d->experts,
+                          .ced = d->ced,
+                          .prefill_prune = d->prefill_prune,
+                          .packed_state_rows = d->packed_state_rows};
+  }
   const char *bad =
       options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
-      : ops->decide && (options.draft || options.lookup || d->experts ||
-                        d->ced || d->substitute || d->packed_state_rows)
+      : ops->decide && (options.draft || options.lookup || has_deepseek ||
+                        has_minimax_h3)
           ? "a decision model takes no drafts, lookup, experts, "
+            "ced, substitute, packed state rows or image checkpoint paths"
+      : ops->generate_image && (options.draft || options.lookup || has_deepseek)
+          ? "an image model takes no drafts, lookup, experts, "
             "ced, substitute or packed state rows"
+      : ops->generate_image &&
+              (!h3->text_encoder || !h3->text_encoder[0] || !h3->dit ||
+               !h3->dit[0] || !h3->vae || !h3->vae[0])
+          ? "an image model requires text_encoder, dit and vae paths"
+      : !ops->generate_image && has_minimax_h3
+          ? "text_encoder, dit and vae apply to image models only"
       : options.draft < 0 || options.draft > BLOCK
           ? "draft exceeds this model's proposal limit"
       : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
           ? "lookup takes off or 1 to 15 proposals"
-      : d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
+      : !ops->generate_image && d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
           ? "ced takes off or 128 to 1048576 replay tokens"
       : !isfinite(c->memory_gb) || c->memory_gb < 0
           ? "memory takes 0 (none) or a GiB limit"
@@ -225,8 +255,15 @@ eremite_model *eremite_open(const eremite_config *c) {
   atomic_init(&x->loaded, 0);
   x->ops = ops;
   x->opt = options;
-  x->opt.deepseek.experts = copy(options.deepseek.experts);
-  x->tk = tokenizer_open(c->model, ops->media_token);
+  if (ops->generate_image) {
+    x->opt.minimax_h3_image.text_encoder =
+        copy(options.minimax_h3_image.text_encoder);
+    x->opt.minimax_h3_image.dit = copy(options.minimax_h3_image.dit);
+    x->opt.minimax_h3_image.vae = copy(options.minimax_h3_image.vae);
+  } else {
+    x->opt.deepseek.experts = copy(options.deepseek.experts);
+  }
+  x->tk = open_model_tokenizer(c->model, ops->media_token);
   x->dir = copy(c->model);
   x->m = model_create(memory, NULL, x->dir, (uint64_t)(c->memory_gb * GiB));
   models[nmodels++] = x;
@@ -237,6 +274,7 @@ eremite_model *eremite_open(const eremite_config *c) {
 
 int eremite_is_loaded(const eremite_model *m) {
   if (!atomic_load_explicit(&m->loaded, memory_order_acquire)) return 0;
+  if (m->ops->is_loaded) return m->ops->is_loaded();
   MemorySlot *slot =
       m->ops->dense_weight_slot ? m->ops->dense_weight_slot() : NULL;
   return !slot || memory_ready(slot);
@@ -268,6 +306,9 @@ int eremite_load(eremite_model *m) {
   atomic_store_explicit(&m->loaded, 1, memory_order_release);
   if (!was_loaded && m->ops->decide)
     say("%s: %s decision model, context %d", m->dir, m->ops->family,
+        m->opt.ctx);
+  else if (!was_loaded && m->ops->generate_image)
+    say("%s: %s image model, prompt limit %d tokens", m->dir, m->ops->family,
         m->opt.ctx);
   else if (!was_loaded)
     say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
@@ -348,12 +389,57 @@ const float *eremite_decide(eremite_model *m, const int32_t *tokens, int n,
                     ids, count, images, NULL);
 }
 
-// Ends the program for a decision model: it keeps no states and runs no
-// prefills, decoding or drafts.
+int eremite_is_image_model(const eremite_model *m) {
+  return m->ops->generate_image != NULL;
+}
+
+// Converts an eremite_image_request and runs the image model's generation pass.
+static int run_image_generation(eremite_model *m,
+                                const eremite_image_request *request,
+                                const PassWait *wait, const int *cancelled,
+                                eremite_image_result *out) {
+  if (!m->ops->generate_image) die("%s: not an image model", m->dir);
+  static_assert(sizeof(eremite_image_input) == sizeof(ImageInput),
+                "image input structs match");
+  ImageRequest req = {.prompt = request->prompt,
+                      .width = request->width,
+                      .height = request->height,
+                      .min_generation_area = request->min_generation_area,
+                      .format = (ImageFormat)request->format,
+                      .quality = request->quality,
+                      .seed = request->seed,
+                      .refs = (const ImageInput *)request->refs,
+                      .ref_count = request->ref_count};
+  ImageResult res = {0};
+  int ok = m->ops->generate_image(&req, wait, cancelled, &res);
+  out->data = res.data;
+  out->len = res.len;
+  memcpy(out->error, res.error, sizeof out->error);
+  out->invalid_input = res.invalid_input;
+  return ok;
+}
+
+int eremite_generate_image(eremite_model *m,
+                           const eremite_image_request *request,
+                           eremite_image_result *out) {
+  return run_image_generation(m, request, NULL, NULL, out);
+}
+
+void eremite_image_result_free(eremite_image_result *result) {
+  if (!result) return;
+  free(result->data);
+  memset(result, 0, sizeof *result);
+}
+
+// Ends the program for a decision or image model: neither keeps attention
+// states or runs prefills, decoding or drafts.
 static void require_states(const eremite_model *m) {
   if (m->ops->decide)
     die("%s: a decision model keeps no states and runs no prefills or "
         "decoding",
+        m->dir);
+  if (m->ops->generate_image)
+    die("%s: an image model keeps no states and runs no prefills or decoding",
         m->dir);
 }
 
@@ -515,6 +601,7 @@ typedef enum {
   STREAM_DECODE,
   STREAM_VERIFY,
   STREAM_DECIDE,
+  STREAM_IMAGE,
   STREAM_QUIT
 } StreamCall;
 
@@ -547,6 +634,10 @@ struct eremite_stream {
   const int32_t *question_ends, *logit_rows, *logit_ids;
   const eremite_media *images;
   eremite_sampler *sampler;
+  // An image call's request, cooperative cancellation flag and result.
+  eremite_image_request image_request;
+  eremite_image_result image_result;
+  int cancelled;
   // its results
   const float *logits;
   eremite_snapshot *captured;
@@ -688,6 +779,10 @@ static void stream_run(eremite_stream *x) {
         m, x->tokens, x->n, x->state_tokens, x->question_ends, x->questions,
         x->logit_rows, x->logit_ids, x->count, x->images, &x->wait_for_turn);
     break;
+  case STREAM_IMAGE:
+    run_image_generation(m, &x->image_request, &x->wait_for_decoding,
+                         &x->cancelled, &x->image_result);
+    break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
     const double *q =
@@ -740,6 +835,7 @@ void eremite_stream_free(eremite_stream *x) {
   x->call = STREAM_QUIT;
   pass_run(x->pass);
   pass_free(x->pass);
+  eremite_image_result_free(&x->image_result);
   free(x);
 }
 
@@ -793,6 +889,19 @@ void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
   x->logit_rows = rows, x->logit_ids = ids, x->count = count;
   x->images = images;
   post_call(x, STREAM_DECIDE);
+}
+
+void eremite_stream_generate_image(eremite_stream *x,
+                                   const eremite_image_request *request) {
+  if (!x->m->ops->generate_image) die("%s: not an image model", x->m->dir);
+  eremite_image_result_free(&x->image_result);
+  x->image_request = *request;
+  x->cancelled = 0;
+  post_call(x, STREAM_IMAGE);
+}
+
+void eremite_stream_cancel(eremite_stream *x) {
+  if (x) x->cancelled = 1;
 }
 
 // What the streams with a call wait for while none can go on (THREAD_*): the
@@ -876,6 +985,12 @@ void eremite_stream_prefill_info(const eremite_stream *x,
 int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted) {
   if (accepted) *accepted = x->accepted;
   return x->next;
+}
+
+int eremite_stream_image_result(eremite_stream *x, eremite_image_result *out) {
+  *out = x->image_result;
+  memset(&x->image_result, 0, sizeof x->image_result);
+  return out->data != NULL;
 }
 
 int eremite_replay_rows(const eremite_model *m, int k) {

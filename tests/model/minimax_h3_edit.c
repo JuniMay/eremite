@@ -137,8 +137,8 @@ int main(int argc, char **argv) {
             : image_resize_rgb_lanczos(ref_rgb, ref_w, ref_h, vw, vh);
     Buf vm = {0}, vds[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS] = {0};
     int vgh = 0, vgw = 0;
-    int ok_v = minimax_h3_vision_encoder_encode_image(vis, vrgb, vw, vh, shared,
-                                                      &vm, vds, &vgh, &vgw);
+    int ok_v = minimax_h3_vision_encoder_encode_image(
+        vis, vrgb, vw, vh, shared, &vm, vds, &vgh, &vgw, NULL);
     if (vrgb != ref_rgb) free(vrgb);
     size_t vn =
         (size_t)(vgh / 2) * (size_t)(vgw / 2) * (size_t)MINIMAX_H3_TEXT_DIM;
@@ -200,7 +200,8 @@ int main(int argc, char **argv) {
   float *ref_lat = xmalloc((size_t)MINIMAX_H3_VAE_LATENT_CHANNELS *
                            (size_t)ref_lh * (size_t)ref_lw * sizeof(float));
   double t_ve = now();
-  int ok_ve = minimax_h3_image_vae_encode(vae, vae_rgb, vae_w, vae_h, ref_lat);
+  int ok_ve =
+      minimax_h3_image_vae_encode(vae, vae_rgb, vae_w, vae_h, ref_lat, NULL);
   printf("VAE encode reference (%dx%d -> %dx%d lat): %.1f ms\n", vae_w, vae_h,
          ref_lw, ref_lh, (now() - t_ve) * 1000.0);
   check(ok_ve, "reference image encodes cleanly through VAE encoder");
@@ -214,7 +215,7 @@ int main(int argc, char **argv) {
   int seq_len = 0;
   int *tags = NULL;
   int ok_mm = minimax_h3_encode_multimodal_prompt(
-      te, vis, prompt, &vis_ref, 1, shared, &text_h, &seq_len, &tags);
+      te, vis, prompt, &vis_ref, 1, shared, &text_h, &seq_len, &tags, NULL);
   printf("multimodal encode (%d tokens): %.2f s\n", seq_len, now() - t_mm);
   if (ok_mm) {
     const float *hp = (const float *)text_h.ptr;
@@ -242,11 +243,11 @@ int main(int argc, char **argv) {
   uint8_t *out_rgb = xmalloc((size_t)out_h * (size_t)out_w * 3u);
   double t_dit = now();
   int ok_dit = minimax_h3_dit_sample(dit, &text_h, seq_len, tags, &dit_ref, 1,
-                                     out_lh, out_lw, 42, out_lat);
+                                     out_lh, out_lw, 42, out_lat, NULL);
   printf("DiT edit 1024x1024 (6 steps, seq=%d + 2048 vis): %.2f s\n", seq_len,
          now() - t_dit);
   int ok_dec = ok_dit && minimax_h3_image_vae_decode(vae, out_lat, out_lh,
-                                                     out_lw, out_rgb);
+                                                     out_lw, out_rgb, NULL);
   uint8_t *ref_1024 =
       (ref_w == out_w && ref_h == out_h)
           ? ref_rgb
@@ -298,10 +299,10 @@ int main(int argc, char **argv) {
           te, vis,
           "Apply an intense crimson red color filter and bright red lighting "
           "over the entire scene of <Picture 1>.",
-          &vis_ref, 1, shared, &rh, &rlen, &rtags) &&
+          &vis_ref, 1, shared, &rh, &rlen, &rtags, NULL) &&
       minimax_h3_dit_sample(dit, &rh, rlen, rtags, &dit_ref, 1, h512, w512, 9,
-                            lat512_r) &&
-      minimax_h3_image_vae_decode(vae, lat512_r, h512, w512, rgb512);
+                            lat512_r, NULL) &&
+      minimax_h3_image_vae_decode(vae, lat512_r, h512, w512, rgb512, NULL);
   if (ok_r) mean_rgb(rgb512, w512 * 16, h512 * 16, red_m);
 
   int ok_b =
@@ -309,10 +310,10 @@ int main(int argc, char **argv) {
           te, vis,
           "Apply an intense deep sapphire blue color filter and bright blue "
           "lighting over the entire scene of <Picture 1>.",
-          &vis_ref, 1, shared, &bh, &blen, &btags) &&
+          &vis_ref, 1, shared, &bh, &blen, &btags, NULL) &&
       minimax_h3_dit_sample(dit, &bh, blen, btags, &dit_ref, 1, h512, w512, 9,
-                            lat512_b) &&
-      minimax_h3_image_vae_decode(vae, lat512_b, h512, w512, rgb512);
+                            lat512_b, NULL) &&
+      minimax_h3_image_vae_decode(vae, lat512_b, h512, w512, rgb512, NULL);
   if (ok_b) mean_rgb(rgb512, w512 * 16, h512 * 16, blue_m);
 
   // Diagnostic: check hidden state & latent differences between red and blue.

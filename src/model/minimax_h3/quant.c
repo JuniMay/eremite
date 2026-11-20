@@ -1,5 +1,6 @@
 #include "model/minimax_h3/quant.h"
 #include "base/error.h"
+#include "base/shutdown.h"
 #include "engine/io.h"
 #include "engine/pass.h"
 #include <errno.h>
@@ -135,14 +136,28 @@ static void gpu_wait_block(void *context) {
   gpu_wait_until_finished(wait->gpu, wait->number);
 }
 
-void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number) {
-  if (!number) return;
-  if (!pass_current()) {
-    gpu_wait_until_finished(gpu, number);
-    return;
+int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks) {
+  return shutdown_requested() ||
+         (hooks && hooks->cancelled && *hooks->cancelled);
+}
+
+void minimax_h3_gpu_wait_hooks(Gpu *gpu, uint64_t number,
+                               const MinimaxH3RunHooks *hooks) {
+  if (number) {
+    if (!pass_current()) {
+      gpu_wait_until_finished(gpu, number);
+    } else {
+      GpuWaitContext context = {.gpu = gpu, .number = number};
+      pass_wait(&(PassWait){gpu_wait_ready, gpu_wait_block, &context,
+                            PASS_WAIT_GPU, NULL});
+      gpu_check_finished(gpu);
+    }
   }
-  GpuWaitContext context = {.gpu = gpu, .number = number};
-  pass_wait(&(PassWait){gpu_wait_ready, gpu_wait_block, &context, PASS_WAIT_GPU,
-                        NULL});
-  gpu_check_finished(gpu);
+  if (pass_current() && hooks && hooks->yield_wait &&
+      !minimax_h3_should_stop(hooks))
+    pass_wait(hooks->yield_wait);
+}
+
+void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number) {
+  minimax_h3_gpu_wait_hooks(gpu, number, NULL);
 }

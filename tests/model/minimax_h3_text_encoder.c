@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
   int seq_len = 0;
   double t1 = now();
   int encoded = minimax_h3_text_encoder_encode_prompt(enc, prompt, slot,
-                                                      &hidden, &seq_len);
+                                                      &hidden, &seq_len, NULL);
   double enc_ms = (now() - t1) * 1000.0;
   printf("encoded %d tokens in %.1f ms\n", seq_len, enc_ms);
   double mean_abs = 0.0;
@@ -104,8 +104,8 @@ int main(int argc, char **argv) {
   Buf hidden2 = {0};
   int seq_len2 = 0;
   double t2 = now();
-  int encoded2 = minimax_h3_text_encoder_encode_prompt(enc, prompt, slot,
-                                                       &hidden2, &seq_len2);
+  int encoded2 = minimax_h3_text_encoder_encode_prompt(
+      enc, prompt, slot, &hidden2, &seq_len2, NULL);
   printf("second encode of %d tokens in %.1f ms\n", seq_len2,
          (now() - t2) * 1000.0);
   float max_diff = 0.0f;
@@ -146,9 +146,9 @@ int main(int argc, char **argv) {
   free(row_i8);
 
   int ok_g = minimax_h3_text_encoder_encode_tokens(
-      enc, &single_id, NULL, NULL, NULL, NULL, 0, 1, &h_gpu_emb);
+      enc, &single_id, NULL, NULL, NULL, NULL, 0, 1, &h_gpu_emb, NULL);
   int ok_c = minimax_h3_text_encoder_encode_tokens(
-      enc, &neg_id, NULL, &emb_override, NULL, NULL, 0, 1, &h_cpu_emb);
+      enc, &neg_id, NULL, &emb_override, NULL, NULL, 0, 1, &h_cpu_emb, NULL);
   float emb_diff = 0.0f;
   for (int d = 0; d < MINIMAX_H3_TEXT_DIM; d++) {
     float d0 = fabsf(((const float *)h_gpu_emb.ptr)[d] -
@@ -168,9 +168,11 @@ int main(int argc, char **argv) {
   Buf h_s1 = {0}, h_s2 = {0};
   int n_s1 = 0, n_s2 = 0;
   int ok_s1 = minimax_h3_text_encoder_encode_prompt(
-      enc, "The cat sat quietly on the warm wooden mat.", slot, &h_s1, &n_s1);
+      enc, "The cat sat quietly on the warm wooden mat.", slot, &h_s1, &n_s1,
+      NULL);
   int ok_s2 = minimax_h3_text_encoder_encode_prompt(
-      enc, "The dog sat quietly on the warm wooden mat.", slot, &h_s2, &n_s2);
+      enc, "The dog sat quietly on the warm wooden mat.", slot, &h_s2, &n_s2,
+      NULL);
   double cos_sim = 0.0;
   if (ok_s1 && ok_s2 && n_s1 > 0 && n_s1 == n_s2) {
     const float *a =

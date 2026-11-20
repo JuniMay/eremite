@@ -4,6 +4,7 @@
 #include "engine/safetensors.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
+#include "model/minimax_h3/quant.h"
 #include <stdint.h>
 
 // MiniMax-H3's shared text encoder: Qwen3-VL-32B truncated to layers 0 through
@@ -76,19 +77,22 @@ int minimax_h3_text_encoder_tokenize(const MinimaxH3TextEncoder *enc,
 //   copied into out_hidden before embedding lookup for ids >= 0.
 // - deepstack: optional array of 3 FP32 buffers (visual_count by 5120) added at
 //   visual_indices after layers 0, 1 and 2.
-// Returns 1 on success or 0 if weight loading or workspace allocation fails.
+// - hooks: optional cooperative yield and cancellation hooks; may be null.
+// Returns 1 on success or 0 if loading, workspace allocation or stop fails.
 int minimax_h3_text_encoder_encode_tokens(
     MinimaxH3TextEncoder *enc, const int *ids, const int *pos_ids,
     const Buf *embeds_override,
     const Buf *const deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS],
-    const int *visual_indices, int visual_count, int seq_len, Buf *out_hidden);
+    const int *visual_indices, int visual_count, int seq_len, Buf *out_hidden,
+    const MinimaxH3RunHooks *hooks);
 
-// Convenience wrapper for text-only prompts: tokenizes prompt, allocates
-// out_hidden in out_slot, runs the text encoder, and sets *out_seq_len.
-// Returns 1 on success or 0 on failure.
+// Convenience wrapper for text-only prompts: tokenizes prompt (truncating to
+// 4096 tokens), allocates out_hidden in out_slot, runs the text encoder with
+// optional hooks, and sets *out_seq_len. Returns 1 on success or 0 on failure.
 int minimax_h3_text_encoder_encode_prompt(MinimaxH3TextEncoder *enc,
                                           const char *prompt,
                                           MemorySlot *out_slot, Buf *out_hidden,
-                                          int *out_seq_len);
+                                          int *out_seq_len,
+                                          const MinimaxH3RunHooks *hooks);
 
 #endif

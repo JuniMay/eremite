@@ -5,16 +5,26 @@
 #include "engine/weights.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-static const ModelOps *const families[] = {&deepseek_ops, &lfm3_ops};
+static const ModelOps *const families[] = {&deepseek_ops, &lfm3_ops,
+                                           &minimax_h3_image_ops};
 
 const ModelOps *model_find_family(const char *dir) {
   char path[1024];
   snprintf(path, sizeof path, "%s/config.json", dir);
+  const char *key = "model_type";
+  if (access(path, R_OK) != 0) {
+    snprintf(path, sizeof path, "%s/model_index.json", dir);
+    if (access(path, R_OK) == 0)
+      key = "_class_name";
+    else
+      snprintf(path, sizeof path, "%s/config.json", dir);
+  }
   char *text = read_file(path, 0);
   Json *root = json_parse(text);
-  const Json *type = json_get(root, "model_type");
-  if (!type || type->type != J_STR) die("%s: no model_type", path);
+  const Json *type = json_get(root, key);
+  if (!type || type->type != J_STR) die("%s: no %s", path, key);
   for (size_t f = 0; f < sizeof families / sizeof *families; f++)
     for (const char *const *t = families[f]->model_types; *t; t++)
       if (!strcmp(*t, type->s)) {
@@ -22,7 +32,7 @@ const ModelOps *model_find_family(const char *dir) {
         free(text);
         return families[f];
       }
-  die("%s: model_type %s is not one this engine runs", path, type->s);
+  die("%s: %s %s is not one this engine runs", path, key, type->s);
 }
 
 Model *model_create(Memory *memory, Gpu *gpu, const char *dir, uint64_t limit) {

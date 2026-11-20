@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 5;
+const ABI: c_int = 6;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -46,6 +46,15 @@ struct RawDeepSeekConfig {
     packed_state_rows: c_int,
 }
 
+/// MiniMax-H3-Image's checkpoint paths (eremite_minimax_h3_config).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawMinimaxH3Config {
+    text_encoder: *const c_char,
+    dit: *const c_char,
+    vae: *const c_char,
+}
+
 /// A model's settings (eremite_config).
 #[repr(C)]
 struct RawConfig {
@@ -55,6 +64,7 @@ struct RawConfig {
     lookup: c_int,
     memory_gb: f64,
     deepseek: RawDeepSeekConfig,
+    minimax_h3: RawMinimaxH3Config,
 }
 
 /// A registered model (eremite_model).
@@ -901,6 +911,11 @@ impl Model {
                 ced: deepseek.ced,
                 prefill_prune: deepseek.prunes_prefill().into(),
                 packed_state_rows: deepseek.packed_state_rows.into(),
+            },
+            minimax_h3: RawMinimaxH3Config {
+                text_encoder: ptr::null(),
+                dit: ptr::null(),
+                vae: ptr::null(),
             },
         };
         let m = unsafe { eremite_open(&raw) };

@@ -152,8 +152,8 @@ int main(int argc, char **argv) {
   double t_enc = now();
   Buf text_hidden = {0};
   int text_len = 0;
-  int ok_enc = minimax_h3_text_encoder_encode_prompt(te, prompt, shared,
-                                                     &text_hidden, &text_len);
+  int ok_enc = minimax_h3_text_encoder_encode_prompt(
+      te, prompt, shared, &text_hidden, &text_len, NULL);
   printf("text encode (%d tokens): %.1f ms\n", text_len,
          (now() - t_enc) * 1000.0);
   check(ok_enc && text_len > 0, "prompt encodes to Qwen3-VL layer-49 states");
@@ -166,10 +166,10 @@ int main(int argc, char **argv) {
   float *z512_b = xmalloc(lat512_n * sizeof(float));
   double t_s1 = now();
   int ok_s1 = minimax_h3_dit_sample(dit, &text_hidden, text_len, NULL, NULL, 0,
-                                    h512, w512, 42, z512_a);
+                                    h512, w512, 42, z512_a, NULL);
   printf("DiT 512x512 (6 steps): %.2f s\n", now() - t_s1);
   int ok_s2 = minimax_h3_dit_sample(dit, &text_hidden, text_len, NULL, NULL, 0,
-                                    h512, w512, 42, z512_b);
+                                    h512, w512, 42, z512_b, NULL);
   double mean512 = 0.0, std512 = 0.0;
   int fin512 = latent_stats(z512_a, lat512_n, &mean512, &std512);
   printf("512x512 latent stats: mean=%.4f std=%.4f\n", mean512, std512);
@@ -183,7 +183,8 @@ int main(int argc, char **argv) {
   size_t rgb512_bytes = (size_t)(h512 * 16) * (size_t)(w512 * 16) * 3u;
   uint8_t *rgb512 = xmalloc(rgb512_bytes);
   double t_v1 = now();
-  int ok_v1 = minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512);
+  int ok_v1 =
+      minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512, NULL);
   printf("VAE decode 512x512: %.1f ms\n", (now() - t_v1) * 1000.0);
   double std_px512 = 0.0, step_px512 = 0.0;
   image_stats(rgb512, w512 * 16, h512 * 16, &std_px512, &step_px512);
@@ -197,24 +198,26 @@ int main(int argc, char **argv) {
   // mean B above R.
   Buf red_h = {0}, blue_h = {0};
   int red_len = 0, blue_len = 0;
-  int ok_red = minimax_h3_text_encoder_encode_prompt(
-                   te,
-                   "A vibrant crimson red wall filling the entire frame, solid "
-                   "bright red color.",
-                   shared, &red_h, &red_len) &&
-               minimax_h3_dit_sample(dit, &red_h, red_len, NULL, NULL, 0, h512,
-                                     w512, 7, z512_a) &&
-               minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512);
+  int ok_red =
+      minimax_h3_text_encoder_encode_prompt(
+          te,
+          "A vibrant crimson red wall filling the entire frame, solid "
+          "bright red color.",
+          shared, &red_h, &red_len, NULL) &&
+      minimax_h3_dit_sample(dit, &red_h, red_len, NULL, NULL, 0, h512, w512, 7,
+                            z512_a, NULL) &&
+      minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512, NULL);
   double red_rgb[3] = {0};
   if (ok_red) mean_rgb(rgb512, w512 * 16, h512 * 16, red_rgb);
-  int ok_blue = minimax_h3_text_encoder_encode_prompt(
-                    te,
-                    "A vibrant deep sapphire blue wall filling the entire "
-                    "frame, solid bright blue color.",
-                    shared, &blue_h, &blue_len) &&
-                minimax_h3_dit_sample(dit, &blue_h, blue_len, NULL, NULL, 0,
-                                      h512, w512, 7, z512_a) &&
-                minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512);
+  int ok_blue =
+      minimax_h3_text_encoder_encode_prompt(
+          te,
+          "A vibrant deep sapphire blue wall filling the entire "
+          "frame, solid bright blue color.",
+          shared, &blue_h, &blue_len, NULL) &&
+      minimax_h3_dit_sample(dit, &blue_h, blue_len, NULL, NULL, 0, h512, w512,
+                            7, z512_a, NULL) &&
+      minimax_h3_image_vae_decode(vae, z512_a, h512, w512, rgb512, NULL);
   double blue_rgb[3] = {0};
   if (ok_blue) mean_rgb(rgb512, w512 * 16, h512 * 16, blue_rgb);
   printf("red prompt mean RGB=(%.1f, %.1f, %.1f), blue prompt mean RGB=(%.1f, "
@@ -237,7 +240,7 @@ int main(int argc, char **argv) {
   float *z1024 = xmalloc(lat1024_n * sizeof(float));
   double t_s3 = now();
   int ok_s3 = minimax_h3_dit_sample(dit, &text_hidden, text_len, NULL, NULL, 0,
-                                    h1024, w1024, 42, z1024);
+                                    h1024, w1024, 42, z1024, NULL);
   printf("DiT 1024x1024 (6 steps): %.2f s\n", now() - t_s3);
   double mean1024 = 0.0, std1024 = 0.0;
   int fin1024 = latent_stats(z1024, lat1024_n, &mean1024, &std1024);
@@ -248,7 +251,8 @@ int main(int argc, char **argv) {
   size_t rgb1024_bytes = (size_t)(h1024 * 16) * (size_t)(w1024 * 16) * 3u;
   uint8_t *rgb1024 = xmalloc(rgb1024_bytes);
   double t_v2 = now();
-  int ok_v2 = minimax_h3_image_vae_decode(vae, z1024, h1024, w1024, rgb1024);
+  int ok_v2 =
+      minimax_h3_image_vae_decode(vae, z1024, h1024, w1024, rgb1024, NULL);
   printf("VAE decode 1024x1024: %.1f ms\n", (now() - t_v2) * 1000.0);
   double std_px1024 = 0.0, step_px1024 = 0.0;
   image_stats(rgb1024, w1024 * 16, h1024 * 16, &std_px1024, &step_px1024);
