@@ -1,3 +1,4 @@
+#include "engine/memory.h"
 #include "eremite.h"
 #include "model/minimax_h3/dit.h"
 #include "model/minimax_h3/image_vae.h"
@@ -158,6 +159,57 @@ int main(void) {
   check(memcmp(g1, g2, sizeof g1) == 0 && memcmp(g1, g3, sizeof g1) != 0 &&
             fabs(mean) < 0.1 && fabs(std - 1.0) < 0.1,
         "shared Gaussian RNG is deterministic, seed-sensitive and ~N(0, 1)");
+
+  // Per-request canvas memory planning and early admission under Memory.
+  MinimaxH3WeightBytes w = {.text = 18ull << 30,
+                            .vision = 1ull << 30,
+                            .dit = 15ull << 30,
+                            .vae = 2ull << 30,
+                            .vae_encoder = 1ull << 30};
+  MinimaxH3RequestMemory mem_default =
+      minimax_h3_image_plan_request_memory(w, 2048, 2048, 64, 0, 0, 0);
+  MinimaxH3RequestMemory mem_huge =
+      minimax_h3_image_plan_request_memory(w, 4896, 4896, 64, 0, 0, 0);
+  uint64_t dit_delta = minimax_h3_dit_workspace_bytes(64, 0, 153 * 153) -
+                       minimax_h3_dit_workspace_bytes(64, 0, 64 * 64);
+  check(mem_huge.full_bytes == mem_default.full_bytes + dit_delta &&
+            mem_huge.staged_bytes > mem_default.staged_bytes &&
+            mem_huge.full_bytes > mem_huge.staged_bytes,
+        "planned request memory scales exactly by DiT workspace growth");
+
+  Memory *mem = memory_new();
+  MemoryAccount acct;
+  memory_account_init(mem, &acct, "minimax-h3-test", 0);
+  int use_full = -1;
+
+  // Under a 50 GiB limit, 4896x4896 fits in full residence.
+  memory_set_limit(mem, 50ull << 30);
+  err[0] = '\0';
+  check(minimax_h3_image_admit_request(&acct, 1, 4896, 4896, mem_huge,
+                                       &use_full, err, sizeof err) == 1 &&
+            use_full == 1 && acct.minimum == mem_huge.full_bytes,
+        "4896x4896 admits in full residence when limit covers full_bytes");
+
+  // Under a 40 GiB limit, 4896x4896 falls back cleanly from full to staged.
+  memory_set_minimum(&acct, mem_default.full_bytes, MEMORY_REQUIRED);
+  memory_set_limit(mem, 40ull << 30);
+  err[0] = '\0';
+  check(minimax_h3_image_admit_request(&acct, 1, 4896, 4896, mem_huge,
+                                       &use_full, err, sizeof err) == 1 &&
+            use_full == 0 && acct.minimum == mem_huge.staged_bytes,
+        "4896x4896 falls back to staged when only staged_bytes fits");
+
+  // Under a 22 GiB limit, 4896x4896 refuses early with a clear message and
+  // leaves the account's baseline minimum intact.
+  memory_set_minimum(&acct, mem_default.staged_bytes, MEMORY_REQUIRED);
+  memory_set_limit(mem, 22ull << 30);
+  uint64_t min_before = acct.minimum;
+  err[0] = '\0';
+  check(minimax_h3_image_admit_request(&acct, 0, 4896, 4896, mem_huge,
+                                       &use_full, err, sizeof err) == 0 &&
+            acct.minimum == min_before && strstr(err, "4896x4896") != NULL &&
+            strstr(err, "GiB") != NULL,
+        "4896x4896 refuses early when staged_bytes exceeds limit");
 
   printf("minimax_h3_image unit checks: %d failures\n", failures);
   return failures != 0;

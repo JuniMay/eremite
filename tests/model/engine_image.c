@@ -260,12 +260,45 @@ int main(int argc, char **argv) {
   eremite_stream_free(stream);
 
   // 7. Idle unload frees all resident weight groups and clears is_loaded.
+  uint64_t staged_required = st.required_bytes;
   eremite_set_request_running(m, 0);
   uint64_t freed = eremite_unload(m);
   printf("eremite_unload freed %.2f GiB, is_loaded=%d\n",
          (double)freed / (double)(1ull << 30), eremite_is_loaded(m));
   check(freed > (20ull << 30) && eremite_is_loaded(m) == 0,
         "eremite_unload releases all weight groups cleanly");
+
+  // 8. A large canvas that exceeds memory under staged mode is refused before
+  //    running the text encoder, with a message naming the canvas and memory.
+  uint64_t tight_limit = staged_required + (512ull << 20);
+  eremite_set_memory_limit(tight_limit);
+  int staged_loaded = eremite_load(m);
+  check(staged_loaded == 1 && eremite_is_loaded(m) == 1,
+        "staged reload succeeds under tight memory limit");
+  eremite_refresh_stats();
+  eremite_read_stats(m, &st);
+  uint64_t prefill_before = st.prefill_rows;
+  eremite_image_request req_huge = {.prompt = "A wide mountain landscape.",
+                                    .width = 4896,
+                                    .height = 4896,
+                                    .min_generation_area = 1024,
+                                    .format = EREMITE_IMAGE_PNG,
+                                    .seed = 55};
+  int ok_huge = eremite_generate_image(m, &req_huge, &res);
+  eremite_refresh_stats();
+  eremite_read_stats(m, &st);
+  printf("huge canvas under %.2f GiB limit: ok=%d prefill_delta=%llu err=%s\n",
+         (double)tight_limit / (double)(1ull << 30), ok_huge,
+         (unsigned long long)(st.prefill_rows - prefill_before), res.error);
+  check(!ok_huge && res.invalid_input == 0 &&
+            st.prefill_rows == prefill_before &&
+            strstr(res.error, "4896x4896") != NULL &&
+            strstr(res.error, "GiB") != NULL,
+        "oversized canvas is refused before text encoding with clear message");
+  eremite_image_result_free(&res);
+  eremite_set_request_running(m, 0);
+  eremite_unload(m);
+  eremite_set_memory_limit(0);
 
   printf("engine_image checks: %d failures\n", failures);
   return failures != 0;
