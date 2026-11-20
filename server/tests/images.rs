@@ -121,6 +121,98 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// The most bytes in one stored, uncompressed deflate block.
+const STORED_BLOCK_BYTES: usize = 65_535;
+/// The modulus of zlib's Adler-32 checksum.
+const ADLER_MODULUS: u32 = 65_521;
+/// The reversed polynomial of PNG's CRC-32.
+const CRC_POLYNOMIAL: u32 = 0xEDB8_8320;
+
+/// Returns the CRC-32 of `bytes`, as PNG chunks carry it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ CRC_POLYNOMIAL
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Returns a PNG file of `width` by `height` RGBA pixels that `pixel` gives
+/// for each x and y, with its data stored without compression.
+fn rgba_png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+    let mut rows = Vec::new();
+    for y in 0..height {
+        // Each row starts with its filter type, 0: none.
+        rows.push(0);
+        for x in 0..width {
+            rows.extend_from_slice(&pixel(x, y));
+        }
+    }
+    // A zlib stream with no compression, then its Adler-32 checksum.
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = rows.chunks(STORED_BLOCK_BYTES).collect();
+    for (index, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(index + 1 == blocks.len()));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut low, mut high) = (1u32, 0u32);
+    for &byte in &rows {
+        low = (low + u32::from(byte)) % ADLER_MODULUS;
+        high = (high + low) % ADLER_MODULUS;
+    }
+    zlib.extend_from_slice(&((high << 16) | low).to_be_bytes());
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    // 8 bits a channel, color type 6 (RGBA), and the default methods.
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    for (kind, data) in [
+        (&b"IHDR"[..], &header[..]),
+        (b"IDAT", &zlib),
+        (b"IEND", &[]),
+    ] {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+    png
+}
+
+/// Returns `bytes` as a base64 data URL of a PNG image.
+fn png_data_url(bytes: &[u8]) -> String {
+    format!(
+        "data:image/png;base64,{}",
+        eremite_server::image::encode_base64(bytes)
+    )
+}
+
+#[test]
+fn rgba_png_writes_a_png_that_imageio_reads() {
+    // Rows of 3 RGBA pixels and a filter byte; one row more than one stored
+    // block holds, so that the data spans two blocks.
+    let row_bytes = 1 + 3 * 4;
+    let height = (STORED_BLOCK_BYTES / row_bytes + 1) as u32;
+    let png = rgba_png(3, height, |x, y| [x as u8, y as u8, 0, 128]);
+    assert_eq!(
+        eremite_server::engine::read_image_size(&png),
+        Ok((3, height as i32))
+    );
+}
+
 #[test]
 fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let _one = one_model();
@@ -302,10 +394,7 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     let json_edit = json!({
         "model": "gpt-image-2",
         "prompt": "Keep <Picture 1> with warm golden sunset lighting.",
-        "images": [{"image_url": format!(
-            "data:image/png;base64,{}",
-            eremite_server::image::encode_base64(&ref_bytes)
-        )}],
+        "images": [{"image_url": png_data_url(&ref_bytes)}],
         "size": "auto",
         "quality": "auto",
         "background": "opaque",
@@ -316,13 +405,34 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
     assert_eq!(code, 200, "JSON edit failed: {answer}");
     assert_eq!(answer["size"], format!("{}x{}", ref_size.0, ref_size.1));
 
+    // 5d. A masked edit: the mask keeps the first image's bottom half. A size
+    // other than the first image's is refused before the weights run.
+    let mask = rgba_png(ref_size.0, ref_size.1, |_, y| {
+        [0, 0, 0, if y < ref_size.1 / 2 { 0 } else { 255 }]
+    });
+    let masked = |size: &str| {
+        json!({
+            "prompt": "Turn <Picture 1> into a pencil sketch.",
+            "images": [{"image_url": png_data_url(&ref_bytes)}],
+            "mask": {"image_url": png_data_url(&mask)},
+            "size": size,
+            "seed": 5,
+            "min_generation_area": 1024
+        })
+    };
+    let (code, answer) = ask(&server, "POST", "/v1/images/edits", Some(&masked("64x64")));
+    assert_eq!(code, 400, "a mask with another size: {answer}");
+    let (code, answer) = ask(&server, "POST", "/v1/images/edits", Some(&masked("auto")));
+    assert_eq!(code, 200, "masked edit failed: {answer}");
+    assert_eq!(answer["size"], format!("{}x{}", ref_size.0, ref_size.1));
+
     // 6. Status endpoint reports loaded image model with separated counters.
     let (code, status) = ask(&server, "GET", "/v1/models/minimax-h3-image", None);
     assert_eq!(code, 200, "{status}");
     let st = &status["status"];
     assert_eq!(st["loaded"], json!(true));
     assert_eq!(st["phase"], json!("idle"));
-    assert_eq!(st["totals"]["generated_images"], json!(7));
+    assert_eq!(st["totals"]["generated_images"], json!(8));
     assert_eq!(st["totals"]["generated_tokens"], json!(0));
     assert!(
         st["totals"]["prefilled_tokens"].as_u64().unwrap_or(0) > 0,
@@ -336,8 +446,8 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         st["totals"]["image_seconds"].as_f64().unwrap_or(0.0) > 0.0,
         "{st}"
     );
-    assert_eq!(st["engine_counters"]["generated_images"], json!(7));
-    assert_eq!(st["engine_counters"]["image_steps"], json!(42));
+    assert_eq!(st["engine_counters"]["generated_images"], json!(8));
+    assert_eq!(st["engine_counters"]["image_steps"], json!(48));
     assert_eq!(st["engine_counters"]["image_stage"], json!(0));
 
     server.stop();

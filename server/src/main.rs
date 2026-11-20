@@ -799,6 +799,7 @@ async fn run_image_request(
         format: parsed.format,
         quality: parsed.quality,
         references: parsed.references,
+        mask: parsed.mask,
         note,
     })
     .map_err(convert_submit_error)

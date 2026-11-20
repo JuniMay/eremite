@@ -1903,11 +1903,16 @@ pub struct ImageInputs {
     _references: Vec<Vec<u8>>,
     /// Heap-allocated C descriptors whose address stays stable across moves.
     raw_refs: Box<[RawImageInput]>,
+    /// An edit's mask bytes, pointed into by `raw_mask`.
+    _mask: Option<Vec<u8>>,
+    /// The mask's C descriptor, with null data for no mask.
+    raw_mask: RawImageInput,
 }
 
 impl ImageInputs {
-    /// Packages `prompt` and `references` into stable memory for C FFI.
-    pub fn new(prompt: &str, references: Vec<Vec<u8>>) -> ImageInputs {
+    /// Packages `prompt`, `references` and an edit's `mask` into stable memory
+    /// for C FFI.
+    pub fn new(prompt: &str, references: Vec<Vec<u8>>, mask: Option<Vec<u8>>) -> ImageInputs {
         let raw_refs: Vec<RawImageInput> = references
             .iter()
             .map(|bytes| RawImageInput {
@@ -1915,10 +1920,16 @@ impl ImageInputs {
                 len: bytes.len(),
             })
             .collect();
+        let raw_mask = RawImageInput {
+            data: mask.as_ref().map_or(ptr::null(), |bytes| bytes.as_ptr()),
+            len: mask.as_ref().map_or(0, Vec::len),
+        };
         ImageInputs {
             prompt: c_string(prompt),
             _references: references,
             raw_refs: raw_refs.into_boxed_slice(),
+            _mask: mask,
+            raw_mask,
         }
     }
 }
@@ -2063,10 +2074,7 @@ impl Stream {
                 inputs.raw_refs.as_ptr()
             },
             ref_count: inputs.raw_refs.len() as c_int,
-            mask: RawImageInput {
-                data: ptr::null(),
-                len: 0,
-            },
+            mask: inputs.raw_mask,
         };
         unsafe { eremite_stream_generate_image(self.0, &req) }
     }

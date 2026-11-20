@@ -229,6 +229,9 @@ pub struct ImageRequest {
     pub quality: i32,
     /// Optional reference image bytes in upload order (`<Picture 1>`, ...).
     pub references: Vec<Vec<u8>>,
+    /// An edit's mask image bytes, whose alpha marks what changes; None for
+    /// no mask.
+    pub mask: Option<Vec<u8>>,
     /// The log shows "req ID NOTE" with this note when the request is queued.
     pub note: String,
 }
@@ -4922,7 +4925,8 @@ impl WorkerModel {
         }
         self.last_used_at = Instant::now();
         let refs = std::mem::take(&mut job.request.references);
-        let inputs = ImageInputs::new(&job.request.prompt, refs);
+        let mask = job.request.mask.take();
+        let inputs = ImageInputs::new(&job.request.prompt, refs, mask);
         let task = ImageTask {
             job,
             width,
@@ -4950,6 +4954,17 @@ impl WorkerModel {
     /// size cannot be used, its total pixels across the request included.
     fn resolve_image_size(&self, request: &ImageRequest) -> Result<(i32, i32), String> {
         let (width, height) = match (request.size, request.references.first()) {
+            (ImageSize::Exact { width, height }, Some(image)) if request.mask.is_some() => {
+                let first = engine::read_image_size(image)
+                    .map_err(|why| format!("reference image 1: {why}"))?;
+                if (width, height) != first {
+                    return Err(format!(
+                        "with a mask, size must be auto or the first image's size, {}x{}",
+                        first.0, first.1
+                    ));
+                }
+                return Ok(first);
+            }
             (ImageSize::Exact { width, height }, _) => return Ok((width, height)),
             (ImageSize::Auto, None) => self
                 .settings
@@ -5324,6 +5339,7 @@ mod tests {
                 format: engine::ImageFormat::Png,
                 quality: 0,
                 references: Vec::new(),
+                mask: None,
                 note: String::new(),
             },
             events: image_events,

@@ -157,7 +157,13 @@ return `{"created": ..., "data": [{"b64_json": "..."}], "size": "WIDTHxHEIGHT",
 - `images`: `/v1/images/edits` with JSON only; 1 to 16 objects, each with an
   `image_url` that is a base64 data URL, in the same order. The server
   fetches no URLs and has no Files API, so `file_id` gets HTTP 400.
-- `mask`: unsupported; it gets HTTP 400.
+- `mask`: `/v1/images/edits` only, optional: an image with an alpha channel,
+  the size of the first image, as a file part or in JSON as an object with an
+  `image_url`. Its transparent pixels mark what the edit changes; its opaque
+  pixels keep the first image's, and partly transparent pixels mix the two.
+  MiniMax-H3-Image takes no mask itself: it edits the whole image, and the
+  server then keeps the first image's pixels under the mask. With a mask,
+  `size` must be `auto` or the first image's size.
 - `n`: optional image count, 1 to 16 (default 1); image `i` uses `seed + i`.
 - `seed`: optional nonnegative integer (random when omitted).
 - `generator_device`: accepted and ignored (initial noise always uses the
