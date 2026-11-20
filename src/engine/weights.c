@@ -248,22 +248,31 @@ static float value(const uint8_t *bytes, int index, int dtype) {
     memcpy(&result, &bits, 4);
     return result;
   }
+  if (dtype == 'h') {
+    _Float16 half_value;
+    memcpy(&half_value, bytes + (size_t)index * 2, 2);
+    return (float)half_value;
+  }
   float result;
   memcpy(&result, bytes + (size_t)index * 4, 4);
   return result;
 }
 
+static size_t vector_element_bytes(int dtype) {
+  return dtype == 'b' || dtype == 'h' ? 2 : 4;
+}
+
 static void vector_fill(Buf *buffer, const void *context) {
   const Vector *vector = context;
   uint8_t first[16384], second[16384];
-  size_t count = vector->first.size / (vector->first.dtype == 'b' ? 2 : 4);
+  size_t width = vector_element_bytes(vector->first.dtype);
+  size_t count = vector->first.size / width;
   float *output = (float *)buffer->ptr;
   for (size_t at = 0; at < count; at += 4096) {
     size_t n = count - at < 4096 ? count - at : 4096;
-    size_t width = vector->first.dtype == 'b' ? 2 : 4;
     read_bytes(vector->first, at * width, first, n * width);
     if (vector->product) {
-      size_t other_width = vector->second.dtype == 'b' ? 2 : 4;
+      size_t other_width = vector_element_bytes(vector->second.dtype);
       read_bytes(vector->second, at * other_width, second, n * other_width);
     }
     for (size_t i = 0; i < n; i++) {
@@ -278,10 +287,10 @@ static void vector_fill(Buf *buffer, const void *context) {
 
 void weight_group_add_vector(WeightGroup *group, Buf *target, Tensor tensor,
                              float add, int operations) {
-  if (tensor.dtype != 'b' && tensor.dtype != 'f')
-    die("weight vector must use BF16 or FP32");
+  if (tensor.dtype != 'b' && tensor.dtype != 'h' && tensor.dtype != 'f')
+    die("weight vector must use BF16, F16 or FP32");
   Vector vector = {.first = tensor, .add = add, .operations = operations};
-  size_t bytes = tensor.size / (tensor.dtype == 'b' ? 2 : 4) * 4;
+  size_t bytes = tensor.size / vector_element_bytes(tensor.dtype) * 4;
   weight_group_add_generated(group, target, bytes, vector_fill, &vector,
                              sizeof vector);
 }
@@ -289,8 +298,8 @@ void weight_group_add_vector(WeightGroup *group, Buf *target, Tensor tensor,
 void weight_group_add_product(WeightGroup *group, Buf *target, Tensor first,
                               Tensor second) {
   Vector vector = {.first = first, .second = second, .product = 1};
-  size_t n = first.size / (first.dtype == 'b' ? 2 : 4);
-  if (n != second.size / (second.dtype == 'b' ? 2 : 4))
+  size_t n = first.size / vector_element_bytes(first.dtype);
+  if (n != second.size / vector_element_bytes(second.dtype))
     die("weight product sizes differ");
   weight_group_add_generated(group, target, n * 4, vector_fill, &vector,
                              sizeof vector);

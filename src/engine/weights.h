@@ -60,8 +60,8 @@ void weight_group_add_compressed_scales(WeightGroup *group, Buf *target,
                                         Tensor fixed, Tensor exceptions,
                                         int rows, int cols);
 
-// Adds a BF16 or FP32 vector as FP32 values. With WEIGHT_ADD, add is added to
-// each value. With WEIGHT_EXP, each value is then exponentiated.
+// Adds a BF16, F16 or FP32 vector as FP32 values. With WEIGHT_ADD, add is added
+// to each value. With WEIGHT_EXP, each value is then exponentiated.
 void weight_group_add_vector(WeightGroup *group, Buf *target, Tensor tensor,
                              float add, int operations);
 

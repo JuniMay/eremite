@@ -1,0 +1,384 @@
+// ---- MiniMax-H3-Image 2D ViT VAE decoder kernels ----
+//
+// Weights are stored in FP16 (half). Linear projections run native half x half
+// -> float matmul2d with FP32 bias addition. Norms, SwiGLU, residual scaling,
+// non-affine QK-Norm and 2D partial split-half RoPE run in FP32. Bidirectional
+// attention uses half Q/K/V/P with FP32 scores, softmax and accumulation.
+
+// 2D ViT decoder geometry: 16 heads of 64 values (width 1024), 24 latent
+// channels, 4 register tokens + 1 zero suffix token, 32 rotated RoPE dims.
+constant constexpr uint MINIMAX_H3_VAE_LATENT_CH = 24,
+                        MINIMAX_H3_VAE_DIM = 1024,
+                        MINIMAX_H3_VAE_HEADS = 16,
+                        MINIMAX_H3_VAE_HEAD_DIM = 64,
+                        MINIMAX_H3_VAE_HALF_HEAD = MINIMAX_H3_VAE_HEAD_DIM / 2,
+                        MINIMAX_H3_VAE_ROT_PAIRS = 16,
+                        MINIMAX_H3_VAE_FREQ_PER_AXIS = 8,
+                        MINIMAX_H3_VAE_REGISTERS = 4,
+                        MINIMAX_H3_VAE_TILE_M = 64,
+                        MINIMAX_H3_VAE_ATTN_ROWS = 16,
+                        MINIMAX_H3_VAE_ATTN_KEYS = 64,
+                        MINIMAX_H3_VAE_ATTN_SGROUPS = 4;
+
+// 2 * pi factor applied to normalized [-1, 1] patch coordinates in VAE RoPE.
+constant constexpr float MINIMAX_H3_VAE_TWO_PI = 6.28318530717958647692f;
+
+// Parameters for converting FP32 activations to padded FP16 rows.
+struct MinimaxH3F16X {
+  uint m, k, lda;
+};
+
+// Parameters for FP16 matrix multiplication: y = xh @ W_f16^T + bias.
+struct MinimaxH3F16MM {
+  uint m, n, k, ldy, has_bias;
+};
+
+// Parameters for residual scaled add: x[r, c] += scale[c] * y[r, c].
+struct MinimaxH3AddScaled {
+  uint rows, dim;
+};
+
+// Parameters for chunked SwiGLU: out[r, c] = silu(in[r, c]) * in[r, inner + c].
+struct MinimaxH3SwigluChunked {
+  uint rows, inner;
+};
+
+// Parameters for affine LayerNorm over rows of n floats.
+struct MinimaxH3LayerNorm {
+  uint n;
+  float eps;
+};
+
+// Parameters for VAE tile embedding (post_quant_conv + x_embedder + suffixes).
+struct MinimaxH3VaeEmbed {
+  uint h_lat, w_lat;
+};
+
+// Parameters for VAE head-interleaved QKV split, non-affine QK-Norm and 2D RoPE.
+struct MinimaxH3VaeHeads {
+  uint rows, padded, h_lat, w_lat;
+  float eps;
+};
+
+// Parameters for VAE bidirectional 16-head FlashAttention.
+struct MinimaxH3VaeAttend {
+  uint rows, padded;
+};
+
+// Converts m rows of k FP32 activations into FP16 rows padded to a multiple of
+// 64 rows (zeroing padded rows). k must be a multiple of 4.
+kernel void minimax_h3_x_f16(device const float4 *x [[buffer(0)]],
+                             device half4 *y [[buffer(1)]],
+                             constant MinimaxH3F16X &p [[buffer(2)]],
+                             uint2 i [[thread_position_in_grid]]) {
+  uint col4 = i.x, row = i.y;
+  uint k4 = p.k / 4u;
+  if (col4 >= k4) return;
+  if (row >= p.m) {
+    y[row * k4 + col4] = half4(0);
+    return;
+  }
+  y[row * k4 + col4] = half4(x[row * (p.lda / 4u) + col4]);
+}
+
+// Native FP16 matrix product accumulating in FP32, with optional FP32 bias.
+// xh must have rows padded to a multiple of 64; k and n must be multiples of
+// 64. Each threadgroup of 128 threads computes a 64x64 tile.
+kernel void minimax_h3_mm_f16(device const half *w [[buffer(0)]],
+                              device const half *xh [[buffer(1)]],
+                              device const float *bias [[buffer(2)]],
+                              device float *y [[buffer(3)]],
+                              constant MinimaxH3F16MM &p [[buffer(4)]],
+                              uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc =
+      matmul2d_descriptor(64, 64, static_cast<int>(dynamic_extent), false, true,
+                          false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  uint padded_m = (p.m + MINIMAX_H3_VAE_TILE_M - 1u) / MINIMAX_H3_VAE_TILE_M *
+                  MINIMAX_H3_VAE_TILE_M;
+  tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(
+      (device half *)xh, dextents<int32_t, 2>(p.k, padded_m));
+  tensor<device half, dextents<int32_t, 2>, tensor_inline> tw(
+      (device half *)w, dextents<int32_t, 2>(p.k, p.n));
+  uint m0 = tg.y * 64u, n0 = tg.x * 64u;
+  auto a = tx.slice(0, m0);
+  auto b = tw.slice(0, n0);
+  auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
+                                                 float>();
+  op.run(a, b, c);
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (col < p.n && row < p.m)
+        y[row * p.ldy + col] = c[i] + (p.has_bias ? bias[col] : 0.0f);
+    }
+}
+
+// Adds a channel-scaled residual in place: x[r, c] += scale[c] * y[r, c].
+kernel void minimax_h3_add_scaled(device float *x [[buffer(0)]],
+                                  device const float *y [[buffer(1)]],
+                                  device const float *scale [[buffer(2)]],
+                                  constant MinimaxH3AddScaled &p [[buffer(3)]],
+                                  uint2 i [[thread_position_in_grid]]) {
+  if (i.x < p.dim && i.y < p.rows) {
+    uint idx = i.y * p.dim + i.x;
+    x[idx] += scale[i.x] * y[idx];
+  }
+}
+
+// Splits each row of 2 * inner floats into (gate, up) and writes silu(gate)*up.
+kernel void minimax_h3_swiglu_chunked(device const float *in [[buffer(0)]],
+                                      device float *out [[buffer(1)]],
+                                      constant MinimaxH3SwigluChunked &p [[buffer(2)]],
+                                      uint2 i [[thread_position_in_grid]]) {
+  if (i.x >= p.inner || i.y >= p.rows) return;
+  uint row_in = i.y * (2u * p.inner);
+  float g = in[row_in + i.x];
+  float u = in[row_in + p.inner + i.x];
+  out[i.y * p.inner + i.x] = g / (1.0f + exp(-g)) * u;
+}
+
+// Affine LayerNorm over each row of n floats: y = w * (x - mean) / std + b.
+kernel void minimax_h3_layernorm(device const float *x [[buffer(0)]],
+                                 device const float *w [[buffer(1)]],
+                                 device const float *b [[buffer(2)]],
+                                 device float *y [[buffer(3)]],
+                                 constant MinimaxH3LayerNorm &p [[buffer(4)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint t [[thread_index_in_threadgroup]],
+                                 uint nt [[threads_per_threadgroup]]) {
+  threadgroup float tmp[32];
+  x += row * p.n;
+  y += row * p.n;
+  float sum = 0.0f;
+  for (uint i = t; i < p.n; i += nt) sum += x[i];
+  float mean = tg_sum(sum, tmp, t, nt) / float(p.n);
+  float var = 0.0f;
+  for (uint i = t; i < p.n; i += nt) {
+    float d = x[i] - mean;
+    var += d * d;
+  }
+  float inv = rsqrt(tg_sum(var, tmp, t, nt) / float(p.n) + p.eps);
+  for (uint i = t; i < p.n; i += nt) y[i] = w[i] * ((x[i] - mean) * inv) + b[i];
+}
+
+// Runs post_quant_conv (24->24) and x_embedder (24->1024) on a channel-first
+// latent tile [24, h_lat, w_lat], and appends 4 register tokens + 1 zero token.
+// Dispatched with one threadgroup of 256 threads per output row (h_lat*w_lat+5).
+kernel void minimax_h3_vae_embed(device const float *z [[buffer(0)]],
+                                 device const float *pqc_w [[buffer(1)]],
+                                 device const float *pqc_b [[buffer(2)]],
+                                 device const float *emb_w [[buffer(3)]],
+                                 device const float *emb_b [[buffer(4)]],
+                                 device const float *reg [[buffer(5)]],
+                                 device float *out [[buffer(6)]],
+                                 constant MinimaxH3VaeEmbed &p [[buffer(7)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint t [[thread_index_in_threadgroup]],
+                                 uint nt [[threads_per_threadgroup]]) {
+  uint patches = p.h_lat * p.w_lat;
+  device float *dst = out + row * MINIMAX_H3_VAE_DIM;
+  if (row >= patches) {
+    uint suf = row - patches;
+    if (suf < MINIMAX_H3_VAE_REGISTERS) {
+      device const float *rp = reg + suf * MINIMAX_H3_VAE_DIM;
+      for (uint c = t; c < MINIMAX_H3_VAE_DIM; c += nt) dst[c] = rp[c];
+    } else {
+      for (uint c = t; c < MINIMAX_H3_VAE_DIM; c += nt) dst[c] = 0.0f;
+    }
+    return;
+  }
+
+  threadgroup float zp[MINIMAX_H3_VAE_LATENT_CH];
+  if (t < MINIMAX_H3_VAE_LATENT_CH) {
+    float acc = pqc_b[t];
+    device const float *wr = pqc_w + t * MINIMAX_H3_VAE_LATENT_CH;
+    for (uint k = 0; k < MINIMAX_H3_VAE_LATENT_CH; k++)
+      acc += wr[k] * z[k * patches + row];
+    zp[t] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint c = t; c < MINIMAX_H3_VAE_DIM; c += nt) {
+    float acc = emb_b[c];
+    device const float *wr = emb_w + c * MINIMAX_H3_VAE_LATENT_CH;
+    for (uint k = 0; k < MINIMAX_H3_VAE_LATENT_CH; k++) acc += wr[k] * zp[k];
+    dst[c] = acc;
+  }
+}
+
+// Splits head-interleaved qkv [rows, 16, 3, 64] into head-major half qh, kh, vh
+// [16, padded, 64]. Applies non-affine per-head RMSNorm and 2D partial
+// split-half RoPE (rot_dim = 32: pairs (i, i + 16) for i = 0..15; dims 32..63
+// unrotated; suffix rows past h_lat * w_lat unrotated). Zeroes rows >= rows.
+// Threadgroup: 32 threads (1 simdgroup); grid.x: 48 (16 Q + 16 K + 16 V);
+// grid.y: row in 0..padded-1.
+kernel void minimax_h3_vae_heads(device const float *qkv [[buffer(0)]],
+                                 device const float *inv_freq [[buffer(1)]],
+                                 device half *qh [[buffer(2)]],
+                                 device half *kh [[buffer(3)]],
+                                 device half *vh [[buffer(4)]],
+                                 constant MinimaxH3VaeHeads &p [[buffer(5)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  uint kind = tg.x / MINIMAX_H3_VAE_HEADS;
+  uint h = tg.x % MINIMAX_H3_VAE_HEADS;
+  uint row = tg.y;
+  device half *dst = (kind == 0u ? qh : kind == 1u ? kh : vh) +
+                     (h * p.padded + row) * MINIMAX_H3_VAE_HEAD_DIM;
+  if (row >= p.rows) {
+    dst[lane] = half(0.0f);
+    dst[lane + MINIMAX_H3_VAE_HALF_HEAD] = half(0.0f);
+    return;
+  }
+
+  device const float *src =
+      qkv + row * (3u * MINIMAX_H3_VAE_DIM) +
+      (h * 3u + kind) * MINIMAX_H3_VAE_HEAD_DIM;
+  float a = src[lane];
+  float b = src[lane + MINIMAX_H3_VAE_HALF_HEAD];
+  if (kind == 2u) {
+    dst[lane] = half(a);
+    dst[lane + MINIMAX_H3_VAE_HALF_HEAD] = half(b);
+    return;
+  }
+
+  // Non-affine per-head RMSNorm across all 64 dimensions.
+  float ss = simd_sum(a * a + b * b);
+  float r = rsqrt(ss / float(MINIMAX_H3_VAE_HEAD_DIM) + p.eps);
+  a *= r;
+  b *= r;
+
+  // Partial 2D split-half RoPE on first 32 dimensions (lane holds dim 0..31).
+  float out_a = a;
+  uint patches = p.h_lat * p.w_lat;
+  if (row < patches) {
+    uint py = row / p.w_lat, px = row % p.w_lat;
+    float cy = ((float(py) + 0.5f) / float(p.h_lat)) * 2.0f - 1.0f;
+    float cx = ((float(px) + 0.5f) / float(p.w_lat)) * 2.0f - 1.0f;
+    uint pair = lane & (MINIMAX_H3_VAE_ROT_PAIRS - 1u);
+    float coord = pair < MINIMAX_H3_VAE_FREQ_PER_AXIS ? cy : cx;
+    uint fi = pair < MINIMAX_H3_VAE_FREQ_PER_AXIS
+                  ? pair
+                  : pair - MINIMAX_H3_VAE_FREQ_PER_AXIS;
+    float angle = MINIMAX_H3_VAE_TWO_PI * coord * inv_freq[fi];
+    float c = cos(angle), s = sin(angle);
+    float partner = simd_shuffle_xor(a, MINIMAX_H3_VAE_ROT_PAIRS);
+    bool lo = lane < MINIMAX_H3_VAE_ROT_PAIRS;
+    float u0 = lo ? a : partner;
+    float u1 = lo ? partner : a;
+    out_a = lo ? (u0 * c - u1 * s) : (u1 * c + u0 * s);
+  }
+  dst[lane] = half(out_a);
+  dst[lane + MINIMAX_H3_VAE_HALF_HEAD] = half(b);
+}
+
+// Bidirectional 16-head FlashAttention (head_dim = 64) for the VAE decoder.
+// Uses half Q/K/V and softmax probabilities with FP32 scores and accumulation.
+kernel void minimax_h3_vae_attend(device const half *qh [[buffer(0)]],
+                                  device const half *kh [[buffer(1)]],
+                                  device const half *vh [[buffer(2)]],
+                                  device float *o [[buffer(3)]],
+                                  constant MinimaxH3VaeAttend &p [[buffer(4)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint rows = MINIMAX_H3_VAE_ATTN_ROWS;
+  constexpr uint keys = MINIMAX_H3_VAE_ATTN_KEYS;
+  constexpr uint half_keys = keys / 2u;
+  threadgroup float scores[MINIMAX_H3_VAE_ATTN_SGROUPS][rows * keys];
+  threadgroup float rescales[MINIMAX_H3_VAE_ATTN_SGROUPS][rows];
+  threadgroup float sums[MINIMAX_H3_VAE_ATTN_SGROUPS][rows];
+  threadgroup half probs[MINIMAX_H3_VAE_ATTN_SGROUPS][rows * keys];
+
+  uint h = tg.y;
+  uint first = (tg.x * MINIMAX_H3_VAE_ATTN_SGROUPS + sg) * rows;
+  if (first >= p.rows) return;
+
+  threadgroup float *ss = scores[sg], *rescale = rescales[sg], *sum = sums[sg];
+  threadgroup half *ps = probs[sg];
+  const float scale = rsqrt(float(MINIMAX_H3_VAE_HEAD_DIM));
+
+  constexpr auto sdesc =
+      matmul2d_descriptor(rows, keys, MINIMAX_H3_VAE_HEAD_DIM, false, true,
+                          false, matmul2d_descriptor::mode::multiply);
+  constexpr auto odesc =
+      matmul2d_descriptor(rows, MINIMAX_H3_VAE_HEAD_DIM, keys, false, false,
+                          false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroup> sop;
+  matmul2d<odesc, execution_simdgroup> oop;
+
+  tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(
+      (device half *)qh + h * p.padded * MINIMAX_H3_VAE_HEAD_DIM,
+      dextents<int32_t, 2>(MINIMAX_H3_VAE_HEAD_DIM, p.padded));
+  tensor<device half, dextents<int32_t, 2>, tensor_inline> tk(
+      (device half *)kh + h * p.padded * MINIMAX_H3_VAE_HEAD_DIM,
+      dextents<int32_t, 2>(MINIMAX_H3_VAE_HEAD_DIM, p.padded));
+  tensor<device half, dextents<int32_t, 2>, tensor_inline> tv(
+      (device half *)vh + h * p.padded * MINIMAX_H3_VAE_HEAD_DIM,
+      dextents<int32_t, 2>(MINIMAX_H3_VAE_HEAD_DIM, p.padded));
+  tensor<threadgroup half, extents<int32_t, keys, rows>, tensor_inline> tp(
+      ps, extents<int32_t, keys, rows>());
+
+  auto qt = tq.slice(0, first), vt0 = tv.slice(0, 0);
+  auto acc =
+      oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt0),
+                                             float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+  uint row = lane / 2u, column = (lane % 2u) * half_keys;
+  float running_max = -INFINITY, running_sum = 0.0f;
+
+  for (uint k0 = 0; k0 < p.rows; k0 += keys) {
+    auto kt = tk.slice(0, k0), vt = tv.slice(0, k0);
+    auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt),
+                                                     float>();
+    sop.run(qt, kt, sc);
+    for (uint16_t i = 0; i < sc.get_capacity(); i++)
+      if (sc.is_valid_element(i)) {
+        auto at = sc.get_multidimensional_index(i);
+        uint key = k0 + at[0], query = first + at[1];
+        bool seen = query < p.rows && key < p.rows;
+        ss[at[1] * keys + at[0]] = seen ? sc[i] * scale : -INFINITY;
+      }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float *own = ss + row * keys + column;
+    float block_max = -INFINITY;
+    for (uint c = 0; c < half_keys; c++) block_max = max(block_max, own[c]);
+    block_max = max(block_max, simd_shuffle_xor(block_max, 1u));
+    float new_max = max(running_max, block_max);
+    float old_scale =
+        running_max == -INFINITY ? 0.0f : exp(running_max - new_max);
+    float block_sum = 0.0f;
+    for (uint c = 0; c < half_keys; c++) {
+      float e = own[c] == -INFINITY ? 0.0f : exp(own[c] - new_max);
+      ps[row * keys + column + c] = half(e);
+      block_sum += e;
+    }
+    block_sum += simd_shuffle_xor(block_sum, 1u);
+    running_sum = running_sum * old_scale + block_sum;
+    running_max = new_max;
+    if (lane % 2u == 0u) rescale[row] = old_scale;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint16_t i = 0; i < acc.get_capacity(); i++)
+      if (acc.is_valid_element(i))
+        acc[i] *= rescale[acc.get_multidimensional_index(i)[1]];
+    oop.run(tp, vt, acc);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lane % 2u == 0u) sum[row] = running_sum;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) {
+      auto at = acc.get_multidimensional_index(i);
+      uint out_row = first + at[1];
+      if (out_row < p.rows)
+        o[out_row * MINIMAX_H3_VAE_DIM + h * MINIMAX_H3_VAE_HEAD_DIM + at[0]] =
+            acc[i] / sum[at[1]];
+    }
+}
