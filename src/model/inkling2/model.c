@@ -1,0 +1,2394 @@
+#include "model/inkling2/model.h"
+#include "base/clock.h"
+#include "base/error.h"
+#include "base/file.h"
+#include "base/json.h"
+#include "engine/memory.h"
+#include "engine/pass.h"
+#include "engine/safetensors.h"
+#include "engine/weights.h"
+#include "gpu/gpu.h"
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// thinkingmachines/Inkling-2-Mini (model_type inkling2_loop and
+// inkling2_loop_text): weights, KV and short-convolution state, snapshots and
+// forward passes.
+//
+// The checkpoint stores 24 physical decoder layers. Prelude layers 0..5 run
+// once, core layers 6..17 run 3 times with cross-pass message retrieval and
+// low-rank message gates on passes 1 and 2, and postlude layers 18..23 run
+// once, yielding 48 logical layer visits. Each logical visit owns its own KV
+// cache (8 growing global caches, 40 rolling sliding-window rings) and its own
+// 4 short-convolution rings. All weights stay resident in one WeightGroup.
+
+// Numerical parameters from config.json text_config and modeling_inkling2.py.
+static constexpr float RMS_EPS = 1e-6f;
+static constexpr float GATE_SOFTCAP = 4.0f;
+static constexpr float UP_SOFTCAP = 25.0f;
+static constexpr float ROUTE_SCALE = 8.0f;
+static constexpr float LOGIT_SOFTCAP = 30.0f;
+static constexpr double LOG_SCALING_ALPHA = 0.1;
+static constexpr int LOG_SCALING_FLOOR = 8192;
+static constexpr double QK_L2_CLIP = 22.627416997969522;
+static constexpr double REL_L2_CLIP = 8.0;
+
+// Prefill chunk size, KV allocation growth, FlashDecoding split bounds and
+// aligned direct-read threshold.
+static constexpr int PREFILL_CHUNK = 512;
+static constexpr int START_CAP = 256;
+static constexpr int MAX_DECODE_PARTS = 64;
+static constexpr int DECODE_PART_TARGET = 128;
+static constexpr int DECODE_PART_FLOATS = INK2_HEAD_DIM + 2;
+static constexpr int PREFILL_Q_PAD = 16;
+static constexpr int PREFILL_Q_GROUP = 32;
+static constexpr int MOE_MM_TILE = 64;
+static constexpr int MOE_MV_MAX_M = 8;
+static constexpr int MOE_MV_ROWS_PER_TG = 32;
+static constexpr int LOGITS_STRIDE = 200064;
+static constexpr int DEFAULT_CTX = 8192;
+static constexpr size_t ALIGN_READ_MIN_BYTES = 1u << 20;
+static constexpr size_t ALIGN_MASK = 15u;
+static constexpr size_t PASS_STACK_BYTES = 4u << 20;
+static constexpr size_t PATH_CAP = 1024;
+
+// Metal threadgroup sizes matching src/kernels/inkling2.metal and
+// src/kernels/kernels.metal.
+static constexpr uint32_t ROW_THREADS = 256;
+static constexpr uint32_t QKVR_THREADS = 128;
+static constexpr uint32_t QKVR_HEADS =
+    INK2_HEADS + 2 * INK2_KV_HEADS + INK2_HEADS;
+static constexpr uint32_t DECODE_THREADS = 128;
+static constexpr uint32_t COMBINE_THREADS = 32;
+static constexpr uint32_t PREFILL_THREADS = 64;
+static constexpr uint32_t ROUTE_THREADS = 128;
+static constexpr uint32_t MV_THREADS = 256;
+static constexpr uint32_t MM_THREADS = 128;
+static constexpr uint32_t ELEM_THREADS = 256;
+static constexpr uint32_t SCONV_THREADS = 64;
+static constexpr uint32_t VEC4_WIDTH = 4;
+static constexpr uint32_t BF16_MV_SPLIT_SMALL_N = 256;
+static constexpr uint32_t BF16_MV_SPLIT_MIN_K = 2048;
+static constexpr uint32_t BF16_MV_SPLIT_FACTOR = 4;
+static constexpr uint32_t BF16_MV_ROWS_PER_SG = 4;
+static constexpr uint32_t BF16_MV_SGS = 8;
+static constexpr uint32_t ATTNRES_GLOBAL_QUERIES = 3;
+static constexpr int MAX_CHAT_IMAGES = 16;
+static constexpr int MAX_THINK_PERCENT = 99;
+static constexpr double THINK_PERCENT_SCALE = 100.0;
+
+// Byte layout of rolling state buffers inside one Ink2State.
+static constexpr size_t SLIDE_KV_ONE_BYTES =
+    (size_t)INK2_SLIDE_RING * INK2_KV_DIM * sizeof(uint16_t);
+static constexpr size_t SLIDE_KV_BYTES =
+    (size_t)INK2_SLIDE_COUNT * 2 * SLIDE_KV_ONE_BYTES;
+static constexpr size_t CONV_KV_RING_BYTES =
+    (size_t)INK2_SCONV_RING * INK2_KV_DIM * sizeof(float);
+static constexpr size_t CONV_DIM_RING_BYTES =
+    (size_t)INK2_SCONV_RING * INK2_DIM * sizeof(float);
+static constexpr size_t CONV_K_OFF = 0;
+static constexpr size_t CONV_V_OFF = CONV_KV_RING_BYTES;
+static constexpr size_t CONV_ATTN_OFF = 2 * CONV_KV_RING_BYTES;
+static constexpr size_t CONV_MLP_OFF =
+    2 * CONV_KV_RING_BYTES + CONV_DIM_RING_BYTES;
+static constexpr size_t CONV_LAYER_BYTES =
+    2 * CONV_KV_RING_BYTES + 2 * CONV_DIM_RING_BYTES;
+static constexpr size_t CONV_TOTAL_BYTES =
+    (size_t)INK2_TOTAL_LAYERS * CONV_LAYER_BYTES;
+static constexpr size_t SNAP_ROLLING_BYTES = SLIDE_KV_BYTES + CONV_TOTAL_BYTES;
+static constexpr size_t GLOBAL_KV_ROW_BYTES =
+    (size_t)INK2_KV_DIM * sizeof(uint16_t);
+static constexpr size_t LOGITS_BYTES = (size_t)INK2_VOCAB * sizeof(float);
+static constexpr int SCONV_RINGS_PER_LAYER = 4;
+
+// Kernel parameter structs matching src/kernels/kernels.metal.
+typedef struct {
+  // Output rows, input columns, group row count, group column offset, BF16
+  // rounding flag and split-K factor.
+  uint32_t n, k, group_rows, group_k, round, split;
+} MvParam;
+
+typedef struct {
+  // Base matrix-vector parameters.
+  MvParam mv;
+  // Batch rows, input row stride and output row stride in floats.
+  uint32_t m, lda, ldy;
+} MvmParam;
+
+typedef struct {
+  // Active rows, output width, inner width, BF16 rounding flag and strides.
+  uint32_t m, n, k, round, lda, ldy;
+} MmParam;
+
+// Kernel parameter structs matching src/kernels/inkling2.metal.
+typedef struct {
+  // Row width in floats and BF16 rounding flag.
+  uint32_t dim, round;
+  // RMSNorm epsilon.
+  float eps;
+} NormParam;
+
+typedef struct {
+  // Active rows, block row stride, hidden width, completed blocks, queries.
+  uint32_t rows, block_stride, dim, nblocks, nqueries;
+  // Output row stride between query results.
+  uint32_t out_row_stride;
+  // Unweighted RMSNorm epsilon.
+  float eps;
+} AttnResParam;
+
+typedef struct {
+  // Active rows, hidden width and bottleneck gate rank.
+  uint32_t rows, dim, rank;
+  // Unweighted RMSNorm epsilon.
+  float eps;
+} MsgGateParam;
+
+typedef struct {
+  // Active rows, channel width, ring capacity, row-0 pos, BF16 round flag.
+  uint32_t rows, dim, ring_rows, pos0, round;
+} SconvParam;
+
+typedef struct {
+  // Device GPU address of the state's FP32 ring buffer.
+  uint64_t ring;
+  // Token position of this row and alignment padding.
+  uint32_t pos, pad;
+} SconvTarget;
+
+typedef struct {
+  // Device GPU addresses of the state's BF16 K and V buffers.
+  uint64_t k, v;
+  // Token position and ring capacity (0 for global linear KV).
+  uint32_t pos, ring_rows;
+} KvTarget;
+
+typedef struct {
+  // Active rows, head-major Q stride, row-0 pos, ring capacity, flags.
+  uint32_t rows, q_stride, pos0, ring_rows, is_global, batched;
+} QkvrParam;
+
+typedef struct {
+  // Active rows, heads, relative dim and relative bias extent.
+  uint32_t rows, heads, d_rel, extent;
+} RelBiasParam;
+
+typedef struct {
+  // Active rows, Q stride, row-0 pos, ring capacity, window, partitions, flag.
+  uint32_t rows, q_stride, pos0, ring_rows, window, nparts, part_stride,
+      batched;
+} AttendDecodeParam;
+
+typedef struct {
+  // Active rows, Q stride, row-0 pos, ring capacity and sliding window.
+  uint32_t rows, q_stride, pos0, ring_rows, window;
+} AttendPrefillParam;
+
+typedef struct {
+  // Active rows, total experts and top-k count.
+  uint32_t rows, experts, topk;
+  // Routing weight multiplier.
+  float scale;
+} RouteParam;
+
+typedef struct {
+  // Matrix output rows, inner columns, active pair count and tile count.
+  uint32_t n, k, npairs, ntiles;
+  // Gate and up softcap bounds.
+  float gate_cap, up_cap;
+} MoeParam;
+
+typedef struct {
+  // Active rows, hidden width and top-k count.
+  uint32_t rows, dim, topk;
+} MoeCombineParam;
+
+typedef struct {
+  // Active rows, unpadded vocab size and row stride in floats.
+  uint32_t rows, vocab, stride;
+  // Logit softcap bound.
+  float cap;
+} SoftcapParam;
+
+// One BF16 linear weight matrix of shape [n, k].
+typedef struct {
+  // Raw BF16 weight buffer in GPU memory.
+  Buf w;
+  // Output rows and input columns.
+  int n, k;
+} Bf16Lin;
+
+// Cross-pass message controller weights for one loop sub-stream.
+typedef struct {
+  // Low-rank down projection [64, 4608] in BF16.
+  Bf16Lin down;
+  // Forget gate projection [2304, 64] in BF16.
+  Buf forget_w;
+  // Gain gate projection [2304, 64] in BF16.
+  Buf gain_w;
+} MsgController;
+
+// All weights for one of the 24 physical decoder layers.
+typedef struct {
+  // Nonzero for full-attention layers (5, 11, 17, 23).
+  int is_global;
+  // Nonzero for core looped layers (6..17).
+  int is_loop;
+  // Nonzero for NVFP4 layers (0..19); zero for MXFP8 layers (20..23).
+  int is_nvfp4;
+
+  // AttnRes queries: attn_query ([2304] or [3, 2304] FP32; unused on layer 0)
+  // and mlp_query ([2304] FP32).
+  Buf attn_query, mlp_query;
+  // Pre-attention RMSNorm(s): attn_norm on sliding layers, or q/k/v norms on
+  // global layers, plus mlp_norm (all FP32 [2304]).
+  Buf attn_norm, q_norm, k_norm, v_norm, mlp_norm;
+  // Cross-pass message controllers (valid when is_loop is nonzero).
+  MsgController ctrl_q, ctrl_k, ctrl_v, ctrl_mlp;
+
+  // Attention linear projections in BF16.
+  Bf16Lin wq, wk, wv, wr, gate_attn, sink_proj, wo;
+  // Relative position bias projection BF16 [16, 1024] and clip scales (FP32).
+  Buf rel_proj, q_clip_scale, rel_clip_scale;
+  // Key/value short convolution weights: static [1024, 4] FP32 on sliding
+  // layers, or static_w [4, 1024] FP32 + weight_proj [32, 2304] BF16 on global.
+  Buf k_sconv_w, v_sconv_w;
+  Bf16Lin k_sconv_proj, v_sconv_proj;
+  // Post-attention and post-MLP static short convolution filters FP32 [2304,4].
+  Buf attn_sconv_w, mlp_sconv_w;
+
+  // Router weights (BF16 [128, 2304]) and FP32 bias ([128]).
+  Bf16Lin router_w;
+  Buf router_bias;
+  // Routed expert weights: packed NVFP4 (layers 0..19) or MXFP8 (layers 20..23)
+  // with block scales and (for NVFP4) precomputed FP32 per-expert factors.
+  Buf w13, s13, f13;
+  Buf w2, s2, f2;
+} PhysLayer;
+
+// Per-sequence attention and short-convolution state.
+typedef struct {
+  // Allocated global KV capacity in tokens.
+  int cap;
+  // Growing BF16 global K and V caches for the 8 global logical visits.
+  Buf gk[INK2_GLOBAL_COUNT], gv[INK2_GLOBAL_COUNT];
+  // Rolling BF16 K and V rings for all 40 sliding logical visits.
+  Buf slide_kv;
+  // Rolling FP32 short-convolution rings for all 48 logical visits.
+  Buf conv_ring;
+} Ink2State;
+
+// Saved rolling state (sliding KV rings, sconv rings and optional logits) at
+// one sequence position.
+typedef struct {
+  // Number of positions already processed when this snapshot was taken.
+  int pos;
+  // Host buffer holding slide_kv followed by conv_ring.
+  uint8_t *rows;
+  // Optional host buffer of INK2_VOCAB FP32 logits, or null.
+  float *logits;
+} Ink2Snapshot;
+
+// Per-pass reusable GPU scratch buffers.
+typedef struct {
+  // Row capacity currently allocated across row-scaled buffers.
+  int cap_rows;
+  // Padded head-major Q row stride (multiple of 16).
+  int q_stride;
+  // Row capacity currently allocated in `logits`.
+  int logits_rows;
+  // Token IDs, residual streams, AttnRes block stacks and cross-pass states.
+  Buf ids, cur, cur2, residual, pre_loop_cur, prev_blk, prev_cur;
+  Buf blk, msg, attn_in, q_in, k_in, v_in;
+  // Loop message gate scratch buffers.
+  Buf msg_cat, msg_g, msg_gated;
+  // Attention projections, short-conv outputs, relative bias and FlashDecoding
+  // partials.
+  Buf q_raw, k_raw, k_conv, v_raw, v_conv, dyn_w, r_raw, r_out, gate, sink;
+  Buf q_hm, rel_bias, part, attn_out;
+  // MoE routing, tile grouping and expert intermediate buffers.
+  Buf route_logits, route_ids, route_w, ptok, pw, tp, tiles;
+  Buf x_bf16, h_bf16, y_pair;
+  // Final output logits buffer (stride LOGITS_STRIDE floats per row).
+  Buf logits;
+  // Batched per-row device-address target tables for multi-state decoding.
+  Buf sconv_tgt, kv_tgt;
+} Ink2Work;
+
+// Parameters passed to the NVFP4 per-expert scale factor fill callback.
+typedef struct {
+  // Per-expert amax FP32 [128] and outer scale denominator FP32 [1].
+  Tensor amax, denom;
+} FactorFillParam;
+
+// Parameters passed to the cross-pass message query merge callback.
+typedef struct {
+  // Original [24, 2304] Q/MLP and K/V cross-pass query tensors.
+  Tensor q_mlp, kv;
+} MsgQueryFillParam;
+
+// Global model handles and loaded weights.
+static Gpu *gpu;
+static MemorySlot *work_slot, state_slot;
+static TensorIndex *checkpoint;
+static WeightGroup *text_weights;
+static Options opt;
+static int eos_token = INK2_EOS_TOKEN;
+static Ink2Visit schedule[INK2_TOTAL_LAYERS];
+static PhysLayer layers[INK2_PHYS_LAYERS];
+static Buf embed_w, embed_norm, msg_queries, output_query, final_norm,
+    unembed_w;
+static uint64_t required_bytes;
+
+// Runtime counters for server status reporting.
+static uint64_t decode_rows_count, prefill_rows_count;
+static double decode_seconds_total, decode_gpu_seconds_total;
+static int prefill_layer_now, prefill_rows_now;
+
+// Pass-local state swapped automatically across concurrent passes.
+static Ink2Work work;
+static uint64_t last_committed;
+static float *logits_compact;
+static int logits_compact_rows;
+
+// Compiled Metal kernel handles.
+static int K_mv_bf16, K_mv_bf16_3, K_mvm_bf16, K_mvm_bf16_3, K_mm_bf16;
+static int K_embed_norm, K_rmsnorm, K_attn_res, K_msg_cat_norm,
+    K_msg_gate_apply;
+static int K_sconv_static, K_sconv_static_batched, K_sconv_dynamic,
+    K_sconv_dynamic_batched, K_sconv_ring_save;
+static int K_qkvr_prep, K_rel_bias, K_attend_part, K_attend_combine,
+    K_attend_prefill;
+static int K_route_topk, K_moe_group, K_moe_gather_bf16;
+static int K_nv_up_mv, K_nv_dn_mv, K_nv_up_mm, K_nv_dn_mm;
+static int K_mx_up_mv, K_mx_dn_mv, K_mx_up_mm, K_mx_dn_mm;
+static int K_moe_combine, K_copy, K_add, K_logit_softcap;
+
+// ---- schedule and tile grouping ----
+
+// Builds the 48-visit unrolled schedule: 6 prelude layers, 3 passes over core
+// layers 6..17, and 6 postlude layers.
+void inkling2_build_schedule(Ink2Visit out[INK2_TOTAL_LAYERS]) {
+  int v = 0, gslot = 0, sslot = 0;
+  for (int p = 0; p < INK2_CORE_START; p++) {
+    int is_g = (p % INK2_BLOCK_SPAN) == (INK2_BLOCK_SPAN - 1);
+    out[v++] = (Ink2Visit){.phys = p,
+                           .loop_pass = 0,
+                           .loop_idx = -1,
+                           .is_global = is_g,
+                           .is_boundary = (p % INK2_BLOCK_SPAN) == 0,
+                           .global_slot = is_g ? gslot++ : -1,
+                           .slide_slot = is_g ? -1 : sslot++};
+  }
+  for (int pass = 0; pass < INK2_LOOP_PASSES; pass++) {
+    for (int li = 0; li < INK2_CORE_LAYERS; li++) {
+      int p = INK2_CORE_START + li;
+      int is_g = (p % INK2_BLOCK_SPAN) == (INK2_BLOCK_SPAN - 1);
+      out[v++] = (Ink2Visit){.phys = p,
+                             .loop_pass = pass,
+                             .loop_idx = li,
+                             .is_global = is_g,
+                             .is_boundary = (p % INK2_BLOCK_SPAN) == 0,
+                             .global_slot = is_g ? gslot++ : -1,
+                             .slide_slot = is_g ? -1 : sslot++};
+    }
+  }
+  for (int p = INK2_CORE_END; p < INK2_PHYS_LAYERS; p++) {
+    int is_g = (p % INK2_BLOCK_SPAN) == (INK2_BLOCK_SPAN - 1);
+    out[v++] = (Ink2Visit){.phys = p,
+                           .loop_pass = 0,
+                           .loop_idx = -1,
+                           .is_global = is_g,
+                           .is_boundary = (p % INK2_BLOCK_SPAN) == 0,
+                           .global_slot = is_g ? gslot++ : -1,
+                           .slide_slot = is_g ? -1 : sslot++};
+  }
+}
+
+// Groups routed (token, expert) pairs by expert into tiles of at most max_tile
+// pairs.
+int inkling2_group_expert_tiles(const uint32_t *route_ids, const float *route_w,
+                                int rows, int max_tile, int *ptok, float *pw,
+                                int *tp, Ink2MoeTile *tiles) {
+  int counts[INK2_EXPERTS] = {0};
+  int offsets[INK2_EXPERTS];
+  int npairs = rows * INK2_TOPK;
+  for (int p = 0; p < npairs; p++) {
+    uint32_t e = route_ids[p];
+    if (e >= (uint32_t)INK2_EXPERTS) die("router selected expert %u", e);
+    counts[e]++;
+  }
+  int cursor = 0, ntiles = 0;
+  for (int e = 0; e < INK2_EXPERTS; e++) {
+    offsets[e] = cursor;
+    int left = counts[e], start = cursor;
+    while (left > 0) {
+      int take = left < max_tile ? left : max_tile;
+      tiles[ntiles++] = (Ink2MoeTile){.expert = (uint32_t)e,
+                                      .start = (uint32_t)start,
+                                      .count = (uint32_t)take,
+                                      .pad = 0};
+      start += take;
+      left -= take;
+    }
+    cursor += counts[e];
+  }
+  for (int p = 0; p < npairs; p++) {
+    uint32_t e = route_ids[p];
+    int pos = offsets[e]++;
+    ptok[pos] = p / INK2_TOPK;
+    pw[pos] = route_w[p];
+    tp[p] = pos;
+  }
+  return ntiles;
+}
+
+// ---- synchronization and buffer helpers ----
+
+// Commits a command buffer and records it as this pass's latest submission.
+static void model_commit(GpuCommandBuffer *c) {
+  last_committed = c->number;
+  gpu_commit(c);
+}
+
+// Returns whether the command buffer with the given sequence number finished.
+static int committed_finished(void *number) {
+  return gpu_has_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+// Blocks until the command buffer with the given sequence number finishes.
+static void committed_wait(void *number) {
+  gpu_wait_until_finished(gpu, (uint64_t)(uintptr_t)number);
+}
+
+// Waits for this pass's GPU work, yielding when inside a cooperative pass.
+static void model_sync(void) {
+  if (!pass_current()) {
+    gpu_sync(gpu);
+    return;
+  }
+  if (last_committed)
+    pass_wait(&(PassWait){committed_finished, committed_wait,
+                          (void *)(uintptr_t)last_committed, PASS_WAIT_GPU,
+                          NULL});
+  gpu_check_finished(gpu);
+}
+
+// Allocates a resident buffer counted in the workspace slot.
+static Buf work_alloc(size_t size) {
+  Buf b = gpu_alloc(gpu, work_slot, size);
+  gpu_set_resident(&b, 1);
+  gpu_commit_residency(gpu);
+  return b;
+}
+
+// Allocates a resident buffer counted in the state slot, returning empty on
+// memory refusal.
+static Buf state_try_alloc(size_t size) {
+  Buf b = gpu_try_alloc_required(gpu, &state_slot, size);
+  if (!b.obj) return b;
+  gpu_set_resident(&b, 1);
+  gpu_commit_residency(gpu);
+  return b;
+}
+
+// Rounds n up to a multiple of align (a power of two).
+static int align_up(int n, int align) { return (n + align - 1) & ~(align - 1); }
+
+// Returns the byte offset of sliding visit slot's K or V ring in slide_kv.
+static size_t slide_ring_off(int slide_slot, int is_v) {
+  return ((size_t)slide_slot * 2 + (size_t)is_v) * SLIDE_KV_ONE_BYTES;
+}
+
+// Returns the byte offset of logical visit v's sub-ring in conv_ring.
+static size_t conv_ring_off(int visit, size_t sub_off) {
+  return (size_t)visit * CONV_LAYER_BYTES + sub_off;
+}
+
+// Reads all bytes of a small checkpoint tensor directly via pread.
+static void read_tensor_exact(Tensor t, void *dst) {
+  size_t done = 0;
+  while (done < t.size) {
+    ssize_t n = pread(t.fd, (uint8_t *)dst + done, t.size - done,
+                      (off_t)(t.off + done));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) die("cannot read Inkling-2-Mini tensor bytes");
+    done += (size_t)n;
+  }
+}
+
+// ---- config validation and weight loading ----
+
+// Reads a required JSON number field from object, ending the process if absent.
+static double json_req_num(const Json *obj, const char *key, const char *path) {
+  const Json *v = json_get(obj, key);
+  if (!v || v->type != J_NUM) die("%s: missing number %s", path, key);
+  return v->num;
+}
+
+// Validates that config.json matches Inkling-2-Mini's expected geometry.
+static void check_config(const char *dir) {
+  char path[PATH_CAP];
+  snprintf(path, sizeof path, "%s/config.json", dir);
+  char *text = read_file(path, 0);
+  Json *root = json_parse(text);
+  const Json *tc = json_get(root, "text_config");
+  if (!tc) tc = root;
+  const Json *eos = json_get(root, "eos_token_id");
+  if (eos && eos->type == J_NUM) eos_token = (int)eos->num;
+
+  if ((int)json_req_num(tc, "hidden_size", path) != INK2_DIM ||
+      (int)json_req_num(tc, "num_hidden_layers", path) != INK2_PHYS_LAYERS ||
+      (int)json_req_num(tc, "vocab_size", path) != INK2_VOCAB_PADDED ||
+      (int)json_req_num(tc, "unpadded_vocab_size", path) != INK2_VOCAB ||
+      (int)json_req_num(tc, "num_attention_heads", path) != INK2_HEADS ||
+      (int)json_req_num(tc, "num_key_value_heads", path) != INK2_KV_HEADS ||
+      (int)json_req_num(tc, "head_dim", path) != INK2_HEAD_DIM ||
+      (int)json_req_num(tc, "d_rel", path) != INK2_D_REL ||
+      (int)json_req_num(tc, "rel_extent", path) != INK2_REL_EXTENT ||
+      (int)json_req_num(tc, "sliding_window_size", path) != INK2_WINDOW ||
+      (int)json_req_num(tc, "sconv_kernel_size", path) != INK2_SCONV_K ||
+      (int)json_req_num(tc, "n_layers_per_attn_res_block", path) !=
+          INK2_BLOCK_SPAN ||
+      (int)json_req_num(tc, "n_routed_experts", path) != INK2_EXPERTS ||
+      (int)json_req_num(tc, "num_experts_per_tok", path) != INK2_TOPK ||
+      (int)json_req_num(tc, "intermediate_size", path) != INK2_INTER ||
+      (int)json_req_num(tc, "log_scaling_n_floor", path) != LOG_SCALING_FLOOR)
+    die("%s: Inkling-2-Mini text_config dimensions do not match", path);
+
+  if (fabs(json_req_num(tc, "log_scaling_alpha", path) - LOG_SCALING_ALPHA) >
+          1e-6 ||
+      fabs(json_req_num(tc, "qk_l2_clip_threshold", path) - QK_L2_CLIP) >
+          1e-5 ||
+      fabs(json_req_num(tc, "rel_l2_clip_threshold", path) - REL_L2_CLIP) >
+          1e-5 ||
+      fabs(json_req_num(tc, "mlp_gate_softcap", path) - GATE_SOFTCAP) > 1e-5 ||
+      fabs(json_req_num(tc, "mlp_up_softcap", path) - UP_SOFTCAP) > 1e-5 ||
+      fabs(json_req_num(tc, "route_scale", path) - ROUTE_SCALE) > 1e-5 ||
+      fabs(json_req_num(tc, "final_logit_softcapping", path) - LOGIT_SOFTCAP) >
+          1e-5)
+    die("%s: Inkling-2-Mini text_config scaling constants do not match", path);
+
+  const Json *lc = json_get(tc, "loop_config");
+  if (!lc || (int)json_req_num(lc, "core_start", path) != INK2_CORE_START ||
+      (int)json_req_num(lc, "core_end", path) != INK2_CORE_END ||
+      (int)json_req_num(lc, "num_passes", path) != INK2_LOOP_PASSES ||
+      (int)json_req_num(lc, "gate_rank", path) != INK2_GATE_RANK)
+    die("%s: Inkling-2-Mini loop_config does not match", path);
+
+  json_free(root);
+  free(text);
+}
+
+// Adds a raw tensor to text_weights, enabling aligned direct reads when large
+// and 16-byte aligned in the safetensors file.
+static void add_raw(Buf *dst, Tensor t) {
+  int aligned =
+      t.size >= ALIGN_READ_MIN_BYTES && (t.off & ALIGN_MASK) == 0 ? 1 : 0;
+  weight_group_add_tensor(text_weights, dst, t, aligned);
+}
+
+// Adds a BF16 linear projection tensor [n, k] to text_weights and validates its
+// dtype and shape.
+static void add_bf16_lin(Bf16Lin *lin, Tensor t, int n, int k) {
+  if (t.dtype != 'b' || t.ndim != 2 || t.shape[0] != n || t.shape[1] != k)
+    die("unexpected BF16 linear tensor shape (%lldx%lld, expected %dx%d)",
+        (long long)t.shape[0], (long long)t.shape[1], n, k);
+  lin->n = n;
+  lin->k = k;
+  add_raw(&lin->w, t);
+}
+
+// Computes the per-expert NVFP4 FP32 scale factors amax[e] / denom[0].
+static void fill_nvfp4_factor(Buf *buf, const void *ctx) {
+  const FactorFillParam *p = ctx;
+  float amax[INK2_EXPERTS], denom = 1.0f;
+  read_tensor_exact(p->amax, amax);
+  read_tensor_exact(p->denom, &denom);
+  float *dst = (float *)buf->ptr;
+  for (int e = 0; e < INK2_EXPERTS; e++) dst[e] = amax[e] / denom;
+}
+
+// Merges middle_cycle_cross_pass_queries ([12, 2, 2304] Q/MLP) and
+// middle_cycle_cross_pass_kv_queries ([12, 2, 2304] K/V) into [12, 4, 2304]
+// in [Q, K, V, MLP] order matching Inkling2LoopMergeMessageQueries.
+static void fill_msg_queries(Buf *buf, const void *ctx) {
+  const MsgQueryFillParam *p = ctx;
+  size_t half_floats = (size_t)INK2_CORE_LAYERS * 2 * INK2_DIM;
+  float *qm = xmalloc(half_floats * sizeof(float));
+  float *kv = xmalloc(half_floats * sizeof(float));
+  read_tensor_exact(p->q_mlp, qm);
+  read_tensor_exact(p->kv, kv);
+  float *dst = (float *)buf->ptr;
+  for (int li = 0; li < INK2_CORE_LAYERS; li++) {
+    float *out = dst + (size_t)li * INK2_MSG_COUNT * INK2_DIM;
+    const float *q_src = qm + (size_t)(li * 2) * INK2_DIM;
+    const float *mlp_src = qm + (size_t)(li * 2 + 1) * INK2_DIM;
+    const float *k_src = kv + (size_t)(li * 2) * INK2_DIM;
+    const float *v_src = kv + (size_t)(li * 2 + 1) * INK2_DIM;
+    memcpy(out + (size_t)0 * INK2_DIM, q_src, INK2_DIM * sizeof(float));
+    memcpy(out + (size_t)1 * INK2_DIM, k_src, INK2_DIM * sizeof(float));
+    memcpy(out + (size_t)2 * INK2_DIM, v_src, INK2_DIM * sizeof(float));
+    memcpy(out + (size_t)3 * INK2_DIM, mlp_src, INK2_DIM * sizeof(float));
+  }
+  free(qm);
+  free(kv);
+}
+
+// Registers one loop layer's message controller tensors in text_weights.
+static void add_controller(MsgController *c, int l, const char *name) {
+  add_bf16_lin(&c->down,
+               tensor_index_get(
+                   checkpoint, "model.llm.layers.%d.controllers.%s.down_weight",
+                   l, name),
+               INK2_GATE_RANK, 2 * INK2_DIM);
+  add_raw(&c->forget_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.controllers.%s.forget_weight",
+                           l, name));
+  add_raw(&c->gain_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.controllers.%s.gain_weight", l,
+                           name));
+}
+
+// Registers every text backbone weight tensor in text_weights.
+static void register_text_weights(void) {
+  add_raw(&embed_w, tensor_index_get(checkpoint, "model.llm.embed.weight"));
+  weight_group_add_vector(
+      text_weights, &embed_norm,
+      tensor_index_get(checkpoint, "model.llm.embed_norm.weight"), 0.0f, 0);
+  weight_group_add_vector(
+      text_weights, &output_query,
+      tensor_index_get(checkpoint, "model.llm.attn_res.output_query"), 0.0f, 0);
+  weight_group_add_vector(text_weights, &final_norm,
+                          tensor_index_get(checkpoint, "model.llm.norm.weight"),
+                          0.0f, 0);
+  add_raw(&unembed_w, tensor_index_get(checkpoint, "model.llm.unembed.weight"));
+
+  MsgQueryFillParam mqp = {
+      .q_mlp = tensor_index_get(checkpoint,
+                                "model.llm.middle_cycle_cross_pass_queries"),
+      .kv = tensor_index_get(checkpoint,
+                             "model.llm.middle_cycle_cross_pass_kv_queries")};
+  weight_group_add_generated(text_weights, &msg_queries,
+                             (size_t)INK2_CORE_LAYERS * INK2_MSG_COUNT *
+                                 INK2_DIM * sizeof(float),
+                             fill_msg_queries, &mqp, sizeof mqp);
+
+  for (int l = 0; l < INK2_PHYS_LAYERS; l++) {
+    PhysLayer *pl = &layers[l];
+    pl->is_global = (l % INK2_BLOCK_SPAN) == (INK2_BLOCK_SPAN - 1);
+    pl->is_loop = (l >= INK2_CORE_START && l < INK2_CORE_END);
+    pl->is_nvfp4 = (l < INK2_NVFP4_LAYERS);
+
+    // attn_queries.{l - 1} maps to physical layer l (layer 0 has none).
+    if (l > 0)
+      weight_group_add_vector(
+          text_weights, &pl->attn_query,
+          tensor_index_get(checkpoint, "model.llm.attn_res.attn_queries.%d",
+                           l - 1),
+          0.0f, 0);
+    weight_group_add_vector(
+        text_weights, &pl->mlp_query,
+        tensor_index_get(checkpoint, "model.llm.attn_res.mlp_queries.%d", l),
+        0.0f, 0);
+
+    if (pl->is_global) {
+      weight_group_add_vector(
+          text_weights, &pl->q_norm,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.q_input_norm.weight", l),
+          0.0f, 0);
+      weight_group_add_vector(
+          text_weights, &pl->k_norm,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.k_input_norm.weight", l),
+          0.0f, 0);
+      weight_group_add_vector(
+          text_weights, &pl->v_norm,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.v_input_norm.weight", l),
+          0.0f, 0);
+    } else {
+      weight_group_add_vector(
+          text_weights, &pl->attn_norm,
+          tensor_index_get(checkpoint, "model.llm.layers.%d.attn_norm.weight",
+                           l),
+          0.0f, 0);
+    }
+    weight_group_add_vector(
+        text_weights, &pl->mlp_norm,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.mlp_norm.weight", l),
+        0.0f, 0);
+
+    if (pl->is_loop) {
+      add_controller(&pl->ctrl_q, l, "attn");
+      add_controller(&pl->ctrl_k, l, "k");
+      add_controller(&pl->ctrl_v, l, "v");
+      add_controller(&pl->ctrl_mlp, l, "mlp");
+    }
+
+    add_bf16_lin(&pl->wq,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.wq_du.weight", l),
+                 INK2_Q_DIM, INK2_DIM);
+    add_bf16_lin(&pl->wk,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.wk_dv.weight", l),
+                 INK2_KV_DIM, INK2_DIM);
+    add_bf16_lin(&pl->wv,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.wv_dv.weight", l),
+                 INK2_KV_DIM, INK2_DIM);
+    add_bf16_lin(&pl->wr,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.wr_du.weight", l),
+                 INK2_R_DIM, INK2_DIM);
+    add_bf16_lin(&pl->gate_attn,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.gate_attn.weight",
+                                  l),
+                 INK2_Q_DIM, INK2_DIM);
+    add_bf16_lin(
+        &pl->sink_proj,
+        tensor_index_get(checkpoint,
+                         "model.llm.layers.%d.attn.attn_sink_proj.weight", l),
+        INK2_HEADS, INK2_DIM);
+    add_bf16_lin(&pl->wo,
+                 tensor_index_get(checkpoint,
+                                  "model.llm.layers.%d.attn.wo_ud.weight", l),
+                 INK2_DIM, INK2_Q_DIM);
+
+    add_raw(&pl->rel_proj,
+            tensor_index_get(checkpoint,
+                             "model.llm.layers.%d.attn.rel_logits_proj.proj",
+                             l));
+    weight_group_add_vector(
+        text_weights, &pl->q_clip_scale,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.attn.q_l2_clip.scale",
+                         l),
+        0.0f, 0);
+    weight_group_add_vector(
+        text_weights, &pl->rel_clip_scale,
+        tensor_index_get(checkpoint,
+                         "model.llm.layers.%d.attn.rel_l2_clip.scale", l),
+        0.0f, 0);
+
+    if (pl->is_global) {
+      weight_group_add_vector(
+          text_weights, &pl->k_sconv_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.k_sconv.static_w", l),
+          0.0f, 0);
+      add_bf16_lin(
+          &pl->k_sconv_proj,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.k_sconv.weight_proj", l),
+          INK2_SCONV_DYN_DIM, INK2_DIM);
+      weight_group_add_vector(
+          text_weights, &pl->v_sconv_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.v_sconv.static_w", l),
+          0.0f, 0);
+      add_bf16_lin(
+          &pl->v_sconv_proj,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.v_sconv.weight_proj", l),
+          INK2_SCONV_DYN_DIM, INK2_DIM);
+    } else {
+      weight_group_add_vector(
+          text_weights, &pl->k_sconv_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.k_sconv.weight", l),
+          0.0f, 0);
+      weight_group_add_vector(
+          text_weights, &pl->v_sconv_w,
+          tensor_index_get(checkpoint,
+                           "model.llm.layers.%d.attn.v_sconv.weight", l),
+          0.0f, 0);
+    }
+
+    weight_group_add_vector(
+        text_weights, &pl->attn_sconv_w,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.attn_sconv.weight",
+                         l),
+        0.0f, 0);
+    weight_group_add_vector(
+        text_weights, &pl->mlp_sconv_w,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.mlp_sconv.weight", l),
+        0.0f, 0);
+
+    add_bf16_lin(
+        &pl->router_w,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.mlp.gate.weight", l),
+        INK2_EXPERTS, INK2_DIM);
+    weight_group_add_vector(
+        text_weights, &pl->router_bias,
+        tensor_index_get(checkpoint, "model.llm.layers.%d.mlp.gate.bias", l),
+        0.0f, 0);
+
+    add_raw(&pl->w13,
+            tensor_index_get(checkpoint,
+                             "model.llm.layers.%d.mlp.experts.w13_weight", l));
+    add_raw(&pl->s13,
+            tensor_index_get(checkpoint,
+                             "model.llm.layers.%d.mlp.experts.w13_weight_scale",
+                             l));
+    add_raw(&pl->w2,
+            tensor_index_get(checkpoint,
+                             "model.llm.layers.%d.mlp.experts.w2_weight", l));
+    add_raw(&pl->s2, tensor_index_get(
+                         checkpoint,
+                         "model.llm.layers.%d.mlp.experts.w2_weight_scale", l));
+
+    if (pl->is_nvfp4) {
+      FactorFillParam f13 = {
+          .amax = tensor_index_get(
+              checkpoint, "model.llm.layers.%d.mlp.experts.w13_weight_amax", l),
+          .denom = tensor_index_get(checkpoint,
+                                    "model.llm.layers.%d.mlp.experts.w13_"
+                                    "weight_outer_scale_denominator",
+                                    l)};
+      FactorFillParam f2 = {
+          .amax = tensor_index_get(
+              checkpoint, "model.llm.layers.%d.mlp.experts.w2_weight_amax", l),
+          .denom = tensor_index_get(checkpoint,
+                                    "model.llm.layers.%d.mlp.experts.w2_weight_"
+                                    "outer_scale_denominator",
+                                    l)};
+      weight_group_add_generated(text_weights, &pl->f13,
+                                 (size_t)INK2_EXPERTS * sizeof(float),
+                                 fill_nvfp4_factor, &f13, sizeof f13);
+      weight_group_add_generated(text_weights, &pl->f2,
+                                 (size_t)INK2_EXPERTS * sizeof(float),
+                                 fill_nvfp4_factor, &f2, sizeof f2);
+    }
+  }
+}
+
+// ---- workspace management ----
+
+// Returns the approximate GPU workspace byte count required for `rows` tokens.
+static uint64_t estimate_work_bytes(int rows) {
+  int q_stride = align_up(rows, PREFILL_Q_PAD);
+  int npairs = rows * INK2_TOPK;
+  int max_tiles = npairs + INK2_EXPERTS;
+  int part_rows = rows < INK2_MAX_VERIFY ? rows : INK2_MAX_VERIFY;
+  uint64_t bytes = 0;
+  bytes += gpu_round_up_to_pages((size_t)rows * sizeof(int32_t));
+  bytes += 6 * gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)INK2_MAX_BLOCKS * rows * INK2_DIM *
+                                 sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)INK2_MSG_COUNT * rows * INK2_DIM *
+                                 sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * rows *
+                                 INK2_DIM * sizeof(float));
+  bytes += 3 * gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)rows * 2 * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)rows * INK2_GATE_RANK * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
+  bytes += 3 * gpu_round_up_to_pages((size_t)rows * INK2_Q_DIM * sizeof(float));
+  bytes +=
+      4 * gpu_round_up_to_pages((size_t)rows * INK2_KV_DIM * sizeof(float));
+  bytes +=
+      gpu_round_up_to_pages((size_t)rows * INK2_SCONV_DYN_DIM * sizeof(float));
+  bytes += 2 * gpu_round_up_to_pages((size_t)rows * INK2_R_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)rows * INK2_HEADS * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)INK2_HEADS * q_stride * INK2_HEAD_DIM *
+                                 sizeof(uint16_t));
+  bytes += gpu_round_up_to_pages((size_t)rows * INK2_HEADS * INK2_REL_EXTENT *
+                                 sizeof(float));
+  bytes +=
+      gpu_round_up_to_pages((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
+                            DECODE_PART_FLOATS * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)rows * INK2_EXPERTS * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(uint32_t));
+  bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(float));
+  bytes += 2 * gpu_round_up_to_pages((size_t)npairs * sizeof(int32_t));
+  bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)max_tiles * sizeof(Ink2MoeTile));
+  bytes += gpu_round_up_to_pages((size_t)(npairs + MOE_MM_TILE) * INK2_DIM *
+                                 sizeof(uint16_t));
+  bytes += gpu_round_up_to_pages((size_t)(npairs + MOE_MM_TILE) * INK2_INTER *
+                                 sizeof(uint16_t));
+  bytes += gpu_round_up_to_pages((size_t)npairs * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)LOGITS_STRIDE * sizeof(float));
+  return bytes;
+}
+
+// Marks all buffers in w to be freed once prior GPU commands finish.
+static void free_work(Ink2Work *w) {
+  Buf *list[] = {
+      &w->ids,          &w->cur,       &w->cur2,         &w->residual,
+      &w->pre_loop_cur, &w->prev_blk,  &w->prev_cur,     &w->blk,
+      &w->msg,          &w->attn_in,   &w->q_in,         &w->k_in,
+      &w->v_in,         &w->msg_cat,   &w->msg_g,        &w->msg_gated,
+      &w->q_raw,        &w->k_raw,     &w->k_conv,       &w->v_raw,
+      &w->v_conv,       &w->dyn_w,     &w->r_raw,        &w->r_out,
+      &w->gate,         &w->sink,      &w->q_hm,         &w->rel_bias,
+      &w->part,         &w->attn_out,  &w->route_logits, &w->route_ids,
+      &w->route_w,      &w->ptok,      &w->pw,           &w->tp,
+      &w->tiles,        &w->x_bf16,    &w->h_bf16,       &w->y_pair,
+      &w->logits,       &w->sconv_tgt, &w->kv_tgt};
+  for (size_t i = 0; i < sizeof list / sizeof *list; i++)
+    if (list[i]->obj) gpu_mark_to_free(list[i]);
+  *w = (Ink2Work){0};
+}
+
+// Ensures the pass-local workspace holds at least `rows` active rows and
+// `logits_rows` rows in the output logits buffer.
+static void ensure_work(int rows, int logits_rows) {
+  if (rows > work.cap_rows) {
+    int new_cap = rows <= INK2_MAX_VERIFY ? INK2_MAX_VERIFY : PREFILL_CHUNK;
+    if (rows > new_cap) new_cap = rows;
+    int old_logits_rows = work.logits_rows;
+    Buf old_logits = work.logits;
+    work.logits = (Buf){0};
+    free_work(&work);
+    work.cap_rows = new_cap;
+    work.q_stride = align_up(new_cap, PREFILL_Q_PAD);
+    int npairs = new_cap * INK2_TOPK;
+    int max_tiles = npairs + INK2_EXPERTS;
+    int part_rows = new_cap < INK2_MAX_VERIFY ? new_cap : INK2_MAX_VERIFY;
+
+    work.ids = work_alloc((size_t)new_cap * sizeof(int32_t));
+    work.cur = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.cur2 = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.residual = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.pre_loop_cur = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.prev_blk = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.prev_cur = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.blk = work_alloc((size_t)INK2_MAX_BLOCKS * new_cap * INK2_DIM *
+                          sizeof(float));
+    work.msg =
+        work_alloc((size_t)INK2_MSG_COUNT * new_cap * INK2_DIM * sizeof(float));
+    work.attn_in = work_alloc((size_t)ATTNRES_GLOBAL_QUERIES * new_cap *
+                              INK2_DIM * sizeof(float));
+    work.q_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.k_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.v_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.msg_cat = work_alloc((size_t)new_cap * 2 * INK2_DIM * sizeof(float));
+    work.msg_g = work_alloc((size_t)new_cap * INK2_GATE_RANK * sizeof(float));
+    work.msg_gated = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.q_raw = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
+    work.k_raw = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
+    work.k_conv = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
+    work.v_raw = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
+    work.v_conv = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
+    work.dyn_w =
+        work_alloc((size_t)new_cap * INK2_SCONV_DYN_DIM * sizeof(float));
+    work.r_raw = work_alloc((size_t)new_cap * INK2_R_DIM * sizeof(float));
+    work.r_out = work_alloc((size_t)new_cap * INK2_R_DIM * sizeof(float));
+    work.gate = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
+    work.sink = work_alloc((size_t)new_cap * INK2_HEADS * sizeof(float));
+    work.q_hm = work_alloc((size_t)INK2_HEADS * work.q_stride * INK2_HEAD_DIM *
+                           sizeof(uint16_t));
+    work.rel_bias = work_alloc((size_t)new_cap * INK2_HEADS * INK2_REL_EXTENT *
+                               sizeof(float));
+    work.part = work_alloc((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
+                           DECODE_PART_FLOATS * sizeof(float));
+    work.attn_out = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
+    work.route_logits =
+        work_alloc((size_t)new_cap * INK2_EXPERTS * sizeof(float));
+    work.route_ids = work_alloc((size_t)npairs * sizeof(uint32_t));
+    work.route_w = work_alloc((size_t)npairs * sizeof(float));
+    work.ptok = work_alloc((size_t)npairs * sizeof(int32_t));
+    work.pw = work_alloc((size_t)npairs * sizeof(float));
+    work.tp = work_alloc((size_t)npairs * sizeof(int32_t));
+    work.tiles = work_alloc((size_t)max_tiles * sizeof(Ink2MoeTile));
+    work.x_bf16 = work_alloc((size_t)(npairs + MOE_MM_TILE) * INK2_DIM *
+                             sizeof(uint16_t));
+    work.h_bf16 = work_alloc((size_t)(npairs + MOE_MM_TILE) * INK2_INTER *
+                             sizeof(uint16_t));
+    work.y_pair = work_alloc((size_t)npairs * INK2_DIM * sizeof(float));
+    work.sconv_tgt =
+        work_alloc((size_t)INK2_TOTAL_LAYERS * SCONV_RINGS_PER_LAYER *
+                   INK2_MAX_BATCH_ROWS * sizeof(SconvTarget));
+    work.kv_tgt = work_alloc((size_t)INK2_TOTAL_LAYERS * INK2_MAX_BATCH_ROWS *
+                             sizeof(KvTarget));
+    work.logits = old_logits;
+    work.logits_rows = old_logits_rows;
+  }
+  if (logits_rows > work.logits_rows) {
+    if (work.logits.obj) gpu_mark_to_free(&work.logits);
+    work.logits =
+        work_alloc((size_t)logits_rows * LOGITS_STRIDE * sizeof(float));
+    work.logits_rows = logits_rows;
+  }
+}
+
+// ---- state and snapshot management ----
+
+// Returns the next power-of-two capacity holding `positions` tokens, capped at
+// opt.ctx.
+static int grown_cap(int positions) {
+  int cap = START_CAP;
+  while (cap < positions && cap < opt.ctx) cap *= 2;
+  if (cap > opt.ctx) cap = opt.ctx;
+  if (cap < positions)
+    die("sequence length %d exceeds context limit %d", positions, opt.ctx);
+  return cap;
+}
+
+// Resizes the 8 global KV buffer pairs of s to hold `new_cap` rows, preserving
+// the first `keep` rows. Returns 1 on success or 0 on memory refusal.
+static int state_resize_global(Ink2State *s, int new_cap, int keep) {
+  size_t new_bytes = (size_t)new_cap * GLOBAL_KV_ROW_BYTES;
+  size_t copy_bytes = (size_t)keep * GLOBAL_KV_ROW_BYTES;
+  Buf nk[INK2_GLOBAL_COUNT] = {0}, nv[INK2_GLOBAL_COUNT] = {0};
+  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
+    nk[i] = state_try_alloc(new_bytes);
+    nv[i] = nk[i].obj ? state_try_alloc(new_bytes) : (Buf){0};
+    if (!nv[i].obj) {
+      for (int j = 0; j <= i; j++) {
+        if (nk[j].obj) gpu_free(&nk[j]);
+        if (nv[j].obj) gpu_free(&nv[j]);
+      }
+      return 0;
+    }
+    if (copy_bytes && s->gk[i].obj) {
+      memcpy(nk[i].ptr, s->gk[i].ptr, copy_bytes);
+      memcpy(nv[i].ptr, s->gv[i].ptr, copy_bytes);
+    }
+  }
+  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
+    if (s->gk[i].obj) gpu_mark_to_free(&s->gk[i]);
+    if (s->gv[i].obj) gpu_mark_to_free(&s->gv[i]);
+    s->gk[i] = nk[i];
+    s->gv[i] = nv[i];
+  }
+  s->cap = new_cap;
+  return 1;
+}
+
+// Ensures s holds at least `need` positions in its global KV caches.
+static void state_ensure_cap(Ink2State *s, int need) {
+  if (need <= s->cap) return;
+  model_sync();
+  int next = grown_cap(need);
+  if (!state_resize_global(s, next, s->cap))
+    die("out of memory growing Inkling-2-Mini KV cache to %d tokens", next);
+}
+
+// Allocates a new Ink2State, or returns null when memory does not fit.
+static ModelState *ink2_state_new(void) {
+  Ink2State *s = xmalloc(sizeof *s);
+  *s = (Ink2State){0};
+  s->slide_kv = state_try_alloc(SLIDE_KV_BYTES);
+  s->conv_ring = s->slide_kv.obj ? state_try_alloc(CONV_TOTAL_BYTES) : (Buf){0};
+  if (!s->conv_ring.obj || !state_resize_global(s, grown_cap(1), 0)) {
+    if (s->slide_kv.obj) gpu_free(&s->slide_kv);
+    if (s->conv_ring.obj) gpu_free(&s->conv_ring);
+    free(s);
+    return NULL;
+  }
+  memset(s->slide_kv.ptr, 0, SLIDE_KV_BYTES);
+  memset(s->conv_ring.ptr, 0, CONV_TOTAL_BYTES);
+  return (ModelState *)s;
+}
+
+// Frees an Ink2State and its GPU buffers.
+static void ink2_state_free(ModelState *ms) {
+  Ink2State *s = (Ink2State *)ms;
+  if (!s) return;
+  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
+    if (s->gk[i].obj) gpu_mark_to_free(&s->gk[i]);
+    if (s->gv[i].obj) gpu_mark_to_free(&s->gv[i]);
+  }
+  if (s->slide_kv.obj) gpu_mark_to_free(&s->slide_kv);
+  if (s->conv_ring.obj) gpu_mark_to_free(&s->conv_ring);
+  free(s);
+}
+
+// Returns the byte footprint of state s (or a new state when s is null) at
+// `positions` tokens.
+static size_t ink2_state_bytes(const ModelState *ms, int positions) {
+  const Ink2State *s = (const Ink2State *)ms;
+  int cap = s ? s->cap : grown_cap(positions > 0 ? positions : 1);
+  if (positions > cap) cap = grown_cap(positions);
+  size_t gk_one = gpu_round_up_to_pages((size_t)cap * GLOBAL_KV_ROW_BYTES);
+  return (size_t)INK2_GLOBAL_COUNT * 2 * gk_one +
+         gpu_round_up_to_pages(SLIDE_KV_BYTES) +
+         gpu_round_up_to_pages(CONV_TOTAL_BYTES);
+}
+
+// Writes the 16 growing global KV regions of s. When fill is nonzero, grows s
+// to hold `positions` tokens first.
+static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
+                                    StateRegion *out) {
+  Ink2State *s = (Ink2State *)ms;
+  if (positions < 0 || (!fill && positions > s->cap))
+    die("invalid Inkling-2-Mini state regions for %d positions", positions);
+  model_sync();
+  if (fill) {
+    int cap = grown_cap(positions > 0 ? positions : 1);
+    if (s->cap != cap && !state_resize_global(s, cap, 0))
+      die("out of memory sizing Inkling-2-Mini state to %d tokens", cap);
+  }
+  int n = 0;
+  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
+    out[n++] =
+        (StateRegion){s->gk[i].ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+    out[n++] =
+        (StateRegion){s->gv[i].ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+  }
+  return n;
+}
+
+// Copies the growing global KV rows before `positions` from src into dst.
+static void ink2_state_copy(ModelState *dst_ms, const ModelState *src_ms,
+                            int positions) {
+  if (dst_ms == src_ms) die("cannot copy an Inkling-2-Mini state onto itself");
+  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
+  int n = ink2_write_state_regions(dst_ms, positions, 1, to);
+  ink2_write_state_regions((ModelState *)src_ms, positions, 0, from);
+  regions_copy(to, from, n, positions);
+}
+
+// Captures the rolling sliding-window KV and short-convolution state of s at
+// `pos`, along with optional logits.
+static ModelSnapshot *ink2_snapshot_take(ModelState *ms, int pos,
+                                         const float *lg) {
+  Ink2State *s = (Ink2State *)ms;
+  model_sync();
+  Ink2Snapshot *x = xmalloc(sizeof *x);
+  *x = (Ink2Snapshot){
+      .pos = pos,
+      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+  memcpy(x->rows, s->slide_kv.ptr, SLIDE_KV_BYTES);
+  memcpy(x->rows + SLIDE_KV_BYTES, s->conv_ring.ptr, CONV_TOTAL_BYTES);
+  if (lg) {
+    x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
+    memcpy(x->logits, lg, LOGITS_BYTES);
+  }
+  return (ModelSnapshot *)x;
+}
+
+// Restores rolling sliding-window KV and short-convolution state from x into s.
+static void ink2_snapshot_restore(ModelState *ms, const ModelSnapshot *mx) {
+  Ink2State *s = (Ink2State *)ms;
+  const Ink2Snapshot *x = (const Ink2Snapshot *)mx;
+  model_sync();
+  memcpy(s->slide_kv.ptr, x->rows, SLIDE_KV_BYTES);
+  memcpy(s->conv_ring.ptr, x->rows + SLIDE_KV_BYTES, CONV_TOTAL_BYTES);
+}
+
+// Frees a snapshot and its host buffers.
+static void ink2_snapshot_free(ModelSnapshot *mx) {
+  Ink2Snapshot *x = (Ink2Snapshot *)mx;
+  if (!x) return;
+  memory_host_free(&state_slot, x->rows);
+  memory_host_free(&state_slot, x->logits);
+  free(x);
+}
+
+// Returns the byte footprint of one snapshot.
+static size_t ink2_snapshot_bytes(int with_logits) {
+  return SNAP_ROLLING_BYTES + (with_logits ? LOGITS_BYTES : 0);
+}
+
+// Returns the saved logits of snapshot x, or null if none were saved.
+static const float *ink2_snapshot_logits(const ModelSnapshot *mx) {
+  const Ink2Snapshot *x = (const Ink2Snapshot *)mx;
+  return x->logits;
+}
+
+// Writes the serialized parts and metadata of snapshot x, or of state s's
+// live rolling rings when x is null.
+static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
+                                     SnapshotPart *out, int32_t *meta,
+                                     int *nmeta) {
+  model_sync();
+  Ink2Snapshot *x = (Ink2Snapshot *)mx;
+  Ink2State *s = (Ink2State *)ms;
+  *nmeta = 1;
+  int n = 0;
+  if (x) {
+    meta[0] = x->pos;
+    out[n++] = (SnapshotPart){x->rows, SNAP_ROLLING_BYTES};
+    if (x->logits) out[n++] = (SnapshotPart){x->logits, LOGITS_BYTES};
+    return n;
+  }
+  meta[0] = pos;
+  out[n++] = (SnapshotPart){s->slide_kv.ptr, SLIDE_KV_BYTES};
+  out[n++] = (SnapshotPart){s->conv_ring.ptr, CONV_TOTAL_BYTES};
+  return n;
+}
+
+// Allocates an empty snapshot matching the serialized metadata.
+static ModelSnapshot *ink2_snapshot_new_empty(const int32_t *meta, int nmeta,
+                                              int with_logits) {
+  if (nmeta != 1 || meta[0] < 0) return NULL;
+  Ink2Snapshot *x = xmalloc(sizeof *x);
+  *x = (Ink2Snapshot){
+      .pos = meta[0],
+      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+  if (with_logits)
+    x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
+  return (ModelSnapshot *)x;
+}
+
+// ---- GPU kernel dispatch helpers ----
+
+// Chooses split-K for mv_bf16 / mvm_bf16 to saturate the GPU on narrow output
+// projections.
+static uint32_t pick_mv_split(int n, int k) {
+  return (n < (int)BF16_MV_SPLIT_SMALL_N && k >= (int)BF16_MV_SPLIT_MIN_K)
+             ? BF16_MV_SPLIT_FACTOR
+             : 1u;
+}
+
+// Dispatches a single BF16 linear projection y = x @ w^T (optionally BF16-
+// rounded), choosing mv_bf16 (m = 1), mvm_bf16 (2 <= m <= 8, non-prefill), or
+// tiled mm_bf16 (m > 8 or prefill).
+static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
+                            const Buf *y, int m, int n, int k, int ldy,
+                            int round, int is_prefill) {
+  if (!is_prefill && m == 1) {
+    uint32_t split = pick_mv_split(n, k);
+    uint32_t rows_per_tg = (BF16_MV_SGS / split) * BF16_MV_ROWS_PER_SG;
+    MvParam p = {(uint32_t)n, (uint32_t)k,     (uint32_t)n,
+                 0,           (uint32_t)round, split};
+    gpu_select_kernel(c, K_mv_bf16);
+    gpu_bind_buffer(c, 0, w, 0);
+    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 3, y, 0);
+    gpu_copy_bytes(c, 4, &p, sizeof p);
+    gpu_run_kernel(c, ((uint32_t)n + rows_per_tg - 1u) / rows_per_tg, 1, 1,
+                   MV_THREADS, 1, 1);
+  } else if (!is_prefill && m <= INK2_MAX_BATCH_ROWS) {
+    uint32_t split = pick_mv_split(n, k);
+    uint32_t rows_per_tg = (BF16_MV_SGS / split) * BF16_MV_ROWS_PER_SG;
+    MvmParam p = {
+        {(uint32_t)n, (uint32_t)k, (uint32_t)n, 0, (uint32_t)round, split},
+        (uint32_t)m,
+        (uint32_t)k,
+        (uint32_t)ldy};
+    gpu_select_kernel(c, K_mvm_bf16);
+    gpu_bind_buffer(c, 0, w, 0);
+    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 3, y, 0);
+    gpu_copy_bytes(c, 4, &p, sizeof p);
+    gpu_run_kernel(c, ((uint32_t)n + rows_per_tg - 1u) / rows_per_tg, 1, 1,
+                   MV_THREADS, 1, 1);
+  } else {
+    MmParam p = {(uint32_t)m,     (uint32_t)n, (uint32_t)k,
+                 (uint32_t)round, (uint32_t)k, (uint32_t)ldy};
+    gpu_select_kernel(c, K_mm_bf16);
+    gpu_bind_buffer(c, 0, w, 0);
+    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 3, y, 0);
+    gpu_copy_bytes(c, 4, &p, sizeof p);
+    gpu_run_kernel(c, ((uint32_t)n + MOE_MM_TILE - 1u) / MOE_MM_TILE,
+                   ((uint32_t)m + MOE_MM_TILE - 1u) / MOE_MM_TILE, 1,
+                   MM_THREADS, 1, 1);
+  }
+}
+
+// Dispatches 3 BF16 linear projections sharing the same input x and width k in
+// one fused dispatch during decode (mv_bf16_3 / mvm_bf16_3), or 3 mm_bf16
+// calls during prefill or verify with m > 8.
+static void run_bf16_linear3(GpuCommandBuffer *c, const Bf16Lin *a,
+                             const Buf *ya, const Bf16Lin *b, const Buf *yb,
+                             const Bf16Lin *d, const Buf *yd, const Buf *x,
+                             int m, int round, int is_prefill) {
+  if (!is_prefill && m <= INK2_MAX_BATCH_ROWS) {
+    int max_n = a->n;
+    if (b->n > max_n) max_n = b->n;
+    if (d->n > max_n) max_n = d->n;
+    uint32_t rows_per_tg = BF16_MV_SGS * BF16_MV_ROWS_PER_SG;
+    uint32_t dims[3][2] = {{(uint32_t)a->n, (uint32_t)a->n},
+                           {(uint32_t)b->n, (uint32_t)b->n},
+                           {(uint32_t)d->n, (uint32_t)d->n}};
+    if (m == 1) {
+      MvParam p = {(uint32_t)max_n, (uint32_t)a->k,
+                   (uint32_t)max_n, 0,
+                   (uint32_t)round, 1u};
+      gpu_select_kernel(c, K_mv_bf16_3);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_bind_buffer(c, 8, &d->w, 0);
+      gpu_bind_buffer(c, 10, yd, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, ((uint32_t)max_n + rows_per_tg - 1u) / rows_per_tg, 3,
+                     1, MV_THREADS, 1, 1);
+    } else {
+      MvmParam p = {{(uint32_t)max_n, (uint32_t)a->k, (uint32_t)max_n, 0,
+                     (uint32_t)round, 1u},
+                    (uint32_t)m,
+                    (uint32_t)a->k,
+                    (uint32_t)max_n};
+      gpu_select_kernel(c, K_mvm_bf16_3);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_bind_buffer(c, 8, &d->w, 0);
+      gpu_bind_buffer(c, 10, yd, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, ((uint32_t)max_n + rows_per_tg - 1u) / rows_per_tg, 3,
+                     1, MV_THREADS, 1, 1);
+    }
+    return;
+  }
+  run_bf16_linear(c, &a->w, x, ya, m, a->n, a->k, a->n, round, is_prefill);
+  run_bf16_linear(c, &b->w, x, yb, m, b->n, b->k, b->n, round, is_prefill);
+  run_bf16_linear(c, &d->w, x, yd, m, d->n, d->k, d->n, round, is_prefill);
+}
+
+// Dispatches weighted RMSNorm on `rows` rows of INK2_DIM floats.
+static void run_rmsnorm(GpuCommandBuffer *c, const Buf *x, size_t x_off,
+                        const Buf *w, const Buf *y, int rows, int round) {
+  NormParam p = {(uint32_t)INK2_DIM, (uint32_t)round, RMS_EPS};
+  gpu_select_kernel(c, K_rmsnorm);
+  gpu_bind_buffer(c, 0, x, x_off);
+  gpu_bind_buffer(c, 1, w, 0);
+  gpu_bind_buffer(c, 2, y, 0);
+  gpu_copy_bytes(c, 3, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches Block Attention Residuals over `nblocks` stacked blocks and
+// `partial` using `nqueries` FP32 queries.
+static void run_attn_res(GpuCommandBuffer *c, const Buf *blocks,
+                         const Buf *partial, const Buf *queries, size_t q_off,
+                         const Buf *out, int rows, int block_stride,
+                         int nblocks, int nqueries, int out_stride) {
+  AttnResParam p = {(uint32_t)rows,
+                    (uint32_t)block_stride,
+                    (uint32_t)INK2_DIM,
+                    (uint32_t)nblocks,
+                    (uint32_t)nqueries,
+                    (uint32_t)out_stride,
+                    RMS_EPS};
+  gpu_select_kernel(c, K_attn_res);
+  gpu_bind_buffer(c, 0, blocks, 0);
+  gpu_bind_buffer(c, 1, partial, 0);
+  gpu_bind_buffer(c, 2, queries, q_off);
+  gpu_bind_buffer(c, 3, out, 0);
+  gpu_copy_bytes(c, 4, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches one loop message gate (h, m) -> out (FP32) using `ctrl`.
+static void run_msg_gate(GpuCommandBuffer *c, const Buf *h, size_t h_off,
+                         const Buf *m, size_t m_off, const MsgController *ctrl,
+                         const Buf *out, int rows, int is_prefill) {
+  MsgGateParam p = {(uint32_t)rows, (uint32_t)INK2_DIM,
+                    (uint32_t)INK2_GATE_RANK, RMS_EPS};
+  gpu_select_kernel(c, K_msg_cat_norm);
+  gpu_bind_buffer(c, 0, h, h_off);
+  gpu_bind_buffer(c, 1, m, m_off);
+  gpu_bind_buffer(c, 2, &work.msg_cat, 0);
+  gpu_copy_bytes(c, 3, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+
+  run_bf16_linear(c, &ctrl->down.w, &work.msg_cat, &work.msg_g, rows,
+                  ctrl->down.n, ctrl->down.k, ctrl->down.n, 1, is_prefill);
+
+  gpu_select_kernel(c, K_msg_gate_apply);
+  gpu_bind_buffer(c, 0, h, h_off);
+  gpu_bind_buffer(c, 1, m, m_off);
+  gpu_bind_buffer(c, 2, &work.msg_g, 0);
+  gpu_bind_buffer(c, 3, &ctrl->forget_w, 0);
+  gpu_bind_buffer(c, 4, &ctrl->gain_w, 0);
+  gpu_bind_buffer(c, 5, out, 0);
+  gpu_copy_bytes(c, 6, &p, sizeof p);
+  gpu_run_kernel(
+      c, ((uint32_t)INK2_DIM + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG,
+      (uint32_t)rows, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches a float buffer copy of `count` floats on the GPU.
+static void run_copy(GpuCommandBuffer *c, const Buf *src, size_t src_off,
+                     const Buf *dst, size_t dst_off, uint32_t count) {
+  gpu_select_kernel(c, K_copy);
+  gpu_bind_buffer(c, 0, src, src_off);
+  gpu_bind_buffer(c, 1, dst, dst_off);
+  gpu_copy_bytes(c, 2, &count, sizeof count);
+  gpu_run_kernel(c, (count + ELEM_THREADS - 1u) / ELEM_THREADS, 1, 1,
+                 ELEM_THREADS, 1, 1);
+}
+
+// Dispatches elementwise residual addition out = a + b with optional BF16
+// rounding.
+static void run_add(GpuCommandBuffer *c, const Buf *a, const Buf *b,
+                    const Buf *out, uint32_t count, int round) {
+  uint32_t args[2] = {count, (uint32_t)round};
+  gpu_select_kernel(c, K_add);
+  gpu_bind_buffer(c, 0, a, 0);
+  gpu_bind_buffer(c, 1, b, 0);
+  gpu_bind_buffer(c, 2, out, 0);
+  gpu_copy_bytes(c, 3, args, sizeof args);
+  gpu_run_kernel(c, (count + ELEM_THREADS - 1u) / ELEM_THREADS, 1, 1,
+                 ELEM_THREADS, 1, 1);
+}
+
+// Dispatches static short convolution and updates the ring buffer.
+static void run_sconv_static(GpuCommandBuffer *c, const Buf *x, const Buf *w,
+                             const Buf *y, const Ink2State *s, int visit,
+                             size_t ring_sub_off, int ring_kind, int rows,
+                             int dim, int pos0, int batched) {
+  SconvParam p = {(uint32_t)rows, (uint32_t)dim, (uint32_t)INK2_SCONV_RING,
+                  (uint32_t)pos0, 1u};
+  uint32_t gx = ((uint32_t)dim + SCONV_THREADS - 1u) / SCONV_THREADS;
+  if (batched) {
+    size_t tgt_off =
+        ((size_t)visit * SCONV_RINGS_PER_LAYER + (size_t)ring_kind) *
+        INK2_MAX_BATCH_ROWS * sizeof(SconvTarget);
+    gpu_select_kernel(c, K_sconv_static_batched);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &work.sconv_tgt, tgt_off);
+    gpu_bind_buffer(c, 2, w, 0);
+    gpu_bind_buffer(c, 3, y, 0);
+    gpu_copy_bytes(c, 4, &p, sizeof p);
+    gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+    return;
+  }
+  size_t roff = conv_ring_off(visit, ring_sub_off);
+  gpu_select_kernel(c, K_sconv_static);
+  gpu_bind_buffer(c, 0, x, 0);
+  gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+  gpu_bind_buffer(c, 2, w, 0);
+  gpu_bind_buffer(c, 3, y, 0);
+  gpu_copy_bytes(c, 4, &p, sizeof p);
+  gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+
+  if (rows > 1) {
+    uint32_t keep = (uint32_t)(rows < INK2_SCONV_RING ? rows : INK2_SCONV_RING);
+    gpu_select_kernel(c, K_sconv_ring_save);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+    gpu_copy_bytes(c, 2, &p, sizeof p);
+    gpu_run_kernel(c, gx, keep, 1, SCONV_THREADS, 1, 1);
+  }
+}
+
+// Dispatches dynamic short convolution (global layers' K and V) and updates
+// the ring buffer.
+static void run_sconv_dynamic(GpuCommandBuffer *c, const Buf *x,
+                              const Buf *static_w, const Buf *dyn_w,
+                              const Buf *y, const Ink2State *s, int visit,
+                              size_t ring_sub_off, int ring_kind, int rows,
+                              int pos0, int batched) {
+  SconvParam p = {(uint32_t)rows, (uint32_t)INK2_KV_DIM,
+                  (uint32_t)INK2_SCONV_RING, (uint32_t)pos0, 1u};
+  uint32_t gx = ((uint32_t)INK2_KV_DIM + SCONV_THREADS - 1u) / SCONV_THREADS;
+  if (batched) {
+    size_t tgt_off =
+        ((size_t)visit * SCONV_RINGS_PER_LAYER + (size_t)ring_kind) *
+        INK2_MAX_BATCH_ROWS * sizeof(SconvTarget);
+    gpu_select_kernel(c, K_sconv_dynamic_batched);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &work.sconv_tgt, tgt_off);
+    gpu_bind_buffer(c, 2, static_w, 0);
+    gpu_bind_buffer(c, 3, dyn_w, 0);
+    gpu_bind_buffer(c, 4, y, 0);
+    gpu_copy_bytes(c, 5, &p, sizeof p);
+    gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+    return;
+  }
+  size_t roff = conv_ring_off(visit, ring_sub_off);
+  gpu_select_kernel(c, K_sconv_dynamic);
+  gpu_bind_buffer(c, 0, x, 0);
+  gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+  gpu_bind_buffer(c, 2, static_w, 0);
+  gpu_bind_buffer(c, 3, dyn_w, 0);
+  gpu_bind_buffer(c, 4, y, 0);
+  gpu_copy_bytes(c, 5, &p, sizeof p);
+  gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+
+  if (rows > 1) {
+    uint32_t keep = (uint32_t)(rows < INK2_SCONV_RING ? rows : INK2_SCONV_RING);
+    gpu_select_kernel(c, K_sconv_ring_save);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+    gpu_copy_bytes(c, 2, &p, sizeof p);
+    gpu_run_kernel(c, gx, keep, 1, SCONV_THREADS, 1, 1);
+  }
+}
+
+// Encodes the routed MoE expert kernels given already-populated tile metadata.
+static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
+                               int rows, int ntiles, int run_mv, int run_mm) {
+  int npairs = rows * INK2_TOPK;
+  if (run_mm) {
+    uint32_t dim4 = INK2_DIM / VEC4_WIDTH;
+    gpu_select_kernel(c, K_moe_gather_bf16);
+    gpu_bind_buffer(c, 0, &work.q_in, 0);
+    gpu_bind_buffer(c, 1, &work.ptok, 0);
+    gpu_bind_buffer(c, 2, &work.x_bf16, 0);
+    gpu_copy_bytes(c, 3, &dim4, sizeof dim4);
+    gpu_run_kernel(c, (dim4 + COMBINE_THREADS - 1u) / COMBINE_THREADS,
+                   (uint32_t)npairs, 1, COMBINE_THREADS, 1, 1);
+  }
+  MoeParam mp13 = {
+      (uint32_t)INK2_W13_ROWS, (uint32_t)INK2_DIM, (uint32_t)npairs,
+      (uint32_t)ntiles,        GATE_SOFTCAP,       UP_SOFTCAP};
+  MoeParam mp2 = {(uint32_t)INK2_DIM, (uint32_t)INK2_INTER, (uint32_t)npairs,
+                  (uint32_t)ntiles,   GATE_SOFTCAP,         UP_SOFTCAP};
+  uint32_t gx13_mv =
+      ((uint32_t)INK2_W13_ROWS + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG;
+  uint32_t gx13_mm = ((uint32_t)INK2_W13_ROWS + MOE_MM_TILE - 1u) / MOE_MM_TILE;
+  uint32_t gx2_mv =
+      ((uint32_t)INK2_DIM + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG;
+  uint32_t gx2_mm = ((uint32_t)INK2_DIM + MOE_MM_TILE - 1u) / MOE_MM_TILE;
+
+  if (pl->is_nvfp4) {
+    if (run_mv) {
+      gpu_select_kernel(c, K_nv_up_mv);
+      gpu_bind_buffer(c, 0, &pl->w13, 0);
+      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_bind_buffer(c, 2, &pl->f13, 0);
+      gpu_bind_buffer(c, 3, &work.q_in, 0);
+      gpu_bind_buffer(c, 4, &work.ptok, 0);
+      gpu_bind_buffer(c, 5, &work.tiles, 0);
+      gpu_bind_buffer(c, 6, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 7, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_nv_up_mm);
+      gpu_bind_buffer(c, 0, &pl->w13, 0);
+      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_bind_buffer(c, 2, &pl->f13, 0);
+      gpu_bind_buffer(c, 3, &work.x_bf16, 0);
+      gpu_bind_buffer(c, 4, &work.tiles, 0);
+      gpu_bind_buffer(c, 5, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 6, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+    if (run_mv) {
+      gpu_select_kernel(c, K_nv_dn_mv);
+      gpu_bind_buffer(c, 0, &pl->w2, 0);
+      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_bind_buffer(c, 2, &pl->f2, 0);
+      gpu_bind_buffer(c, 3, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 4, &work.pw, 0);
+      gpu_bind_buffer(c, 5, &work.tiles, 0);
+      gpu_bind_buffer(c, 6, &work.y_pair, 0);
+      gpu_copy_bytes(c, 7, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_nv_dn_mm);
+      gpu_bind_buffer(c, 0, &pl->w2, 0);
+      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_bind_buffer(c, 2, &pl->f2, 0);
+      gpu_bind_buffer(c, 3, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 4, &work.pw, 0);
+      gpu_bind_buffer(c, 5, &work.tiles, 0);
+      gpu_bind_buffer(c, 6, &work.y_pair, 0);
+      gpu_copy_bytes(c, 7, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+  } else {
+    if (run_mv) {
+      gpu_select_kernel(c, K_mx_up_mv);
+      gpu_bind_buffer(c, 0, &pl->w13, 0);
+      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_bind_buffer(c, 2, &work.q_in, 0);
+      gpu_bind_buffer(c, 3, &work.ptok, 0);
+      gpu_bind_buffer(c, 4, &work.tiles, 0);
+      gpu_bind_buffer(c, 5, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 6, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_mx_up_mm);
+      gpu_bind_buffer(c, 0, &pl->w13, 0);
+      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_bind_buffer(c, 2, &work.x_bf16, 0);
+      gpu_bind_buffer(c, 3, &work.tiles, 0);
+      gpu_bind_buffer(c, 4, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 5, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+    if (run_mv) {
+      gpu_select_kernel(c, K_mx_dn_mv);
+      gpu_bind_buffer(c, 0, &pl->w2, 0);
+      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_bind_buffer(c, 2, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 3, &work.pw, 0);
+      gpu_bind_buffer(c, 4, &work.tiles, 0);
+      gpu_bind_buffer(c, 5, &work.y_pair, 0);
+      gpu_copy_bytes(c, 6, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_mx_dn_mm);
+      gpu_bind_buffer(c, 0, &pl->w2, 0);
+      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_bind_buffer(c, 2, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 3, &work.pw, 0);
+      gpu_bind_buffer(c, 4, &work.tiles, 0);
+      gpu_bind_buffer(c, 5, &work.y_pair, 0);
+      gpu_copy_bytes(c, 6, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+  }
+
+  MoeCombineParam mcp = {(uint32_t)rows, (uint32_t)INK2_DIM,
+                         (uint32_t)INK2_TOPK};
+  gpu_select_kernel(c, K_moe_combine);
+  gpu_bind_buffer(c, 0, &work.y_pair, 0);
+  gpu_bind_buffer(c, 1, &work.tp, 0);
+  gpu_bind_buffer(c, 2, &work.cur2, 0);
+  gpu_copy_bytes(c, 3, &mcp, sizeof mcp);
+  gpu_run_kernel(c, ((uint32_t)INK2_DIM + SCONV_THREADS - 1u) / SCONV_THREADS,
+                 (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+}
+
+// ---- forward pass ----
+
+// Runs one logical visit v (0..47) over `rows` tokens. When is_prefill is
+// nonzero, commits and syncs around router tile grouping and checks `wait`.
+// When is_prefill is zero (decode or verify), stays entirely on GPU in *cmd.
+static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
+                      int max_pos, const Ink2State *s, int batched,
+                      int is_prefill, int *nblocks, const PassWait *wait) {
+  const Ink2Visit *vis = &schedule[v];
+  const PhysLayer *pl = &layers[vis->phys];
+  size_t row_floats = (size_t)rows * INK2_DIM;
+  size_t stride_bytes = (size_t)work.cap_rows * INK2_DIM * sizeof(float);
+  int use_msg = (vis->loop_pass > 0);
+
+  if (use_msg) {
+    size_t q_off =
+        (size_t)vis->loop_idx * INK2_MSG_COUNT * INK2_DIM * sizeof(float);
+    run_attn_res(cmd, &work.prev_blk, &work.prev_cur, &msg_queries, q_off,
+                 &work.msg, rows, work.cap_rows, 1, INK2_MSG_COUNT,
+                 work.cap_rows);
+  }
+
+  // Attention input via AttnRes, optional loop message gates, and input norm.
+  const Buf *q_src = &work.q_in;
+  const Buf *k_src = &work.q_in;
+  const Buf *v_src = &work.q_in;
+  if (vis->phys == 0) {
+    run_rmsnorm(cmd, &work.cur, 0, &pl->attn_norm, &work.q_in, rows, 1);
+  } else if (pl->is_global) {
+    run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
+                 rows, work.cap_rows, *nblocks, ATTNRES_GLOBAL_QUERIES,
+                 work.cap_rows);
+    if (use_msg) {
+      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 0, &pl->ctrl_q,
+                   &work.msg_gated, rows, is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->q_norm, &work.q_in, rows, 1);
+
+      run_msg_gate(cmd, &work.attn_in, stride_bytes, &work.msg, stride_bytes,
+                   &pl->ctrl_k, &work.msg_gated, rows, is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->k_norm, &work.k_in, rows, 1);
+
+      run_msg_gate(cmd, &work.attn_in, 2 * stride_bytes, &work.msg,
+                   2 * stride_bytes, &pl->ctrl_v, &work.msg_gated, rows,
+                   is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->v_norm, &work.v_in, rows, 1);
+    } else {
+      run_rmsnorm(cmd, &work.attn_in, 0, &pl->q_norm, &work.q_in, rows, 1);
+      run_rmsnorm(cmd, &work.attn_in, stride_bytes, &pl->k_norm, &work.k_in,
+                  rows, 1);
+      run_rmsnorm(cmd, &work.attn_in, 2 * stride_bytes, &pl->v_norm, &work.v_in,
+                  rows, 1);
+    }
+    k_src = &work.k_in;
+    v_src = &work.v_in;
+  } else {
+    run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
+                 rows, work.cap_rows, *nblocks, 1, work.cap_rows);
+    if (use_msg) {
+      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 0, &pl->ctrl_q,
+                   &work.msg_gated, rows, is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.q_in, rows, 1);
+
+      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, stride_bytes, &pl->ctrl_k,
+                   &work.msg_gated, rows, is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.k_in, rows, 1);
+
+      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 2 * stride_bytes,
+                   &pl->ctrl_v, &work.msg_gated, rows, is_prefill);
+      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.v_in, rows, 1);
+      k_src = &work.k_in;
+      v_src = &work.v_in;
+    } else {
+      run_rmsnorm(cmd, &work.attn_in, 0, &pl->attn_norm, &work.q_in, rows, 1);
+    }
+  }
+
+  // Q, R, gate, sink, K and V projections and K/V short convolutions.
+  run_bf16_linear3(cmd, &pl->wq, &work.q_raw, &pl->gate_attn, &work.gate,
+                   &pl->wr, &work.r_raw, q_src, rows, 1, is_prefill);
+  if (!pl->is_global && !use_msg) {
+    run_bf16_linear3(cmd, &pl->wk, &work.k_raw, &pl->wv, &work.v_raw,
+                     &pl->sink_proj, &work.sink, q_src, rows, 1, is_prefill);
+    run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
+                     CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
+    run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
+                     CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+  } else {
+    run_bf16_linear(cmd, &pl->sink_proj.w, q_src, &work.sink, rows,
+                    pl->sink_proj.n, pl->sink_proj.k, pl->sink_proj.n, 1,
+                    is_prefill);
+    if (pl->is_global) {
+      run_bf16_linear(cmd, &pl->wk.w, k_src, &work.k_raw, rows, pl->wk.n,
+                      pl->wk.k, pl->wk.n, 1, is_prefill);
+      run_bf16_linear(cmd, &pl->k_sconv_proj.w, k_src, &work.dyn_w, rows,
+                      pl->k_sconv_proj.n, pl->k_sconv_proj.k,
+                      pl->k_sconv_proj.n, 1, is_prefill);
+      run_sconv_dynamic(cmd, &work.k_raw, &pl->k_sconv_w, &work.dyn_w,
+                        &work.k_conv, s, v, CONV_K_OFF, 0, rows, pos0, batched);
+
+      run_bf16_linear(cmd, &pl->wv.w, v_src, &work.v_raw, rows, pl->wv.n,
+                      pl->wv.k, pl->wv.n, 1, is_prefill);
+      run_bf16_linear(cmd, &pl->v_sconv_proj.w, v_src, &work.dyn_w, rows,
+                      pl->v_sconv_proj.n, pl->v_sconv_proj.k,
+                      pl->v_sconv_proj.n, 1, is_prefill);
+      run_sconv_dynamic(cmd, &work.v_raw, &pl->v_sconv_w, &work.dyn_w,
+                        &work.v_conv, s, v, CONV_V_OFF, 1, rows, pos0, batched);
+    } else {
+      run_bf16_linear(cmd, &pl->wk.w, k_src, &work.k_raw, rows, pl->wk.n,
+                      pl->wk.k, pl->wk.n, 1, is_prefill);
+      run_bf16_linear(cmd, &pl->wv.w, v_src, &work.v_raw, rows, pl->wv.n,
+                      pl->wv.k, pl->wv.n, 1, is_prefill);
+      run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
+                       CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
+      run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
+                       CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+    }
+  }
+
+  // Q/K/V/R head prep, KV cache store, and relative position bias projection.
+  const Buf *k_buf = pl->is_global ? &s->gk[vis->global_slot] : &s->slide_kv;
+  const Buf *v_buf = pl->is_global ? &s->gv[vis->global_slot] : &s->slide_kv;
+  size_t k_off = pl->is_global ? 0 : slide_ring_off(vis->slide_slot, 0);
+  size_t v_off = pl->is_global ? 0 : slide_ring_off(vis->slide_slot, 1);
+  uint32_t ring_rows = pl->is_global ? 0u : (uint32_t)INK2_SLIDE_RING;
+  size_t kv_tgt_off = (size_t)v * INK2_MAX_BATCH_ROWS * sizeof(KvTarget);
+
+  QkvrParam qp = {(uint32_t)rows, (uint32_t)work.q_stride, (uint32_t)pos0,
+                  ring_rows,      (uint32_t)pl->is_global, (uint32_t)batched};
+  gpu_select_kernel(cmd, K_qkvr_prep);
+  gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
+  gpu_bind_buffer(cmd, 1, &work.k_conv, 0);
+  gpu_bind_buffer(cmd, 2, &work.v_conv, 0);
+  gpu_bind_buffer(cmd, 3, &work.r_raw, 0);
+  gpu_bind_buffer(cmd, 4, &pl->q_clip_scale, 0);
+  gpu_bind_buffer(cmd, 5, &pl->rel_clip_scale, 0);
+  gpu_bind_buffer(cmd, 6, &work.q_hm, 0);
+  gpu_bind_buffer(cmd, 7, k_buf, k_off);
+  gpu_bind_buffer(cmd, 8, v_buf, v_off);
+  gpu_bind_buffer(cmd, 9, &work.r_out, 0);
+  gpu_bind_buffer(cmd, 10, &work.kv_tgt, kv_tgt_off);
+  gpu_copy_bytes(cmd, 11, &qp, sizeof qp);
+  gpu_run_kernel(cmd, QKVR_HEADS, (uint32_t)rows, 1, QKVR_THREADS, 1, 1);
+
+  RelBiasParam rbp = {(uint32_t)rows, (uint32_t)INK2_HEADS,
+                      (uint32_t)INK2_D_REL, (uint32_t)INK2_REL_EXTENT};
+  gpu_select_kernel(cmd, K_rel_bias);
+  gpu_bind_buffer(cmd, 0, &work.r_out, 0);
+  gpu_bind_buffer(cmd, 1, &pl->rel_proj, 0);
+  gpu_bind_buffer(cmd, 2, &work.rel_bias, 0);
+  gpu_copy_bytes(cmd, 3, &rbp, sizeof rbp);
+  gpu_run_kernel(cmd, (uint32_t)INK2_HEADS, (uint32_t)rows, 1, ROW_THREADS, 1,
+                 1);
+
+  // Attention: tiled MPP FlashAttention for prefill, FlashDecoding otherwise.
+  uint32_t window = pl->is_global ? 0u : (uint32_t)INK2_WINDOW;
+  if (is_prefill) {
+    AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
+                              (uint32_t)pos0, ring_rows, window};
+    gpu_select_kernel(cmd, K_attend_prefill);
+    gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
+    gpu_bind_buffer(cmd, 1, k_buf, k_off);
+    gpu_bind_buffer(cmd, 2, v_buf, v_off);
+    gpu_bind_buffer(cmd, 3, &work.rel_bias, 0);
+    gpu_bind_buffer(cmd, 4, &work.sink, 0);
+    gpu_bind_buffer(cmd, 5, &work.gate, 0);
+    gpu_bind_buffer(cmd, 6, &work.attn_out, 0);
+    gpu_copy_bytes(cmd, 7, &app, sizeof app);
+    gpu_run_kernel(cmd,
+                   ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP,
+                   (uint32_t)INK2_HEADS, 1, PREFILL_THREADS, 1, 1);
+  } else {
+    int total_k = max_pos + 1;
+    if (window && total_k > (int)window) total_k = (int)window;
+    int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
+    if (nparts < 1) nparts = 1;
+    if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
+    AttendDecodeParam adp = {(uint32_t)rows,
+                             (uint32_t)work.q_stride,
+                             (uint32_t)pos0,
+                             ring_rows,
+                             window,
+                             (uint32_t)nparts,
+                             (uint32_t)MAX_DECODE_PARTS,
+                             (uint32_t)batched};
+    gpu_select_kernel(cmd, K_attend_part);
+    gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
+    gpu_bind_buffer(cmd, 1, k_buf, k_off);
+    gpu_bind_buffer(cmd, 2, v_buf, v_off);
+    gpu_bind_buffer(cmd, 3, &work.rel_bias, 0);
+    gpu_bind_buffer(cmd, 4, &work.kv_tgt, kv_tgt_off);
+    gpu_bind_buffer(cmd, 5, &work.part, 0);
+    gpu_copy_bytes(cmd, 6, &adp, sizeof adp);
+    gpu_run_kernel(cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                   (uint32_t)rows, DECODE_THREADS, 1, 1);
+
+    gpu_select_kernel(cmd, K_attend_combine);
+    gpu_bind_buffer(cmd, 0, &work.part, 0);
+    gpu_bind_buffer(cmd, 1, &work.sink, 0);
+    gpu_bind_buffer(cmd, 2, &work.gate, 0);
+    gpu_bind_buffer(cmd, 3, &work.attn_out, 0);
+    gpu_copy_bytes(cmd, 4, &adp, sizeof adp);
+    gpu_run_kernel(cmd, (uint32_t)INK2_HEADS, (uint32_t)rows, 1,
+                   COMBINE_THREADS, 1, 1);
+  }
+
+  // Output projection and post-attention static short convolution.
+  run_bf16_linear(cmd, &pl->wo.w, &work.attn_out, &work.cur2, rows, pl->wo.n,
+                  pl->wo.k, pl->wo.n, 1, is_prefill);
+  run_sconv_static(cmd, &work.cur2, &pl->attn_sconv_w, &work.residual, s, v,
+                   CONV_ATTN_OFF, 2, rows, INK2_DIM, pos0, batched);
+
+  // Block boundary pushes previous block_residual to blk and resets residual.
+  if (vis->is_boundary) {
+    run_copy(cmd, &work.cur, 0, &work.blk, (size_t)(*nblocks) * stride_bytes,
+             (uint32_t)row_floats);
+    (*nblocks)++;
+  } else {
+    run_add(cmd, &work.cur, &work.residual, &work.residual,
+            (uint32_t)row_floats, 0);
+  }
+
+  // MLP input via AttnRes, optional loop message gate, and mlp_norm.
+  run_attn_res(cmd, &work.blk, &work.residual, &pl->mlp_query, 0, &work.attn_in,
+               rows, work.cap_rows, *nblocks, 1, work.cap_rows);
+  if (use_msg) {
+    run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 3 * stride_bytes,
+                 &pl->ctrl_mlp, &work.msg_gated, rows, is_prefill);
+    run_rmsnorm(cmd, &work.msg_gated, 0, &pl->mlp_norm, &work.q_in, rows, 1);
+  } else {
+    run_rmsnorm(cmd, &work.attn_in, 0, &pl->mlp_norm, &work.q_in, rows, 1);
+  }
+
+  // Router logits (FP32, unrounded) and biased top-8 selection.
+  run_bf16_linear(cmd, &pl->router_w.w, &work.q_in, &work.route_logits, rows,
+                  pl->router_w.n, pl->router_w.k, pl->router_w.n, 0,
+                  is_prefill);
+  RouteParam rp = {(uint32_t)rows, (uint32_t)INK2_EXPERTS, (uint32_t)INK2_TOPK,
+                   ROUTE_SCALE};
+  gpu_select_kernel(cmd, K_route_topk);
+  gpu_bind_buffer(cmd, 0, &work.route_logits, 0);
+  gpu_bind_buffer(cmd, 1, &pl->router_bias, 0);
+  gpu_bind_buffer(cmd, 2, &work.route_ids, 0);
+  gpu_bind_buffer(cmd, 3, &work.route_w, 0);
+  gpu_copy_bytes(cmd, 4, &rp, sizeof rp);
+  gpu_run_kernel(cmd, (uint32_t)rows, 1, 1, ROUTE_THREADS, 1, 1);
+
+  // Tile grouping and expert execution.
+  if (is_prefill) {
+    model_commit(cmd);
+    model_sync();
+    int ntiles = inkling2_group_expert_tiles(
+        (const uint32_t *)work.route_ids.ptr, (const float *)work.route_w.ptr,
+        rows, MOE_MM_TILE, (int *)work.ptok.ptr, (float *)work.pw.ptr,
+        (int *)work.tp.ptr, (Ink2MoeTile *)work.tiles.ptr);
+    int has_mv = 0, has_mm = 0;
+    const Ink2MoeTile *tl = (const Ink2MoeTile *)work.tiles.ptr;
+    for (int t = 0; t < ntiles; t++) {
+      if (tl[t].count <= (uint32_t)MOE_MV_MAX_M)
+        has_mv = 1;
+      else
+        has_mm = 1;
+    }
+    if (wait && wait->ready && !wait->ready(wait->context)) pass_wait(wait);
+    *cmd = gpu_begin(gpu);
+    encode_moe_experts(cmd, pl, rows, ntiles, has_mv, has_mm);
+  } else {
+    uint32_t m_topk[2] = {(uint32_t)rows, (uint32_t)INK2_TOPK};
+    gpu_select_kernel(cmd, K_moe_group);
+    gpu_bind_buffer(cmd, 0, &work.route_ids, 0);
+    gpu_bind_buffer(cmd, 1, &work.route_w, 0);
+    gpu_bind_buffer(cmd, 2, &work.ptok, 0);
+    gpu_bind_buffer(cmd, 3, &work.pw, 0);
+    gpu_bind_buffer(cmd, 4, &work.tp, 0);
+    gpu_bind_buffer(cmd, 5, &work.tiles, 0);
+    gpu_copy_bytes(cmd, 6, m_topk, sizeof m_topk);
+    gpu_run_kernel(cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
+    int ntiles = rows * INK2_TOPK;
+    int run_mm = rows > MOE_MV_MAX_M ? 1 : 0;
+    encode_moe_experts(cmd, pl, rows, ntiles, 1, run_mm);
+  }
+
+  // Post-MLP static short convolution and BF16-rounded residual update.
+  run_sconv_static(cmd, &work.cur2, &pl->mlp_sconv_w, &work.cur, s, v,
+                   CONV_MLP_OFF, 3, rows, INK2_DIM, pos0, batched);
+  run_add(cmd, &work.residual, &work.cur, &work.cur, (uint32_t)row_floats, 1);
+}
+
+// Runs the complete 48-visit Inkling-2-Mini forward pass over `rows` tokens.
+// Computes logits for all `rows` rows when `logits_mode == 2`, for the last
+// row only when `logits_mode == 1`, or skips unembed when `logits_mode == 0`.
+static void run_forward(Ink2State *const *states, const int *tokens,
+                        const int *pos, int rows, int batched, int is_prefill,
+                        int logits_mode, const PassWait *wait) {
+  int need_logits = logits_mode == 2 ? rows : (logits_mode == 1 ? 1 : 0);
+  ensure_work(rows, need_logits);
+  memcpy(work.ids.ptr, tokens, (size_t)rows * sizeof(int32_t));
+
+  int pos0 = pos[0], max_pos = pos[0];
+  if (batched) {
+    for (int r = 0; r < rows; r++) {
+      state_ensure_cap(states[r], pos[r] + 1);
+      if (pos[r] > max_pos) max_pos = pos[r];
+    }
+    SconvTarget *st = (SconvTarget *)work.sconv_tgt.ptr;
+    KvTarget *kt = (KvTarget *)work.kv_tgt.ptr;
+    for (int v = 0; v < INK2_TOTAL_LAYERS; v++) {
+      const Ink2Visit *vis = &schedule[v];
+      for (int r = 0; r < rows; r++) {
+        const Ink2State *sr = states[r];
+        uint64_t conv_base = sr->conv_ring.address + sr->conv_ring.off +
+                             (size_t)v * CONV_LAYER_BYTES;
+        size_t base_idx =
+            (size_t)v * SCONV_RINGS_PER_LAYER * INK2_MAX_BATCH_ROWS;
+        st[base_idx + 0 * INK2_MAX_BATCH_ROWS + r] =
+            (SconvTarget){conv_base + CONV_K_OFF, (uint32_t)pos[r], 0};
+        st[base_idx + 1 * INK2_MAX_BATCH_ROWS + r] =
+            (SconvTarget){conv_base + CONV_V_OFF, (uint32_t)pos[r], 0};
+        st[base_idx + 2 * INK2_MAX_BATCH_ROWS + r] =
+            (SconvTarget){conv_base + CONV_ATTN_OFF, (uint32_t)pos[r], 0};
+        st[base_idx + 3 * INK2_MAX_BATCH_ROWS + r] =
+            (SconvTarget){conv_base + CONV_MLP_OFF, (uint32_t)pos[r], 0};
+        if (vis->is_global) {
+          const Buf *kb = &sr->gk[vis->global_slot];
+          const Buf *vb = &sr->gv[vis->global_slot];
+          kt[(size_t)v * INK2_MAX_BATCH_ROWS + r] =
+              (KvTarget){kb->address + kb->off, vb->address + vb->off,
+                         (uint32_t)pos[r], 0u};
+        } else {
+          uint64_t sb = sr->slide_kv.address + sr->slide_kv.off;
+          kt[(size_t)v * INK2_MAX_BATCH_ROWS + r] =
+              (KvTarget){sb + slide_ring_off(vis->slide_slot, 0),
+                         sb + slide_ring_off(vis->slide_slot, 1),
+                         (uint32_t)pos[r], (uint32_t)INK2_SLIDE_RING};
+        }
+      }
+    }
+  } else {
+    state_ensure_cap(states[0], pos0 + rows);
+    max_pos = pos0 + rows - 1;
+  }
+
+  size_t row_floats = (size_t)rows * INK2_DIM;
+  size_t stride_bytes = (size_t)work.cap_rows * INK2_DIM * sizeof(float);
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+
+  // Embedding lookup + embed_norm (BF16-rounded).
+  NormParam ep = {(uint32_t)INK2_DIM, 1u, RMS_EPS};
+  gpu_select_kernel(&cmd, K_embed_norm);
+  gpu_bind_buffer(&cmd, 0, &embed_w, 0);
+  gpu_bind_buffer(&cmd, 1, &work.ids, 0);
+  gpu_bind_buffer(&cmd, 2, &embed_norm, 0);
+  gpu_bind_buffer(&cmd, 3, &work.cur, 0);
+  gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
+  gpu_run_kernel(&cmd, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+
+  int nblocks = 0;
+  // Prelude visits 0..5.
+  for (int v = 0; v < INK2_CORE_START; v++) {
+    if (is_prefill) prefill_layer_now = v + 1;
+    run_visit(&cmd, v, rows, pos0, max_pos, states[0], batched, is_prefill,
+              &nblocks, wait);
+  }
+  // Save pre-loop hidden state; blk[0] (h_embed) stays untouched across loops.
+  run_copy(&cmd, &work.cur, 0, &work.pre_loop_cur, 0, (uint32_t)row_floats);
+  int pre_loop_blocks = nblocks;
+
+  // Core loop passes 0, 1, 2 (visits 6..41).
+  int visit = INK2_CORE_START;
+  for (int pass = 0; pass < INK2_LOOP_PASSES; pass++) {
+    if (pass > 0) {
+      // Previous pass's blocks past pre_loop_blocks + 1 is blk[2]; restart
+      // hidden state from pre_loop_cur and blk[0..pre_loop_blocks-1].
+      run_copy(&cmd, &work.blk, (size_t)(pre_loop_blocks + 1) * stride_bytes,
+               &work.prev_blk, 0, (uint32_t)row_floats);
+      run_copy(&cmd, &work.cur, 0, &work.prev_cur, 0, (uint32_t)row_floats);
+      run_copy(&cmd, &work.pre_loop_cur, 0, &work.cur, 0, (uint32_t)row_floats);
+      nblocks = pre_loop_blocks;
+    }
+    for (int li = 0; li < INK2_CORE_LAYERS; li++, visit++) {
+      if (is_prefill) prefill_layer_now = visit + 1;
+      run_visit(&cmd, visit, rows, pos0, max_pos, states[0], batched,
+                is_prefill, &nblocks, wait);
+    }
+  }
+
+  // Postlude visits 42..47.
+  for (; visit < INK2_TOTAL_LAYERS; visit++) {
+    if (is_prefill) prefill_layer_now = visit + 1;
+    run_visit(&cmd, visit, rows, pos0, max_pos, states[0], batched, is_prefill,
+              &nblocks, wait);
+  }
+
+  if (logits_mode > 0) {
+    run_attn_res(&cmd, &work.blk, &work.cur, &output_query, 0, &work.attn_in,
+                 rows, work.cap_rows, nblocks, 1, work.cap_rows);
+    if (logits_mode == 1) {
+      size_t last_off = (size_t)(rows - 1) * INK2_DIM * sizeof(float);
+      run_rmsnorm(&cmd, &work.attn_in, last_off, &final_norm, &work.q_in, 1, 1);
+      run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, 1, INK2_VOCAB,
+                      INK2_DIM, LOGITS_STRIDE, 0, 0);
+    } else {
+      run_rmsnorm(&cmd, &work.attn_in, 0, &final_norm, &work.q_in, rows, 1);
+      run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, rows,
+                      INK2_VOCAB, INK2_DIM, LOGITS_STRIDE, 0, is_prefill);
+    }
+    SoftcapParam sp = {(uint32_t)need_logits, (uint32_t)INK2_VOCAB,
+                       (uint32_t)LOGITS_STRIDE, LOGIT_SOFTCAP};
+    gpu_select_kernel(&cmd, K_logit_softcap);
+    gpu_bind_buffer(&cmd, 0, &work.logits, 0);
+    gpu_copy_bytes(&cmd, 1, &sp, sizeof sp);
+    gpu_run_kernel(&cmd,
+                   ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
+                   (uint32_t)need_logits, 1, ELEM_THREADS, 1, 1);
+  }
+
+  model_commit(&cmd);
+  model_sync();
+}
+
+// Copies `rows` padded logits rows (stride LOGITS_STRIDE) into the tightly
+// packed pass-local `logits_compact` buffer (stride INK2_VOCAB).
+static const float *pack_logits(int rows) {
+  if (rows == 1) return (const float *)work.logits.ptr;
+  if (rows > logits_compact_rows) {
+    free(logits_compact);
+    logits_compact = xmalloc((size_t)rows * LOGITS_BYTES);
+    logits_compact_rows = rows;
+  }
+  const float *src = (const float *)work.logits.ptr;
+  for (int r = 0; r < rows; r++)
+    memcpy(logits_compact + (size_t)r * INK2_VOCAB,
+           src + (size_t)r * LOGITS_STRIDE, LOGITS_BYTES);
+  return logits_compact;
+}
+
+// ---- ModelOps entry points ----
+
+// Loads the Inkling-2-Mini text backbone weights on model_gpu.
+static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
+                     const Options *o) {
+  opt = *o;
+  if (opt.ctx <= 0) opt.ctx = DEFAULT_CTX;
+  if (!checkpoint) {
+    gpu = model_gpu;
+    work_slot = work_mem;
+    memory_slot_init(&state_slot, work_mem->account, MEMORY_STATE, NULL,
+                     "Inkling-2-Mini states", NULL, NULL);
+    state_slot.automatic = 1;
+    check_config(dir);
+    inkling2_build_schedule(schedule);
+
+#define K(field, name) field = gpu_find_kernel(gpu, name)
+    K(K_mv_bf16, "mv_bf16");
+    K(K_mv_bf16_3, "mv_bf16_3");
+    K(K_mvm_bf16, "mvm_bf16");
+    K(K_mvm_bf16_3, "mvm_bf16_3");
+    K(K_mm_bf16, "mm_bf16");
+    K(K_embed_norm, "ink2_embed_norm");
+    K(K_rmsnorm, "ink2_rmsnorm");
+    K(K_attn_res, "ink2_attn_res");
+    K(K_msg_cat_norm, "ink2_msg_cat_norm");
+    K(K_msg_gate_apply, "ink2_msg_gate_apply");
+    K(K_sconv_static, "ink2_sconv_static");
+    K(K_sconv_static_batched, "ink2_sconv_static_batched");
+    K(K_sconv_dynamic, "ink2_sconv_dynamic");
+    K(K_sconv_dynamic_batched, "ink2_sconv_dynamic_batched");
+    K(K_sconv_ring_save, "ink2_sconv_ring_save");
+    K(K_qkvr_prep, "ink2_qkvr_prep");
+    K(K_rel_bias, "ink2_rel_bias");
+    K(K_attend_part, "ink2_attend_part");
+    K(K_attend_combine, "ink2_attend_combine");
+    K(K_attend_prefill, "ink2_attend_prefill");
+    K(K_route_topk, "ink2_route_topk");
+    K(K_moe_group, "ink2_moe_group");
+    K(K_moe_gather_bf16, "ink2_moe_gather_bf16");
+    K(K_nv_up_mv, "ink2_moe_nvfp4_up_mv");
+    K(K_nv_dn_mv, "ink2_moe_nvfp4_down_mv");
+    K(K_nv_up_mm, "ink2_moe_nvfp4_up_mm");
+    K(K_nv_dn_mm, "ink2_moe_nvfp4_down_mm");
+    K(K_mx_up_mv, "ink2_moe_mxfp8_up_mv");
+    K(K_mx_dn_mv, "ink2_moe_mxfp8_down_mv");
+    K(K_mx_up_mm, "ink2_moe_mxfp8_up_mm");
+    K(K_mx_dn_mm, "ink2_moe_mxfp8_down_mm");
+    K(K_moe_combine, "ink2_moe_combine");
+    K(K_copy, "ink2_copy");
+    K(K_add, "ink2_add");
+    K(K_logit_softcap, "ink2_logit_softcap");
+#undef K
+
+    checkpoint = tensor_index_open(dir);
+    text_weights =
+        weight_group_new(gpu, work_mem->account, "Inkling-2-Mini weights");
+    register_text_weights();
+    required_bytes = weight_group_required_bytes(text_weights) +
+                     estimate_work_bytes(PREFILL_CHUNK);
+  }
+
+  MemorySlot *slot = weight_group_slot(text_weights);
+  memory_pin(slot, 1);
+  if (!memory_wait_for_minimum(slot->account,
+                               weight_group_required_bytes(text_weights) +
+                                   estimate_work_bytes(INK2_MAX_VERIFY)) ||
+      !weight_group_load(text_weights)) {
+    memory_pin(slot, 0);
+    return 0;
+  }
+  weight_group_set_resident(text_weights, 1);
+  gpu_commit_residency(gpu);
+  return 1;
+}
+
+// Returns the memory slot of the loaded text weights.
+static MemorySlot *ink2_dense_weight_slot(void) {
+  return text_weights ? weight_group_slot(text_weights) : NULL;
+}
+
+// Writes runtime counters into c.
+static void ink2_read_counters(ModelCounters *c) {
+  *c = (ModelCounters){.decode_rows = decode_rows_count,
+                       .prefill_rows = prefill_rows_count,
+                       .decode_seconds = decode_seconds_total,
+                       .decode_gpu_seconds = decode_gpu_seconds_total,
+                       .prefill_layer = prefill_layer_now,
+                       .prefill_rows_now = prefill_rows_now,
+                       .layers = INK2_TOTAL_LAYERS,
+                       .experts_per_row = 0,
+                       .routed_layers = INK2_TOTAL_LAYERS,
+                       .experts_per_layer = INK2_EXPERTS,
+                       .dense_bytes = weight_group_resident_bytes(text_weights),
+                       .required_bytes = required_bytes};
+}
+
+// Returns the unpadded output vocabulary size.
+static int ink2_vocab_size(void) { return INK2_VOCAB; }
+
+// Returns the maximum distinct states decoded in one batched pass.
+static int ink2_max_rows(void) { return INK2_MAX_BATCH_ROWS; }
+
+// Returns the maximum rows verified in one speculative verification pass.
+static int ink2_max_verify(void) { return INK2_MAX_VERIFY; }
+
+// Returns the model's self-draft count per pass (0 until MTP support lands).
+static int ink2_drafts_per_pass(void) { return 0; }
+
+// Returns how many positions a state can rewind safely without overwriting its
+// sliding KV or short-convolution rings.
+static int ink2_rewind_margin(void) { return INK2_REWIND_MARGIN; }
+
+// Returns whether `token` ends a model reply.
+static int ink2_is_stop_token(int token) { return token == eos_token; }
+
+// Indicates that Inkling-2-Mini resumes only from a saved snapshot, not replay.
+static int ink2_replay_rows(int k) {
+  (void)k;
+  return -1;
+}
+
+// Prefills positions `from` through `n - 1` of state `ms` in chunks of up to
+// PREFILL_CHUNK tokens, capturing a snapshot at `capture` if requested.
+static const float *ink2_prefill(ModelState *ms, const int *tokens, int n,
+                                 int from, int replay, int capture,
+                                 ModelSnapshot **captured, float *every,
+                                 const PassWait *wait) {
+  if (replay && from > 0)
+    die("Inkling-2-Mini does not support replay without a snapshot");
+  if (from < 0 || n <= from || n > opt.ctx)
+    die("invalid Inkling-2-Mini prefill range %d..%d (ctx %d)", from, n,
+        opt.ctx);
+  if (capture >= 0 && (capture <= from || capture >= n || !captured))
+    die("invalid Inkling-2-Mini capture %d in %d..%d", capture, from, n);
+  if (captured) *captured = NULL;
+
+  Ink2State *s = (Ink2State *)ms;
+  prefill_rows_now = n - from;
+  for (int pos = from; pos < n;) {
+    int chunk = n - pos;
+    if (chunk > PREFILL_CHUNK) chunk = PREFILL_CHUNK;
+    if (capture > pos && pos + chunk > capture) chunk = capture - pos;
+    int is_last = (pos + chunk == n);
+    int logits_mode = every ? 2 : (is_last ? 1 : 0);
+    run_forward(&s, tokens + pos, &pos, chunk, 0, 1, logits_mode, wait);
+    if (every) {
+      const float *src = (const float *)work.logits.ptr;
+      for (int r = 0; r < chunk; r++)
+        memcpy(every + (size_t)(pos - from + r) * INK2_VOCAB,
+               src + (size_t)r * LOGITS_STRIDE, LOGITS_BYTES);
+    }
+    pos += chunk;
+    prefill_rows_count += (uint64_t)chunk;
+    if (capture >= 0 && pos == capture && captured)
+      *captured = ink2_snapshot_take(ms, capture, NULL);
+  }
+  prefill_layer_now = 0;
+  prefill_rows_now = 0;
+  return every ? every + (size_t)(n - from - 1) * INK2_VOCAB
+               : (const float *)work.logits.ptr;
+}
+
+// Decodes one token for each of `m` distinct states.
+static const float *ink2_decode_rows(ModelState *const *states,
+                                     const int *tokens, const int *pos, int m) {
+  if (m < 1 || m > INK2_MAX_BATCH_ROWS)
+    die("invalid Inkling-2-Mini decode batch size %d", m);
+  double t0 = now();
+  GpuTimes g0 = gpu_times(gpu);
+  Ink2State *s_arr[INK2_MAX_BATCH_ROWS];
+  for (int i = 0; i < m; i++) s_arr[i] = (Ink2State *)states[i];
+  int batched = m > 1 ? 1 : 0;
+  run_forward(s_arr, tokens, pos, m, batched, 0, m == 1 ? 1 : 2, NULL);
+  GpuTimes g1 = gpu_times(gpu);
+  decode_rows_count += (uint64_t)m;
+  decode_seconds_total += now() - t0;
+  decode_gpu_seconds_total += g1.busy_seconds - g0.busy_seconds;
+  return pack_logits(m);
+}
+
+// Verifies `m` contiguous candidate tokens starting at `pos` on state `ms`.
+static const float *ink2_verify(ModelState *ms, const int *tokens, int m,
+                                int pos) {
+  if (m < 1 || m > INK2_MAX_VERIFY)
+    die("invalid Inkling-2-Mini verify length %d", m);
+  double t0 = now();
+  GpuTimes g0 = gpu_times(gpu);
+  Ink2State *s = (Ink2State *)ms;
+  run_forward(&s, tokens, &pos, m, 0, 0, 2, NULL);
+  GpuTimes g1 = gpu_times(gpu);
+  decode_rows_count += (uint64_t)m;
+  decode_seconds_total += now() - t0;
+  decode_gpu_seconds_total += g1.busy_seconds - g0.busy_seconds;
+  return pack_logits(m);
+}
+
+// Accepts the first `n` verified tokens; rejected ring slots are overwritten on
+// subsequent writes and need no rollback.
+static void ink2_accept(ModelState *ms, const int *tokens, int n, int pos) {
+  (void)ms;
+  (void)tokens;
+  (void)n;
+  (void)pos;
+}
+
+// No-op idle work hook: Inkling-2-Mini has no SSD expert cache.
+static int ink2_run_idle_work(void) { return 0; }
+
+// Formats one CLI user turn matching chat_template.jinja.
+static void ink2_render_chat_turn(char *text, size_t cap, const char *prompt,
+                                  int media_count, int think) {
+  char effort[16];
+  if (think <= 0) {
+    snprintf(effort, sizeof effort, "0");
+  } else {
+    int clamped = think > MAX_THINK_PERCENT ? MAX_THINK_PERCENT : think;
+    snprintf(effort, sizeof effort, "%.2g",
+             (double)clamped / THINK_PERCENT_SCALE);
+  }
+  int off =
+      snprintf(text, cap,
+               "<|message_system|><|content_text|>Thinking effort level: %s"
+               "<|end_message|>",
+               effort);
+  if (off < 0 || (size_t)off >= cap) return;
+  for (int i = 0; i < media_count && i < MAX_CHAT_IMAGES; i++) {
+    int n = snprintf(
+        text + off, cap - (size_t)off,
+        "<|message_user|><|content_image|><|unused_200054|><|end_message|>");
+    if (n < 0 || (size_t)n >= cap - (size_t)off) return;
+    off += n;
+  }
+  snprintf(text + off, cap - (size_t)off,
+           "<|message_user|><|content_text|>%s<|end_message|>", prompt);
+}
+
+// Creates a cooperative pass with its own workspace, submission sequence and
+// packed logits buffer.
+static Pass *ink2_pass_new(void (*body)(void *), void *argument) {
+  const PassVariable variables[] = {
+      {&work, sizeof work},
+      {&last_committed, sizeof last_committed},
+      {&logits_compact, sizeof logits_compact},
+      {&logits_compact_rows, sizeof logits_compact_rows}};
+  Pass *pass = pass_new(body, argument, PASS_STACK_BYTES);
+  pass_set_variables(pass, variables, sizeof variables / sizeof *variables);
+  return pass;
+}
+
+// Initializes pass-local scratch handles when a pass begins.
+static void ink2_pass_begin(void) {
+  work = (Ink2Work){0};
+  last_committed = 0;
+  logits_compact = NULL;
+  logits_compact_rows = 0;
+}
+
+// Syncs and releases pass-local scratch buffers when a pass ends.
+static void ink2_pass_end(void) {
+  model_sync();
+  free_work(&work);
+  free(logits_compact);
+  logits_compact = NULL;
+  logits_compact_rows = 0;
+}
+
+// config.json model_type values served by this family.
+static const char *const ink2_model_types[] = {"inkling2_loop",
+                                               "inkling2_loop_text", NULL};
+
+const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
+                               .model_types = ink2_model_types,
+                               .media_token = "<|unused_200054|>",
+                               .load = ink2_load,
+                               .dense_weight_slot = ink2_dense_weight_slot,
+                               .read_counters = ink2_read_counters,
+                               .vocab_size = ink2_vocab_size,
+                               .max_rows = ink2_max_rows,
+                               .max_verify = ink2_max_verify,
+                               .drafts_per_pass = ink2_drafts_per_pass,
+                               .rewind_margin = ink2_rewind_margin,
+                               .is_stop_token = ink2_is_stop_token,
+                               .state_new = ink2_state_new,
+                               .state_free = ink2_state_free,
+                               .state_bytes = ink2_state_bytes,
+                               .state_copy = ink2_state_copy,
+                               .snapshot_take = ink2_snapshot_take,
+                               .snapshot_restore = ink2_snapshot_restore,
+                               .snapshot_free = ink2_snapshot_free,
+                               .snapshot_bytes = ink2_snapshot_bytes,
+                               .snapshot_logits = ink2_snapshot_logits,
+                               .state_version = 1,
+                               .write_state_regions = ink2_write_state_regions,
+                               .write_snapshot_parts =
+                                   ink2_write_snapshot_parts,
+                               .snapshot_new_empty = ink2_snapshot_new_empty,
+                               .prefill = ink2_prefill,
+                               .replay_rows = ink2_replay_rows,
+                               .decode_rows = ink2_decode_rows,
+                               .verify = ink2_verify,
+                               .accept = ink2_accept,
+                               .run_idle_work = ink2_run_idle_work,
+                               .render_chat_turn = ink2_render_chat_turn,
+                               .pass_new = ink2_pass_new,
+                               .pass_begin = ink2_pass_begin,
+                               .pass_end = ink2_pass_end};

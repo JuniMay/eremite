@@ -641,7 +641,7 @@ int model_load(Model *model, const Options *options);
 void model_set_request_running(Model *model, int active);
 Model *model_open(Memory *memory, Gpu *gpu, const char *dir, const Options *o);
 
-extern const ModelOps deepseek_ops, lfm3_ops, minimax_h3_image_ops,
-    minimax_h3_video_ops;
+extern const ModelOps deepseek_ops, inkling2_ops, lfm3_ops,
+    minimax_h3_image_ops, minimax_h3_video_ops;
 
 #endif

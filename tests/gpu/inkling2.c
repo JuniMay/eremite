@@ -429,7 +429,8 @@ static void test_attn_res_and_msg_gate(Gpu *gpu, MemorySlot *slot) {
   run_op(&cmd, k_cat, (Buf[]){h, m, cat}, 3, &mgp, sizeof mgp, rows, 1, 1,
          ROW_THREADS, 1, 1);
   run_op(&cmd, k_apply, (Buf[]){h, m, g, fw, gw, mixed}, 6, &mgp, sizeof mgp,
-         rows, 1, 1, ROW_THREADS, 1, 1);
+         (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, rows, 1, ROW_THREADS, 1,
+         1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -1314,6 +1315,82 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&mx_s2);
 }
 
+// Tests ink2_copy and GPU-side ink2_moe_group tile packing against CPU checks.
+static void test_copy_and_moe_group(Gpu *gpu, MemorySlot *slot) {
+  int k_copy = gpu_find_kernel(gpu, "ink2_copy");
+  int k_group = gpu_find_kernel(gpu, "ink2_moe_group");
+
+  uint32_t rng = 0x51a7b3c9u;
+  uint32_t count = 517;
+  Buf src = gpu_alloc(gpu, slot, (size_t)count * sizeof(float));
+  Buf dst = gpu_alloc(gpu, slot, (size_t)count * sizeof(float));
+  float *sp = (float *)src.ptr;
+  for (uint32_t i = 0; i < count; i++) sp[i] = rng_f32(&rng);
+
+  uint32_t rows = 12, npairs = rows * TOPK;
+  Buf rids = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(uint32_t));
+  Buf rw = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(float));
+  Buf ptok = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(int));
+  Buf pw = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(float));
+  Buf tp = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(int));
+  Buf tiles = gpu_alloc(gpu, slot, (size_t)npairs * sizeof(MoeTile));
+
+  uint32_t *idp = (uint32_t *)rids.ptr;
+  float *rwp = (float *)rw.ptr;
+  for (uint32_t r = 0; r < rows; r++) {
+    for (uint32_t k = 0; k < TOPK; k++) {
+      idp[r * TOPK + k] = (r + k * 7u) % 24u;
+      rwp[r * TOPK + k] = 0.25f + 0.05f * (float)k;
+    }
+  }
+  uint32_t m_topk[2] = {rows, TOPK};
+
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  run_op(&cmd, k_copy, (Buf[]){src, dst}, 2, &count, sizeof count,
+         (count + ELEM_THREADS - 1) / ELEM_THREADS, 1, 1, ELEM_THREADS, 1, 1);
+  run_op(&cmd, k_group, (Buf[]){rids, rw, ptok, pw, tp, tiles}, 6, m_topk,
+         sizeof m_topk, 1, 1, 1, ROUTE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float copy_err = 0.0f;
+  const float *dp = (const float *)dst.ptr;
+  for (uint32_t i = 0; i < count; i++)
+    copy_err = fmaxf(copy_err, fabsf(dp[i] - sp[i]));
+  check_err("ink2_copy", copy_err, TOL_F32);
+
+  const MoeTile *tl = (const MoeTile *)tiles.ptr;
+  const int *ptp = (const int *)ptok.ptr, *tpp = (const int *)tp.ptr;
+  const float *pwp = (const float *)pw.ptr;
+  uint32_t covered = 0, pair_exp[128];
+  int ok = 1;
+  for (uint32_t t = 0; t < npairs; t++) {
+    if (tl[t].count == 0) continue;
+    if (tl[t].start != covered) ok = 0;
+    for (uint32_t j = 0; j < tl[t].count; j++)
+      pair_exp[tl[t].start + j] = tl[t].expert;
+    covered += tl[t].count;
+  }
+  if (covered != npairs) ok = 0;
+  for (uint32_t p = 0; p < npairs; p++) {
+    int slot_idx = tpp[p];
+    if (slot_idx < 0 || (uint32_t)slot_idx >= npairs ||
+        pair_exp[slot_idx] != idp[p] || ptp[slot_idx] != (int)(p / TOPK) ||
+        pwp[slot_idx] != rwp[p])
+      ok = 0;
+  }
+  check(ok, "ink2_moe_group packs tiles and inverse token map");
+
+  gpu_free(&src);
+  gpu_free(&dst);
+  gpu_free(&rids);
+  gpu_free(&rw);
+  gpu_free(&ptok);
+  gpu_free(&pw);
+  gpu_free(&tp);
+  gpu_free(&tiles);
+}
+
 int main(void) {
   Memory *memory = memory_new();
   MemorySlot *slot = memory_shared(memory);
@@ -1327,6 +1404,7 @@ int main(void) {
   test_short_convs(gpu, slot);
   test_attention(gpu, slot);
   test_router_and_moe(gpu, slot);
+  test_copy_and_moe_group(gpu, slot);
 
   gpu_return_freed_memory(gpu);
   return failures != 0;
