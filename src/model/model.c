@@ -7,8 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-static const ModelOps *const families[] = {&deepseek_ops, &lfm3_ops,
-                                           &minimax_h3_image_ops};
+static const ModelOps *const families[] = {
+    &deepseek_ops, &lfm3_ops, &minimax_h3_image_ops, &minimax_h3_video_ops};
 
 const ModelOps *model_find_family(const char *dir) {
   char path[1024];

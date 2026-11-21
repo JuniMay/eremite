@@ -44,8 +44,8 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_adaln.
 typedef struct {
-  // Number of timesteps and output vector width per timestep.
-  uint32_t num_t, out_dim;
+  // Number of timesteps, output width per timestep and F16 bias flag.
+  uint32_t num_t, out_dim, bias_f16;
 } DitAdalnParam;
 
 // Parameters passed to minimax_h3_dit_norm_mod.
@@ -232,7 +232,7 @@ static void test_mm_f32(Gpu *gpu, MemorySlot *slot) {
   check(worst < FP32_TOL, "minimax_h3_mm_f32 matches CPU reference");
 }
 
-// Tests minimax_h3_dit_adaln (F16 weight + BF16 bias, 2 timesteps).
+// Tests minimax_h3_dit_adaln (F16 weight + BF16 and F16 bias, 2 timesteps).
 static void test_adaln(Gpu *gpu, MemorySlot *slot) {
   int k_adaln = gpu_find_kernel(gpu, "minimax_h3_dit_adaln");
   int num_t = 2, out_dim = 384;
@@ -247,38 +247,49 @@ static void test_adaln(Gpu *gpu, MemorySlot *slot) {
       gpu_alloc(gpu, slot, (size_t)num_t * (size_t)out_dim * sizeof(float));
 
   _Float16 *wp = (_Float16 *)w.ptr;
-  uint16_t *bp = (uint16_t *)b.ptr;
   float *tp = (float *)t_emb.ptr;
   for (int i = 0; i < out_dim * DIT_ADALN_RANK; i++)
     wp[i] = (_Float16)rng_float(&rng);
-  for (int i = 0; i < out_dim; i++) bp[i] = f32_to_bf16(rng_float(&rng));
   for (int i = 0; i < num_t * DIT_ADALN_RANK; i++) tp[i] = rng_float(&rng);
 
-  DitAdalnParam p = {(uint32_t)num_t, (uint32_t)out_dim};
-  GpuCommandBuffer cmd = gpu_begin(gpu);
-  gpu_select_kernel(&cmd, k_adaln);
-  gpu_bind_buffer(&cmd, 0, &w, 0);
-  gpu_bind_buffer(&cmd, 1, &b, 0);
-  gpu_bind_buffer(&cmd, 2, &t_emb, 0);
-  gpu_bind_buffer(&cmd, 3, &out, 0);
-  gpu_copy_bytes(&cmd, 4, &p, sizeof p);
-  gpu_run_kernel(&cmd, ((uint32_t)out_dim + ELEM_THREADS - 1) / ELEM_THREADS,
-                 (uint32_t)num_t, 1, ELEM_THREADS, 1, 1);
-  gpu_commit(&cmd);
-  gpu_sync(gpu);
-
-  const float *op = (const float *)out.ptr;
-  float worst = 0.0f;
-  for (int t = 0; t < num_t; t++) {
-    for (int j = 0; j < out_dim; j++) {
-      float ref = bf16_to_f32(bp[j]);
-      for (int k = 0; k < DIT_ADALN_RANK; k++)
-        ref += (float)wp[j * DIT_ADALN_RANK + k] * tp[t * DIT_ADALN_RANK + k];
-      float d = fabsf(op[t * out_dim + j] - ref);
-      if (d > worst) worst = d;
+  for (uint32_t bias_f16 = 0; bias_f16 <= 1; bias_f16++) {
+    uint16_t *bp = (uint16_t *)b.ptr;
+    _Float16 *b16 = (_Float16 *)b.ptr;
+    for (int i = 0; i < out_dim; i++) {
+      if (bias_f16)
+        b16[i] = (_Float16)rng_float(&rng);
+      else
+        bp[i] = f32_to_bf16(rng_float(&rng));
     }
+
+    DitAdalnParam p = {(uint32_t)num_t, (uint32_t)out_dim, bias_f16};
+    GpuCommandBuffer cmd = gpu_begin(gpu);
+    gpu_select_kernel(&cmd, k_adaln);
+    gpu_bind_buffer(&cmd, 0, &w, 0);
+    gpu_bind_buffer(&cmd, 1, &b, 0);
+    gpu_bind_buffer(&cmd, 2, &t_emb, 0);
+    gpu_bind_buffer(&cmd, 3, &out, 0);
+    gpu_copy_bytes(&cmd, 4, &p, sizeof p);
+    gpu_run_kernel(&cmd, ((uint32_t)out_dim + ELEM_THREADS - 1) / ELEM_THREADS,
+                   (uint32_t)num_t, 1, ELEM_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+
+    const float *op = (const float *)out.ptr;
+    float worst = 0.0f;
+    for (int t = 0; t < num_t; t++) {
+      for (int j = 0; j < out_dim; j++) {
+        float ref = bias_f16 ? (float)b16[j] : bf16_to_f32(bp[j]);
+        for (int k = 0; k < DIT_ADALN_RANK; k++)
+          ref += (float)wp[j * DIT_ADALN_RANK + k] * tp[t * DIT_ADALN_RANK + k];
+        float d = fabsf(op[t * out_dim + j] - ref);
+        if (d > worst) worst = d;
+      }
+    }
+    check(worst < FP32_TOL,
+          bias_f16 ? "minimax_h3_dit_adaln (F16 bias) matches CPU reference"
+                   : "minimax_h3_dit_adaln (BF16 bias) matches CPU reference");
   }
-  check(worst < FP32_TOL, "minimax_h3_dit_adaln matches CPU reference");
 
   gpu_free(&out);
   gpu_free(&t_emb);

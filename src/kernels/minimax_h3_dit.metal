@@ -38,8 +38,9 @@ struct MinimaxH3F32MM {
 };
 
 // Parameters for curve-form AdaLN projection: out[t, j] = dot(w[j], t_emb[t]) + b[j].
+// bias_f16 selects IEEE FP16 (1, video DiT) versus BF16 (0, image DiT) bias storage.
 struct MinimaxH3DitAdaln {
-  uint num_t, out_dim;
+  uint num_t, out_dim, bias_f16;
 };
 
 // Parameters for fused RMSNorm + AdaLN modulation.
@@ -198,7 +199,8 @@ kernel void minimax_h3_dit_adaln(device const half *w [[buffer(0)]],
   if (i.x >= p.out_dim || i.y >= p.num_t) return;
   device const half *wr = w + i.x * MINIMAX_H3_DIT_ADALN_RANK;
   device const float *te = t_emb + i.y * MINIMAX_H3_DIT_ADALN_RANK;
-  float acc = bf16f(bias[i.x]);
+  float acc =
+      p.bias_f16 ? float(as_type<half>(bias[i.x])) : bf16f(bias[i.x]);
   for (uint k = 0; k < MINIMAX_H3_DIT_ADALN_RANK; k++)
     acc += float(wr[k]) * te[k];
   out[i.y * p.out_dim + i.x] = acc;

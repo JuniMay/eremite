@@ -45,6 +45,36 @@ typedef struct {
   const char *vae;
 } MinimaxH3ImageOptions;
 
+// MiniMax-H3 Video task variant selected by the DiT checkpoint.
+typedef enum {
+  // T2VA and first/last-frame-to-audio-video checkpoint (FL2VA).
+  VIDEO_VARIANT_FL2VA = 0,
+  // Reference-to-audio-video checkpoint (REF2VA).
+  VIDEO_VARIANT_REF2VA = 1
+} VideoVariant;
+
+// MiniMax-H3 Video checkpoint files and sampling defaults.
+typedef struct {
+  // Safetensors file of the Qwen3-VL text and vision encoder.
+  const char *text_encoder;
+  // Safetensors file of the pruned INT8-ConvRot FL2VA or REF2VA DiT.
+  const char *dit;
+  // Safetensors file of the INT8-ConvRot 3D video VAE.
+  const char *vae;
+  // Safetensors file of the FP32 stereo audio VAE.
+  const char *audio_vae;
+  // Optional safetensors file of a BF16 Turbo LoRA adapter; null for none.
+  const char *lora;
+  // Runtime LoRA multiplier; <= 0 uses 1.0.
+  float lora_strength;
+  // Default denoising steps when a request leaves steps unset; 0 uses default.
+  int default_steps;
+  // Video and audio flow-matching shift factors; <= 0 use 12.0 and 3.0.
+  double shift_video, shift_audio;
+  // DiT task variant (FL2VA or REF2VA).
+  VideoVariant variant;
+} MinimaxH3VideoOptions;
+
 // Common execution settings and family-specific options.
 typedef struct {
   // Capacity in tokens.
@@ -65,6 +95,7 @@ typedef struct {
   union {
     DeepSeekOptions deepseek;
     MinimaxH3ImageOptions minimax_h3_image;
+    MinimaxH3VideoOptions minimax_h3_video;
   };
 } Options;
 
@@ -122,6 +153,16 @@ typedef enum {
   IMAGE_STAGE_GENERATING = 2
 } ImageStage;
 
+// Running stage of a video generation call.
+typedef enum {
+  // No video call is running.
+  VIDEO_STAGE_NONE = 0,
+  // The prompt encoder runs over text and reference media tokens.
+  VIDEO_STAGE_PREFILL = 1,
+  // The denoiser, video/audio VAEs and MP4 muxer generate audio-video output.
+  VIDEO_STAGE_GENERATING = 2
+} VideoStage;
+
 // A model's counters since it loaded, for the server's status. Only a model
 // with routed experts (experts_per_row > 0) has the expert cache's.
 typedef struct {
@@ -140,6 +181,16 @@ typedef struct {
   int image_step;
   // Total denoising steps in the active image call, or 0 outside denoising.
   int image_steps_total;
+  // Videos generated and denoising steps finished since the model opened.
+  uint64_t generated_videos, video_steps;
+  // Seconds spent denoising, VAE decoding and MP4 encoding videos.
+  double video_seconds;
+  // Active video generation stage (VideoStage).
+  int video_stage;
+  // Active 1-based video denoising step, or 0 outside denoising.
+  int video_step;
+  // Total denoising steps in the active video call, or 0 outside denoising.
+  int video_steps_total;
   // The layers, and the experts a row chooses: 0 without routed experts.
   int layers, experts_per_row;
   // The layers with routed experts, and each one's experts.
@@ -281,6 +332,110 @@ typedef struct {
   double guidance_scale;
 } ImageLimits;
 
+// Capacity in bytes of VideoResult.error, including its NUL terminator.
+static constexpr size_t VIDEO_ERROR_BYTES = 256;
+
+// One encoded media file buffer passed to video generation (image, video or
+// audio clip).
+typedef struct {
+  // Encoded file bytes (PNG/JPEG, MP4/MOV or WAV/AAC/MP3/M4A).
+  const uint8_t *data;
+  // Byte length of data.
+  size_t len;
+} VideoMediaInput;
+
+// Parameters of one video generation pass (T2VA, FL2VA or REF2VA).
+typedef struct {
+  // Prompt text (UTF-8, NUL-terminated).
+  const char *prompt;
+  // Requested output width and height in pixels; 0 uses default or adapts to
+  // the first input reference.
+  int width, height;
+  // Requested duration in whole seconds (0 uses frames or model default).
+  int seconds;
+  // Explicit requested frame count at 24 fps (0 uses seconds or default);
+  // snapped up to the 17k + 5 grid.
+  int frames;
+  // Requested denoising steps (0 uses model default).
+  int steps;
+  // Optional video and audio flow-shift overrides (<= 0 use model defaults).
+  double shift_video, shift_audio;
+  // Deterministic RNG seed for initial video/audio noise and cond noise aug.
+  uint64_t seed;
+  // Optional FL2VA first and last keyframe images (data null when omitted).
+  VideoMediaInput first_frame, last_frame;
+  // Optional REF2VA reference images, videos and standalone audio clips.
+  const VideoMediaInput *ref_images;
+  // Number of reference images in ref_images.
+  int ref_image_count;
+  // Optional REF2VA reference video clips (each may carry a soundtrack).
+  const VideoMediaInput *ref_videos;
+  // Optional explicit soundtracks index-paired with ref_videos; null or zero
+  // len falls back to the video container's own audio track.
+  const VideoMediaInput *ref_video_audios;
+  // Number of reference videos in ref_videos.
+  int ref_video_count;
+  // Optional REF2VA standalone reference audio clips.
+  const VideoMediaInput *ref_audios;
+  // Number of standalone audio clips in ref_audios.
+  int ref_audio_count;
+  // Nonzero in REF2VA to scale reference images to 2048 short edge instead of
+  // matching the generation pixel area.
+  int ref_image_max;
+} VideoRequest;
+
+// Output of one video generation pass.
+typedef struct {
+  // Heap-allocated MP4 bytes (H.264 + 32 kHz stereo AAC); null on failure.
+  uint8_t *data;
+  // Byte length of data.
+  size_t len;
+  // Actual generated video width, height, frame count and fps.
+  int width, height, frames, fps;
+  // Error message when data is null; empty on success.
+  char error[VIDEO_ERROR_BYTES];
+  // Nonzero when failure was a client input error; zero for load, memory or
+  // stop failures.
+  int invalid_input;
+  // Encoded prompt tokens processed by the text encoder, including reference
+  // media tokens.
+  int prompt_tokens;
+  // Seconds spent in the prompt encoder stage.
+  double prefill_seconds;
+  // Seconds spent denoising, VAE decoding and MP4 muxing.
+  double video_seconds;
+} VideoResult;
+
+// Input and output limits of a video generation model.
+typedef struct {
+  // Maximum prompt tokens retained before encoding.
+  int max_prompt_tokens;
+  // Spatial multiple in pixels required for width and height.
+  int patch_px;
+  // Maximum single-axis output dimension in pixels.
+  int max_dim;
+  // Default output width and height in pixels.
+  int default_width, default_height;
+  // Maximum generation canvas area in pixels.
+  int64_t max_canvas_area;
+  // Output frame rate in frames per second.
+  int fps;
+  // Minimum, maximum and default video frame counts.
+  int min_frames, max_frames, default_frames;
+  // Minimum, maximum and default durations in whole seconds.
+  int min_seconds, max_seconds, default_seconds;
+  // Minimum, maximum and default denoising step counts.
+  int min_steps, max_steps, default_steps;
+  // Maximum reference images, videos, standalone audios and total references.
+  int max_ref_images, max_ref_videos, max_ref_audios, max_total_refs;
+  // Active checkpoint task variant (FL2VA or REF2VA).
+  VideoVariant variant;
+  // Required guidance scale for CFG-free checkpoints.
+  double guidance_scale;
+  // Default video and audio flow-matching shift factors.
+  double default_shift_video, default_shift_audio;
+} VideoLimits;
+
 typedef struct {
   // The family's name, for the log.
   const char *family;
@@ -406,6 +561,15 @@ typedef struct {
   // shape fits. Null for a model that generates no images.
   int (*fit_image_size)(int width, int height, int *out_width, int *out_height,
                         char *error, size_t error_cap);
+  // Generates one audio-video MP4 clip from request, writing the MP4 bytes or
+  // error message into out. wait yields between layers to decoding calls, and
+  // *cancelled requests early stop when nonzero; either may be null. Returns 1
+  // on success or 0 on failure. Null for a model that generates no videos.
+  int (*generate_video)(const VideoRequest *request, const PassWait *wait,
+                        const int *cancelled, VideoResult *out);
+  // Writes the video model's request and output limits into out. Null for a
+  // model that generates no videos.
+  void (*read_video_limits)(VideoLimits *out);
   // Drafts. propose_drafts writes up to drafts_per_pass() drafts after token
   // at pos, once every position before it has run. It returns the sampled
   // proposals' probabilities, n vocabulary rows, or null for proposals without
@@ -477,6 +641,7 @@ int model_load(Model *model, const Options *options);
 void model_set_request_running(Model *model, int active);
 Model *model_open(Memory *memory, Gpu *gpu, const char *dir, const Options *o);
 
-extern const ModelOps deepseek_ops, lfm3_ops, minimax_h3_image_ops;
+extern const ModelOps deepseek_ops, lfm3_ops, minimax_h3_image_ops,
+    minimax_h3_video_ops;
 
 #endif

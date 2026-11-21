@@ -154,8 +154,8 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_adaln.
 typedef struct {
-  // Number of distinct timesteps and output vector width per timestep.
-  uint32_t num_t, out_dim;
+  // Number of distinct timesteps, output width per timestep and F16 bias flag.
+  uint32_t num_t, out_dim, bias_f16;
 } DitAdalnParam;
 
 // Parameters passed to minimax_h3_dit_norm_mod.
@@ -224,8 +224,10 @@ typedef struct {
   Buf norm1, norm2;
   // Per-head Q and K RMSNorm weights (FP32, 128).
   Buf q_norm, k_norm;
-  // Pruned curve-form AdaLN linear (F16 [96768, 8] weight + BF16 [96768] bias).
+  // Pruned curve-form AdaLN linear (F16 [96768, 8] weight + BF16/F16 bias).
   Buf adaln_w, adaln_b;
+  // Non-zero when adaln_b is stored as IEEE FP16 instead of BF16.
+  uint32_t adaln_bias_f16;
   // Attention QKV and output INT8-ConvRot projections.
   Int8Lin qkv_proj, out_proj;
   // SwiGLU MLP fc1 and fc2 INT8-ConvRot projections.
@@ -305,6 +307,8 @@ struct MinimaxH3Dit {
   DitBlock blocks[DIT_LAYERS];
   // Final RMSNorm and curve-form AdaLN weights (10752x8).
   Buf final_norm, final_adaln_w, final_adaln_b;
+  // Non-zero when final_adaln_b is stored as IEEE FP16 instead of BF16.
+  uint32_t final_adaln_bias_f16;
   // Unfolded FP32 PDD video_out head weights and biases.
   Buf pdd_w, pdd_b;
   // Optional unfolded FP32 audio_out head weights and biases.
@@ -536,8 +540,9 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
     if (aw.dtype != 'h' || aw.shape[0] != DIT_ADALN_OUT ||
         aw.shape[1] != DIT_ADALN_RANK)
       die("unexpected blocks.%d.adaln_proj.linear.weight shape", i);
-    if (ab.dtype != 'b' || ab.shape[0] != DIT_ADALN_OUT)
+    if ((ab.dtype != 'b' && ab.dtype != 'h') || ab.shape[0] != DIT_ADALN_OUT)
       die("unexpected blocks.%d.adaln_proj.linear.bias shape", i);
+    b->adaln_bias_f16 = (uint32_t)(ab.dtype == 'h');
     weight_group_add_tensor(dit->weights, &b->adaln_w, aw, 0);
     weight_group_add_tensor(dit->weights, &b->adaln_b, ab, 0);
 
@@ -567,8 +572,10 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
   if (faw.dtype != 'h' || faw.shape[0] != DIT_FINAL_ADALN_OUT ||
       faw.shape[1] != DIT_ADALN_RANK)
     die("unexpected final_layer.adaln_proj.linear.weight shape");
-  if (fab.dtype != 'b' || fab.shape[0] != DIT_FINAL_ADALN_OUT)
+  if ((fab.dtype != 'b' && fab.dtype != 'h') ||
+      fab.shape[0] != DIT_FINAL_ADALN_OUT)
     die("unexpected final_layer.adaln_proj.linear.bias shape");
+  dit->final_adaln_bias_f16 = (uint32_t)(fab.dtype == 'h');
   weight_group_add_tensor(dit->weights, &dit->final_adaln_w, faw, 0);
   weight_group_add_tensor(dit->weights, &dit->final_adaln_b, fab, 0);
 
@@ -1126,7 +1133,6 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
                           const MinimaxH3Lora *lora,
                           const MinimaxH3RunHooks *hooks, uint64_t *prev_cmd) {
   uint32_t padded_seq = ((uint32_t)seq_len + TILE_M - 1) / TILE_M * TILE_M;
-  DitAdalnParam adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT};
   DitNormModParam msa_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
                                 OFF_SHIFT_MSA, OFF_SCALE_MSA, DIT_NORM_EPS};
   DitNormModParam mlp_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
@@ -1143,6 +1149,8 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     if (minimax_h3_should_stop(hooks)) return 0;
     const DitBlock *b = &dit->blocks[i];
     const MinimaxH3LoraBlock *lb = minimax_h3_lora_dit_block(lora, i);
+    DitAdalnParam block_adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT,
+                                   b->adaln_bias_f16};
     GpuCommandBuffer cmd = gpu_begin(dit->gpu);
 
     gpu_select_kernel(&cmd, dit->k_adaln);
@@ -1150,7 +1158,7 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     gpu_bind_buffer(&cmd, 1, &b->adaln_b, 0);
     gpu_bind_buffer(&cmd, 2, &ws->t_emb, 0);
     gpu_bind_buffer(&cmd, 3, &ws->mod, 0);
-    gpu_copy_bytes(&cmd, 4, &adaln_p, sizeof adaln_p);
+    gpu_copy_bytes(&cmd, 4, &block_adaln_p, sizeof block_adaln_p);
     gpu_run_kernel(&cmd,
                    ((uint32_t)DIT_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
                    num_t, 1, ELEM_THREADS, 1, 1);
@@ -1350,7 +1358,8 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   minimax_h3_fill_gaussian(out_latents, latent_floats, seed);
 
   uint32_t num_t = ref_count > 0 ? 2u : 1u;
-  DitAdalnParam final_adaln_p = {1u, (uint32_t)DIT_FINAL_ADALN_OUT};
+  DitAdalnParam final_adaln_p = {1u, (uint32_t)DIT_FINAL_ADALN_OUT,
+                                 dit->final_adaln_bias_f16};
   DitNormModParam final_norm_p = {(uint32_t)DIT_DIM,
                                   (uint32_t)DIT_FINAL_ADALN_OUT, 0,
                                   (uint32_t)DIT_DIM, DIT_NORM_EPS};
@@ -1984,7 +1993,8 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
   size_t audio_norm_off =
       (size_t)layout.target_video_rows * (size_t)DIT_DIM * sizeof(float);
 
-  DitAdalnParam final_adaln_p = {2u, (uint32_t)DIT_FINAL_ADALN_OUT};
+  DitAdalnParam final_adaln_p = {2u, (uint32_t)DIT_FINAL_ADALN_OUT,
+                                 dit->final_adaln_bias_f16};
   DitNormModParam final_norm_p = {(uint32_t)DIT_DIM,
                                   (uint32_t)DIT_FINAL_ADALN_OUT, 0,
                                   (uint32_t)DIT_DIM, DIT_NORM_EPS};
