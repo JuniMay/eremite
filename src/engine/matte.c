@@ -56,6 +56,13 @@ static constexpr int LEAD_OFFSET = LEVELS - 1;
 // The number of different leads.
 static constexpr int LEADS = 2 * LEVELS - 1;
 
+// The ratio of a normal distribution's standard deviation to its median
+// absolute deviation: 1 over the normal quantile at three quarters.
+static constexpr double MAD_TO_SIGMA = 1.4826;
+
+// The smallest lead that a pixel can have: one level.
+static constexpr double SMALLEST_LEAD = 1.0;
+
 // Returns how far pixel's channel strong leads its other two channels: its
 // level less the larger of theirs.
 static int lead_of(const uint8_t *pixel, int strong) {
@@ -72,6 +79,24 @@ static int median_of(const size_t *histogram, int values, size_t total) {
   for (int v = 0; v < values; v++) {
     seen += histogram[v];
     if (2 * seen >= total) return v;
+  }
+  return values - 1;
+}
+
+// Returns the median of the values counted in histogram, whose counts add up
+// to total, where each whole value stands for the values that round to it:
+// value 0 for those from 0 to one half, and value v for those within one half
+// of v.
+static double interpolated_median_of(const size_t *histogram, int values,
+                                     size_t total) {
+  double half = (double)total / 2.0, seen = 0.0;
+  for (int v = 0; v < values; v++) {
+    double count = (double)histogram[v];
+    if (count > 0.0 && seen + count >= half) {
+      double low = v == 0 ? 0.0 : v - 0.5, width = v == 0 ? 0.5 : 1.0;
+      return low + width * (half - seen) / count;
+    }
+    seen += count;
   }
   return values - 1;
 }
@@ -126,12 +151,21 @@ int matte_remove_key(const uint8_t *rgb, int width, int height,
     spread_counts[distance] += lead_counts[v];
   }
   free(lead_counts);
-  int spread = median_of(spread_counts, LEADS, keyed);
-  // A pixel whose lead is at least the key's lead less its spread is
-  // transparent, and a pixel with no lead is opaque.
-  int clear_lead = key_lead - spread > 0 ? key_lead - spread : key_lead;
-
+  // The background's noise, as a normal spread: its standard deviation comes
+  // from the median distance of the border's leads from the key's lead.
+  double sigma =
+      MAD_TO_SIGMA * interpolated_median_of(spread_counts, LEADS, keyed);
+  // How far below the key's lead the noise of the image's background reaches:
+  // the farthest of n normal samples lies about sqrt(2 ln n) standard
+  // deviations from their mean.
   size_t pixels = (size_t)width * (size_t)height;
+  double reach = sigma * sqrt(2.0 * log((double)pixels));
+  // A pixel whose lead is within that reach of the key's lead is transparent,
+  // and a pixel with no lead is opaque. When the noise reaches below the
+  // smallest lead, every pixel that leads at all is transparent.
+  double clear_lead =
+      key_lead - reach > SMALLEST_LEAD ? key_lead - reach : SMALLEST_LEAD;
+
   for (size_t i = 0; i < pixels; i++) {
     const uint8_t *px = rgb + i * RGB_CHANNELS;
     uint8_t *out = rgba + i * RGBA_CHANNELS;

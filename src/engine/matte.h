@@ -22,9 +22,11 @@ void matte_keep_masked_rgba(uint8_t *edited, const uint8_t *original,
 // rgb: an image generated on a flat background of the color requested, which
 // becomes transparent. The key is the median color of the image's border, and
 // it must lead in requested's strongest channel. A pixel's alpha comes from
-// how far its color leads in that channel: pixels within the border's spread
-// of the key's lead are transparent, and pixels with no lead are opaque. A
-// partly transparent pixel's color is unmixed from the key. Returns 0 when the
+// how far its color leads in that channel. A pixel is transparent when its
+// lead is within the background's noise of the key's lead: the noise is
+// measured on the border, and widened to how far it reaches among as many
+// pixels as the image holds. A pixel with no lead is opaque. A partly
+// transparent pixel's color is unmixed from the key. Returns 0 when the
 // border shows no such key.
 int matte_remove_key(const uint8_t *rgb, int width, int height,
                      const uint8_t requested[3], uint8_t *rgba);

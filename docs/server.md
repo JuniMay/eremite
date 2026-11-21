@@ -180,8 +180,10 @@ the returned images, `output_format` is their format, and `background` is
   flat pure green (#00FF00) background; the token limit cuts a long prompt's
   end, so the sentence stays. It then makes that background clear. The key
   is the median color of the image's border, and a pixel's alpha comes from
-  how far its green leads its red and blue, measured against the border's
-  own spread. With a mask, the key comes from the edit's own border, and the
+  how far its green leads its red and blue. A pixel is clear when its lead is
+  within the background's noise of the key's: the noise is measured on the
+  border, and widened to how far it reaches among all the image's pixels. A
+  pixel with no lead stays opaque. With a mask, the key comes from the edit's own border, and the
   mask then keeps the first image's pixels, opaque. This is an
   approximation: the edges of hair, glass, smoke and soft shadows suffer, and
   green parts of the subject turn clear. An image whose border has no green

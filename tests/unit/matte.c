@@ -80,6 +80,38 @@ int main(void) {
                 (edge_out[0] > edge_out[2] ? edge_out[0] : edge_out[2]),
         "a mixed edge pixel is partly clear and loses the key's lead");
 
+  // A 64 by 64 image whose green background leads by 237 to 249 levels, the
+  // spread that MiniMax-H3-Image draws, around a red square: every background
+  // pixel is clear, and the square stays opaque.
+  enum { WIDE = 64, WIDE_FROM = 24, WIDE_TO = 40 };
+
+  static uint8_t spread[WIDE * WIDE * 3], spread_rgba[WIDE * WIDE * 4];
+  for (int y = 0; y < WIDE; y++)
+    for (int x = 0; x < WIDE; x++) {
+      uint8_t *px = spread + (y * WIDE + x) * 3;
+      int inside =
+          x >= WIDE_FROM && x < WIDE_TO && y >= WIDE_FROM && y < WIDE_TO;
+      // Two patterns of 0 to 6 levels: the blue rises and the green falls,
+      // so that the lead takes every value from 237 to 249.
+      int blue_rise = (x * 7 + y * 3) % 7, green_fall = (x * 5 + y * 11) % 7;
+      px[0] = (uint8_t)(inside ? 200 : 0);
+      px[1] = (uint8_t)(inside ? 30 : 255 - green_fall);
+      px[2] = (uint8_t)(inside ? 30 : 6 + blue_rise);
+    }
+  int spread_keyed = matte_remove_key(spread, WIDE, WIDE, green, spread_rgba);
+  int spread_clear = 1, square_opaque = 1;
+  for (int i = 0; i < WIDE * WIDE; i++) {
+    int x = i % WIDE, y = i / WIDE;
+    int inside = x >= WIDE_FROM && x < WIDE_TO && y >= WIDE_FROM && y < WIDE_TO;
+    if (inside)
+      square_opaque &= spread_rgba[i * 4 + 3] == 255;
+    else
+      spread_clear &= spread_rgba[i * 4 + 3] == 0;
+  }
+  check(spread_keyed && spread_clear && square_opaque,
+        "a background whose green lead varies by a dozen levels is clear "
+        "everywhere");
+
   // A border without the key's color has nothing to remove.
   uint8_t red[4 * 4 * 3], red_rgba[4 * 4 * 4];
   for (int i = 0; i < 4 * 4; i++)
