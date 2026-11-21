@@ -8,10 +8,12 @@
 //! The format also reads the reasoning and tool calls in the model's output.
 //! deepseek.rs holds the DeepSeek V4.1 format.
 //! That format uses the deepseek-recipe crate.
+//! inkling2.rs holds the Inkling-2-Mini format.
 //! This file holds what every format shares: request checks, errors and
 //! response ids.
 
 pub mod deepseek;
+pub mod inkling2;
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
