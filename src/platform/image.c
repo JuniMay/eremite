@@ -3,6 +3,8 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
 #include <jpeglib.h>
+// libjpeg's message codes, such as its warning that the data ended early.
+#include <jerror.h>
 #include <webp/encode.h>
 #include <setjmp.h>
 #include <stdlib.h>
@@ -127,9 +129,20 @@ typedef struct {
 typedef struct {
   struct jpeg_error_mgr mgr;
   jmp_buf back;
+  // Whether the data ended before the image: libjpeg then fills the rest of
+  // the image itself and only warns.
+  int cut_short;
 } JpegErr;
 
 static void jpeg_fail(j_common_ptr c) { longjmp(((JpegErr *)c->err)->back, 1); }
+
+// Notes libjpeg's warning that the data ended before the image. Other
+// warnings, such as extra bytes before a marker, leave a usable image, as
+// Pillow decodes it.
+static void jpeg_note(j_common_ptr c, int level) {
+  if (level < 0 && c->err->msg_code == JWRN_JPEG_EOF)
+    ((JpegErr *)c->err)->cut_short = 1;
+}
 
 static Rgb decode_jpeg(const void *bytes, size_t len, const char **err) {
   struct jpeg_decompress_struct c;
@@ -139,6 +152,8 @@ static Rgb decode_jpeg(const void *bytes, size_t len, const char **err) {
   r = (Rgb){0};
   c.err = jpeg_std_error(&je.mgr);
   je.mgr.error_exit = jpeg_fail;
+  je.mgr.emit_message = jpeg_note;
+  je.cut_short = 0;
   if (setjmp(je.back)) {
     jpeg_destroy_decompress(&c);
     free(r.p);
@@ -167,6 +182,11 @@ static Rgb decode_jpeg(const void *bytes, size_t len, const char **err) {
   }
   jpeg_finish_decompress(&c);
   jpeg_destroy_decompress(&c);
+  if (je.cut_short) {
+    free(r.p);
+    *err = "the JPEG file is cut short or damaged";
+    return (Rgb){0};
+  }
   return r;
 }
 

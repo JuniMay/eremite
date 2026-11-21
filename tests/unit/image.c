@@ -375,6 +375,38 @@ int main(void) {
   free(whole);
   free(whole_rgba);
 
+  // The same for a JPEG file: under zeros or cut off, its end is gone.
+  size_t damaged_jpeg_length = 0;
+  error = 0;
+  uint8_t *whole_jpeg =
+      image_encode_jpeg(pattern, DAMAGED_SIDE, DAMAGED_SIDE, IMAGE_QUALITY_MAX,
+                        &damaged_jpeg_length, &error);
+  size_t damaged_jpeg_kept = damaged_jpeg_length - damaged_jpeg_length / 4;
+  uint8_t *zeroed_jpeg = xmalloc(damaged_jpeg_length);
+  memcpy(zeroed_jpeg, whole_jpeg, damaged_jpeg_length);
+  memset(zeroed_jpeg + damaged_jpeg_kept, 0,
+         damaged_jpeg_length - damaged_jpeg_kept);
+  const char *jpeg_cut_error = 0, *jpeg_zeroed_error = 0;
+  uint8_t *from_cut_jpeg = image_decode_rgb(
+      whole_jpeg, damaged_jpeg_kept, &damaged_w, &damaged_h, &jpeg_cut_error);
+  uint8_t *from_zeroed_jpeg =
+      image_decode_rgb(zeroed_jpeg, damaged_jpeg_length, &damaged_w, &damaged_h,
+                       &jpeg_zeroed_error);
+  int whole_w = 0, whole_h = 0;
+  const char *whole_error = 0;
+  uint8_t *from_whole_jpeg = image_decode_rgb(whole_jpeg, damaged_jpeg_length,
+                                              &whole_w, &whole_h, &whole_error);
+  check(whole_jpeg && !from_cut_jpeg && jpeg_cut_error && !from_zeroed_jpeg &&
+            jpeg_zeroed_error && from_whole_jpeg && !whole_error &&
+            whole_w == DAMAGED_SIDE && whole_h == DAMAGED_SIDE,
+        "a JPEG file whose end is zeroed or cut off is refused, and the whole "
+        "file decodes");
+  free(from_cut_jpeg);
+  free(from_zeroed_jpeg);
+  free(from_whole_jpeg);
+  free(zeroed_jpeg);
+  free(whole_jpeg);
+
   CGColorSpaceRelease(gray_space);
   CGColorSpaceRelease(srgb);
   return failures != 0;

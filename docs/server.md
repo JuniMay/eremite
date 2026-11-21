@@ -160,7 +160,7 @@ the returned images, `output_format` is their format, and `background` is
   fetches no URLs and has no Files API, so `file_id` gets HTTP 400. An image
   that does not decode gets HTTP 400, and so does a PNG file that is cut
   short or damaged: one whose chunks run past its end, fail their CRC, or
-  end before IEND.
+  end before IEND. A JPEG file whose data ends before the image does too.
 - `mask`: `/v1/images/edits` only, optional: an image with an alpha channel,
   the size of the first image, as a file part or in JSON as an object with an
   `image_url`. Its transparent pixels mark what the edit changes; its opaque
