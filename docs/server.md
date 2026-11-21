@@ -2,8 +2,9 @@
 
 `build/eremite-server` serves the models that its configuration file lists
 (README.md, Serve). This document lists every setting, and explains how the
-server handles requests, memory, decision models, image models, Codex's image
-tool and Codex's web search.
+server handles requests, memory, decision models and image models.
+`docs/codex.md` describes Codex configuration, the Codex model catalog, Codex's
+image tool and Codex's web search.
 
 ## Settings
 
@@ -237,87 +238,3 @@ request that does not fit now gets HTTP 503.
 
 During a pass, the image model yields between layers to any running
 text-decoding calls so decoding latency is not degraded.
-
-## Codex's image tool
-
-Codex's image tool, `image_gen`, calls the provider's
-`POST /v1/images/generations` and `POST /v1/images/edits` when the provider is
-OpenAI, signs in with OpenAI, or sends an `x-openai-actor-authorization`
-header. For eremite, the provider's entry in Codex's `config.toml` sends that
-header, and the `image_generation` feature turns the tool on:
-
-```toml
-[model_providers.eremite]
-http_headers = { "x-openai-actor-authorization" = "eremite" }
-
-[features]
-image_generation = true
-```
-
-The server ignores the header's value. The tool always sends `size` and
-`quality` as `auto`: a new image gets the image model's `default_size`, and an
-edit gets the size of its first image. It sends `background` as `transparent`
-or `opaque`, edits as JSON with data URLs, and no mask. It names the model
-`gpt-image-2`, which no served model has, so the request goes to the image
-model when the server serves only one. Its `gif` option sends
-`output_format: "gif"`, which gets HTTP 400: the server makes no GIFs.
-
-`skills/README.md` describes the `image-generation` skill for using this tool
-and calling the image API directly.
-
-## Codex's web search
-
-Codex's web tool sends each call to `POST /v1/alpha/search`, with its session
-`id` and the model's `commands`. Each call takes the next turn number N of its
-session. The call's references carry N: a search result is `turnNsearchM`,
-and an opened page is `turnNviewM`. So no two calls of a session share a
-reference.
-
-A session `id` that the server has not seen starts at turn 0, unless it is a
-fork. For a new `id`, the server reads the string `forked_from_thread_id` from
-the JSON object in the `x-codex-turn-metadata` header. The fork then starts at
-its parent's next turn. When the server does not know the parent, the fork
-starts after the highest turn that any session has used. A fork whose header
-names no readable parent starts at 0, and can reuse references from the
-history it copied.
-
-The server keeps each session's next turn in `turns.json` in `search_dir`. The
-file holds one entry per session and keeps it forever. Each call saves the
-file before the call issues references: the server syncs a new copy, puts it
-in place of the old one, and syncs the folder. Only one server at a time can
-use the folder. When the file cannot be saved, the call fails with HTTP 500,
-and its turn number stays unused. Without `search_dir` and without a nonempty
-`HOME`, the counters stay in memory, so a restart can give a resumed chat
-references that it already holds.
-
-To move `search_dir`, stop the server and copy `turns.json` along. A lost or
-older copy of the file can also give a chat references that it already holds.
-
-The pages and search results behind the references stay in memory, per
-session. The server drops them after `search_session_idle` without a call,
-and at a restart. A call that names a dropped reference tells the model to
-open its URL instead.
-
-The server runs `search_query` through SearXNG. Each query shows up to 5, 8
-or 12 results, by Codex's `response_length`. With
-`search_ranking_model` set, that decision model ranks the query's first 20
-results from SearXNG, one decision each. A decision's input is `Query:` and
-the query, a blank line, then `Passage:` and the result's title, with its
-snippet on the next line. Its one predicate is "Is this passage relevant to
-answering the query?", Liquid AI's prompt for reranking. The results with the
-highest probability of yes show, ties in SearXNG's order. Without the
-setting, or when the decision is refused, fails, cannot be queued or takes
-longer than `search_timeout`, the query's first results show in SearXNG's
-order, and the log says why. The `output` text lists each query's results
-under the query: title, URL, citation reference and snippet. For each result
-in `output`, `results` holds a `text_result` with the same `ref_id`, `url`,
-`title` and `snippet`, in the same order. A successful query with no result
-shown gives an empty array, and a call without a successful query gives
-`null`. `encrypted_output` is always `null`.
-
-Within a session, `open` accepts a search reference, a page reference or a
-URL. Page views number each line and link. `find` says how many lines match.
-It returns the whole page when the page fits the view's line and output
-limits, and otherwise the matching lines with up to two lines on either side.
-`click` follows a numbered link of the page. These commands do not use the
-model.

@@ -40,5 +40,5 @@ variables:
   `http://127.0.0.1:8008/v1`).
 - `IMAGE_API_AUTH_FILE`: path to the file holding the server's API key.
 
-See `docs/server.md` (Codex's image tool) for the Codex `config.toml` lines
-that enable the image tool with eremite.
+See `docs/codex.md` for the Codex `config.toml` lines that enable the image
+tool with eremite.
