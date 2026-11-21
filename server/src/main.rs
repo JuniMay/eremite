@@ -17,7 +17,9 @@
 //! The configuration file (config.rs) holds every setting. The command line
 //! names only that file.
 
-use eremite_server::{chat, codex, config, control, decision, engine, http, image, ui, worker};
+use eremite_server::{
+    chat, codex, config, control, decision, engine, http, image, ui, video, worker,
+};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -29,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -106,6 +108,8 @@ struct Shared {
     models: Vec<Served>,
     /// Codex's web tool (POST /v1/alpha/search).
     search: codex::search::Service,
+    /// OpenAI Videos API job store and MP4 directory.
+    videos: video::VideoStore,
     /// The limits on connections and requests.
     limits: http::Limits,
     /// The time between the comment lines of a streamed response that waits for
@@ -129,6 +133,12 @@ fn makes_decisions(model: &Served) -> bool {
 /// /v1/images/generations and POST /v1/images/edits.
 fn generates_images(model: &Served) -> bool {
     matches!(model.format, Format::MinimaxH3Image(_))
+}
+
+/// Returns whether `model` is a video model: whether it answers POST
+/// /v1/videos.
+fn generates_videos(model: &Served) -> bool {
+    matches!(model.format, Format::MinimaxH3Video(_))
 }
 
 /// Finds the index of the model named `name` (in any case). For an unknown
@@ -950,6 +960,273 @@ async fn stream_image_events(
         .expect("a valid response")
 }
 
+/// Finds the served video model named `name` (or the default video model) and
+/// returns its index and engine-reported limits, or an HTTP status and message.
+fn resolve_video_model(
+    shared: &Shared,
+    name: Option<&str>,
+) -> Result<(usize, engine::VideoLimits), (StatusCode, String)> {
+    let index = find_model_index_by_name(shared, name, generates_videos)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    let model = &shared.models[index];
+    let Format::MinimaxH3Video(limits) = model.format else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{} generates no videos", model.id),
+        ));
+    };
+    Ok((index, limits))
+}
+
+/// Answers POST /v1/videos: parses JSON or multipart/form-data, selects the
+/// target video model, validates against that model's limits, queues the job
+/// on the worker, spawns a background collector, and returns the queued video
+/// object immediately.
+async fn answer_video_create(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let video_limits = http::Limits {
+        max_body_bytes: video::MAX_VIDEO_BODY_BYTES,
+        ..shared.limits
+    };
+    let body = match http::read_body(body, video_limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let submission = match video::parse_create_body(content_type, &body) {
+        Ok(submission) => submission,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let (index, limits) = match resolve_video_model(&shared, submission.model()) {
+        Ok(pair) => pair,
+        Err((status, message)) => return refuse_image_model(&peer, status, message),
+    };
+    let parsed = match submission.validate(&limits) {
+        Ok(parsed) => parsed,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let id = shared.videos.next_id();
+    let model_id = shared.models[index].id.clone();
+    let prompt_copy = parsed.prompt.clone();
+    let display_size = parsed.display_size.clone();
+    let display_seconds = parsed.display_seconds.clone();
+    let note =
+        format!("http {arrival} from {peer}: video {id} ({display_size}, {display_seconds}s)");
+    let (cancel, mut events) = match worker::submit_video(parsed.into_worker_request(index, note))
+        .map_err(convert_submit_error)
+    {
+        Ok(pair) => pair,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let job = shared.videos.insert_queued(
+        id.clone(),
+        model_id,
+        index,
+        prompt_copy,
+        display_size,
+        display_seconds,
+        cancel,
+    );
+    let store = shared.videos.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                worker::Event::VideoStarted => store.mark_in_progress(&id),
+                worker::Event::Video(output) => {
+                    store.complete(&id, output);
+                    return;
+                }
+                worker::Event::Refused(message) => {
+                    store.fail(&id, "invalid_request_error", message);
+                    return;
+                }
+                worker::Event::Failed(message) => {
+                    store.fail(&id, "video_generation_failed", message);
+                    return;
+                }
+                worker::Event::Done { reason } => {
+                    let message = if reason == worker::FinishReason::Cancelled {
+                        "video job cancelled"
+                    } else {
+                        "the server is stopping"
+                    };
+                    store.fail(&id, "cancelled", message.into());
+                    return;
+                }
+                _ => {}
+            }
+        }
+        store.fail(&id, "video_generation_failed", "worker stopped".into());
+    });
+    build_json_response(job.to_json().to_string())
+}
+
+/// Parses `key=value` pairs from a URL query string without percent-decoding
+/// keys (keys in the Videos API are ASCII identifiers).
+fn find_query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
+}
+
+/// Answers GET /v1/videos with a paginated list of video jobs.
+async fn list_videos(State(shared): App, uri: Uri) -> Response {
+    if shared.videos.has_in_progress() {
+        worker::refresh_status().await;
+    }
+    let query = uri.query();
+    let limit = match find_query_param(query, "limit") {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return chat::build_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "limit must be a positive integer",
+                );
+            }
+        },
+    };
+    let after = find_query_param(query, "after").filter(|s| !s.is_empty());
+    let order = find_query_param(query, "order")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("desc");
+    if !order.eq_ignore_ascii_case("asc") && !order.eq_ignore_ascii_case("desc") {
+        return chat::build_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "order must be \"asc\" or \"desc\"",
+        );
+    }
+    let (jobs, has_more) = shared
+        .videos
+        .list(limit, after, order, worker::video_progress);
+    let first_id = jobs.first().map(|j| j.id.clone());
+    let last_id = jobs.last().map(|j| j.id.clone());
+    let data: Vec<Value> = jobs.iter().map(video::VideoJob::to_json).collect();
+    build_json_response(
+        json!({
+            "object": "list",
+            "data": data,
+            "first_id": first_id,
+            "last_id": last_id,
+            "has_more": has_more,
+        })
+        .to_string(),
+    )
+}
+
+/// Answers GET /v1/videos/{id} with the job's current status and live progress.
+async fn get_video(State(shared): App, Path(id): Path<String>) -> Response {
+    let Some(initial) = shared.videos.get(&id, |_, _| None) else {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("no video {id:?}"),
+        );
+    };
+    if initial.status == video::JobStatus::InProgress {
+        worker::refresh_status().await;
+    }
+    let Some(job) = shared.videos.get(&id, worker::video_progress) else {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("no video {id:?}"),
+        );
+    };
+    build_json_response(job.to_json().to_string())
+}
+
+/// Answers GET /v1/videos/{id}/content with the completed MP4 bytes.
+async fn get_video_content(State(shared): App, Path(id): Path<String>, uri: Uri) -> Response {
+    if let Some(variant) = find_query_param(uri.query(), "variant")
+        && !variant.is_empty()
+        && !variant.eq_ignore_ascii_case("video")
+    {
+        return chat::build_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("variant {variant:?} is not supported; use \"video\""),
+        );
+    }
+    let Some(job) = shared.videos.get(&id, |_, _| None) else {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("no video {id:?}"),
+        );
+    };
+    if job.status != video::JobStatus::Completed {
+        return chat::build_error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &format!("video {id} is {}, not completed", job.status.as_str()),
+        );
+    }
+    let Some(path) = job.content_path else {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("video {id} content is missing"),
+        );
+    };
+    match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+        Ok(Ok(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "video/mp4")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{id}.mp4\""),
+            )
+            .body(Body::from(bytes))
+            .expect("a valid response"),
+        Ok(Err(error)) => chat::build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("cannot read video {id}: {error}"),
+        ),
+        Err(error) => chat::build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("cannot read video {id}: {error}"),
+        ),
+    }
+}
+
+/// Answers DELETE /v1/videos/{id}: cancels if active and deletes job and MP4.
+async fn delete_video(State(shared): App, Path(id): Path<String>) -> Response {
+    if !shared.videos.delete(&id) {
+        return chat::build_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("no video {id:?}"),
+        );
+    }
+    build_json_response(
+        json!({
+            "id": id,
+            "object": "video.deleted",
+            "deleted": true,
+        })
+        .to_string(),
+    )
+}
+
 /// Answers a request for an unknown path with 404.
 async fn refuse_unknown_endpoint() -> Response {
     chat::build_error_response(
@@ -974,6 +1251,24 @@ async fn refuse_other_than_post() -> Response {
         StatusCode::METHOD_NOT_ALLOWED,
         "invalid_request_error",
         "use POST",
+    )
+}
+
+/// Answers a request with a method other than GET or POST with 405.
+async fn refuse_other_than_get_or_post() -> Response {
+    chat::build_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "use GET or POST",
+    )
+}
+
+/// Answers a request with a method other than GET or DELETE with 405.
+async fn refuse_other_than_get_or_delete() -> Response {
+    chat::build_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "use GET or DELETE",
     )
 }
 
@@ -1054,7 +1349,7 @@ fn main() {
             Family::DeepSeek => deepseek::DEFAULT_MODEL_ID.into(),
             Family::D1 => d1::derive_model_names(&model.engine.model).0,
             Family::MinimaxH3Image => image::DEFAULT_MODEL_ID.into(),
-            Family::MinimaxH3Video => "minimax-h3-video".into(),
+            Family::MinimaxH3Video => video::DEFAULT_MODEL_ID.into(),
         });
         if served
             .iter()
@@ -1167,7 +1462,7 @@ fn main() {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
             Family::D1 => d1::derive_model_names(&settings.options.model).1,
             Family::MinimaxH3Image => image::DISPLAY_NAME.to_string(),
-            Family::MinimaxH3Video => "MiniMax-H3 Video".to_string(),
+            Family::MinimaxH3Video => video::DISPLAY_NAME.to_string(),
         };
         let extra = match &format {
             Format::MinimaxH3Video(limits) => format!(
@@ -1296,6 +1591,12 @@ fn main() {
                 None => service,
             }
         },
+        videos: {
+            let dir = settings
+                .video_folder(std::env::var_os("HOME"))
+                .unwrap_or_else(|| PathBuf::from(".local/share/eremite/videos"));
+            video::VideoStore::new(dir)
+        },
         limits: http::Limits {
             timeout: Duration::from_secs_f64(configuration.server.http_timeout_s),
             ..http::DEFAULT_LIMITS
@@ -1389,6 +1690,38 @@ fn main() {
         .route(
             "/images/edits",
             post(answer_image_edits).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/videos",
+            get(list_videos)
+                .post(answer_video_create)
+                .fallback(refuse_other_than_get_or_post),
+        )
+        .route(
+            "/videos",
+            get(list_videos)
+                .post(answer_video_create)
+                .fallback(refuse_other_than_get_or_post),
+        )
+        .route(
+            "/v1/videos/{id}",
+            get(get_video)
+                .delete(delete_video)
+                .fallback(refuse_other_than_get_or_delete),
+        )
+        .route(
+            "/videos/{id}",
+            get(get_video)
+                .delete(delete_video)
+                .fallback(refuse_other_than_get_or_delete),
+        )
+        .route(
+            "/v1/videos/{id}/content",
+            get(get_video_content).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/videos/{id}/content",
+            get(get_video_content).fallback(refuse_other_than_get),
         )
         .fallback(refuse_unknown_endpoint)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))

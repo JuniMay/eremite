@@ -416,7 +416,10 @@ static int minimax_h3_video_load(Gpu *gpu, MemorySlot *work, const char *dir,
     v_audio_vae = minimax_h3_audio_vae_open(gpu, work->account,
                                             o->minimax_h3_video.audio_vae);
 
-    // Baseline memory budget for the default 1344x768 124-frame T2VA clip.
+    // Full-residence budget covers the default 1344x768 124-frame T2VA clip.
+    // Staged baseline covers the smallest valid clip so smaller videos can load
+    // and run when memory is tighter; each request still reserves its exact
+    // canvas and frame budget before Qwen3-VL runs.
     int def_t = minimax_h3_video_latent_t(MINIMAX_H3_VIDEO_DEFAULT_FRAMES);
     int def_at = minimax_h3_video_audio_t(MINIMAX_H3_VIDEO_DEFAULT_FRAMES);
     int def_frame_rows =
@@ -435,10 +438,23 @@ static int minimax_h3_video_load(Gpu *gpu, MemorySlot *work, const char *dir,
                   text_hidden_bytes,
         .decode_video = minimax_h3_video_vae_decode_workspace_bytes(),
         .decode_audio = minimax_h3_audio_vae_decode_workspace_bytes(def_at)};
-    MinimaxH3RequestMemory base_mem = minimax_h3_video_plan_request_memory(
-        read_weight_bytes(), def_stages, 0, 0, 0);
-    required_full_bytes = base_mem.full_bytes;
-    required_staged_bytes = base_mem.staged_bytes;
+    MinimaxH3VideoWeightBytes wb = read_weight_bytes();
+    MinimaxH3RequestMemory full_mem =
+        minimax_h3_video_plan_request_memory(wb, def_stages, 0, 0, 0);
+    required_full_bytes = full_mem.full_bytes;
+
+    int min_t = minimax_h3_video_latent_t(MINIMAX_H3_VIDEO_MIN_FRAMES);
+    int min_at = minimax_h3_video_audio_t(MINIMAX_H3_VIDEO_MIN_FRAMES);
+    int min_aud = min_at * MINIMAX_H3_AUDIO_STEREO_CHANNELS;
+    MinimaxH3VideoStageBytes min_stages = {
+        .encode = minimax_h3_text_encoder_workspace_bytes(1, 0),
+        .sample = minimax_h3_dit_video_workspace_bytes(0, min_t, min_t, min_aud,
+                                                       min_aud, v_lora),
+        .decode_video = minimax_h3_video_vae_decode_workspace_bytes(),
+        .decode_audio = minimax_h3_audio_vae_decode_workspace_bytes(min_at)};
+    MinimaxH3RequestMemory min_mem =
+        minimax_h3_video_plan_request_memory(wb, min_stages, 0, 0, 0);
+    required_staged_bytes = min_mem.staged_bytes;
   }
 
   // Primary mode: load and keep all core video weight groups resident.

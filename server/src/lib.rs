@@ -16,4 +16,5 @@ pub mod http;
 pub mod image;
 pub mod state_cache;
 pub mod ui;
+pub mod video;
 pub mod worker;
