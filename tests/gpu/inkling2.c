@@ -127,6 +127,11 @@ typedef struct {
 } MoeTile;
 
 typedef struct {
+  // Device GPU addresses of w13 weights, w13 scales, w2 weights and w2 scales.
+  uint64_t w13, s13, w2, s2;
+} ExpertRef;
+
+typedef struct {
   // Matrix N, K, total pairs, total tiles.
   uint32_t n, k, npairs, ntiles;
   // Softcap bounds for gate and up.
@@ -1127,6 +1132,7 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   Buf nv_w2 = gpu_alloc(gpu, slot, (size_t)nexp * dim * (inter / 2));
   Buf nv_s2 = gpu_alloc(gpu, slot, (size_t)nexp * dim * (inter / NVFP4_BLOCK));
   Buf nv_f2 = gpu_alloc(gpu, slot, (size_t)nexp * sizeof(float));
+  Buf nv_refs = gpu_alloc(gpu, slot, (size_t)nexp * sizeof(ExpertRef));
 
   uint8_t *nw13 = nv_w13.ptr, *ns13 = nv_s13.ptr, *nw2 = nv_w2.ptr,
           *ns2 = nv_s2.ptr;
@@ -1141,6 +1147,16 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   nf13[1] = 0.17f;
   nf2[0] = 0.11f;
   nf2[1] = 0.19f;
+  ExpertRef *nref = (ExpertRef *)nv_refs.ptr;
+  for (uint32_t e = 0; e < nexp; e++) {
+    nref[e] = (ExpertRef){
+        .w13 = nv_w13.address + nv_w13.off + (uint64_t)e * n13 * (dim / 2),
+        .s13 = nv_s13.address + nv_s13.off +
+               (uint64_t)e * n13 * (dim / NVFP4_BLOCK),
+        .w2 = nv_w2.address + nv_w2.off + (uint64_t)e * dim * (inter / 2),
+        .s2 = nv_s2.address + nv_s2.off +
+              (uint64_t)e * dim * (inter / NVFP4_BLOCK)};
+  }
 
   uint32_t dim4 = dim / VEC4_WIDTH;
   MoeParam mp13 = {.n = n13,
@@ -1158,22 +1174,24 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   MoeCombineParam mcp = {.rows = tokens, .dim = dim, .topk = topk_small};
 
   cmd = gpu_begin(gpu);
+  gpu_declare_read(&cmd, &nv_w13);
+  gpu_declare_read(&cmd, &nv_s13);
+  gpu_declare_read(&cmd, &nv_w2);
+  gpu_declare_read(&cmd, &nv_s2);
   run_op(&cmd, k_gather, (Buf[]){x, ptok, x_bf}, 3, &dim4, sizeof dim4,
          (dim4 + 31) / 32, npairs, 1, 32, 1, 1);
-  run_op(&cmd, k_nv_up_mv,
-         (Buf[]){nv_w13, nv_s13, nv_f13, x, ptok, tiles, h_bf}, 7, &mp13,
-         sizeof mp13, (n13 + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
+  run_op(&cmd, k_nv_up_mv, (Buf[]){nv_refs, nv_f13, x, ptok, tiles, h_bf}, 6,
+         &mp13, sizeof mp13, (n13 + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
          MV_THREADS, 1, 1);
-  run_op(&cmd, k_nv_up_mm, (Buf[]){nv_w13, nv_s13, nv_f13, x_bf, tiles, h_bf},
-         6, &mp13, sizeof mp13, (n13 + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS,
-         1, 1);
-  run_op(&cmd, k_nv_dn_mv,
-         (Buf[]){nv_w2, nv_s2, nv_f2, h_bf, pw, tiles, y_pair}, 7, &mp2,
-         sizeof mp2, (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
+  run_op(&cmd, k_nv_up_mm, (Buf[]){nv_refs, nv_f13, x_bf, tiles, h_bf}, 5,
+         &mp13, sizeof mp13, (n13 + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1,
+         1);
+  run_op(&cmd, k_nv_dn_mv, (Buf[]){nv_refs, nv_f2, h_bf, pw, tiles, y_pair}, 6,
+         &mp2, sizeof mp2, (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
          MV_THREADS, 1, 1);
-  run_op(&cmd, k_nv_dn_mm,
-         (Buf[]){nv_w2, nv_s2, nv_f2, h_bf, pw, tiles, y_pair}, 7, &mp2,
-         sizeof mp2, (dim + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1, 1);
+  run_op(&cmd, k_nv_dn_mm, (Buf[]){nv_refs, nv_f2, h_bf, pw, tiles, y_pair}, 6,
+         &mp2, sizeof mp2, (dim + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1,
+         1);
   run_op(&cmd, k_comb, (Buf[]){y_pair, tp, y_out}, 3, &mcp, sizeof mcp,
          (dim + 63) / 64, tokens, 1, 64, 1, 1);
   gpu_commit(&cmd);
@@ -1222,6 +1240,7 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   Buf mx_s13 = gpu_alloc(gpu, slot, (size_t)nexp * n13 * (dim / MXFP8_BLOCK));
   Buf mx_w2 = gpu_alloc(gpu, slot, (size_t)nexp * dim * inter);
   Buf mx_s2 = gpu_alloc(gpu, slot, (size_t)nexp * dim * (inter / MXFP8_BLOCK));
+  Buf mx_refs = gpu_alloc(gpu, slot, (size_t)nexp * sizeof(ExpertRef));
 
   uint8_t *mw13 = mx_w13.ptr, *ms13 = mx_s13.ptr, *mw2 = mx_w2.ptr,
           *ms2 = mx_s2.ptr;
@@ -1238,19 +1257,32 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   for (size_t i = 0; i < mx_s2.size; i++)
     ms2[i] = (uint8_t)(123u + (rng_next(&rng) % 5u));
   memset(h_bf.ptr, 0, h_bf.size);
+  ExpertRef *mref = (ExpertRef *)mx_refs.ptr;
+  for (uint32_t e = 0; e < nexp; e++) {
+    mref[e] = (ExpertRef){
+        .w13 = mx_w13.address + mx_w13.off + (uint64_t)e * n13 * dim,
+        .s13 = mx_s13.address + mx_s13.off +
+               (uint64_t)e * n13 * (dim / MXFP8_BLOCK),
+        .w2 = mx_w2.address + mx_w2.off + (uint64_t)e * dim * inter,
+        .s2 = mx_s2.address + mx_s2.off +
+              (uint64_t)e * dim * (inter / MXFP8_BLOCK)};
+  }
 
   cmd = gpu_begin(gpu);
-  run_op(&cmd, k_mx_up_mv, (Buf[]){mx_w13, mx_s13, x, ptok, tiles, h_bf}, 6,
-         &mp13, sizeof mp13, (n13 + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
+  gpu_declare_read(&cmd, &mx_w13);
+  gpu_declare_read(&cmd, &mx_s13);
+  gpu_declare_read(&cmd, &mx_w2);
+  gpu_declare_read(&cmd, &mx_s2);
+  run_op(&cmd, k_mx_up_mv, (Buf[]){mx_refs, x, ptok, tiles, h_bf}, 5, &mp13,
+         sizeof mp13, (n13 + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
          MV_THREADS, 1, 1);
-  run_op(&cmd, k_mx_up_mm, (Buf[]){mx_w13, mx_s13, x_bf, tiles, h_bf}, 5, &mp13,
+  run_op(&cmd, k_mx_up_mm, (Buf[]){mx_refs, x_bf, tiles, h_bf}, 4, &mp13,
          sizeof mp13, (n13 + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1, 1);
-  run_op(&cmd, k_mx_dn_mv, (Buf[]){mx_w2, mx_s2, h_bf, pw, tiles, y_pair}, 6,
-         &mp2, sizeof mp2, (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
+  run_op(&cmd, k_mx_dn_mv, (Buf[]){mx_refs, h_bf, pw, tiles, y_pair}, 5, &mp2,
+         sizeof mp2, (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, 2, 1,
          MV_THREADS, 1, 1);
-  run_op(&cmd, k_mx_dn_mm, (Buf[]){mx_w2, mx_s2, h_bf, pw, tiles, y_pair}, 6,
-         &mp2, sizeof mp2, (dim + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1,
-         1);
+  run_op(&cmd, k_mx_dn_mm, (Buf[]){mx_refs, h_bf, pw, tiles, y_pair}, 5, &mp2,
+         sizeof mp2, (dim + MM_TILE - 1) / MM_TILE, 2, 1, MM_THREADS, 1, 1);
   run_op(&cmd, k_comb, (Buf[]){y_pair, tp, y_out}, 3, &mcp, sizeof mcp,
          (dim + 63) / 64, tokens, 1, 64, 1, 1);
   gpu_commit(&cmd);
@@ -1309,10 +1341,12 @@ static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&nv_w2);
   gpu_free(&nv_s2);
   gpu_free(&nv_f2);
+  gpu_free(&nv_refs);
   gpu_free(&mx_w13);
   gpu_free(&mx_s13);
   gpu_free(&mx_w2);
   gpu_free(&mx_s2);
+  gpu_free(&mx_refs);
 }
 
 // Tests ink2_copy and GPU-side ink2_moe_group tile packing against CPU checks.

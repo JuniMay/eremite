@@ -152,6 +152,16 @@ struct Ink2MoeTile {
   uint expert, start, count, pad;
 };
 
+// Device pointers for one routed expert's weight and scale tensors.
+struct Ink2ExpertRef {
+  // Packed gate/up matrix and block scales for this expert.
+  device const uchar *w13;
+  device const uchar *s13;
+  // Packed down matrix and block scales for this expert.
+  device const uchar *w2;
+  device const uchar *s2;
+};
+
 // Parameters for NVFP4 and MXFP8 MoE matvec/matmul kernels.
 struct Ink2MoeParam {
   // Number of output rows (N) and input columns (K) per expert matrix.
@@ -1002,14 +1012,13 @@ kernel void ink2_moe_gather_bf16(device const float4 *x [[buffer(0)]],
 // up to 8 tokens sharing one expert, reading weights once per tile and writing
 // BF16 intermediate activations.
 // Grid: x = ceil(n / 32) = 72, y = ntiles. Threadgroup: 256 threads (8 sgs).
-kernel void ink2_moe_nvfp4_up_mv(device const uchar *w13 [[buffer(0)]],
-                                 device const uchar *s13 [[buffer(1)]],
-                                 device const float *factor13 [[buffer(2)]],
-                                 device const float *x [[buffer(3)]],
-                                 device const int *ptok [[buffer(4)]],
-                                 device const Ink2MoeTile *tiles [[buffer(5)]],
-                                 device bfloat *h_out [[buffer(6)]],
-                                 constant Ink2MoeParam &p [[buffer(7)]],
+kernel void ink2_moe_nvfp4_up_mv(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                 device const float *factor13 [[buffer(1)]],
+                                 device const float *x [[buffer(2)]],
+                                 device const int *ptok [[buffer(3)]],
+                                 device const Ink2MoeTile *tiles [[buffer(4)]],
+                                 device bfloat *h_out [[buffer(5)]],
+                                 constant Ink2MoeParam &p [[buffer(6)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
@@ -1020,8 +1029,9 @@ kernel void ink2_moe_nvfp4_up_mv(device const uchar *w13 [[buffer(0)]],
 
   uint blocks = p.k / INK2_NVFP4_BLOCK;
   uint w_row_bytes = p.k / 2u;
-  device const uchar *we = w13 + (ulong)tl.expert * p.n * w_row_bytes + (ulong)row * w_row_bytes;
-  device const uchar *se = s13 + (ulong)tl.expert * p.n * blocks + (ulong)row * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w13 + (ulong)row * w_row_bytes;
+  device const uchar *se = er.s13 + (ulong)row * blocks;
   float ef = factor13[tl.expert];
   uint inter = p.n / 2u, pair_col = row / 2u;
 
@@ -1163,14 +1173,13 @@ kernel void ink2_moe_nvfp4_up_mv(device const uchar *w13 [[buffer(0)]],
 // Multi-vec NVFP4 w2 for tiles with count <= 8, reading BF16 intermediate
 // activations and scaling outputs by each pair's routing weight.
 // Grid: x = ceil(n / 32) = 72, y = ntiles. Threadgroup: 256 threads (8 sgs).
-kernel void ink2_moe_nvfp4_down_mv(device const uchar *w2 [[buffer(0)]],
-                                   device const uchar *s2 [[buffer(1)]],
-                                   device const float *factor2 [[buffer(2)]],
-                                   device const bfloat *h [[buffer(3)]],
-                                   device const float *pw [[buffer(4)]],
-                                   device const Ink2MoeTile *tiles [[buffer(5)]],
-                                   device float *y_out [[buffer(6)]],
-                                   constant Ink2MoeParam &p [[buffer(7)]],
+kernel void ink2_moe_nvfp4_down_mv(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                   device const float *factor2 [[buffer(1)]],
+                                   device const bfloat *h [[buffer(2)]],
+                                   device const float *pw [[buffer(3)]],
+                                   device const Ink2MoeTile *tiles [[buffer(4)]],
+                                   device float *y_out [[buffer(5)]],
+                                   constant Ink2MoeParam &p [[buffer(6)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint sg [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
@@ -1181,8 +1190,9 @@ kernel void ink2_moe_nvfp4_down_mv(device const uchar *w2 [[buffer(0)]],
 
   uint blocks = p.k / INK2_NVFP4_BLOCK;
   uint w_row_bytes = p.k / 2u;
-  device const uchar *we = w2 + (ulong)tl.expert * p.n * w_row_bytes + (ulong)row * w_row_bytes;
-  device const uchar *se = s2 + (ulong)tl.expert * p.n * blocks + (ulong)row * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w2 + (ulong)row * w_row_bytes;
+  device const uchar *se = er.s2 + (ulong)row * blocks;
   float ef = factor2[tl.expert];
 
   if (tl.count == 1u) {
@@ -1308,13 +1318,12 @@ kernel void ink2_moe_nvfp4_down_mv(device const uchar *w2 [[buffer(0)]],
 
 // Multi-vec MXFP8 w13 + softcapped SwiGLU for layers 20..23 (tile count <= 8).
 // Grid: x = ceil(n / 32) = 72, y = ntiles. Threadgroup: 256 threads (8 sgs).
-kernel void ink2_moe_mxfp8_up_mv(device const uchar *w13 [[buffer(0)]],
-                                 device const uchar *s13 [[buffer(1)]],
-                                 device const float *x [[buffer(2)]],
-                                 device const int *ptok [[buffer(3)]],
-                                 device const Ink2MoeTile *tiles [[buffer(4)]],
-                                 device bfloat *h_out [[buffer(5)]],
-                                 constant Ink2MoeParam &p [[buffer(6)]],
+kernel void ink2_moe_mxfp8_up_mv(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                 device const float *x [[buffer(1)]],
+                                 device const int *ptok [[buffer(2)]],
+                                 device const Ink2MoeTile *tiles [[buffer(3)]],
+                                 device bfloat *h_out [[buffer(4)]],
+                                 constant Ink2MoeParam &p [[buffer(5)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
@@ -1324,8 +1333,9 @@ kernel void ink2_moe_mxfp8_up_mv(device const uchar *w13 [[buffer(0)]],
   if (row >= p.n) return;
 
   uint blocks = p.k / INK2_MXFP8_BLOCK;
-  device const uchar *we = w13 + (ulong)tl.expert * p.n * p.k + (ulong)row * p.k;
-  device const uchar *se = s13 + (ulong)tl.expert * p.n * blocks + (ulong)row * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w13 + (ulong)row * p.k;
+  device const uchar *se = er.s13 + (ulong)row * blocks;
   uint inter = p.n / 2u, pair_col = row / 2u;
 
   if (tl.count == 1u) {
@@ -1441,13 +1451,12 @@ kernel void ink2_moe_mxfp8_up_mv(device const uchar *w13 [[buffer(0)]],
 // Multi-vec MXFP8 w2 for layers 20..23 (tile count <= 8), reading BF16
 // intermediate activations and scaling outputs by routing weight.
 // Grid: x = ceil(n / 32) = 72, y = ntiles. Threadgroup: 256 threads (8 sgs).
-kernel void ink2_moe_mxfp8_down_mv(device const uchar *w2 [[buffer(0)]],
-                                   device const uchar *s2 [[buffer(1)]],
-                                   device const bfloat *h [[buffer(2)]],
-                                   device const float *pw [[buffer(3)]],
-                                   device const Ink2MoeTile *tiles [[buffer(4)]],
-                                   device float *y_out [[buffer(5)]],
-                                   constant Ink2MoeParam &p [[buffer(6)]],
+kernel void ink2_moe_mxfp8_down_mv(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                   device const bfloat *h [[buffer(1)]],
+                                   device const float *pw [[buffer(2)]],
+                                   device const Ink2MoeTile *tiles [[buffer(3)]],
+                                   device float *y_out [[buffer(4)]],
+                                   constant Ink2MoeParam &p [[buffer(5)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint sg [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
@@ -1457,8 +1466,9 @@ kernel void ink2_moe_mxfp8_down_mv(device const uchar *w2 [[buffer(0)]],
   if (row >= p.n) return;
 
   uint blocks = p.k / INK2_MXFP8_BLOCK;
-  device const uchar *we = w2 + (ulong)tl.expert * p.n * p.k + (ulong)row * p.k;
-  device const uchar *se = s2 + (ulong)tl.expert * p.n * blocks + (ulong)row * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w2 + (ulong)row * p.k;
+  device const uchar *se = er.s2 + (ulong)row * blocks;
 
   if (tl.count == 1u) {
     float4 acc = float4(0.0f);
@@ -1620,13 +1630,12 @@ inline void ink2_stage_mxfp8_tile(device const uchar *we, device const uchar *se
 
 // Tiled MPP NVFP4 w13 + softcapped SwiGLU for tiles with count > 8 (up to 64).
 // Grid: x = n / 64, y = ntiles. Threadgroup: 128 threads (4 simdgroups).
-kernel void ink2_moe_nvfp4_up_mm(device const uchar *w13 [[buffer(0)]],
-                                 device const uchar *s13 [[buffer(1)]],
-                                 device const float *factor13 [[buffer(2)]],
-                                 device const bfloat *x_bf16 [[buffer(3)]],
-                                 device const Ink2MoeTile *tiles [[buffer(4)]],
-                                 device bfloat *h_out [[buffer(5)]],
-                                 constant Ink2MoeParam &p [[buffer(6)]],
+kernel void ink2_moe_nvfp4_up_mm(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                 device const float *factor13 [[buffer(1)]],
+                                 device const bfloat *x_bf16 [[buffer(2)]],
+                                 device const Ink2MoeTile *tiles [[buffer(3)]],
+                                 device bfloat *h_out [[buffer(4)]],
+                                 constant Ink2MoeParam &p [[buffer(5)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint t [[thread_index_in_threadgroup]]) {
   Ink2MoeTile tl = tiles[tg.y];
@@ -1648,9 +1657,9 @@ kernel void ink2_moe_nvfp4_up_mm(device const uchar *w13 [[buffer(0)]],
     if (c.is_valid_element(i)) c[i] = 0.0f;
 
   uint n0 = tg.x * INK2_MM_TILE;
-  uint w_row_bytes = p.k / 2u, blocks = p.k / INK2_NVFP4_BLOCK;
-  device const uchar *we = w13 + (ulong)tl.expert * p.n * w_row_bytes;
-  device const uchar *se = s13 + (ulong)tl.expert * p.n * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w13;
+  device const uchar *se = er.s13;
   float ef = factor13[tl.expert];
 
   for (uint k0 = 0; k0 < p.k; k0 += INK2_MM_TILE) {
@@ -1679,14 +1688,13 @@ kernel void ink2_moe_nvfp4_up_mm(device const uchar *w13 [[buffer(0)]],
 
 // Tiled MPP NVFP4 w2 for tiles with count > 8 (up to 64).
 // Grid: x = n / 64, y = ntiles. Threadgroup: 128 threads (4 simdgroups).
-kernel void ink2_moe_nvfp4_down_mm(device const uchar *w2 [[buffer(0)]],
-                                   device const uchar *s2 [[buffer(1)]],
-                                   device const float *factor2 [[buffer(2)]],
-                                   device const bfloat *h_bf16 [[buffer(3)]],
-                                   device const float *pw [[buffer(4)]],
-                                   device const Ink2MoeTile *tiles [[buffer(5)]],
-                                   device float *y_out [[buffer(6)]],
-                                   constant Ink2MoeParam &p [[buffer(7)]],
+kernel void ink2_moe_nvfp4_down_mm(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                   device const float *factor2 [[buffer(1)]],
+                                   device const bfloat *h_bf16 [[buffer(2)]],
+                                   device const float *pw [[buffer(3)]],
+                                   device const Ink2MoeTile *tiles [[buffer(4)]],
+                                   device float *y_out [[buffer(5)]],
+                                   constant Ink2MoeParam &p [[buffer(6)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint t [[thread_index_in_threadgroup]]) {
   Ink2MoeTile tl = tiles[tg.y];
@@ -1707,9 +1715,9 @@ kernel void ink2_moe_nvfp4_down_mm(device const uchar *w2 [[buffer(0)]],
     if (c.is_valid_element(i)) c[i] = 0.0f;
 
   uint n0 = tg.x * INK2_MM_TILE;
-  uint w_row_bytes = p.k / 2u, blocks = p.k / INK2_NVFP4_BLOCK;
-  device const uchar *we = w2 + (ulong)tl.expert * p.n * w_row_bytes;
-  device const uchar *se = s2 + (ulong)tl.expert * p.n * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w2;
+  device const uchar *se = er.s2;
   float ef = factor2[tl.expert];
 
   for (uint k0 = 0; k0 < p.k; k0 += INK2_MM_TILE) {
@@ -1734,12 +1742,11 @@ kernel void ink2_moe_nvfp4_down_mm(device const uchar *w2 [[buffer(0)]],
 
 // Tiled MPP MXFP8 w13 + softcapped SwiGLU for layers 20..23 (tile count > 8).
 // Grid: x = n / 64, y = ntiles. Threadgroup: 128 threads (4 simdgroups).
-kernel void ink2_moe_mxfp8_up_mm(device const uchar *w13 [[buffer(0)]],
-                                 device const uchar *s13 [[buffer(1)]],
-                                 device const bfloat *x_bf16 [[buffer(2)]],
-                                 device const Ink2MoeTile *tiles [[buffer(3)]],
-                                 device bfloat *h_out [[buffer(4)]],
-                                 constant Ink2MoeParam &p [[buffer(5)]],
+kernel void ink2_moe_mxfp8_up_mm(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                 device const bfloat *x_bf16 [[buffer(1)]],
+                                 device const Ink2MoeTile *tiles [[buffer(2)]],
+                                 device bfloat *h_out [[buffer(3)]],
+                                 constant Ink2MoeParam &p [[buffer(4)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint t [[thread_index_in_threadgroup]]) {
   Ink2MoeTile tl = tiles[tg.y];
@@ -1761,9 +1768,9 @@ kernel void ink2_moe_mxfp8_up_mm(device const uchar *w13 [[buffer(0)]],
     if (c.is_valid_element(i)) c[i] = 0.0f;
 
   uint n0 = tg.x * INK2_MM_TILE;
-  uint blocks = p.k / INK2_MXFP8_BLOCK;
-  device const uchar *we = w13 + (ulong)tl.expert * p.n * p.k;
-  device const uchar *se = s13 + (ulong)tl.expert * p.n * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w13;
+  device const uchar *se = er.s13;
 
   for (uint k0 = 0; k0 < p.k; k0 += INK2_MM_TILE) {
     ink2_stage_mxfp8_tile(we, se, n0, k0, p.n, p.k, ws, t);
@@ -1791,13 +1798,12 @@ kernel void ink2_moe_mxfp8_up_mm(device const uchar *w13 [[buffer(0)]],
 
 // Tiled MPP MXFP8 w2 for layers 20..23 (tile count > 8, up to 64).
 // Grid: x = n / 64, y = ntiles. Threadgroup: 128 threads (4 simdgroups).
-kernel void ink2_moe_mxfp8_down_mm(device const uchar *w2 [[buffer(0)]],
-                                   device const uchar *s2 [[buffer(1)]],
-                                   device const bfloat *h_bf16 [[buffer(2)]],
-                                   device const float *pw [[buffer(3)]],
-                                   device const Ink2MoeTile *tiles [[buffer(4)]],
-                                   device float *y_out [[buffer(5)]],
-                                   constant Ink2MoeParam &p [[buffer(6)]],
+kernel void ink2_moe_mxfp8_down_mm(device const Ink2ExpertRef *experts [[buffer(0)]],
+                                   device const bfloat *h_bf16 [[buffer(1)]],
+                                   device const float *pw [[buffer(2)]],
+                                   device const Ink2MoeTile *tiles [[buffer(3)]],
+                                   device float *y_out [[buffer(4)]],
+                                   constant Ink2MoeParam &p [[buffer(5)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
                                    uint t [[thread_index_in_threadgroup]]) {
   Ink2MoeTile tl = tiles[tg.y];
@@ -1818,9 +1824,9 @@ kernel void ink2_moe_mxfp8_down_mm(device const uchar *w2 [[buffer(0)]],
     if (c.is_valid_element(i)) c[i] = 0.0f;
 
   uint n0 = tg.x * INK2_MM_TILE;
-  uint blocks = p.k / INK2_MXFP8_BLOCK;
-  device const uchar *we = w2 + (ulong)tl.expert * p.n * p.k;
-  device const uchar *se = s2 + (ulong)tl.expert * p.n * blocks;
+  Ink2ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w2;
+  device const uchar *se = er.s2;
 
   for (uint k0 = 0; k0 < p.k; k0 += INK2_MM_TILE) {
     ink2_stage_mxfp8_tile(we, se, n0, k0, p.n, p.k, ws, t);

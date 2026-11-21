@@ -142,6 +142,20 @@ static void test_chat_and_ops(void) {
   check(!strcmp(inkling2_ops.model_types[0], "inkling2_loop") &&
             !strcmp(inkling2_ops.model_types[1], "inkling2_loop_text"),
         "model_types registers inkling2_loop and inkling2_loop_text");
+  check(inkling2_ops.set_request_running != NULL &&
+            inkling2_ops.expert_store_bytes != NULL &&
+            inkling2_ops.read_routes != NULL &&
+            inkling2_ops.set_other_passes != NULL,
+        "ModelOps exposes expert-store lifecycle, route and counter hooks");
+  check(inkling2_ops.expert_store_bytes() == 0,
+        "expert_store_bytes is 0 before load");
+  ModelCounters c;
+  inkling2_ops.read_counters(&c);
+  check(c.layers == INK2_TOTAL_LAYERS && c.routed_layers == INK2_TOTAL_LAYERS &&
+            c.experts_per_layer == INK2_EXPERTS &&
+            c.experts_per_row == INK2_TOTAL_LAYERS * INK2_TOPK &&
+            c.experts == INK2_PHYS_LAYERS * INK2_EXPERTS && c.dense_bytes == 0,
+        "read_counters reports 48 logical routed visits and 3072 experts");
 }
 
 int main(void) {

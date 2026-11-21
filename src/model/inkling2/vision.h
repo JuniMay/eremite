@@ -69,4 +69,8 @@ int inkling2_prepare_media(const char *dir, Media *im, const void *data,
 // 1 on success or 0 when memory does not fit.
 int inkling2_encode_media(Media *im);
 
+// Returns the resident bytes of the lazy vision WeightGroup, or 0 while
+// unloaded.
+uint64_t inkling2_vision_resident_bytes(void);
+
 #endif

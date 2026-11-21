@@ -89,8 +89,11 @@ Inkling-2-Mini checkpoints (`model_type` `inkling2_loop` or
 and `GET /v1/codex/models`. Their entry takes `model`, `id`, `ctx` (up to
 1,048,576), `draft` (0 to 7, using `mtp.safetensors` when present), `lookup`
 (`off` or 1 to 15), `memory`, `max_cached_states` and `idle_unload`, and
-refuses DeepSeek-only and MiniMax-H3 settings. All weights stay resident in
-GPU memory (about 18.5 to 20.3 GiB with its draft head). Thinking effort takes
+refuses DeepSeek-only and MiniMax-H3 settings. Its dense backbone stays
+resident in GPU memory (about 3.6 GiB, or about 4.3 GiB with its draft head),
+while its 3,072 routed experts across 24 physical layers live in an SSD-backed
+expert cache (preloaded into GPU memory — about 15.1 GiB — when memory fits,
+or streamed on demand from SSD on smaller-memory Macs). Thinking effort takes
 `"none"` (0), `"minimal"` (0.1), `"low"` (0.2), `"medium"` (0.7), `"high"`
 (0.9), `"xhigh"` or `"max"` (0.99), or any number in `0.0` to `0.99`. Images
 are accepted as base64 `data:` URLs in `user` and `tool` messages; audio parts

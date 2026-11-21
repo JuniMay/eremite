@@ -740,3 +740,9 @@ int inkling2_encode_media(Media *im) {
   memory_pin(vslot, 0);
   return 1;
 }
+
+// Returns the resident bytes of the lazy vision WeightGroup, or 0 while
+// unloaded.
+uint64_t inkling2_vision_resident_bytes(void) {
+  return vis_weights ? weight_group_resident_bytes(vis_weights) : 0;
+}

@@ -5,6 +5,8 @@
 #include "base/error.h"
 #include "base/file.h"
 #include "base/json.h"
+#include "base/shutdown.h"
+#include "engine/expert_store.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/safetensors.h"
@@ -18,15 +20,17 @@
 #include <unistd.h>
 
 // thinkingmachines/Inkling-2-Mini (model_type inkling2_loop and
-// inkling2_loop_text): weights, KV and short-convolution state, snapshots and
-// forward passes.
+// inkling2_loop_text): weights, SSD-backed expert store, KV and
+// short-convolution state, snapshots and forward passes.
 //
 // The checkpoint stores 24 physical decoder layers. Prelude layers 0..5 run
 // once, core layers 6..17 run 3 times with cross-pass message retrieval and
 // low-rank message gates on passes 1 and 2, and postlude layers 18..23 run
 // once, yielding 48 logical layer visits. Each logical visit owns its own KV
 // cache (8 growing global caches, 40 rolling sliding-window rings) and its own
-// 4 short-convolution rings. All weights stay resident in one WeightGroup.
+// 4 short-convolution rings. Dense backbone weights stay resident in
+// text_weights, while the 24 physical layers' 3,072 routed experts live in an
+// ExpertStore (preloaded when memory fits, or streamed from SSD on demand).
 
 // Numerical parameters from config.json text_config and modeling_inkling2.py.
 static constexpr float RMS_EPS = 1e-6f;
@@ -83,6 +87,18 @@ static constexpr uint32_t ATTNRES_GLOBAL_QUERIES = 3;
 static constexpr int MAX_CHAT_IMAGES = 16;
 static constexpr int MAX_THINK_PERCENT = 99;
 static constexpr double THINK_PERCENT_SCALE = 100.0;
+
+// Expert store layout, packing ratio, prefetch threshold and route inspection
+// source codes matching src/eremite.h.
+static constexpr int EXPERT_PARTS = 4;
+static constexpr int NVFP4_VALUES_PER_BYTE = 2;
+static constexpr int NEAR_MISSES = INK2_TOPK;
+static constexpr int PREFILL_BULK_ROWS = 64;
+static constexpr int ROUTE_DECODE_CAP = INK2_MAX_VERIFY;
+static constexpr uint8_t ROUTE_SOURCE_MEMORY = 0;
+static constexpr uint8_t ROUTE_SOURCE_AHEAD = 1;
+static constexpr uint8_t ROUTE_SOURCE_LATE = 2;
+static constexpr uint8_t ROUTE_SOURCE_SSD = 4;
 
 // Byte layout of rolling state buffers inside one Ink2State.
 static constexpr size_t SLIDE_KV_ONE_BYTES =
@@ -267,11 +283,25 @@ typedef struct {
   // Router weights (BF16 [128, 2304]) and FP32 bias ([128]).
   Bf16Lin router_w;
   Buf router_bias;
-  // Routed expert weights: packed NVFP4 (layers 0..19) or MXFP8 (layers 20..23)
-  // with block scales and (for NVFP4) precomputed FP32 per-expert factors.
-  Buf w13, s13, f13;
-  Buf w2, s2, f2;
+  // Precomputed FP32 per-expert scale factors for NVFP4 layers (0..19). The
+  // packed expert weights and block scales live in experts_store.
+  Buf f13, f2;
 } PhysLayer;
+
+// Per-expert GPU device addresses matching Ink2ExpertRef in inkling2.metal.
+typedef struct {
+  // Packed w13 weights, w13 scales, w2 weights and w2 scales.
+  uint64_t w13, s13, w2, s2;
+} ExpertRef;
+
+// Routed experts of one physical layer held by the active pass until its GPU
+// work completes.
+typedef struct {
+  // Physical layer index and count of held experts.
+  int layer, n;
+  // Held expert indices within `layer`.
+  int experts[INK2_EXPERTS];
+} HeldExperts;
 
 // Per-sequence attention and short-convolution state.
 typedef struct {
@@ -315,8 +345,8 @@ typedef struct {
   // partials.
   Buf q_raw, k_raw, k_conv, v_raw, v_conv, dyn_w, r_raw, r_out, gate, sink;
   Buf q_hm, rel_bias, part, attn_out;
-  // MoE routing, tile grouping and expert intermediate buffers.
-  Buf route_logits, route_ids, route_w, ptok, pw, tp, tiles;
+  // MoE routing, tile grouping, per-pass expert table and intermediates.
+  Buf route_logits, route_ids, route_w, ptok, pw, tp, tiles, expert_table;
   Buf x_bf16, h_bf16, y_pair;
   // Final output logits buffer (stride LOGITS_STRIDE floats per row).
   Buf logits;
@@ -338,11 +368,17 @@ typedef struct {
   Tensor q_mlp, kv;
 } MsgQueryFillParam;
 
-// Global model handles and loaded weights.
+// Global model handles, loaded dense weights and SSD-backed expert store.
 static Gpu *gpu;
 static MemorySlot *work_slot, state_slot;
 static TensorIndex *checkpoint;
 static WeightGroup *text_weights;
+static ExpertStore *experts_store;
+static FileSpan expert_spans[INK2_PHYS_LAYERS][INK2_EXPERTS][EXPERT_PARTS];
+static int expert_span_counts[INK2_PHYS_LAYERS];
+static Buf layer_table[INK2_PHYS_LAYERS];
+static uint64_t layer_table_gen[INK2_PHYS_LAYERS];
+static int store_started;
 static Options opt;
 static int eos_token = INK2_EOS_TOKEN;
 static Ink2Visit schedule[INK2_TOTAL_LAYERS];
@@ -350,11 +386,17 @@ static PhysLayer layers[INK2_PHYS_LAYERS];
 static Buf embed_w, embed_norm, msg_queries, output_query, final_norm,
     unembed_w;
 static uint64_t required_bytes;
+static int prepare_prev_rows;
+static uint64_t prepare_prev_payload;
 
-// Runtime counters for server status reporting.
+// Runtime counters and latest decode routes for server status reporting.
 static uint64_t decode_rows_count, prefill_rows_count;
 static double decode_seconds_total, decode_gpu_seconds_total;
 static int prefill_layer_now, prefill_rows_now;
+static ExpertStoreCounts decode_stats, prefill_stats;
+static uint16_t route_id[ROUTE_DECODE_CAP][INK2_TOTAL_LAYERS][INK2_TOPK];
+static uint8_t route_from[ROUTE_DECODE_CAP][INK2_TOTAL_LAYERS][INK2_TOPK];
+static uint64_t route_step[ROUTE_DECODE_CAP][INK2_TOTAL_LAYERS], route_steps;
 
 // Pass-local state swapped automatically across concurrent passes.
 static Ink2Work work;
@@ -363,6 +405,8 @@ static float *logits_compact;
 static int logits_compact_rows;
 static const Media *prefill_media;
 static int prefill_media_count;
+static HeldExperts held;
+static uint32_t held_layers;
 
 // Compiled Metal kernel handles.
 static int K_mv_bf16, K_mv_bf16_3, K_mvm_bf16, K_mvm_bf16_3, K_mm_bf16;
@@ -485,6 +529,13 @@ static void model_sync(void) {
                           (void *)(uintptr_t)last_committed, PASS_WAIT_GPU,
                           NULL});
   gpu_check_finished(gpu);
+}
+
+// Ends the program if a pass yields with an uncommitted command buffer open in
+// the queue, since it would block every command buffer begun after it.
+static void before_yield(void) {
+  if (gpu && gpu_count_uncommitted_in_queue(gpu))
+    die("a pass yields with a command buffer open in the queue");
 }
 
 // Allocates a resident buffer counted in the workspace slot.
@@ -841,20 +892,6 @@ static void register_text_weights(void) {
         tensor_index_get(checkpoint, "model.llm.layers.%d.mlp.gate.bias", l),
         0.0f, 0);
 
-    add_raw(&pl->w13,
-            tensor_index_get(checkpoint,
-                             "model.llm.layers.%d.mlp.experts.w13_weight", l));
-    add_raw(&pl->s13,
-            tensor_index_get(checkpoint,
-                             "model.llm.layers.%d.mlp.experts.w13_weight_scale",
-                             l));
-    add_raw(&pl->w2,
-            tensor_index_get(checkpoint,
-                             "model.llm.layers.%d.mlp.experts.w2_weight", l));
-    add_raw(&pl->s2, tensor_index_get(
-                         checkpoint,
-                         "model.llm.layers.%d.mlp.experts.w2_weight_scale", l));
-
     if (pl->is_nvfp4) {
       FactorFillParam f13 = {
           .amax = tensor_index_get(
@@ -880,83 +917,224 @@ static void register_text_weights(void) {
   }
 }
 
+// Validates one 3D routed-expert tensor [128, rows, cols] and records each
+// expert's 16-byte-aligned FileSpan in expert_spans[layer][e][part].
+static void fill_expert_part_spans(int layer, int part, Tensor t, int64_t rows,
+                                   int64_t cols, int dtype_a, int dtype_b) {
+  if ((t.dtype != dtype_a && t.dtype != dtype_b) || t.ndim != 3 ||
+      t.shape[0] != INK2_EXPERTS || t.shape[1] != rows || t.shape[2] != cols)
+    die("layer %d expert part %d has unexpected shape or dtype", layer, part);
+  uint64_t per_expert = (uint64_t)rows * (uint64_t)cols;
+  if (t.size != (uint64_t)INK2_EXPERTS * per_expert)
+    die("layer %d expert part %d byte size mismatch", layer, part);
+  if ((t.off & ALIGN_MASK) != 0 || (per_expert & ALIGN_MASK) != 0)
+    die("layer %d expert part %d is not 16-byte aligned", layer, part);
+  for (int e = 0; e < INK2_EXPERTS; e++)
+    expert_spans[layer][e][part] =
+        (FileSpan){t.fd, t.off + (uint64_t)e * per_expert, per_expert};
+}
+
+// Registers the 4 checkpoint file spans per expert for all 24 physical layers
+// so the expert store streams them from SSD into GPU slots.
+static void register_expert_spans(void) {
+  for (int l = 0; l < INK2_PHYS_LAYERS; l++) {
+    Tensor w13 = tensor_index_get(
+        checkpoint, "model.llm.layers.%d.mlp.experts.w13_weight", l);
+    Tensor s13 = tensor_index_get(
+        checkpoint, "model.llm.layers.%d.mlp.experts.w13_weight_scale", l);
+    Tensor w2 = tensor_index_get(
+        checkpoint, "model.llm.layers.%d.mlp.experts.w2_weight", l);
+    Tensor s2 = tensor_index_get(
+        checkpoint, "model.llm.layers.%d.mlp.experts.w2_weight_scale", l);
+    if (l < INK2_NVFP4_LAYERS) {
+      fill_expert_part_spans(l, 0, w13, INK2_W13_ROWS,
+                             INK2_DIM / NVFP4_VALUES_PER_BYTE, 'u', 'u');
+      fill_expert_part_spans(l, 1, s13, INK2_W13_ROWS,
+                             INK2_DIM / INK2_NVFP4_BLOCK, '8', '8');
+      fill_expert_part_spans(l, 2, w2, INK2_DIM,
+                             INK2_INTER / NVFP4_VALUES_PER_BYTE, 'u', 'u');
+      fill_expert_part_spans(l, 3, s2, INK2_DIM, INK2_INTER / INK2_NVFP4_BLOCK,
+                             '8', '8');
+    } else {
+      fill_expert_part_spans(l, 0, w13, INK2_W13_ROWS, INK2_DIM, '8', '8');
+      fill_expert_part_spans(l, 1, s13, INK2_W13_ROWS,
+                             INK2_DIM / INK2_MXFP8_BLOCK, 'u', 'e');
+      fill_expert_part_spans(l, 2, w2, INK2_DIM, INK2_INTER, '8', '8');
+      fill_expert_part_spans(l, 3, s2, INK2_DIM, INK2_INTER / INK2_MXFP8_BLOCK,
+                             'u', 'e');
+    }
+    expert_span_counts[l] = EXPERT_PARTS;
+  }
+}
+
 // ---- workspace management ----
 
-// Returns the approximate GPU workspace byte count required for `rows` tokens.
+// Returns the GPU workspace byte count required for `rows` tokens.
 static uint64_t estimate_work_bytes(int rows) {
-  int q_stride = align_up(rows, PREFILL_Q_PAD);
-  int npairs = rows * INK2_TOPK;
+  int cap = rows <= INK2_MAX_VERIFY ? INK2_MAX_VERIFY : rows;
+  int q_stride = align_up(cap, PREFILL_Q_PAD);
+  int npairs = cap * INK2_TOPK;
   int max_tiles = npairs + INK2_EXPERTS;
-  int part_rows = rows < INK2_MAX_VERIFY ? rows : INK2_MAX_VERIFY;
+  int part_rows = cap < INK2_MAX_VERIFY ? cap : INK2_MAX_VERIFY;
+  int route_id_count = INK2_TOTAL_LAYERS * INK2_MAX_VERIFY * INK2_TOPK;
+  if (npairs > route_id_count) route_id_count = npairs;
   uint64_t bytes = 0;
-  bytes += gpu_round_up_to_pages((size_t)rows * sizeof(int32_t));
-  bytes += 6 * gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)INK2_MAX_BLOCKS * rows * INK2_DIM *
+  bytes += gpu_round_up_to_pages((size_t)cap * sizeof(int32_t));
+  bytes += 6 * gpu_round_up_to_pages((size_t)cap * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)INK2_MAX_BLOCKS * cap * INK2_DIM *
                                  sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)INK2_MSG_COUNT * rows * INK2_DIM *
+  bytes += gpu_round_up_to_pages((size_t)INK2_MSG_COUNT * cap * INK2_DIM *
                                  sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * rows *
+  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * cap *
                                  INK2_DIM * sizeof(float));
-  bytes += 3 * gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)rows * 2 * INK2_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)rows * INK2_GATE_RANK * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)rows * INK2_DIM * sizeof(float));
-  bytes += 3 * gpu_round_up_to_pages((size_t)rows * INK2_Q_DIM * sizeof(float));
+  bytes += 3 * gpu_round_up_to_pages((size_t)cap * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)cap * 2 * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)cap * INK2_GATE_RANK * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)cap * INK2_DIM * sizeof(float));
+  bytes += 3 * gpu_round_up_to_pages((size_t)cap * INK2_Q_DIM * sizeof(float));
+  bytes += 4 * gpu_round_up_to_pages((size_t)cap * INK2_KV_DIM * sizeof(float));
   bytes +=
-      4 * gpu_round_up_to_pages((size_t)rows * INK2_KV_DIM * sizeof(float));
-  bytes +=
-      gpu_round_up_to_pages((size_t)rows * INK2_SCONV_DYN_DIM * sizeof(float));
-  bytes += 2 * gpu_round_up_to_pages((size_t)rows * INK2_R_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)rows * INK2_HEADS * sizeof(float));
+      gpu_round_up_to_pages((size_t)cap * INK2_SCONV_DYN_DIM * sizeof(float));
+  bytes += 2 * gpu_round_up_to_pages((size_t)cap * INK2_R_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)cap * INK2_HEADS * sizeof(float));
   bytes += gpu_round_up_to_pages((size_t)INK2_HEADS * q_stride * INK2_HEAD_DIM *
                                  sizeof(uint16_t));
-  bytes += gpu_round_up_to_pages((size_t)rows * INK2_HEADS * INK2_REL_EXTENT *
+  bytes += gpu_round_up_to_pages((size_t)cap * INK2_HEADS * INK2_REL_EXTENT *
                                  sizeof(float));
   bytes +=
       gpu_round_up_to_pages((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
                             DECODE_PART_FLOATS * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)rows * INK2_EXPERTS * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(uint32_t));
+  bytes += gpu_round_up_to_pages((size_t)cap * INK2_EXPERTS * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)route_id_count * sizeof(uint32_t));
   bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(float));
   bytes += 2 * gpu_round_up_to_pages((size_t)npairs * sizeof(int32_t));
   bytes += gpu_round_up_to_pages((size_t)npairs * sizeof(float));
   bytes += gpu_round_up_to_pages((size_t)max_tiles * sizeof(Ink2MoeTile));
+  bytes += gpu_round_up_to_pages((size_t)INK2_EXPERTS * sizeof(ExpertRef));
   bytes += gpu_round_up_to_pages((size_t)(npairs + MOE_MM_TILE) * INK2_DIM *
                                  sizeof(uint16_t));
   bytes += gpu_round_up_to_pages((size_t)(npairs + MOE_MM_TILE) * INK2_INTER *
                                  sizeof(uint16_t));
   bytes += gpu_round_up_to_pages((size_t)npairs * INK2_DIM * sizeof(float));
+  bytes +=
+      gpu_round_up_to_pages((size_t)INK2_TOTAL_LAYERS * SCONV_RINGS_PER_LAYER *
+                            INK2_MAX_BATCH_ROWS * sizeof(SconvTarget));
+  bytes += gpu_round_up_to_pages((size_t)INK2_TOTAL_LAYERS *
+                                 INK2_MAX_BATCH_ROWS * sizeof(KvTarget));
   bytes += gpu_round_up_to_pages((size_t)LOGITS_STRIDE * sizeof(float));
-  bytes += inkling2_mtp_estimate_work_bytes(rows);
+  bytes += inkling2_mtp_estimate_work_bytes(cap);
+  return bytes;
+}
+
+// Returns the bytes currently allocated in this pass's resizable workspace
+// buffers (excluding work.logits, which persists across row-capacity changes).
+static uint64_t work_resizable_bytes(void) {
+  const Buf *list[] = {&work.ids,
+                       &work.cur,
+                       &work.cur2,
+                       &work.residual,
+                       &work.pre_loop_cur,
+                       &work.prev_blk,
+                       &work.prev_cur,
+                       &work.blk,
+                       &work.msg,
+                       &work.attn_in,
+                       &work.q_in,
+                       &work.k_in,
+                       &work.v_in,
+                       &work.msg_cat,
+                       &work.msg_g,
+                       &work.msg_gated,
+                       &work.q_raw,
+                       &work.k_raw,
+                       &work.k_conv,
+                       &work.v_raw,
+                       &work.v_conv,
+                       &work.dyn_w,
+                       &work.r_raw,
+                       &work.r_out,
+                       &work.gate,
+                       &work.sink,
+                       &work.q_hm,
+                       &work.rel_bias,
+                       &work.part,
+                       &work.attn_out,
+                       &work.route_logits,
+                       &work.route_ids,
+                       &work.route_w,
+                       &work.ptok,
+                       &work.pw,
+                       &work.tp,
+                       &work.tiles,
+                       &work.expert_table,
+                       &work.x_bf16,
+                       &work.h_bf16,
+                       &work.y_pair,
+                       &work.sconv_tgt,
+                       &work.kv_tgt,
+                       &work.mtp.taps,
+                       &work.mtp.ctx,
+                       &work.mtp.k_ctx_raw,
+                       &work.mtp.v_ctx_raw,
+                       &work.mtp.kv_tgt,
+                       &work.mtp.frnn_tgt,
+                       &work.mtp.cur,
+                       &work.mtp.xn,
+                       &work.mtp.q_raw,
+                       &work.mtp.k_raw,
+                       &work.mtp.v_raw,
+                       &work.mtp.q_blk,
+                       &work.mtp.k_blk,
+                       &work.mtp.v_blk,
+                       &work.mtp.part,
+                       &work.mtp.attn_out,
+                       &work.mtp.o_out,
+                       &work.mtp.gate,
+                       &work.mtp.up,
+                       &work.mtp.h_mlp,
+                       &work.mtp.mlp_out,
+                       &work.mtp.h_final,
+                       &work.mtp.rnn_state,
+                       &work.mtp.joint,
+                       &work.mtp.proj,
+                       &work.mtp.latent,
+                       &work.mtp.corr,
+                       &work.mtp.h_eff,
+                       &work.mtp.argmax_parts,
+                       &work.mtp.tok};
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < sizeof list / sizeof *list; i++)
+    bytes += list[i]->allocated;
   return bytes;
 }
 
 // Marks all buffers in w to be freed once prior GPU commands finish.
 static void free_work(Ink2Work *w) {
   Buf *list[] = {
-      &w->ids,          &w->cur,       &w->cur2,         &w->residual,
-      &w->pre_loop_cur, &w->prev_blk,  &w->prev_cur,     &w->blk,
-      &w->msg,          &w->attn_in,   &w->q_in,         &w->k_in,
-      &w->v_in,         &w->msg_cat,   &w->msg_g,        &w->msg_gated,
-      &w->q_raw,        &w->k_raw,     &w->k_conv,       &w->v_raw,
-      &w->v_conv,       &w->dyn_w,     &w->r_raw,        &w->r_out,
-      &w->gate,         &w->sink,      &w->q_hm,         &w->rel_bias,
-      &w->part,         &w->attn_out,  &w->route_logits, &w->route_ids,
-      &w->route_w,      &w->ptok,      &w->pw,           &w->tp,
-      &w->tiles,        &w->x_bf16,    &w->h_bf16,       &w->y_pair,
-      &w->logits,       &w->sconv_tgt, &w->kv_tgt};
+      &w->ids,          &w->cur,          &w->cur2,         &w->residual,
+      &w->pre_loop_cur, &w->prev_blk,     &w->prev_cur,     &w->blk,
+      &w->msg,          &w->attn_in,      &w->q_in,         &w->k_in,
+      &w->v_in,         &w->msg_cat,      &w->msg_g,        &w->msg_gated,
+      &w->q_raw,        &w->k_raw,        &w->k_conv,       &w->v_raw,
+      &w->v_conv,       &w->dyn_w,        &w->r_raw,        &w->r_out,
+      &w->gate,         &w->sink,         &w->q_hm,         &w->rel_bias,
+      &w->part,         &w->attn_out,     &w->route_logits, &w->route_ids,
+      &w->route_w,      &w->ptok,         &w->pw,           &w->tp,
+      &w->tiles,        &w->expert_table, &w->x_bf16,       &w->h_bf16,
+      &w->y_pair,       &w->logits,       &w->sconv_tgt,    &w->kv_tgt};
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     if (list[i]->obj) gpu_mark_to_free(list[i]);
   inkling2_mtp_free_work(&w->mtp);
   *w = (Ink2Work){0};
 }
 
-// Ensures the pass-local workspace holds at least `rows` active rows and
-// `logits_rows` rows in the output logits buffer.
+// Ensures the pass-local workspace holds `rows` active rows (shrinking back to
+// INK2_MAX_VERIFY for decode passes) and `logits_rows` rows in work.logits.
 static void ensure_work(int rows, int logits_rows) {
-  if (rows > work.cap_rows) {
-    int new_cap = rows <= INK2_MAX_VERIFY ? INK2_MAX_VERIFY : PREFILL_CHUNK;
-    if (rows > new_cap) new_cap = rows;
+  int new_cap = rows <= INK2_MAX_VERIFY ? INK2_MAX_VERIFY : rows;
+  int shrink_to_small =
+      (new_cap == INK2_MAX_VERIFY && work.cap_rows > INK2_MAX_VERIFY);
+  if (rows > work.cap_rows || shrink_to_small) {
     int old_logits_rows = work.logits_rows;
     Buf old_logits = work.logits;
     work.logits = (Buf){0};
@@ -966,6 +1144,8 @@ static void ensure_work(int rows, int logits_rows) {
     int npairs = new_cap * INK2_TOPK;
     int max_tiles = npairs + INK2_EXPERTS;
     int part_rows = new_cap < INK2_MAX_VERIFY ? new_cap : INK2_MAX_VERIFY;
+    int route_id_count = INK2_TOTAL_LAYERS * INK2_MAX_VERIFY * INK2_TOPK;
+    if (npairs > route_id_count) route_id_count = npairs;
 
     work.ids = work_alloc((size_t)new_cap * sizeof(int32_t));
     work.cur = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
@@ -1006,12 +1186,13 @@ static void ensure_work(int rows, int logits_rows) {
     work.attn_out = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
     work.route_logits =
         work_alloc((size_t)new_cap * INK2_EXPERTS * sizeof(float));
-    work.route_ids = work_alloc((size_t)npairs * sizeof(uint32_t));
+    work.route_ids = work_alloc((size_t)route_id_count * sizeof(uint32_t));
     work.route_w = work_alloc((size_t)npairs * sizeof(float));
     work.ptok = work_alloc((size_t)npairs * sizeof(int32_t));
     work.pw = work_alloc((size_t)npairs * sizeof(float));
     work.tp = work_alloc((size_t)npairs * sizeof(int32_t));
     work.tiles = work_alloc((size_t)max_tiles * sizeof(Ink2MoeTile));
+    work.expert_table = work_alloc((size_t)INK2_EXPERTS * sizeof(ExpertRef));
     work.x_bf16 = work_alloc((size_t)(npairs + MOE_MM_TILE) * INK2_DIM *
                              sizeof(uint16_t));
     work.h_bf16 = work_alloc((size_t)(npairs + MOE_MM_TILE) * INK2_INTER *
@@ -1032,6 +1213,229 @@ static void ensure_work(int rows, int logits_rows) {
     work.logits_rows = logits_rows;
   }
   inkling2_mtp_ensure_work(gpu, work_slot, &work.mtp, work.cap_rows);
+}
+
+// ---- expert store integration helpers ----
+
+// Returns the expert store's live counter structure.
+static ExpertStoreCounts *expert_stats(void) {
+  return expert_store_counts(experts_store);
+}
+
+// Adds the expert store deltas accumulated since `before` into `sum`.
+static void stats_add(ExpertStoreCounts *sum, const ExpertStoreCounts *before) {
+  const ExpertStoreCounts *c = expert_stats();
+  sum->hits += c->hits - before->hits;
+  sum->misses += c->misses - before->misses;
+  sum->prefetch_hits += c->prefetch_hits - before->prefetch_hits;
+  sum->prefetches += c->prefetches - before->prefetches;
+  sum->bytes += c->bytes - before->bytes;
+  sum->evictions += c->evictions - before->evictions;
+  sum->late += c->late - before->late;
+  sum->cancelled += c->cancelled - before->cancelled;
+  sum->substituted += c->substituted - before->substituted;
+  sum->remaps += c->remaps - before->remaps;
+  sum->given_back += c->given_back - before->given_back;
+  sum->decode_uses += c->decode_uses - before->decode_uses;
+  sum->row_own += c->row_own - before->row_own;
+  sum->row_ahead += c->row_ahead - before->row_ahead;
+  sum->row_late += c->row_late - before->row_late;
+  sum->row_sub += c->row_sub - before->row_sub;
+  sum->row_ssd += c->row_ssd - before->row_ssd;
+  sum->row_unique += c->row_unique - before->row_unique;
+  sum->read_s += c->read_s - before->read_s;
+}
+
+// Reserves account memory for a pass of up to `rows` tokens, halving `rows`
+// down to 1 for prompt passes when available memory is tight. Returns the
+// admitted row count, or 0 if even the minimum pass does not fit.
+static int prepare_rows(int rows, int prompt) {
+  if (!prompt && work_slot && rows == prepare_prev_rows &&
+      work_slot->payload == prepare_prev_payload)
+    return rows;
+  if (!work_slot || !text_weights || !experts_store) return rows;
+  int candidate = prompt && rows > PREFILL_CHUNK ? PREFILL_CHUNK : rows;
+  for (;;) {
+    uint64_t fixed = work_slot->payload - work_resizable_bytes();
+    expert_store_set_pass_rows(experts_store, candidate);
+    uint64_t required =
+        weight_group_required_bytes(text_weights) + fixed +
+        estimate_work_bytes(candidate) +
+        expert_store_minimum_bytes(experts_store, INK2_PHYS_LAYERS);
+    MemoryAdmission mode =
+        candidate > 1 && prompt ? MEMORY_WORKSPACE : MEMORY_REQUIRED;
+    if (memory_set_minimum(work_slot->account, required, mode)) {
+      prepare_prev_rows = prompt ? 0 : rows;
+      prepare_prev_payload = work_slot->payload;
+      return candidate;
+    }
+    if (!prompt || candidate == 1) return 0;
+    candidate = (candidate + 1) / 2;
+    if (work.cap_rows > candidate) {
+      model_sync();
+      free_work(&work);
+    }
+  }
+}
+
+// Releases all individual expert holds and whole-layer holds owned by this
+// pass after its GPU work has completed.
+static void held_release_all(void) {
+  if (!experts_store) return;
+  if (held.n) {
+    expert_store_release(experts_store, held.layer, held.experts, held.n);
+    held.n = 0;
+  }
+  if (held_layers) {
+    for (int l = 0; l < INK2_PHYS_LAYERS; l++) {
+      if (held_layers & (1u << l)) expert_store_release_layer(experts_store, l);
+    }
+    held_layers = 0;
+  }
+}
+
+// Requests and holds `n` routed experts of physical layer `l` until released.
+static void hold_experts(int l, const int *experts, int n) {
+  if (held.n)
+    die("Inkling-2-Mini experts of layer %d are still held", held.layer);
+  expert_store_hold(experts_store, l, experts, n);
+  held.layer = l;
+  held.n = n;
+  memcpy(held.experts, experts, (size_t)n * sizeof *experts);
+}
+
+// Holds all experts of physical layer `l` once for this pass's open GPU work.
+static void hold_layer_if_needed(int l) {
+  uint32_t bit = 1u << l;
+  if (!(held_layers & bit)) {
+    expert_store_hold_layer(experts_store, l);
+    held_layers |= bit;
+  }
+}
+
+// Rebuilds physical layer `l`'s resident address table when its slot mapping
+// generation has changed.
+static void refresh_layer_table(int l, uint64_t gen) {
+  if (layer_table_gen[l] == gen) return;
+  ExpertRef *ref = (ExpertRef *)layer_table[l].ptr;
+  for (int e = 0; e < INK2_EXPERTS; e++) {
+    uint32_t at[EXPERT_STORE_PARTS];
+    int fresh = 0;
+    const Buf *b = expert_store_get_buffer(experts_store, l, e, at, &fresh);
+    if (!b)
+      die("reachable Inkling-2-Mini layer %d expert %d has no slot", l, e);
+    uint64_t base = b->address + b->off;
+    ref[e] =
+        (ExpertRef){base + at[0], base + at[1], base + at[2], base + at[3]};
+  }
+  layer_table_gen[l] = gen;
+}
+
+// Populates work.expert_table for the active experts `need[0..nn-1]` of layer
+// `l`, declaring GPU reads on slots not yet in committed residency sets.
+static void fill_streaming_table(GpuCommandBuffer *cmd, int l, const int *need,
+                                 int nn) {
+  ExpertRef *ref = (ExpertRef *)work.expert_table.ptr;
+  for (int i = 0; i < nn; i++) {
+    int e = need[i];
+    uint32_t at[EXPERT_STORE_PARTS];
+    int fresh = 0;
+    const Buf *b = expert_store_get_buffer(experts_store, l, e, at, &fresh);
+    if (!b) die("held Inkling-2-Mini layer %d expert %d has no slot", l, e);
+    uint64_t base = b->address + b->off;
+    ref[e] =
+        (ExpertRef){base + at[0], base + at[1], base + at[2], base + at[3]};
+    if (fresh) gpu_declare_read(cmd, b);
+  }
+}
+
+// Credits each decoded row's top NEAR_MISSES unselected experts in layer `l`,
+// ranked by sigmoid(logit) + bias matching ink2_route_topk.
+static void credit_near_misses(int l, int rows, const uint8_t *used) {
+  const float *bias = (const float *)layers[l].router_bias.ptr;
+  int list[INK2_EXPERTS], n = 0;
+  uint8_t listed[INK2_EXPERTS] = {0};
+  for (int r = 0; r < rows; r++) {
+    const float *lg =
+        (const float *)work.route_logits.ptr + (size_t)r * INK2_EXPERTS;
+    float key[INK2_EXPERTS];
+    for (int e = 0; e < INK2_EXPERTS; e++)
+      key[e] = 1.0f / (1.0f + expf(-lg[e])) + bias[e];
+    int top[NEAR_MISSES], nt = 0;
+    for (int e = 0; e < INK2_EXPERTS; e++) {
+      if (used[e] || (nt == NEAR_MISSES && !(key[e] > key[top[nt - 1]])))
+        continue;
+      int k = nt < NEAR_MISSES ? nt++ : nt - 1;
+      for (; k > 0 && key[e] > key[top[k - 1]]; k--) top[k] = top[k - 1];
+      top[k] = e;
+    }
+    for (int k = 0; k < nt; k++) {
+      if (!listed[top[k]]) {
+        listed[top[k]] = 1;
+        list[n++] = top[k];
+      }
+    }
+  }
+  expert_store_credit_near_misses(experts_store, l, list, n);
+}
+
+// Converts an ExpertPlace location into the route inspection source code.
+static uint8_t expert_place_to_route_source(ExpertPlace place) {
+  switch (place) {
+  case EXPERT_IN_MEMORY: return ROUTE_SOURCE_MEMORY;
+  case EXPERT_READ_AHEAD: return ROUTE_SOURCE_AHEAD;
+  case EXPERT_BEING_READ_AHEAD: return ROUTE_SOURCE_LATE;
+  case EXPERT_ON_SSD: return ROUTE_SOURCE_SSD;
+  }
+  return ROUTE_SOURCE_SSD;
+}
+
+// Records hit counts, expert-store uses and decode route history for every
+// resident fast-path visit executed before the latest model_sync.
+static void flush_fast_visits(uint8_t fast_visits[INK2_TOTAL_LAYERS],
+                              int rows) {
+  ExpertStoreCounts *st = expert_stats();
+  for (int v = 0; v < INK2_TOTAL_LAYERS; v++) {
+    if (!fast_visits[v]) continue;
+    fast_visits[v] = 0;
+    int l = schedule[v].phys;
+    const uint32_t *rids = (const uint32_t *)work.route_ids.ptr +
+                           (size_t)v * (size_t)rows * INK2_TOPK;
+    uint8_t used[INK2_EXPERTS] = {0};
+    int need[INK2_EXPERTS], nn = 0;
+    for (int r = 0; r < rows; r++) {
+      for (int k = 0; k < INK2_TOPK; k++) {
+        uint32_t e = rids[(size_t)r * INK2_TOPK + (size_t)k];
+        if (e >= (uint32_t)INK2_EXPERTS) die("router selected expert %u", e);
+        used[e] = 1;
+        ExpertPlace place = expert_store_locate(experts_store, l, (int)e);
+        if (place == EXPERT_READ_AHEAD)
+          st->row_ahead++;
+        else
+          st->row_own++;
+        if (r < ROUTE_DECODE_CAP) {
+          route_id[r][v][k] = (uint16_t)e;
+          route_from[r][v][k] = place == EXPERT_READ_AHEAD
+                                    ? ROUTE_SOURCE_AHEAD
+                                    : ROUTE_SOURCE_MEMORY;
+          route_step[r][v] = route_steps;
+        }
+      }
+    }
+    for (int e = 0; e < INK2_EXPERTS; e++)
+      if (used[e]) need[nn++] = e;
+    st->row_unique += (uint64_t)nn;
+    expert_store_count_use(experts_store, l, need, nn);
+  }
+}
+
+// Starts background read-ahead for all 128 experts of physical layer `l`
+// during large prefill batches that touch nearly every expert.
+static void prefetch_all_layer_experts(int l) {
+  int all[INK2_EXPERTS];
+  for (int e = 0; e < INK2_EXPERTS; e++) all[e] = e;
+  expert_store_read_ahead(experts_store, l, all, INK2_EXPERTS,
+                          2 * INK2_EXPERTS);
 }
 
 // ---- state and snapshot management ----
@@ -1587,9 +1991,11 @@ static void run_sconv_dynamic(GpuCommandBuffer *c, const Buf *x,
   }
 }
 
-// Encodes the routed MoE expert kernels given already-populated tile metadata.
+// Encodes the routed MoE expert kernels given already-populated tile metadata
+// and an `expert_table` of per-expert device addresses.
 static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
-                               int rows, int ntiles, int run_mv, int run_mm) {
+                               const Buf *expert_table, int rows, int ntiles,
+                               int run_mv, int run_mm) {
   int npairs = rows * INK2_TOPK;
   if (run_mm) {
     uint32_t dim4 = INK2_DIM / VEC4_WIDTH;
@@ -1616,56 +2022,8 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
   if (pl->is_nvfp4) {
     if (run_mv) {
       gpu_select_kernel(c, K_nv_up_mv);
-      gpu_bind_buffer(c, 0, &pl->w13, 0);
-      gpu_bind_buffer(c, 1, &pl->s13, 0);
-      gpu_bind_buffer(c, 2, &pl->f13, 0);
-      gpu_bind_buffer(c, 3, &work.q_in, 0);
-      gpu_bind_buffer(c, 4, &work.ptok, 0);
-      gpu_bind_buffer(c, 5, &work.tiles, 0);
-      gpu_bind_buffer(c, 6, &work.h_bf16, 0);
-      gpu_copy_bytes(c, 7, &mp13, sizeof mp13);
-      gpu_run_kernel(c, gx13_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
-    }
-    if (run_mm) {
-      gpu_select_kernel(c, K_nv_up_mm);
-      gpu_bind_buffer(c, 0, &pl->w13, 0);
-      gpu_bind_buffer(c, 1, &pl->s13, 0);
-      gpu_bind_buffer(c, 2, &pl->f13, 0);
-      gpu_bind_buffer(c, 3, &work.x_bf16, 0);
-      gpu_bind_buffer(c, 4, &work.tiles, 0);
-      gpu_bind_buffer(c, 5, &work.h_bf16, 0);
-      gpu_copy_bytes(c, 6, &mp13, sizeof mp13);
-      gpu_run_kernel(c, gx13_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
-    }
-    if (run_mv) {
-      gpu_select_kernel(c, K_nv_dn_mv);
-      gpu_bind_buffer(c, 0, &pl->w2, 0);
-      gpu_bind_buffer(c, 1, &pl->s2, 0);
-      gpu_bind_buffer(c, 2, &pl->f2, 0);
-      gpu_bind_buffer(c, 3, &work.h_bf16, 0);
-      gpu_bind_buffer(c, 4, &work.pw, 0);
-      gpu_bind_buffer(c, 5, &work.tiles, 0);
-      gpu_bind_buffer(c, 6, &work.y_pair, 0);
-      gpu_copy_bytes(c, 7, &mp2, sizeof mp2);
-      gpu_run_kernel(c, gx2_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
-    }
-    if (run_mm) {
-      gpu_select_kernel(c, K_nv_dn_mm);
-      gpu_bind_buffer(c, 0, &pl->w2, 0);
-      gpu_bind_buffer(c, 1, &pl->s2, 0);
-      gpu_bind_buffer(c, 2, &pl->f2, 0);
-      gpu_bind_buffer(c, 3, &work.h_bf16, 0);
-      gpu_bind_buffer(c, 4, &work.pw, 0);
-      gpu_bind_buffer(c, 5, &work.tiles, 0);
-      gpu_bind_buffer(c, 6, &work.y_pair, 0);
-      gpu_copy_bytes(c, 7, &mp2, sizeof mp2);
-      gpu_run_kernel(c, gx2_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
-    }
-  } else {
-    if (run_mv) {
-      gpu_select_kernel(c, K_mx_up_mv);
-      gpu_bind_buffer(c, 0, &pl->w13, 0);
-      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &pl->f13, 0);
       gpu_bind_buffer(c, 2, &work.q_in, 0);
       gpu_bind_buffer(c, 3, &work.ptok, 0);
       gpu_bind_buffer(c, 4, &work.tiles, 0);
@@ -1674,9 +2032,9 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
       gpu_run_kernel(c, gx13_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
     }
     if (run_mm) {
-      gpu_select_kernel(c, K_mx_up_mm);
-      gpu_bind_buffer(c, 0, &pl->w13, 0);
-      gpu_bind_buffer(c, 1, &pl->s13, 0);
+      gpu_select_kernel(c, K_nv_up_mm);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &pl->f13, 0);
       gpu_bind_buffer(c, 2, &work.x_bf16, 0);
       gpu_bind_buffer(c, 3, &work.tiles, 0);
       gpu_bind_buffer(c, 4, &work.h_bf16, 0);
@@ -1684,9 +2042,9 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
       gpu_run_kernel(c, gx13_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
     }
     if (run_mv) {
-      gpu_select_kernel(c, K_mx_dn_mv);
-      gpu_bind_buffer(c, 0, &pl->w2, 0);
-      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_select_kernel(c, K_nv_dn_mv);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &pl->f2, 0);
       gpu_bind_buffer(c, 2, &work.h_bf16, 0);
       gpu_bind_buffer(c, 3, &work.pw, 0);
       gpu_bind_buffer(c, 4, &work.tiles, 0);
@@ -1695,14 +2053,54 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
       gpu_run_kernel(c, gx2_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
     }
     if (run_mm) {
-      gpu_select_kernel(c, K_mx_dn_mm);
-      gpu_bind_buffer(c, 0, &pl->w2, 0);
-      gpu_bind_buffer(c, 1, &pl->s2, 0);
+      gpu_select_kernel(c, K_nv_dn_mm);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &pl->f2, 0);
       gpu_bind_buffer(c, 2, &work.h_bf16, 0);
       gpu_bind_buffer(c, 3, &work.pw, 0);
       gpu_bind_buffer(c, 4, &work.tiles, 0);
       gpu_bind_buffer(c, 5, &work.y_pair, 0);
       gpu_copy_bytes(c, 6, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+  } else {
+    if (run_mv) {
+      gpu_select_kernel(c, K_mx_up_mv);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &work.q_in, 0);
+      gpu_bind_buffer(c, 2, &work.ptok, 0);
+      gpu_bind_buffer(c, 3, &work.tiles, 0);
+      gpu_bind_buffer(c, 4, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 5, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_mx_up_mm);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &work.x_bf16, 0);
+      gpu_bind_buffer(c, 2, &work.tiles, 0);
+      gpu_bind_buffer(c, 3, &work.h_bf16, 0);
+      gpu_copy_bytes(c, 4, &mp13, sizeof mp13);
+      gpu_run_kernel(c, gx13_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
+    }
+    if (run_mv) {
+      gpu_select_kernel(c, K_mx_dn_mv);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 2, &work.pw, 0);
+      gpu_bind_buffer(c, 3, &work.tiles, 0);
+      gpu_bind_buffer(c, 4, &work.y_pair, 0);
+      gpu_copy_bytes(c, 5, &mp2, sizeof mp2);
+      gpu_run_kernel(c, gx2_mv, (uint32_t)ntiles, 1, MV_THREADS, 1, 1);
+    }
+    if (run_mm) {
+      gpu_select_kernel(c, K_mx_dn_mm);
+      gpu_bind_buffer(c, 0, expert_table, 0);
+      gpu_bind_buffer(c, 1, &work.h_bf16, 0);
+      gpu_bind_buffer(c, 2, &work.pw, 0);
+      gpu_bind_buffer(c, 3, &work.tiles, 0);
+      gpu_bind_buffer(c, 4, &work.y_pair, 0);
+      gpu_copy_bytes(c, 5, &mp2, sizeof mp2);
       gpu_run_kernel(c, gx2_mm, (uint32_t)ntiles, 1, MM_THREADS, 1, 1);
     }
   }
@@ -1720,17 +2118,22 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
 
 // ---- forward pass ----
 
-// Runs one logical visit v (0..47) over `rows` tokens. When is_prefill is
-// nonzero, commits and syncs around router tile grouping and checks `wait`.
-// When is_prefill is zero (decode or verify), stays entirely on GPU in *cmd.
+// Runs one logical visit v (0..47) over `rows` tokens. Prefill visits sync
+// around routing, check `wait` while holding no experts, and stream active
+// experts through experts_store. Decode and verify visits stay on GPU in *cmd
+// when the physical layer is fully resident and committed, or sync and stream
+// missing experts from SSD otherwise.
 static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                       int max_pos, const Ink2State *s, int batched,
-                      int is_prefill, int *nblocks, const PassWait *wait) {
+                      int is_prefill, int *nblocks, const PassWait *wait,
+                      uint8_t fast_visits[INK2_TOTAL_LAYERS]) {
   const Ink2Visit *vis = &schedule[v];
-  const PhysLayer *pl = &layers[vis->phys];
+  int l = vis->phys;
+  const PhysLayer *pl = &layers[l];
   size_t row_floats = (size_t)rows * INK2_DIM;
   size_t stride_bytes = (size_t)work.cap_rows * INK2_DIM * sizeof(float);
   int use_msg = (vis->loop_pass > 0);
+  if (is_prefill) expert_store_set_prompt_layer(experts_store, l);
 
   if (use_msg) {
     size_t q_off =
@@ -1951,6 +2354,8 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   }
 
   // Router logits (FP32, unrounded) and biased top-8 selection.
+  size_t route_ids_off =
+      is_prefill ? 0 : (size_t)v * (size_t)rows * INK2_TOPK * sizeof(uint32_t);
   run_bf16_linear(cmd, &pl->router_w.w, &work.q_in, &work.route_logits, rows,
                   pl->router_w.n, pl->router_w.k, pl->router_w.n, 0,
                   is_prefill);
@@ -1959,7 +2364,7 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   gpu_select_kernel(cmd, K_route_topk);
   gpu_bind_buffer(cmd, 0, &work.route_logits, 0);
   gpu_bind_buffer(cmd, 1, &pl->router_bias, 0);
-  gpu_bind_buffer(cmd, 2, &work.route_ids, 0);
+  gpu_bind_buffer(cmd, 2, &work.route_ids, route_ids_off);
   gpu_bind_buffer(cmd, 3, &work.route_w, 0);
   gpu_copy_bytes(cmd, 4, &rp, sizeof rp);
   gpu_run_kernel(cmd, (uint32_t)rows, 1, 1, ROUTE_THREADS, 1, 1);
@@ -1968,35 +2373,114 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   if (is_prefill) {
     model_commit(cmd);
     model_sync();
+    held_release_all();
+    expert_store_resize_in_prompt(experts_store, l);
+    if (wait && wait->ready && !wait->ready(wait->context)) pass_wait(wait);
     int ntiles = inkling2_group_expert_tiles(
         (const uint32_t *)work.route_ids.ptr, (const float *)work.route_w.ptr,
         rows, MOE_MM_TILE, (int *)work.ptok.ptr, (float *)work.pw.ptr,
         (int *)work.tp.ptr, (Ink2MoeTile *)work.tiles.ptr);
-    int has_mv = 0, has_mm = 0;
+    int has_mv = 0, has_mm = 0, need[INK2_EXPERTS], nn = 0;
+    uint8_t used[INK2_EXPERTS] = {0};
     const Ink2MoeTile *tl = (const Ink2MoeTile *)work.tiles.ptr;
     for (int t = 0; t < ntiles; t++) {
+      used[tl[t].expert] = 1;
       if (tl[t].count <= (uint32_t)MOE_MV_MAX_M)
         has_mv = 1;
       else
         has_mm = 1;
     }
-    if (wait && wait->ready && !wait->ready(wait->context)) pass_wait(wait);
+    for (int e = 0; e < INK2_EXPERTS; e++)
+      if (used[e]) need[nn++] = e;
+    hold_experts(l, need, nn);
+    expert_store_cancel_read_aheads(experts_store, l, need, nn);
+    expert_store_unprotect_read_aheads(experts_store, l);
+    if (rows >= PREFILL_BULK_ROWS && v + 1 < INK2_TOTAL_LAYERS &&
+        schedule[v + 1].phys == l + 1)
+      prefetch_all_layer_experts(l + 1);
+    expert_store_wait_for_reads(experts_store, l, need, nn);
     *cmd = gpu_begin(gpu);
-    encode_moe_experts(cmd, pl, rows, ntiles, has_mv, has_mm);
+    fill_streaming_table(cmd, l, need, nn);
+    encode_moe_experts(cmd, pl, &work.expert_table, rows, ntiles, has_mv,
+                       has_mm);
   } else {
-    uint32_t m_topk[2] = {(uint32_t)rows, (uint32_t)INK2_TOPK};
-    gpu_select_kernel(cmd, K_moe_group);
-    gpu_bind_buffer(cmd, 0, &work.route_ids, 0);
-    gpu_bind_buffer(cmd, 1, &work.route_w, 0);
-    gpu_bind_buffer(cmd, 2, &work.ptok, 0);
-    gpu_bind_buffer(cmd, 3, &work.pw, 0);
-    gpu_bind_buffer(cmd, 4, &work.tp, 0);
-    gpu_bind_buffer(cmd, 5, &work.tiles, 0);
-    gpu_copy_bytes(cmd, 6, m_topk, sizeof m_topk);
-    gpu_run_kernel(cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
-    int ntiles = rows * INK2_TOPK;
-    int run_mm = rows > MOE_MV_MAX_M ? 1 : 0;
-    encode_moe_experts(cmd, pl, rows, ntiles, 1, run_mm);
+    uint64_t gen = 0;
+    if (expert_store_layer_is_reachable(experts_store, l, &gen)) {
+      hold_layer_if_needed(l);
+      refresh_layer_table(l, gen);
+      uint32_t m_topk[2] = {(uint32_t)rows, (uint32_t)INK2_TOPK};
+      gpu_select_kernel(cmd, K_moe_group);
+      gpu_bind_buffer(cmd, 0, &work.route_ids, route_ids_off);
+      gpu_bind_buffer(cmd, 1, &work.route_w, 0);
+      gpu_bind_buffer(cmd, 2, &work.ptok, 0);
+      gpu_bind_buffer(cmd, 3, &work.pw, 0);
+      gpu_bind_buffer(cmd, 4, &work.tp, 0);
+      gpu_bind_buffer(cmd, 5, &work.tiles, 0);
+      gpu_copy_bytes(cmd, 6, m_topk, sizeof m_topk);
+      gpu_run_kernel(cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
+      int ntiles = rows * INK2_TOPK;
+      int run_mm = rows > MOE_MV_MAX_M ? 1 : 0;
+      encode_moe_experts(cmd, pl, &layer_table[l], rows, ntiles, 1, run_mm);
+      fast_visits[v] = 1;
+    } else {
+      model_commit(cmd);
+      model_sync();
+      flush_fast_visits(fast_visits, rows);
+      held_release_all();
+
+      const uint32_t *rids = (const uint32_t *)work.route_ids.ptr +
+                             (size_t)v * (size_t)rows * INK2_TOPK;
+      ExpertStoreCounts *st = expert_stats();
+      uint8_t used[INK2_EXPERTS] = {0};
+      int need[INK2_EXPERTS], nn = 0;
+      for (int r = 0; r < rows; r++) {
+        for (int k = 0; k < INK2_TOPK; k++) {
+          uint32_t e = rids[(size_t)r * INK2_TOPK + (size_t)k];
+          if (e >= (uint32_t)INK2_EXPERTS) die("router selected expert %u", e);
+          used[e] = 1;
+          ExpertPlace place = expert_store_locate(experts_store, l, (int)e);
+          if (place == EXPERT_IN_MEMORY)
+            st->row_own++;
+          else if (place == EXPERT_READ_AHEAD)
+            st->row_ahead++;
+          else if (place == EXPERT_BEING_READ_AHEAD)
+            st->row_late++;
+          else
+            st->row_ssd++;
+          if (r < ROUTE_DECODE_CAP) {
+            route_id[r][v][k] = (uint16_t)e;
+            route_from[r][v][k] = expert_place_to_route_source(place);
+            route_step[r][v] = route_steps;
+          }
+        }
+      }
+      for (int e = 0; e < INK2_EXPERTS; e++)
+        if (used[e]) need[nn++] = e;
+      st->row_unique += (uint64_t)nn;
+
+      hold_experts(l, need, nn);
+      expert_store_cancel_read_aheads(experts_store, l, need, nn);
+      expert_store_unprotect_read_aheads(experts_store, l);
+      credit_near_misses(l, rows, used);
+      expert_store_wait_for_reads(experts_store, l, need, nn);
+
+      int ntiles = inkling2_group_expert_tiles(
+          rids, (const float *)work.route_w.ptr, rows, MOE_MM_TILE,
+          (int *)work.ptok.ptr, (float *)work.pw.ptr, (int *)work.tp.ptr,
+          (Ink2MoeTile *)work.tiles.ptr);
+      int has_mv = 0, has_mm = 0;
+      const Ink2MoeTile *tl = (const Ink2MoeTile *)work.tiles.ptr;
+      for (int t = 0; t < ntiles; t++) {
+        if (tl[t].count <= (uint32_t)MOE_MV_MAX_M)
+          has_mv = 1;
+        else
+          has_mm = 1;
+      }
+      *cmd = gpu_begin(gpu);
+      fill_streaming_table(cmd, l, need, nn);
+      encode_moe_experts(cmd, pl, &work.expert_table, rows, ntiles, has_mv,
+                         has_mm);
+    }
   }
 
   // Post-MLP static short convolution and BF16-rounded residual update.
@@ -2036,9 +2520,10 @@ static void inject_media_rows(const int *tokens, int pos0, int rows) {
 // Runs the complete 48-visit Inkling-2-Mini forward pass over `rows` tokens.
 // Computes logits for all `rows` rows when `logits_mode == 2`, for the last
 // row only when `logits_mode == 1`, or skips unembed when `logits_mode == 0`.
-static void run_forward(Ink2State *const *states, const int *tokens,
-                        const int *pos, int rows, int batched, int is_prefill,
-                        int logits_mode, const PassWait *wait) {
+// Returns 1 on completion, or 0 if shutdown interrupted a prefill pass.
+static int run_forward(Ink2State *const *states, const int *tokens,
+                       const int *pos, int rows, int batched, int is_prefill,
+                       int logits_mode, const PassWait *wait) {
   int need_logits = logits_mode == 2 ? rows : (logits_mode == 1 ? 1 : 0);
   ensure_work(rows, need_logits);
   memcpy(work.ids.ptr, tokens, (size_t)rows * sizeof(int32_t));
@@ -2088,8 +2573,15 @@ static void run_forward(Ink2State *const *states, const int *tokens,
     inject_media_rows(tokens, pos0, rows);
   }
 
+  if (is_prefill && rows >= PREFILL_BULK_ROWS) {
+    expert_store_set_prompt_layer(experts_store, 0);
+    prefetch_all_layer_experts(0);
+  }
+
   size_t row_floats = (size_t)rows * INK2_DIM;
   size_t stride_bytes = (size_t)work.cap_rows * INK2_DIM * sizeof(float);
+  uint8_t fast_visits[INK2_TOTAL_LAYERS] = {0};
+  int stopped = 0;
   GpuCommandBuffer cmd = gpu_begin(gpu);
 
   // Embedding lookup + embed_norm (BF16-rounded).
@@ -2105,19 +2597,27 @@ static void run_forward(Ink2State *const *states, const int *tokens,
   int nblocks = 0;
   // Prelude visits 0..5.
   for (int v = 0; v < INK2_CORE_START; v++) {
+    if (is_prefill && shutdown_requested()) {
+      stopped = 1;
+      break;
+    }
     if (is_prefill) prefill_layer_now = v + 1;
     if (v == INK2_MTP_TAP_0)
       inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 0, rows);
     run_visit(&cmd, v, rows, pos0, max_pos, states[0], batched, is_prefill,
-              &nblocks, wait);
+              &nblocks, wait, fast_visits);
   }
-  // Save pre-loop hidden state; blk[0] (h_embed) stays untouched across loops.
-  run_copy(&cmd, &work.cur, 0, &work.pre_loop_cur, 0, (uint32_t)row_floats);
+
   int pre_loop_blocks = nblocks;
+  if (!stopped) {
+    // Save pre-loop hidden state; blk[0] (h_embed) stays untouched across
+    // loops.
+    run_copy(&cmd, &work.cur, 0, &work.pre_loop_cur, 0, (uint32_t)row_floats);
+  }
 
   // Core loop passes 0, 1, 2 (visits 6..41).
   int visit = INK2_CORE_START;
-  for (int pass = 0; pass < INK2_LOOP_PASSES; pass++) {
+  for (int pass = 0; pass < INK2_LOOP_PASSES && !stopped; pass++) {
     if (pass > 0) {
       // Previous pass's blocks past pre_loop_blocks + 1 is blk[2]; restart
       // hidden state from pre_loop_cur and blk[0..pre_loop_blocks-1].
@@ -2128,25 +2628,33 @@ static void run_forward(Ink2State *const *states, const int *tokens,
       nblocks = pre_loop_blocks;
     }
     for (int li = 0; li < INK2_CORE_LAYERS; li++, visit++) {
+      if (is_prefill && shutdown_requested()) {
+        stopped = 1;
+        break;
+      }
       if (is_prefill) prefill_layer_now = visit + 1;
       if (visit == INK2_MTP_TAP_1)
         inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 1, rows);
       if (visit == INK2_MTP_TAP_2)
         inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 2, rows);
       run_visit(&cmd, visit, rows, pos0, max_pos, states[0], batched,
-                is_prefill, &nblocks, wait);
+                is_prefill, &nblocks, wait, fast_visits);
     }
   }
 
   // Postlude visits 42..47.
-  for (; visit < INK2_TOTAL_LAYERS; visit++) {
+  for (; visit < INK2_TOTAL_LAYERS && !stopped; visit++) {
+    if (is_prefill && shutdown_requested()) {
+      stopped = 1;
+      break;
+    }
     if (is_prefill) prefill_layer_now = visit + 1;
     run_visit(&cmd, visit, rows, pos0, max_pos, states[0], batched, is_prefill,
-              &nblocks, wait);
+              &nblocks, wait, fast_visits);
   }
 
   int mtp_on = inkling2_mtp_active_drafts() > 0;
-  if (logits_mode > 0 || mtp_on) {
+  if (!stopped && (logits_mode > 0 || mtp_on)) {
     run_attn_res(&cmd, &work.blk, &work.cur, &output_query, 0, &work.attn_in,
                  rows, work.cap_rows, nblocks, 1, work.cap_rows);
     if (mtp_on) {
@@ -2188,8 +2696,12 @@ static void run_forward(Ink2State *const *states, const int *tokens,
     }
   }
 
+  if (is_prefill) expert_store_set_prompt_layer(experts_store, -1);
   model_commit(&cmd);
   model_sync();
+  if (!is_prefill) flush_fast_visits(fast_visits, rows);
+  held_release_all();
+  return !stopped;
 }
 
 // Copies `rows` padded logits rows (stride LOGITS_STRIDE) into the tightly
@@ -2210,7 +2722,8 @@ static const float *pack_logits(int rows) {
 
 // ---- ModelOps entry points ----
 
-// Loads the Inkling-2-Mini text backbone weights on model_gpu.
+// Loads the Inkling-2-Mini dense backbone on model_gpu and starts its
+// SSD-backed expert store, preloading all routed experts when memory fits.
 static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
                      const Options *o) {
   opt = *o;
@@ -2221,6 +2734,7 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     memory_slot_init(&state_slot, work_mem->account, MEMORY_STATE, NULL,
                      "Inkling-2-Mini states", NULL, NULL);
     state_slot.automatic = 1;
+    pass_before_yield = before_yield;
     check_config(dir);
     inkling2_build_schedule(schedule);
 
@@ -2266,23 +2780,66 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     text_weights =
         weight_group_new(gpu, work_mem->account, "Inkling-2-Mini weights");
     register_text_weights();
+    register_expert_spans();
     inkling2_mtp_init(gpu, text_weights, dir, opt.draft);
     inkling2_vision_init(gpu, work_mem, checkpoint, text_weights);
-    required_bytes = weight_group_required_bytes(text_weights) +
-                     estimate_work_bytes(PREFILL_CHUNK);
+
+    ExpertLayout layout = {.layers = INK2_PHYS_LAYERS,
+                           .scored_layers = INK2_PHYS_LAYERS,
+                           .experts = INK2_EXPERTS,
+                           .chosen = INK2_TOPK,
+                           .stage_experts = 0,
+                           .parts = EXPERT_PARTS,
+                           .span = &expert_spans[0][0][0],
+                           .spans = expert_span_counts};
+    experts_store = expert_store_new(gpu, &layout);
+    expert_store_set_backbone(experts_store, weight_group_slot(text_weights));
   }
 
   MemorySlot *slot = weight_group_slot(text_weights);
   memory_pin(slot, 1);
-  if (!memory_wait_for_minimum(slot->account,
-                               weight_group_required_bytes(text_weights) +
-                                   estimate_work_bytes(INK2_MAX_VERIFY)) ||
+  expert_store_set_request_running(experts_store, 1);
+  if (work.cap_rows > INK2_MAX_VERIFY) {
+    model_sync();
+    free_work(&work);
+  }
+  expert_store_set_pass_rows(experts_store, 1);
+  uint64_t fixed = work_slot->payload - work_resizable_bytes();
+  uint64_t minimum =
+      weight_group_required_bytes(text_weights) + fixed +
+      estimate_work_bytes(INK2_MAX_VERIFY) +
+      expert_store_minimum_bytes(experts_store, INK2_PHYS_LAYERS);
+  if (!memory_wait_for_minimum(slot->account, minimum) ||
       !weight_group_load(text_weights)) {
     memory_pin(slot, 0);
+    expert_store_set_request_running(experts_store, 0);
     return 0;
   }
   weight_group_set_resident(text_weights, 1);
   gpu_commit_residency(gpu);
+
+  if (!store_started) {
+    for (int l = 0; l < INK2_PHYS_LAYERS; l++) {
+      layer_table[l] = work_alloc((size_t)INK2_EXPERTS * sizeof(ExpertRef));
+      layer_table_gen[l] = UINT64_MAX;
+    }
+    expert_store_start(experts_store, 0, INK2_PHYS_LAYERS);
+    store_started = 1;
+  }
+  expert_store_preload_if_fits(experts_store);
+  if (shutdown_requested()) {
+    memory_pin(slot, 0);
+    expert_store_set_request_running(experts_store, 0);
+    return 0;
+  }
+
+  uint64_t load_fixed = work_slot->payload - work_resizable_bytes();
+  required_bytes = weight_group_required_bytes(text_weights) + load_fixed +
+                   estimate_work_bytes(PREFILL_CHUNK) +
+                   expert_store_pass_minimum_bytes(experts_store, PREFILL_CHUNK,
+                                                   INK2_PHYS_LAYERS);
+  prepare_prev_rows = 0;
+  prepare_prev_payload = 0;
   return 1;
 }
 
@@ -2291,20 +2848,60 @@ static MemorySlot *ink2_dense_weight_slot(void) {
   return text_weights ? weight_group_slot(text_weights) : NULL;
 }
 
-// Writes runtime counters into c.
+// Marks whether a request is running so idle expert slots stay protected while
+// active.
+static void ink2_set_request_running(int running) {
+  if (experts_store) expert_store_set_request_running(experts_store, running);
+}
+
+// Returns the bytes currently held by the routed expert store, or 0 before
+// initialization.
+static uint64_t ink2_cache_bytes(void) {
+  return experts_store ? expert_store_bytes(experts_store) : 0;
+}
+
+// Writes the routed expert IDs and source codes chosen for `row` in the latest
+// decoding pass across all 48 logical visits. Returns 1 on success or 0 when
+// `row` has no complete routing record.
+static int ink2_read_routes(int row, uint16_t *id, uint8_t *from) {
+  if (row < 0 || row >= ROUTE_DECODE_CAP || !route_steps) return 0;
+  for (int v = 0; v < INK2_TOTAL_LAYERS; v++)
+    if (route_step[row][v] != route_steps) return 0;
+  memcpy(id, route_id[row], sizeof route_id[row]);
+  memcpy(from, route_from[row], sizeof route_from[row]);
+  return 1;
+}
+
+// Writes runtime counters and expert-cache statistics into c.
 static void ink2_read_counters(ModelCounters *c) {
-  *c = (ModelCounters){.decode_rows = decode_rows_count,
-                       .prefill_rows = prefill_rows_count,
-                       .decode_seconds = decode_seconds_total,
-                       .decode_gpu_seconds = decode_gpu_seconds_total,
-                       .prefill_layer = prefill_layer_now,
-                       .prefill_rows_now = prefill_rows_now,
-                       .layers = INK2_TOTAL_LAYERS,
-                       .experts_per_row = 0,
-                       .routed_layers = INK2_TOTAL_LAYERS,
-                       .experts_per_layer = INK2_EXPERTS,
-                       .dense_bytes = weight_group_resident_bytes(text_weights),
-                       .required_bytes = required_bytes};
+  *c = (ModelCounters){
+      .decode_rows = decode_rows_count,
+      .prefill_rows = prefill_rows_count,
+      .decode_seconds = decode_seconds_total,
+      .decode_gpu_seconds = decode_gpu_seconds_total,
+      .prefill_layer = prefill_layer_now,
+      .prefill_rows_now = prefill_rows_now,
+      .layers = INK2_TOTAL_LAYERS,
+      .experts_per_row = INK2_TOTAL_LAYERS * INK2_TOPK,
+      .routed_layers = INK2_TOTAL_LAYERS,
+      .experts_per_layer = INK2_EXPERTS,
+      .dense_bytes =
+          (text_weights ? weight_group_resident_bytes(text_weights) : 0) +
+          inkling2_vision_resident_bytes(),
+      .required_bytes = required_bytes,
+      .decode = decode_stats,
+      .prefill = prefill_stats,
+      .experts = INK2_PHYS_LAYERS * INK2_EXPERTS};
+  if (!experts_store) return;
+  c->cache = *expert_stats();
+  c->cache_bytes = expert_store_bytes(experts_store);
+  c->slot_bytes = expert_store_slot_bytes(experts_store);
+  c->cache_slots = expert_store_slot_count(experts_store);
+  c->mapped = expert_store_mapped_count(experts_store);
+  c->cap = expert_store_slot_limit(experts_store);
+  c->max_slots = expert_store_slot_maximum(experts_store);
+  c->uncached_bytes =
+      expert_store_bytes_without_slot(experts_store, &c->uncached);
 }
 
 // Returns the unpadded output vocabulary size.
@@ -2332,8 +2929,9 @@ static int ink2_replay_rows(int k) {
   return -1;
 }
 
-// Prefills positions `from` through `n - 1` of state `ms` in chunks of up to
-// PREFILL_CHUNK tokens, capturing a snapshot at `capture` if requested.
+// Prefills positions `from` through `n - 1` of state `ms` in memory-admitted
+// chunks of up to PREFILL_CHUNK tokens, capturing a snapshot at `capture` if
+// requested. Returns null if memory cannot fit or shutdown interrupts prefill.
 static const float *ink2_prefill(ModelState *ms, const int *tokens, int n,
                                  int from, int replay, int capture,
                                  ModelSnapshot **captured, float *every,
@@ -2349,13 +2947,26 @@ static const float *ink2_prefill(ModelState *ms, const int *tokens, int n,
 
   Ink2State *s = (Ink2State *)ms;
   prefill_rows_now = n - from;
+  ExpertStoreCounts c0 = *expert_stats();
+  int stopped = 0;
   for (int pos = from; pos < n;) {
-    int chunk = n - pos;
-    if (chunk > PREFILL_CHUNK) chunk = PREFILL_CHUNK;
-    if (capture > pos && pos + chunk > capture) chunk = capture - pos;
+    if (shutdown_requested()) {
+      stopped = 1;
+      break;
+    }
+    int rem = n - pos;
+    if (capture > pos && pos + rem > capture) rem = capture - pos;
+    int chunk = prepare_rows(rem, 1);
+    if (!chunk) {
+      stopped = 1;
+      break;
+    }
     int is_last = (pos + chunk == n);
     int logits_mode = every ? 2 : (is_last ? 1 : 0);
-    run_forward(&s, tokens + pos, &pos, chunk, 0, 1, logits_mode, wait);
+    if (!run_forward(&s, tokens + pos, &pos, chunk, 0, 1, logits_mode, wait)) {
+      stopped = 1;
+      break;
+    }
     if (every) {
       const float *src = (const float *)work.logits.ptr;
       for (int r = 0; r < chunk; r++)
@@ -2367,23 +2978,38 @@ static const float *ink2_prefill(ModelState *ms, const int *tokens, int n,
     if (capture >= 0 && pos == capture && captured)
       *captured = ink2_snapshot_take(ms, capture, NULL);
   }
+  expert_store_age_and_resize(experts_store);
+  stats_add(&prefill_stats, &c0);
   prefill_layer_now = 0;
   prefill_rows_now = 0;
+  if (stopped) {
+    if (captured && *captured) {
+      ink2_snapshot_free(*captured);
+      *captured = NULL;
+    }
+    return NULL;
+  }
   return every ? every + (size_t)(n - from - 1) * INK2_VOCAB
                : (const float *)work.logits.ptr;
 }
 
-// Decodes one token for each of `m` distinct states.
+// Decodes one token for each of `m` distinct states. Returns null if the
+// pass's minimum memory does not fit.
 static const float *ink2_decode_rows(ModelState *const *states,
                                      const int *tokens, const int *pos, int m) {
   if (m < 1 || m > INK2_MAX_BATCH_ROWS)
     die("invalid Inkling-2-Mini decode batch size %d", m);
+  if (!prepare_rows(m, 0)) return NULL;
+  ExpertStoreCounts c0 = *expert_stats();
   double t0 = now();
   GpuTimes g0 = gpu_times(gpu);
+  route_steps++;
   Ink2State *s_arr[INK2_MAX_BATCH_ROWS];
   for (int i = 0; i < m; i++) s_arr[i] = (Ink2State *)states[i];
   int batched = m > 1 ? 1 : 0;
   run_forward(s_arr, tokens, pos, m, batched, 0, m == 1 ? 1 : 2, NULL);
+  expert_store_age_and_resize(experts_store);
+  stats_add(&decode_stats, &c0);
   GpuTimes g1 = gpu_times(gpu);
   decode_rows_count += (uint64_t)m;
   decode_seconds_total += now() - t0;
@@ -2403,14 +3029,20 @@ static const double *ink2_propose_drafts(ModelState *ms, int token, int pos,
 }
 
 // Verifies `m` contiguous candidate tokens starting at `pos` on state `ms`.
+// Returns null if the pass's minimum memory does not fit.
 static const float *ink2_verify(ModelState *ms, const int *tokens, int m,
                                 int pos) {
   if (m < 1 || m > INK2_MAX_VERIFY)
     die("invalid Inkling-2-Mini verify length %d", m);
+  if (!prepare_rows(m, 0)) return NULL;
+  ExpertStoreCounts c0 = *expert_stats();
   double t0 = now();
   GpuTimes g0 = gpu_times(gpu);
+  route_steps++;
   Ink2State *s = (Ink2State *)ms;
   run_forward(&s, tokens, &pos, m, 0, 0, 2, NULL);
+  expert_store_age_and_resize(experts_store);
+  stats_add(&decode_stats, &c0);
   GpuTimes g1 = gpu_times(gpu);
   decode_rows_count += (uint64_t)m;
   decode_seconds_total += now() - t0;
@@ -2427,8 +3059,18 @@ static void ink2_accept(ModelState *ms, const int *tokens, int n, int pos) {
   (void)pos;
 }
 
-// No-op idle work hook: Inkling-2-Mini has no SSD expert cache.
-static int ink2_run_idle_work(void) { return 0; }
+// Resizes the routed expert cache while no request runs and returns the
+// remaining slot count.
+static int ink2_run_idle_work(void) {
+  if (!experts_store) return 0;
+  expert_store_resize_when_idle(experts_store);
+  return expert_store_slot_count(experts_store);
+}
+
+// Informs the expert store how many other passes currently hold GPU work.
+static void ink2_set_other_passes(int passes) {
+  if (experts_store) expert_store_set_other_passes(experts_store, passes);
+}
 
 // Formats one CLI user turn matching chat_template.jinja.
 static void ink2_render_chat_turn(char *text, size_t cap, const char *prompt,
@@ -2464,22 +3106,33 @@ static void ink2_set_prefill_media(const Media *im, int n) {
   prefill_media_count = n;
 }
 
-// Creates a cooperative pass with its own workspace, submission sequence and
-// packed logits buffer.
+// Creates a cooperative pass with its own workspace, submission sequence,
+// packed logits buffer, held expert state and expert-store pass variables.
 static Pass *ink2_pass_new(void (*body)(void *), void *argument) {
-  const PassVariable variables[] = {
+  const PassVariable own[] = {
       {&work, sizeof work},
       {&last_committed, sizeof last_committed},
       {&logits_compact, sizeof logits_compact},
       {&logits_compact_rows, sizeof logits_compact_rows},
       {&prefill_media, sizeof prefill_media},
-      {&prefill_media_count, sizeof prefill_media_count}};
+      {&prefill_media_count, sizeof prefill_media_count},
+      {&held, sizeof held},
+      {&held_layers, sizeof held_layers}};
+  constexpr int OWN = sizeof own / sizeof *own;
+  PassVariable variables[OWN + EXPERT_STORE_PASS_VARIABLES];
+  memcpy(variables, own, sizeof own);
+  int count = OWN;
+  if (experts_store) {
+    expert_store_write_pass_variables(experts_store, variables + OWN);
+    count += EXPERT_STORE_PASS_VARIABLES;
+  }
   Pass *pass = pass_new(body, argument, PASS_STACK_BYTES);
-  pass_set_variables(pass, variables, sizeof variables / sizeof *variables);
+  pass_set_variables(pass, variables, count);
   return pass;
 }
 
-// Initializes pass-local scratch handles when a pass begins.
+// Initializes pass-local scratch handles and held-expert state when a pass
+// begins.
 static void ink2_pass_begin(void) {
   work = (Ink2Work){0};
   last_committed = 0;
@@ -2487,11 +3140,16 @@ static void ink2_pass_begin(void) {
   logits_compact_rows = 0;
   prefill_media = NULL;
   prefill_media_count = 0;
+  held.n = 0;
+  held_layers = 0;
+  if (experts_store) expert_store_set_prompt_layer(experts_store, -1);
 }
 
-// Syncs and releases pass-local scratch buffers when a pass ends.
+// Syncs, releases held experts and frees pass-local scratch buffers when a
+// pass ends.
 static void ink2_pass_end(void) {
   model_sync();
+  held_release_all();
   free_work(&work);
   free(logits_compact);
   logits_compact = NULL;
@@ -2508,7 +3166,10 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .max_drafts = INK2_MTP_MAX_DRAFTS,
                                .load = ink2_load,
                                .dense_weight_slot = ink2_dense_weight_slot,
+                               .set_request_running = ink2_set_request_running,
                                .read_counters = ink2_read_counters,
+                               .expert_store_bytes = ink2_cache_bytes,
+                               .read_routes = ink2_read_routes,
                                .vocab_size = ink2_vocab_size,
                                .max_rows = ink2_max_rows,
                                .max_verify = ink2_max_verify,
@@ -2542,4 +3203,5 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .render_chat_turn = ink2_render_chat_turn,
                                .pass_new = ink2_pass_new,
                                .pass_begin = ink2_pass_begin,
-                               .pass_end = ink2_pass_end};
+                               .pass_end = ink2_pass_end,
+                               .set_other_passes = ink2_set_other_passes};
