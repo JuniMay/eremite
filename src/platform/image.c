@@ -170,12 +170,69 @@ static Rgb decode_jpeg(const void *bytes, size_t len, const char **err) {
   return r;
 }
 
+// The 8 bytes that open every PNG file.
+static const uint8_t PNG_SIGNATURE[8] = {0x89, 'P',  'N',  'G',
+                                         '\r', '\n', 0x1a, '\n'};
+
+// Bytes in each of a PNG chunk's length, type and CRC fields.
+static constexpr size_t PNG_FIELD_BYTES = 4;
+
+// Bytes of a PNG chunk besides its data: its length, type and CRC.
+static constexpr size_t PNG_CHUNK_OVERHEAD = 3 * PNG_FIELD_BYTES;
+
+// The reversed polynomial of the CRC-32 that PNG chunks carry.
+static constexpr uint32_t PNG_CRC_POLYNOMIAL = 0xEDB88320u;
+
+// Bits in a byte, which the CRC takes one at a time.
+static constexpr int BYTE_BITS = 8;
+
+// Returns the CRC-32 of the len bytes at p, as a PNG chunk carries it.
+static uint32_t png_crc(const uint8_t *p, size_t len) {
+  uint32_t crc = ~0u;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= p[i];
+    for (int bit = 0; bit < BYTE_BITS; bit++)
+      crc = crc & 1 ? (crc >> 1) ^ PNG_CRC_POLYNOMIAL : crc >> 1;
+  }
+  return ~crc;
+}
+
+// Returns the big-endian 32-bit number at p.
+static uint32_t read_big_endian_32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 |
+         (uint32_t)p[3];
+}
+
+// Returns an error message when the len bytes at data are a PNG file that is
+// cut short or damaged: a chunk runs past the file's end, a chunk's CRC does
+// not match it, or the chunks end before IEND. Returns null for a whole PNG
+// file, and for bytes that are not PNG.
+static const char *check_png(const void *data, size_t len) {
+  const uint8_t *bytes = data;
+  if (len < sizeof PNG_SIGNATURE ||
+      memcmp(bytes, PNG_SIGNATURE, sizeof PNG_SIGNATURE))
+    return 0;
+  size_t at = sizeof PNG_SIGNATURE;
+  while (len - at >= PNG_CHUNK_OVERHEAD) {
+    uint32_t chunk = read_big_endian_32(bytes + at);
+    if (chunk > len - at - PNG_CHUNK_OVERHEAD) break;
+    const uint8_t *type = bytes + at + PNG_FIELD_BYTES;
+    if (png_crc(type, PNG_FIELD_BYTES + chunk) !=
+        read_big_endian_32(type + PNG_FIELD_BYTES + chunk))
+      break;
+    if (!memcmp(type, "IEND", PNG_FIELD_BYTES)) return 0;
+    at += PNG_CHUNK_OVERHEAD + chunk;
+  }
+  return "the PNG file is cut short or damaged";
+}
+
 static Rgb decode(const void *bytes, size_t len, const char **err) {
   *err = 0;
   if (len > 3 && !memcmp(bytes, "\xff\xd8\xff", 3)) {
     Rgb r = decode_jpeg(bytes, len, err);
     if (r.p || *err) return r;
   }
+  if ((*err = check_png(bytes, len))) return (Rgb){0};
   CFDataRef d = CFDataCreate(0, bytes, (CFIndex)len);
   CGImageSourceRef src = d ? CGImageSourceCreateWithData(d, 0) : 0;
   CGImageRef img = src && CGImageSourceGetCount(src)
@@ -216,7 +273,7 @@ uint8_t *image_decode_rgb(const void *data, size_t len, int *width, int *height,
 uint8_t *image_decode_alpha(const void *data, size_t len, int *width,
                             int *height, const char **err) {
   *width = *height = 0;
-  *err = 0;
+  if ((*err = check_png(data, len))) return 0;
   CFDataRef d = CFDataCreate(0, data, (CFIndex)len);
   CGImageSourceRef src = d ? CGImageSourceCreateWithData(d, 0) : 0;
   CGImageRef img = src && CGImageSourceGetCount(src)
@@ -254,7 +311,7 @@ uint8_t *image_decode_alpha(const void *data, size_t len, int *width,
 int image_read_size(const void *data, size_t len, int *width, int *height,
                     const char **error) {
   *width = *height = 0;
-  *error = 0;
+  if ((*error = check_png(data, len))) return 0;
   CFDataRef d = CFDataCreate(0, data, (CFIndex)len);
   CGImageSourceRef src = d ? CGImageSourceCreateWithData(d, 0) : 0;
   CFDictionaryRef props = src && CGImageSourceGetCount(src)

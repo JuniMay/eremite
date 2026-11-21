@@ -157,7 +157,10 @@ the returned images, `output_format` is their format, and `background` is
   `<Picture 2>`, and so on in `prompt`.
 - `images`: `/v1/images/edits` with JSON only; 1 to 16 objects, each with an
   `image_url` that is a base64 data URL, in the same order. The server
-  fetches no URLs and has no Files API, so `file_id` gets HTTP 400.
+  fetches no URLs and has no Files API, so `file_id` gets HTTP 400. An image
+  that does not decode gets HTTP 400, and so does a PNG file that is cut
+  short or damaged: one whose chunks run past its end, fail their CRC, or
+  end before IEND.
 - `mask`: `/v1/images/edits` only, optional: an image with an alpha channel,
   the size of the first image, as a file part or in JSON as an object with an
   `image_url`. Its transparent pixels mark what the edit changes; its opaque

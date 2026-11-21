@@ -333,6 +333,48 @@ int main(void) {
   free(alpha);
   free(encoded_webp);
 
+  // A PNG file whose end is gone, under zeros or cut off, is refused: a
+  // decoder that fills the missing rows with black hands on a wrong image.
+  enum { DAMAGED_SIDE = 64 };
+
+  static uint8_t pattern[DAMAGED_SIDE * DAMAGED_SIDE * 4];
+  for (size_t i = 0; i < sizeof pattern; i++)
+    pattern[i] = (uint8_t)(i * 7 % 251);
+  size_t rgb_length = 0, rgba_file_length = 0;
+  error = 0;
+  uint8_t *whole = image_encode_png(pattern, DAMAGED_SIDE, DAMAGED_SIDE,
+                                    &rgb_length, &error);
+  uint8_t *whole_rgba = image_encode_png_rgba(
+      pattern, DAMAGED_SIDE, DAMAGED_SIDE, &rgba_file_length, &error);
+  // The files lose their last quarter: part of their image data, and their
+  // end.
+  size_t rgb_kept = rgb_length - rgb_length / 4,
+         rgba_kept = rgba_file_length - rgba_file_length / 4;
+  uint8_t *zeroed = xmalloc(rgb_length);
+  memcpy(zeroed, whole, rgb_length);
+  memset(zeroed + rgb_kept, 0, rgb_length - rgb_kept);
+  const char *zeroed_error = 0, *cut_error = 0, *alpha_cut_error = 0,
+             *size_cut_error = 0;
+  int damaged_w = 0, damaged_h = 0;
+  uint8_t *from_zeroed = image_decode_rgb(zeroed, rgb_length, &damaged_w,
+                                          &damaged_h, &zeroed_error);
+  uint8_t *from_cut =
+      image_decode_rgb(whole, rgb_kept, &damaged_w, &damaged_h, &cut_error);
+  uint8_t *alpha_from_cut = image_decode_alpha(
+      whole_rgba, rgba_kept, &damaged_w, &damaged_h, &alpha_cut_error);
+  int size_read =
+      image_read_size(whole, rgb_kept, &damaged_w, &damaged_h, &size_cut_error);
+  check(whole && whole_rgba && !from_zeroed && zeroed_error && !from_cut &&
+            cut_error && !alpha_from_cut && alpha_cut_error && !size_read &&
+            size_cut_error,
+        "a PNG file whose end is zeroed or cut off is refused");
+  free(from_zeroed);
+  free(from_cut);
+  free(alpha_from_cut);
+  free(zeroed);
+  free(whole);
+  free(whole_rgba);
+
   CGColorSpaceRelease(gray_space);
   CGColorSpaceRelease(srgb);
   return failures != 0;
