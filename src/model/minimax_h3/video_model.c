@@ -92,6 +92,32 @@ static double total_video_seconds;
 static int active_prefill_layer, active_prefill_rows;
 static int active_video_stage, active_video_step, active_video_steps_total;
 
+// Count of other active GPU passes and remaining measured turn budget in
+// seconds, updated by the engine before and during multi-model runs.
+static int other_passes;
+static double turn_budget;
+
+// Arguments and outputs for off-GPU background H.264/AAC MP4 encoding.
+typedef struct {
+  // Decoded RGB frames and planar stereo FP32 PCM samples.
+  const uint8_t *rgb;
+  const float *pcm;
+  // Frame count, canvas dimensions, frame rate, sample count and sample rate.
+  int frames, width, height, fps, samples, sample_rate;
+  // Encoded MP4 output buffer, length and error string.
+  uint8_t *mp4;
+  size_t mp4_len;
+  const char *err;
+} Mp4EncodeJob;
+
+// Encodes RGB frames and planar stereo PCM into MP4 on a background thread.
+static void run_mp4_encode_job(void *context) {
+  Mp4EncodeJob *job = context;
+  job->mp4 = video_encode_mp4(job->rgb, job->frames, job->width, job->height,
+                              job->fps, job->pcm, job->samples,
+                              job->sample_rate, &job->mp4_len, &job->err);
+}
+
 // Clears live per-call progress indicators back to idle.
 static void clear_active_progress(void) {
   active_video_stage = VIDEO_STAGE_NONE;
@@ -1248,6 +1274,8 @@ static int minimax_h3_video_generate(const VideoRequest *req,
   }
 
   MinimaxH3RunHooks hooks = {.yield_wait = wait,
+                             .other_passes = &other_passes,
+                             .turn_budget = &turn_budget,
                              .cancelled = cancelled,
                              .prefill_layer = &active_prefill_layer,
                              .prefill_rows_now = &active_prefill_rows,
@@ -1414,12 +1442,27 @@ static int minimax_h3_video_generate(const VideoRequest *req,
     memmove(pcm + keep_samples, pcm + total_pcm_samples,
             (size_t)keep_samples * sizeof(float));
 
-  // Mux H.264 video + 32 kHz stereo AAC into MP4.
-  size_t mp4_len = 0;
-  const char *enc_err = NULL;
-  uint8_t *mp4 = video_encode_mp4(
-      rgb, decoded_frames, canvas_w, canvas_h, MINIMAX_H3_VIDEO_FPS, pcm,
-      keep_samples, MINIMAX_H3_AUDIO_SAMPLE_RATE, &mp4_len, &enc_err);
+  // Mux H.264 video + 32 kHz stereo AAC into MP4 on a background worker thread
+  // so other models keep full GPU power while VideoToolbox encodes.
+  Mp4EncodeJob enc_job = {.rgb = rgb,
+                          .pcm = pcm,
+                          .frames = decoded_frames,
+                          .width = canvas_w,
+                          .height = canvas_h,
+                          .fps = MINIMAX_H3_VIDEO_FPS,
+                          .samples = keep_samples,
+                          .sample_rate = MINIMAX_H3_AUDIO_SAMPLE_RATE};
+  if (pass_current()) {
+    ThreadsGroup *enc_group = threads_group_new();
+    threads_async(enc_group, THREADS_INITIATED, &enc_job, run_mp4_encode_job);
+    pass_wait_background(enc_group);
+    threads_group_free(enc_group);
+  } else {
+    run_mp4_encode_job(&enc_job);
+  }
+  uint8_t *mp4 = enc_job.mp4;
+  size_t mp4_len = enc_job.mp4_len;
+  const char *enc_err = enc_job.err;
   free(pcm);
   free(rgb);
   double video_s = now() - t_gen_start;
@@ -1458,6 +1501,16 @@ static void minimax_h3_video_pass_begin(void) {}
 // No-op per-pass end hook: video passes manage GPU buffers explicitly.
 static void minimax_h3_video_pass_end(void) {}
 
+// Records how many other active GPU passes contend with the video pass.
+static void minimax_h3_video_set_other_passes(int passes) {
+  other_passes = passes;
+}
+
+// Records the remaining measured turn budget in seconds while contending.
+static void minimax_h3_video_set_turn_budget(double seconds) {
+  turn_budget = seconds;
+}
+
 // Pipeline class names from MiniMaxAI/MiniMax-H3 model_index.json and
 // {FL2VA,Ref2VA}/model_index.json.
 static const char *const minimax_h3_video_types[] = {"MiniMaxH3ModularPipeline",
@@ -1478,4 +1531,6 @@ const ModelOps minimax_h3_video_ops = {
     .pass_new = minimax_h3_video_pass_new,
     .pass_begin = minimax_h3_video_pass_begin,
     .pass_end = minimax_h3_video_pass_end,
+    .set_other_passes = minimax_h3_video_set_other_passes,
+    .set_turn_budget = minimax_h3_video_set_turn_budget,
 };

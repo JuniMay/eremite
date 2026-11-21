@@ -1,4 +1,5 @@
 #include "model/minimax_h3/dit.h"
+#include "base/clock.h"
 #include "base/error.h"
 #include "base/json.h"
 #include "engine/safetensors.h"
@@ -185,6 +186,18 @@ typedef struct {
   // Active sequence length, padded head stride and query tile offset.
   uint32_t rows, padded, tile_offset;
 } DitAttendParam;
+
+// Measured GPU seconds per 64-row tile for each heavy DiT block stage during
+// contended execution, reused across blocks and steps of one sample.
+typedef struct {
+  // Seconds per 64-row tile for QKV, attention, out_proj, fc1, fc2, patch_in
+  // and patch_out projections.
+  double qkv, attend, out_proj, fc1, fc2, patch_in, patch_out;
+  // Last measured whole-block seconds when one block fit inside a turn budget.
+  double block;
+  // Nonzero once every stage has at least one measured tile duration.
+  int measured;
+} DitSlicePace;
 
 // One BF16 linear projection (with optional FP32 bias).
 typedef struct {
@@ -982,14 +995,17 @@ static void run_bf16_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
                  1, MM_THREADS, 1, 1);
 }
 
-// Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul.
-static void run_convrot_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
-                               const Buf *x, const Buf *xq, const Buf *xscale,
-                               const Int8Lin *lin, const Buf *y, int rows) {
+// Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul
+// for rows starting at byte offsets x_off in x and y_off in y.
+static void run_convrot_linear_at(const MinimaxH3Dit *dit,
+                                  GpuCommandBuffer *cmd, const Buf *x,
+                                  size_t x_off, const Buf *xq,
+                                  const Buf *xscale, const Int8Lin *lin,
+                                  const Buf *y, size_t y_off, int rows) {
   uint32_t padded = ((uint32_t)rows + TILE_M - 1) / TILE_M * TILE_M;
   ConvRotParam rp = {(uint32_t)rows, (uint32_t)lin->k, (uint32_t)lin->k};
   gpu_select_kernel(cmd, dit->k_convrot);
-  gpu_bind_buffer(cmd, 0, x, 0);
+  gpu_bind_buffer(cmd, 0, x, x_off);
   gpu_bind_buffer(cmd, 1, xq, 0);
   gpu_bind_buffer(cmd, 2, xscale, 0);
   gpu_copy_bytes(cmd, 3, &rp, sizeof rp);
@@ -1003,10 +1019,154 @@ static void run_convrot_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
   gpu_bind_buffer(cmd, 2, xq, 0);
   gpu_bind_buffer(cmd, 3, xscale, 0);
   gpu_bind_buffer(cmd, 4, &dit->rope_inv_freq, 0);
-  gpu_bind_buffer(cmd, 5, y, 0);
+  gpu_bind_buffer(cmd, 5, y, y_off);
   gpu_copy_bytes(cmd, 6, &mp, sizeof mp);
   gpu_run_kernel(cmd, ((uint32_t)lin->n + TILE_N - 1) / TILE_N, padded / TILE_M,
                  1, MM_THREADS, 1, 1);
+}
+
+// Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul
+// at zero buffer offsets.
+static void run_convrot_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
+                               const Buf *x, const Buf *xq, const Buf *xscale,
+                               const Int8Lin *lin, const Buf *y, int rows) {
+  run_convrot_linear_at(dit, cmd, x, 0, xq, xscale, lin, y, 0, rows);
+}
+
+// Picks how many 64-row tiles to dispatch in one contended command buffer from
+// remaining tiles, the remaining measured turn budget in seconds, and the last
+// measured GPU seconds per tile. Runs at least 1 tile and at most remaining.
+static int pick_slice_tiles(int remaining, double budget, double sec_per_tile) {
+  if (remaining <= 1) return remaining;
+  if (sec_per_tile <= 0.0 || budget <= 0.0) return 1;
+  double fit = floor(budget / sec_per_tile);
+  if (fit < 1.0) return 1;
+  if (fit >= (double)remaining) return remaining;
+  return (int)fit;
+}
+
+// Runs one INT8-ConvRot linear projection (plus optional BF16 LoRA) in
+// adaptive 64-row tile slices while contending, yielding between slices and
+// updating *sec_per_tile from measured GPU execution time. Returns 1 on
+// completion or 0 if stopped.
+static int run_convrot_linear_sliced(
+    const MinimaxH3Dit *dit, const DitWorkspace *ws, const Buf *x,
+    const Int8Lin *lin, const MinimaxH3Lora *lora,
+    const MinimaxH3LoraTarget *ltarget, const Buf *y, int seq_len,
+    const MinimaxH3RunHooks *hooks, double *sec_per_tile) {
+  int total_tiles = (seq_len + (int)TILE_M - 1) / (int)TILE_M;
+  for (int tile_off = 0; tile_off < total_tiles;) {
+    if (minimax_h3_should_stop(hooks)) return 0;
+    int rem_tiles = total_tiles - tile_off;
+    int slice_tiles =
+        minimax_h3_hooks_contended(hooks)
+            ? pick_slice_tiles(rem_tiles, minimax_h3_hooks_turn_budget(hooks),
+                               *sec_per_tile)
+            : rem_tiles;
+    int row0 = tile_off * (int)TILE_M;
+    int slice_rows = slice_tiles * (int)TILE_M;
+    if (row0 + slice_rows > seq_len) slice_rows = seq_len - row0;
+    size_t x_off = (size_t)row0 * (size_t)lin->k * sizeof(float);
+    size_t y_off = (size_t)row0 * (size_t)lin->n * sizeof(float);
+
+    GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+    run_convrot_linear_at(dit, &cmd, x, x_off, &ws->xq, &ws->xscale, lin, y,
+                          y_off, slice_rows);
+    if (ltarget)
+      minimax_h3_lora_apply_at(lora, &cmd, ltarget, x, x_off, &ws->xb,
+                               &ws->lora_mid, y, y_off, slice_rows, 0);
+    double t0 = now();
+    gpu_commit(&cmd);
+    minimax_h3_gpu_wait(dit->gpu, cmd.number);
+    double dt = now() - t0;
+    if (dt > 0.0) *sec_per_tile = dt / (double)slice_tiles;
+    minimax_h3_yield_hooks(hooks);
+    tile_off += slice_tiles;
+  }
+  return 1;
+}
+
+// Runs one FP32 linear projection in adaptive 64-row tile slices while
+// contending, yielding between slices and updating *sec_per_tile from measured
+// GPU execution time. Returns 1 on completion or 0 if stopped.
+static int run_f32_linear_sliced(const MinimaxH3Dit *dit, const Buf *w,
+                                 size_t w_off, const Buf *x, size_t x_base_off,
+                                 const Buf *b, size_t b_off, const Buf *y,
+                                 size_t y_base_off, int rows, int out_dim,
+                                 int in_dim, const MinimaxH3RunHooks *hooks,
+                                 double *sec_per_tile) {
+  int total_tiles = (rows + (int)TILE_M - 1) / (int)TILE_M;
+  for (int tile_off = 0; tile_off < total_tiles;) {
+    if (minimax_h3_should_stop(hooks)) return 0;
+    int rem_tiles = total_tiles - tile_off;
+    int slice_tiles =
+        minimax_h3_hooks_contended(hooks)
+            ? pick_slice_tiles(rem_tiles, minimax_h3_hooks_turn_budget(hooks),
+                               *sec_per_tile)
+            : rem_tiles;
+    int row0 = tile_off * (int)TILE_M;
+    int slice_rows = slice_tiles * (int)TILE_M;
+    if (row0 + slice_rows > rows) slice_rows = rows - row0;
+    size_t x_off = x_base_off + (size_t)row0 * (size_t)in_dim * sizeof(float);
+    size_t y_off = y_base_off + (size_t)row0 * (size_t)out_dim * sizeof(float);
+    F32MMParam ep = {(uint32_t)slice_rows, (uint32_t)out_dim, (uint32_t)in_dim,
+                     (uint32_t)out_dim};
+    GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+    gpu_select_kernel(&cmd, dit->k_mm_f32);
+    gpu_bind_buffer(&cmd, 0, w, w_off);
+    gpu_bind_buffer(&cmd, 1, x, x_off);
+    gpu_bind_buffer(&cmd, 2, b, b_off);
+    gpu_bind_buffer(&cmd, 3, y, y_off);
+    gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
+    gpu_run_kernel(&cmd, (uint32_t)out_dim, (uint32_t)slice_rows, 1,
+                   F32MM_THREADS, 1, 1);
+    double t0 = now();
+    gpu_commit(&cmd);
+    minimax_h3_gpu_wait(dit->gpu, cmd.number);
+    double dt = now() - t0;
+    if (dt > 0.0) *sec_per_tile = dt / (double)slice_tiles;
+    minimax_h3_yield_hooks(hooks);
+    tile_off += slice_tiles;
+  }
+  return 1;
+}
+
+// Runs bidirectional 56-head DiT FlashAttention in adaptive 64-query-row tile
+// slices while contending, yielding between slices and updating *sec_per_tile.
+// Returns 1 on completion or 0 if stopped.
+static int run_dit_attend_sliced(const MinimaxH3Dit *dit,
+                                 const DitWorkspace *ws, int seq_len,
+                                 uint32_t padded_seq,
+                                 const MinimaxH3RunHooks *hooks,
+                                 double *sec_per_tile) {
+  int total_tiles = (int)(padded_seq / TILE_M);
+  for (int tile_off = 0; tile_off < total_tiles;) {
+    if (minimax_h3_should_stop(hooks)) return 0;
+    int rem_tiles = total_tiles - tile_off;
+    int slice_tiles =
+        minimax_h3_hooks_contended(hooks)
+            ? pick_slice_tiles(rem_tiles, minimax_h3_hooks_turn_budget(hooks),
+                               *sec_per_tile)
+            : rem_tiles;
+    DitAttendParam ap = {(uint32_t)seq_len, padded_seq, (uint32_t)tile_off};
+    GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+    gpu_select_kernel(&cmd, dit->k_attend);
+    gpu_bind_buffer(&cmd, 0, &ws->qh, 0);
+    gpu_bind_buffer(&cmd, 1, &ws->kh, 0);
+    gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
+    gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
+    gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
+    gpu_run_kernel(&cmd, (uint32_t)slice_tiles, (uint32_t)DIT_HEADS, 1,
+                   MM_THREADS, 1, 1);
+    double t0 = now();
+    gpu_commit(&cmd);
+    minimax_h3_gpu_wait(dit->gpu, cmd.number);
+    double dt = now() - t0;
+    if (dt > 0.0) *sec_per_tile = dt / (double)slice_tiles;
+    minimax_h3_yield_hooks(hooks);
+    tile_off += slice_tiles;
+  }
+  return 1;
 }
 
 // Encodes condition_proj and the 2-layer BF16 token refiner once per sample,
@@ -1125,14 +1285,13 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
   memcpy(ws->text_refined.ptr, ws->norm.ptr, (size_t)count * sizeof(float));
 }
 
-// Runs the 50 INT8-ConvRot DiT blocks (with optional runtime BF16 LoRA deltas),
-// yielding cooperatively between blocks. Updates *prev_cmd to the last
-// committed command buffer number. Returns 1 on completion or 0 if stopped.
-static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
-                          int seq_len, uint32_t num_t,
-                          const MinimaxH3Lora *lora,
-                          const MinimaxH3RunHooks *hooks, uint64_t *prev_cmd) {
-  uint32_t padded_seq = ((uint32_t)seq_len + TILE_M - 1) / TILE_M * TILE_M;
+// Encodes one complete INT8-ConvRot DiT block (with optional BF16 LoRA) into
+// cmd as a single command buffer.
+static void encode_dit_block_full(const MinimaxH3Dit *dit,
+                                  GpuCommandBuffer *cmd, const DitWorkspace *ws,
+                                  const DitBlock *b, const MinimaxH3Lora *lora,
+                                  const MinimaxH3LoraBlock *lb, int seq_len,
+                                  uint32_t padded_seq, uint32_t num_t) {
   DitNormModParam msa_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
                                 OFF_SHIFT_MSA, OFF_SCALE_MSA, DIT_NORM_EPS};
   DitNormModParam mlp_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
@@ -1144,15 +1303,188 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
   DitHeadsParam heads_p = {(uint32_t)seq_len, padded_seq, 1u, DIT_NORM_EPS};
   DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq, 0u};
   SwigluChunkedParam swiglu_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
+  DitAdalnParam block_adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT,
+                                 b->adaln_bias_f16};
+
+  gpu_select_kernel(cmd, dit->k_adaln);
+  gpu_bind_buffer(cmd, 0, &b->adaln_w, 0);
+  gpu_bind_buffer(cmd, 1, &b->adaln_b, 0);
+  gpu_bind_buffer(cmd, 2, &ws->t_emb, 0);
+  gpu_bind_buffer(cmd, 3, &ws->mod, 0);
+  gpu_copy_bytes(cmd, 4, &block_adaln_p, sizeof block_adaln_p);
+  gpu_run_kernel(cmd,
+                 ((uint32_t)DIT_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
+                 num_t, 1, ELEM_THREADS, 1, 1);
+
+  gpu_select_kernel(cmd, dit->k_norm_mod);
+  gpu_bind_buffer(cmd, 0, &ws->h, 0);
+  gpu_bind_buffer(cmd, 1, &b->norm1, 0);
+  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+  gpu_bind_buffer(cmd, 4, &ws->norm, 0);
+  gpu_copy_bytes(cmd, 5, &msa_norm_p, sizeof msa_norm_p);
+  gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+
+  run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->qkv_proj,
+                     &ws->qkv, seq_len);
+  if (lb)
+    minimax_h3_lora_apply(lora, cmd, &lb->qkv_proj, &ws->norm, &ws->xb,
+                          &ws->lora_mid, &ws->qkv, seq_len, 0);
+
+  gpu_select_kernel(cmd, dit->k_heads);
+  gpu_bind_buffer(cmd, 0, &ws->qkv, 0);
+  gpu_bind_buffer(cmd, 1, &b->q_norm, 0);
+  gpu_bind_buffer(cmd, 2, &b->k_norm, 0);
+  gpu_bind_buffer(cmd, 3, &ws->pos, 0);
+  gpu_bind_buffer(cmd, 4, &dit->rope_inv_freq, 0);
+  gpu_bind_buffer(cmd, 5, &ws->qh, 0);
+  gpu_bind_buffer(cmd, 6, &ws->kh, 0);
+  gpu_bind_buffer(cmd, 7, &ws->vh, 0);
+  gpu_copy_bytes(cmd, 8, &heads_p, sizeof heads_p);
+  gpu_run_kernel(cmd, (uint32_t)(MINIMAX_H3_QKV_PARTS * DIT_HEADS), padded_seq,
+                 1, HEADS_THREADS, 1, 1);
+
+  gpu_select_kernel(cmd, dit->k_attend);
+  gpu_bind_buffer(cmd, 0, &ws->qh, 0);
+  gpu_bind_buffer(cmd, 1, &ws->kh, 0);
+  gpu_bind_buffer(cmd, 2, &ws->vh, 0);
+  gpu_bind_buffer(cmd, 3, &ws->attn_out, 0);
+  gpu_copy_bytes(cmd, 4, &attend_p, sizeof attend_p);
+  gpu_run_kernel(cmd, padded_seq / TILE_M, (uint32_t)DIT_HEADS, 1, MM_THREADS,
+                 1, 1);
+
+  run_convrot_linear(dit, cmd, &ws->attn_out, &ws->xq, &ws->xscale,
+                     &b->out_proj, &ws->norm, seq_len);
+  if (lb)
+    minimax_h3_lora_apply(lora, cmd, &lb->out_proj, &ws->attn_out, &ws->xb,
+                          &ws->lora_mid, &ws->norm, seq_len, 0);
+
+  gpu_select_kernel(cmd, dit->k_gate_add);
+  gpu_bind_buffer(cmd, 0, &ws->h, 0);
+  gpu_bind_buffer(cmd, 1, &ws->norm, 0);
+  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+  gpu_copy_bytes(cmd, 4, &msa_gate_p, sizeof msa_gate_p);
+  gpu_run_kernel(cmd, ((uint32_t)DIT_DIM + GRID2D_THREADS - 1) / GRID2D_THREADS,
+                 (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
+
+  gpu_select_kernel(cmd, dit->k_norm_mod);
+  gpu_bind_buffer(cmd, 0, &ws->h, 0);
+  gpu_bind_buffer(cmd, 1, &b->norm2, 0);
+  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+  gpu_bind_buffer(cmd, 4, &ws->norm, 0);
+  gpu_copy_bytes(cmd, 5, &mlp_norm_p, sizeof mlp_norm_p);
+  gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+
+  run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->fc1,
+                     &ws->fc1_out, seq_len);
+  if (lb)
+    minimax_h3_lora_apply(lora, cmd, &lb->fc1, &ws->norm, &ws->xb,
+                          &ws->lora_mid, &ws->fc1_out, seq_len, 0);
+
+  gpu_select_kernel(cmd, dit->k_swiglu_chunked);
+  gpu_bind_buffer(cmd, 0, &ws->fc1_out, 0);
+  gpu_bind_buffer(cmd, 1, &ws->fc1_mid, 0);
+  gpu_copy_bytes(cmd, 2, &swiglu_p, sizeof swiglu_p);
+  gpu_run_kernel(cmd, (uint32_t)DIT_FFN_DIM / GRID2D_THREADS, (uint32_t)seq_len,
+                 1, GRID2D_THREADS, 1, 1);
+
+  run_convrot_linear(dit, cmd, &ws->fc1_mid, &ws->xq, &ws->xscale, &b->fc2,
+                     &ws->norm, seq_len);
+  if (lb)
+    minimax_h3_lora_apply(lora, cmd, &lb->fc2, &ws->fc1_mid, &ws->xb,
+                          &ws->lora_mid, &ws->norm, seq_len, 0);
+
+  gpu_select_kernel(cmd, dit->k_gate_add);
+  gpu_bind_buffer(cmd, 0, &ws->h, 0);
+  gpu_bind_buffer(cmd, 1, &ws->norm, 0);
+  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+  gpu_copy_bytes(cmd, 4, &mlp_gate_p, sizeof mlp_gate_p);
+  gpu_run_kernel(cmd, ((uint32_t)DIT_DIM + GRID2D_THREADS - 1) / GRID2D_THREADS,
+                 (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
+}
+
+// Runs the 50 INT8-ConvRot DiT blocks (with optional runtime BF16 LoRA deltas).
+// Runs full pipelined single-command-buffer blocks when alone, and drains and
+// slices heavy stages to the measured turn budget when sharing the GPU.
+// Updates *prev_cmd to the last committed unawaited command buffer number (0
+// when drained). Returns 1 on completion or 0 if stopped.
+static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
+                          int seq_len, uint32_t num_t,
+                          const MinimaxH3Lora *lora,
+                          const MinimaxH3RunHooks *hooks, DitSlicePace *pace,
+                          uint64_t *prev_cmd) {
+  uint32_t padded_seq = ((uint32_t)seq_len + TILE_M - 1) / TILE_M * TILE_M;
+  int total_tiles = (int)(padded_seq / TILE_M);
+  DitNormModParam msa_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
+                                OFF_SHIFT_MSA, OFF_SCALE_MSA, DIT_NORM_EPS};
+  DitNormModParam mlp_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
+                                OFF_SHIFT_MLP, OFF_SCALE_MLP, DIT_NORM_EPS};
+  DitGateAddParam msa_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
+                                (uint32_t)DIT_ADALN_STRIDE, OFF_GATE_MSA};
+  DitGateAddParam mlp_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
+                                (uint32_t)DIT_ADALN_STRIDE, OFF_GATE_MLP};
+  DitHeadsParam heads_p = {(uint32_t)seq_len, padded_seq, 1u, DIT_NORM_EPS};
+  SwigluChunkedParam swiglu_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
 
   for (int i = 0; i < DIT_LAYERS; i++) {
     if (minimax_h3_should_stop(hooks)) return 0;
     const DitBlock *b = &dit->blocks[i];
     const MinimaxH3LoraBlock *lb = minimax_h3_lora_dit_block(lora, i);
+    if (!minimax_h3_hooks_contended(hooks)) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      encode_dit_block_full(dit, &cmd, ws, b, lora, lb, seq_len, padded_seq,
+                            num_t);
+      gpu_commit(&cmd);
+      minimax_h3_gpu_wait_hooks(dit->gpu, *prev_cmd, hooks);
+      *prev_cmd = cmd.number;
+      continue;
+    }
+
+    if (*prev_cmd) {
+      minimax_h3_gpu_wait_hooks(dit->gpu, *prev_cmd, hooks);
+      *prev_cmd = 0;
+      if (minimax_h3_should_stop(hooks)) return 0;
+      if (!minimax_h3_hooks_contended(hooks)) {
+        GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+        encode_dit_block_full(dit, &cmd, ws, b, lora, lb, seq_len, padded_seq,
+                              num_t);
+        gpu_commit(&cmd);
+        *prev_cmd = cmd.number;
+        continue;
+      }
+    }
+
+    // When a measured whole block already fits within the peer's measured turn
+    // budget, submit it as one drained command buffer to avoid intra-block
+    // synchronization overhead.
+    double budget = minimax_h3_hooks_turn_budget(hooks);
+    double est_block =
+        pace->block > 0.0
+            ? pace->block
+            : (double)total_tiles * (pace->qkv + pace->attend + pace->out_proj +
+                                     pace->fc1 + pace->fc2);
+    if (pace->measured && est_block > 0.0 && budget > 0.0 &&
+        est_block <= budget) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      encode_dit_block_full(dit, &cmd, ws, b, lora, lb, seq_len, padded_seq,
+                            num_t);
+      double t0 = now();
+      gpu_commit(&cmd);
+      minimax_h3_gpu_wait(dit->gpu, cmd.number);
+      double dt = now() - t0;
+      if (dt > 0.0) pace->block = dt;
+      minimax_h3_yield_hooks(hooks);
+      continue;
+    }
+
+    // Contended heavy block: slice each heavy matmul and FlashAttention pass
+    // dynamically to match the measured turn budget.
     DitAdalnParam block_adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT,
                                    b->adaln_bias_f16};
     GpuCommandBuffer cmd = gpu_begin(dit->gpu);
-
     gpu_select_kernel(&cmd, dit->k_adaln);
     gpu_bind_buffer(&cmd, 0, &b->adaln_w, 0);
     gpu_bind_buffer(&cmd, 1, &b->adaln_b, 0);
@@ -1163,8 +1495,6 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
                    ((uint32_t)DIT_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
                    num_t, 1, ELEM_THREADS, 1, 1);
 
-    // Attention branch: norm1 + AdaLN -> ConvRot QKV (+ LoRA) -> QK-Norm + 3D
-    // RoPE -> 56-head FlashAttention -> ConvRot out_proj (+ LoRA) -> gated add.
     gpu_select_kernel(&cmd, dit->k_norm_mod);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &b->norm1, 0);
@@ -1173,13 +1503,18 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     gpu_bind_buffer(&cmd, 4, &ws->norm, 0);
     gpu_copy_bytes(&cmd, 5, &msa_norm_p, sizeof msa_norm_p);
     gpu_run_kernel(&cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    uint64_t pending = cmd.number;
 
-    run_convrot_linear(dit, &cmd, &ws->norm, &ws->xq, &ws->xscale, &b->qkv_proj,
-                       &ws->qkv, seq_len);
-    if (lb)
-      minimax_h3_lora_apply(lora, &cmd, &lb->qkv_proj, &ws->norm, &ws->xb,
-                            &ws->lora_mid, &ws->qkv, seq_len, 0);
+    if (!run_convrot_linear_sliced(dit, ws, &ws->norm, &b->qkv_proj, lora,
+                                   lb ? &lb->qkv_proj : NULL, &ws->qkv, seq_len,
+                                   hooks, &pace->qkv)) {
+      minimax_h3_gpu_wait(dit->gpu, pending);
+      return 0;
+    }
 
+    if (minimax_h3_should_stop(hooks)) return 0;
+    cmd = gpu_begin(dit->gpu);
     gpu_select_kernel(&cmd, dit->k_heads);
     gpu_bind_buffer(&cmd, 0, &ws->qkv, 0);
     gpu_bind_buffer(&cmd, 1, &b->q_norm, 0);
@@ -1192,22 +1527,22 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     gpu_copy_bytes(&cmd, 8, &heads_p, sizeof heads_p);
     gpu_run_kernel(&cmd, (uint32_t)(MINIMAX_H3_QKV_PARTS * DIT_HEADS),
                    padded_seq, 1, HEADS_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    pending = cmd.number;
 
-    gpu_select_kernel(&cmd, dit->k_attend);
-    gpu_bind_buffer(&cmd, 0, &ws->qh, 0);
-    gpu_bind_buffer(&cmd, 1, &ws->kh, 0);
-    gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
-    gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
-    gpu_copy_bytes(&cmd, 4, &attend_p, sizeof attend_p);
-    gpu_run_kernel(&cmd, padded_seq / TILE_M, (uint32_t)DIT_HEADS, 1,
-                   MM_THREADS, 1, 1);
+    if (!run_dit_attend_sliced(dit, ws, seq_len, padded_seq, hooks,
+                               &pace->attend)) {
+      minimax_h3_gpu_wait(dit->gpu, pending);
+      return 0;
+    }
 
-    run_convrot_linear(dit, &cmd, &ws->attn_out, &ws->xq, &ws->xscale,
-                       &b->out_proj, &ws->norm, seq_len);
-    if (lb)
-      minimax_h3_lora_apply(lora, &cmd, &lb->out_proj, &ws->attn_out, &ws->xb,
-                            &ws->lora_mid, &ws->norm, seq_len, 0);
+    if (!run_convrot_linear_sliced(dit, ws, &ws->attn_out, &b->out_proj, lora,
+                                   lb ? &lb->out_proj : NULL, &ws->norm,
+                                   seq_len, hooks, &pace->out_proj))
+      return 0;
 
+    if (minimax_h3_should_stop(hooks)) return 0;
+    cmd = gpu_begin(dit->gpu);
     gpu_select_kernel(&cmd, dit->k_gate_add);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &ws->norm, 0);
@@ -1218,8 +1553,6 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
                    ((uint32_t)DIT_DIM + GRID2D_THREADS - 1) / GRID2D_THREADS,
                    (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
 
-    // MLP branch: norm2 + AdaLN -> ConvRot fc1 (+ LoRA) -> SwiGLU -> ConvRot
-    // fc2 (+ LoRA) -> gated residual add.
     gpu_select_kernel(&cmd, dit->k_norm_mod);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &b->norm2, 0);
@@ -1228,26 +1561,36 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     gpu_bind_buffer(&cmd, 4, &ws->norm, 0);
     gpu_copy_bytes(&cmd, 5, &mlp_norm_p, sizeof mlp_norm_p);
     gpu_run_kernel(&cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    pending = cmd.number;
 
-    run_convrot_linear(dit, &cmd, &ws->norm, &ws->xq, &ws->xscale, &b->fc1,
-                       &ws->fc1_out, seq_len);
-    if (lb)
-      minimax_h3_lora_apply(lora, &cmd, &lb->fc1, &ws->norm, &ws->xb,
-                            &ws->lora_mid, &ws->fc1_out, seq_len, 0);
+    if (!run_convrot_linear_sliced(dit, ws, &ws->norm, &b->fc1, lora,
+                                   lb ? &lb->fc1 : NULL, &ws->fc1_out, seq_len,
+                                   hooks, &pace->fc1)) {
+      minimax_h3_gpu_wait(dit->gpu, pending);
+      return 0;
+    }
 
+    if (minimax_h3_should_stop(hooks)) return 0;
+    cmd = gpu_begin(dit->gpu);
     gpu_select_kernel(&cmd, dit->k_swiglu_chunked);
     gpu_bind_buffer(&cmd, 0, &ws->fc1_out, 0);
     gpu_bind_buffer(&cmd, 1, &ws->fc1_mid, 0);
     gpu_copy_bytes(&cmd, 2, &swiglu_p, sizeof swiglu_p);
     gpu_run_kernel(&cmd, (uint32_t)DIT_FFN_DIM / GRID2D_THREADS,
                    (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    pending = cmd.number;
 
-    run_convrot_linear(dit, &cmd, &ws->fc1_mid, &ws->xq, &ws->xscale, &b->fc2,
-                       &ws->norm, seq_len);
-    if (lb)
-      minimax_h3_lora_apply(lora, &cmd, &lb->fc2, &ws->fc1_mid, &ws->xb,
-                            &ws->lora_mid, &ws->norm, seq_len, 0);
+    if (!run_convrot_linear_sliced(dit, ws, &ws->fc1_mid, &b->fc2, lora,
+                                   lb ? &lb->fc2 : NULL, &ws->norm, seq_len,
+                                   hooks, &pace->fc2)) {
+      minimax_h3_gpu_wait(dit->gpu, pending);
+      return 0;
+    }
 
+    if (minimax_h3_should_stop(hooks)) return 0;
+    cmd = gpu_begin(dit->gpu);
     gpu_select_kernel(&cmd, dit->k_gate_add);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &ws->norm, 0);
@@ -1257,10 +1600,9 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
     gpu_run_kernel(&cmd,
                    ((uint32_t)DIT_DIM + GRID2D_THREADS - 1) / GRID2D_THREADS,
                    (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
-
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait_hooks(dit->gpu, *prev_cmd, hooks);
-    *prev_cmd = cmd.number;
+    minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
+    pace->measured = 1;
   }
   return 1;
 }
@@ -1376,6 +1718,7 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
   // 6-step PDD Euler flow-matching loop.
   if (hooks && hooks->image_steps_total)
     *hooks->image_steps_total = dit->pdd_steps;
+  DitSlicePace pace = {0};
   int stopped = 0;
   for (int step = 0; step < dit->pdd_steps && !stopped; step++) {
     if (minimax_h3_should_stop(hooks)) {
@@ -1398,65 +1741,111 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
                     patch_in + (size_t)ref_patches * DIT_PATCH_DIM);
     memcpy(ws.h.ptr, ws.text_refined.ptr, text_bytes);
 
-    GpuCommandBuffer cmd = gpu_begin(dit->gpu);
-    F32MMParam ep = {(uint32_t)total_vis, (uint32_t)DIT_DIM,
-                     (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
-    gpu_select_kernel(&cmd, dit->k_mm_f32);
-    gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
-    gpu_bind_buffer(&cmd, 1, &ws.patch_in, 0);
-    gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.h, text_bytes);
-    gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-    gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)total_vis, 1,
-                   F32MM_THREADS, 1, 1);
-    gpu_commit(&cmd);
-    uint64_t prev_cmd = cmd.number;
+    uint64_t prev_cmd = 0;
+    if (!minimax_h3_hooks_contended(hooks)) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      F32MMParam ep = {(uint32_t)total_vis, (uint32_t)DIT_DIM,
+                       (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
+      gpu_select_kernel(&cmd, dit->k_mm_f32);
+      gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
+      gpu_bind_buffer(&cmd, 1, &ws.patch_in, 0);
+      gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.h, text_bytes);
+      gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
+      gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)total_vis, 1,
+                     F32MM_THREADS, 1, 1);
+      gpu_commit(&cmd);
+      prev_cmd = cmd.number;
+    } else if (!run_f32_linear_sliced(dit, &dit->patch_proj_w, 0, &ws.patch_in,
+                                      0, &dit->patch_proj_b, 0, &ws.h,
+                                      text_bytes, total_vis, DIT_DIM,
+                                      DIT_PATCH_DIM, hooks, &pace.patch_in)) {
+      stopped = 1;
+      break;
+    }
 
     // 50 INT8-ConvRot DiT blocks, yielding cooperatively between blocks.
-    if (!run_dit_blocks(dit, &ws, seq_len, num_t, NULL, hooks, &prev_cmd)) {
+    if (!run_dit_blocks(dit, &ws, seq_len, num_t, NULL, hooks, &pace,
+                        &prev_cmd)) {
       stopped = 1;
       minimax_h3_gpu_wait(dit->gpu, prev_cmd);
       break;
     }
 
     // FinalLayer on target image slice using PDD head for step.
-    cmd = gpu_begin(dit->gpu);
-    gpu_select_kernel(&cmd, dit->k_adaln);
-    gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
-    gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
-    gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
-    gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
-    gpu_run_kernel(
-        &cmd, ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
-        1, 1, ELEM_THREADS, 1, 1);
-
-    gpu_select_kernel(&cmd, dit->k_norm_mod);
-    gpu_bind_buffer(&cmd, 0, &ws.h, target_h_off);
-    gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
-    gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
-    gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
-    gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
-    gpu_run_kernel(&cmd, (uint32_t)target_patches, 1, 1, NORM_THREADS, 1, 1);
-
     size_t pdd_w_off =
         (size_t)step * (size_t)DIT_PATCH_DIM * (size_t)DIT_DIM * sizeof(float);
     size_t pdd_b_off = (size_t)step * (size_t)DIT_PATCH_DIM * sizeof(float);
-    F32MMParam fp = {(uint32_t)target_patches, (uint32_t)DIT_PATCH_DIM,
-                     (uint32_t)DIT_DIM, (uint32_t)DIT_PATCH_DIM};
-    gpu_select_kernel(&cmd, dit->k_mm_f32);
-    gpu_bind_buffer(&cmd, 0, &dit->pdd_w, pdd_w_off);
-    gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
-    gpu_bind_buffer(&cmd, 2, &dit->pdd_b, pdd_b_off);
-    gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
-    gpu_copy_bytes(&cmd, 4, &fp, sizeof fp);
-    gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM, (uint32_t)target_patches, 1,
-                   F32MM_THREADS, 1, 1);
+    if (!minimax_h3_hooks_contended(hooks)) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      gpu_select_kernel(&cmd, dit->k_adaln);
+      gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
+      gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
+      gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
+      gpu_run_kernel(&cmd,
+                     ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) /
+                         ELEM_THREADS,
+                     1, 1, ELEM_THREADS, 1, 1);
 
-    gpu_commit(&cmd);
-    minimax_h3_gpu_wait(dit->gpu, prev_cmd);
-    minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)target_patches, 1, 1, NORM_THREADS, 1, 1);
+
+      F32MMParam fp = {(uint32_t)target_patches, (uint32_t)DIT_PATCH_DIM,
+                       (uint32_t)DIT_DIM, (uint32_t)DIT_PATCH_DIM};
+      gpu_select_kernel(&cmd, dit->k_mm_f32);
+      gpu_bind_buffer(&cmd, 0, &dit->pdd_w, pdd_w_off);
+      gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
+      gpu_bind_buffer(&cmd, 2, &dit->pdd_b, pdd_b_off);
+      gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
+      gpu_copy_bytes(&cmd, 4, &fp, sizeof fp);
+      gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM, (uint32_t)target_patches, 1,
+                     F32MM_THREADS, 1, 1);
+
+      gpu_commit(&cmd);
+      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
+    } else {
+      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      gpu_select_kernel(&cmd, dit->k_adaln);
+      gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
+      gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
+      gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
+      gpu_run_kernel(&cmd,
+                     ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) /
+                         ELEM_THREADS,
+                     1, 1, ELEM_THREADS, 1, 1);
+
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)target_patches, 1, 1, NORM_THREADS, 1, 1);
+      gpu_commit(&cmd);
+      uint64_t norm_cmd = cmd.number;
+
+      if (!run_f32_linear_sliced(dit, &dit->pdd_w, pdd_w_off, &ws.norm, 0,
+                                 &dit->pdd_b, pdd_b_off, &ws.patch_out, 0,
+                                 target_patches, DIT_PATCH_DIM, DIT_DIM, hooks,
+                                 &pace.patch_out)) {
+        minimax_h3_gpu_wait(dit->gpu, norm_cmd);
+        stopped = 1;
+        break;
+      }
+    }
 
     // Flow-matching Euler step: model predicts v = x_data - noise, so
     // x_next = x + (sigma - sigma_next) * v.
@@ -2003,6 +2392,7 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
   if (hooks && hooks->image_steps_total)
     *hooks->image_steps_total = params->steps;
 
+  DitSlicePace pace = {0};
   int stopped = 0;
   for (int step = 0; step < params->steps && !stopped; step++) {
     if (minimax_h3_should_stop(hooks)) {
@@ -2042,116 +2432,205 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
                                      MINIMAX_H3_AUDIO_LATENT_CHANNELS);
     memcpy(ws.h.ptr, ws.text_refined.ptr, text_bytes);
 
-    GpuCommandBuffer cmd = gpu_begin(dit->gpu);
-    int v_cursor = 0, a_cursor = 0;
-    for (int s = 0; s < layout.seg_count; s++) {
-      MinimaxH3PackedSeg seg = layout.segments[s];
-      size_t h_off = (size_t)seg.start * (size_t)DIT_DIM * sizeof(float);
-      if (seg.kind == MINIMAX_H3_SEG_TEXT) continue;
-      if (seg.kind == MINIMAX_H3_SEG_COND ||
-          seg.kind == MINIMAX_H3_SEG_REF_IMG ||
-          seg.kind == MINIMAX_H3_SEG_VIDEO) {
-        size_t p_off = (size_t)v_cursor * (size_t)DIT_PATCH_DIM * sizeof(float);
-        F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
-                         (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
-        gpu_select_kernel(&cmd, dit->k_mm_f32);
-        gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
-        gpu_bind_buffer(&cmd, 1, &ws.patch_in, p_off);
-        gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
-        gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
-        gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-        gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
-                       F32MM_THREADS, 1, 1);
-        v_cursor += seg.count;
-      } else {
-        size_t a_off = (size_t)a_cursor *
-                       (size_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS * sizeof(float);
-        F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
-                         (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                         (uint32_t)DIT_DIM};
-        gpu_select_kernel(&cmd, dit->k_mm_f32);
-        gpu_bind_buffer(&cmd, 0, &dit->audio_patch_proj_w, 0);
-        gpu_bind_buffer(&cmd, 1, &ws.audio_in, a_off);
-        gpu_bind_buffer(&cmd, 2, &dit->audio_patch_proj_b, 0);
-        gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
-        gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-        gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
-                       F32MM_THREADS, 1, 1);
-        a_cursor += seg.count;
+    uint64_t prev_cmd = 0;
+    if (!minimax_h3_hooks_contended(hooks)) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      int v_cursor = 0, a_cursor = 0;
+      for (int s = 0; s < layout.seg_count; s++) {
+        MinimaxH3PackedSeg seg = layout.segments[s];
+        size_t h_off = (size_t)seg.start * (size_t)DIT_DIM * sizeof(float);
+        if (seg.kind == MINIMAX_H3_SEG_TEXT) continue;
+        if (seg.kind == MINIMAX_H3_SEG_COND ||
+            seg.kind == MINIMAX_H3_SEG_REF_IMG ||
+            seg.kind == MINIMAX_H3_SEG_VIDEO) {
+          size_t p_off =
+              (size_t)v_cursor * (size_t)DIT_PATCH_DIM * sizeof(float);
+          F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
+                           (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
+          gpu_select_kernel(&cmd, dit->k_mm_f32);
+          gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
+          gpu_bind_buffer(&cmd, 1, &ws.patch_in, p_off);
+          gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
+          gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
+          gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
+          gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
+                         F32MM_THREADS, 1, 1);
+          v_cursor += seg.count;
+        } else {
+          size_t a_off = (size_t)a_cursor *
+                         (size_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS *
+                         sizeof(float);
+          F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
+                           (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
+                           (uint32_t)DIT_DIM};
+          gpu_select_kernel(&cmd, dit->k_mm_f32);
+          gpu_bind_buffer(&cmd, 0, &dit->audio_patch_proj_w, 0);
+          gpu_bind_buffer(&cmd, 1, &ws.audio_in, a_off);
+          gpu_bind_buffer(&cmd, 2, &dit->audio_patch_proj_b, 0);
+          gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
+          gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
+          gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
+                         F32MM_THREADS, 1, 1);
+          a_cursor += seg.count;
+        }
       }
+      gpu_commit(&cmd);
+      prev_cmd = cmd.number;
+    } else {
+      int v_cursor = 0, a_cursor = 0;
+      for (int s = 0; s < layout.seg_count && !stopped; s++) {
+        MinimaxH3PackedSeg seg = layout.segments[s];
+        size_t h_off = (size_t)seg.start * (size_t)DIT_DIM * sizeof(float);
+        if (seg.kind == MINIMAX_H3_SEG_TEXT) continue;
+        if (seg.kind == MINIMAX_H3_SEG_COND ||
+            seg.kind == MINIMAX_H3_SEG_REF_IMG ||
+            seg.kind == MINIMAX_H3_SEG_VIDEO) {
+          size_t p_off =
+              (size_t)v_cursor * (size_t)DIT_PATCH_DIM * sizeof(float);
+          if (!run_f32_linear_sliced(dit, &dit->patch_proj_w, 0, &ws.patch_in,
+                                     p_off, &dit->patch_proj_b, 0, &ws.h, h_off,
+                                     seg.count, DIT_DIM, DIT_PATCH_DIM, hooks,
+                                     &pace.patch_in))
+            stopped = 1;
+          v_cursor += seg.count;
+        } else {
+          size_t a_off = (size_t)a_cursor *
+                         (size_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS *
+                         sizeof(float);
+          if (!run_f32_linear_sliced(
+                  dit, &dit->audio_patch_proj_w, 0, &ws.audio_in, a_off,
+                  &dit->audio_patch_proj_b, 0, &ws.h, h_off, seg.count, DIT_DIM,
+                  MINIMAX_H3_AUDIO_LATENT_CHANNELS, hooks, &pace.patch_in))
+            stopped = 1;
+          a_cursor += seg.count;
+        }
+      }
+      if (stopped) break;
     }
-    gpu_commit(&cmd);
-    uint64_t prev_cmd = cmd.number;
 
     if (!run_dit_blocks(dit, &ws, layout.seq_len, (uint32_t)layout.num_t,
-                        params->lora, hooks, &prev_cmd)) {
+                        params->lora, hooks, &pace, &prev_cmd)) {
       stopped = 1;
       minimax_h3_gpu_wait(dit->gpu, prev_cmd);
       break;
     }
 
     // FinalLayer on both target video (t_emb[0]) and target audio (t_emb[1]).
-    cmd = gpu_begin(dit->gpu);
-    gpu_select_kernel(&cmd, dit->k_adaln);
-    gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
-    gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
-    gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
-    gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
-    gpu_run_kernel(
-        &cmd, ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
-        2, 1, ELEM_THREADS, 1, 1);
+    if (!minimax_h3_hooks_contended(hooks)) {
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      gpu_select_kernel(&cmd, dit->k_adaln);
+      gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
+      gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
+      gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
+      gpu_run_kernel(&cmd,
+                     ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) /
+                         ELEM_THREADS,
+                     2, 1, ELEM_THREADS, 1, 1);
 
-    // Modulate and project target video velocity.
-    gpu_select_kernel(&cmd, dit->k_norm_mod);
-    gpu_bind_buffer(&cmd, 0, &ws.h, target_video_h_off);
-    gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
-    gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
-    gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
-    gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
-    gpu_run_kernel(&cmd, (uint32_t)layout.target_video_rows, 1, 1, NORM_THREADS,
-                   1, 1);
+      // Modulate and project target video velocity.
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_video_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)layout.target_video_rows, 1, 1,
+                     NORM_THREADS, 1, 1);
 
-    F32MMParam fvp = {(uint32_t)layout.target_video_rows,
-                      (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM,
-                      (uint32_t)DIT_PATCH_DIM};
-    gpu_select_kernel(&cmd, dit->k_mm_f32);
-    gpu_bind_buffer(&cmd, 0, &dit->pdd_w, 0);
-    gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
-    gpu_bind_buffer(&cmd, 2, &dit->pdd_b, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
-    gpu_copy_bytes(&cmd, 4, &fvp, sizeof fvp);
-    gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM,
-                   (uint32_t)layout.target_video_rows, 1, F32MM_THREADS, 1, 1);
+      F32MMParam fvp = {(uint32_t)layout.target_video_rows,
+                        (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM,
+                        (uint32_t)DIT_PATCH_DIM};
+      gpu_select_kernel(&cmd, dit->k_mm_f32);
+      gpu_bind_buffer(&cmd, 0, &dit->pdd_w, 0);
+      gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
+      gpu_bind_buffer(&cmd, 2, &dit->pdd_b, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
+      gpu_copy_bytes(&cmd, 4, &fvp, sizeof fvp);
+      gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM,
+                     (uint32_t)layout.target_video_rows, 1, F32MM_THREADS, 1,
+                     1);
 
-    // Modulate and project target audio velocity.
-    gpu_select_kernel(&cmd, dit->k_norm_mod);
-    gpu_bind_buffer(&cmd, 0, &ws.h, target_audio_h_off);
-    gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
-    gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.final_audio_mod_rows, 0);
-    gpu_bind_buffer(&cmd, 4, &ws.norm, audio_norm_off);
-    gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
-    gpu_run_kernel(&cmd, (uint32_t)layout.target_audio_rows, 1, 1, NORM_THREADS,
-                   1, 1);
+      // Modulate and project target audio velocity.
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_audio_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_audio_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, audio_norm_off);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)layout.target_audio_rows, 1, 1,
+                     NORM_THREADS, 1, 1);
 
-    F32MMParam fap = {(uint32_t)layout.target_audio_rows,
-                      (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                      (uint32_t)DIT_DIM,
-                      (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS};
-    gpu_select_kernel(&cmd, dit->k_mm_f32);
-    gpu_bind_buffer(&cmd, 0, &dit->audio_out_w, 0);
-    gpu_bind_buffer(&cmd, 1, &ws.norm, audio_norm_off);
-    gpu_bind_buffer(&cmd, 2, &dit->audio_out_b, 0);
-    gpu_bind_buffer(&cmd, 3, &ws.audio_out, 0);
-    gpu_copy_bytes(&cmd, 4, &fap, sizeof fap);
-    gpu_run_kernel(&cmd, (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                   (uint32_t)layout.target_audio_rows, 1, F32MM_THREADS, 1, 1);
+      F32MMParam fap = {(uint32_t)layout.target_audio_rows,
+                        (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
+                        (uint32_t)DIT_DIM,
+                        (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS};
+      gpu_select_kernel(&cmd, dit->k_mm_f32);
+      gpu_bind_buffer(&cmd, 0, &dit->audio_out_w, 0);
+      gpu_bind_buffer(&cmd, 1, &ws.norm, audio_norm_off);
+      gpu_bind_buffer(&cmd, 2, &dit->audio_out_b, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.audio_out, 0);
+      gpu_copy_bytes(&cmd, 4, &fap, sizeof fap);
+      gpu_run_kernel(&cmd, (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
+                     (uint32_t)layout.target_audio_rows, 1, F32MM_THREADS, 1,
+                     1);
 
-    gpu_commit(&cmd);
-    minimax_h3_gpu_wait(dit->gpu, prev_cmd);
-    minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
+      gpu_commit(&cmd);
+      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      minimax_h3_gpu_wait_hooks(dit->gpu, cmd.number, hooks);
+    } else {
+      minimax_h3_gpu_wait(dit->gpu, prev_cmd);
+      GpuCommandBuffer cmd = gpu_begin(dit->gpu);
+      gpu_select_kernel(&cmd, dit->k_adaln);
+      gpu_bind_buffer(&cmd, 0, &dit->final_adaln_w, 0);
+      gpu_bind_buffer(&cmd, 1, &dit->final_adaln_b, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.t_emb, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.mod, 0);
+      gpu_copy_bytes(&cmd, 4, &final_adaln_p, sizeof final_adaln_p);
+      gpu_run_kernel(&cmd,
+                     ((uint32_t)DIT_FINAL_ADALN_OUT + ELEM_THREADS - 1) /
+                         ELEM_THREADS,
+                     2, 1, ELEM_THREADS, 1, 1);
+
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_video_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, 0);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)layout.target_video_rows, 1, 1,
+                     NORM_THREADS, 1, 1);
+
+      gpu_select_kernel(&cmd, dit->k_norm_mod);
+      gpu_bind_buffer(&cmd, 0, &ws.h, target_audio_h_off);
+      gpu_bind_buffer(&cmd, 1, &dit->final_norm, 0);
+      gpu_bind_buffer(&cmd, 2, &ws.mod, 0);
+      gpu_bind_buffer(&cmd, 3, &ws.final_audio_mod_rows, 0);
+      gpu_bind_buffer(&cmd, 4, &ws.norm, audio_norm_off);
+      gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
+      gpu_run_kernel(&cmd, (uint32_t)layout.target_audio_rows, 1, 1,
+                     NORM_THREADS, 1, 1);
+      gpu_commit(&cmd);
+      uint64_t norm_cmd = cmd.number;
+
+      if (!run_f32_linear_sliced(dit, &dit->pdd_w, 0, &ws.norm, 0, &dit->pdd_b,
+                                 0, &ws.patch_out, 0, layout.target_video_rows,
+                                 DIT_PATCH_DIM, DIT_DIM, hooks,
+                                 &pace.patch_out) ||
+          !run_f32_linear_sliced(dit, &dit->audio_out_w, 0, &ws.norm,
+                                 audio_norm_off, &dit->audio_out_b, 0,
+                                 &ws.audio_out, 0, layout.target_audio_rows,
+                                 MINIMAX_H3_AUDIO_LATENT_CHANNELS, DIT_DIM,
+                                 hooks, &pace.patch_out)) {
+        minimax_h3_gpu_wait(dit->gpu, norm_cmd);
+        stopped = 1;
+        break;
+      }
+    }
 
     // Dual-stream flow-matching Euler step on native video and audio latents.
     float dt_v = (float)(sigma_v - sigma_v_next);

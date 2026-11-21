@@ -74,6 +74,11 @@ static int active_prefill_layer, active_prefill_rows;
 // Live image generation stage, 1-based denoising step and total step count.
 static int active_image_stage, active_image_step, active_image_steps_total;
 
+// Count of other active GPU passes and remaining measured turn budget in
+// seconds, updated by the engine before and during multi-model runs.
+static int other_passes;
+static double turn_budget;
+
 // Clears live per-call progress indicators back to idle.
 static void clear_active_progress(void) {
   active_image_stage = IMAGE_STAGE_NONE;
@@ -655,6 +660,52 @@ static uint8_t *encode_output(const uint8_t *canvas, int canvas_w, int canvas_h,
   return file;
 }
 
+// Arguments and outputs for off-GPU background image encoding.
+typedef struct {
+  // Decoded RGB canvas buffer and dimensions.
+  const uint8_t *canvas;
+  int canvas_w, canvas_h;
+  // Output sizing, format, matting and mask plan.
+  const OutputPlan *plan;
+  // Error buffer and capacity.
+  char *error;
+  size_t error_cap;
+  // Encoded output bytes and length.
+  uint8_t *data;
+  size_t len;
+} ImageEncodeJob;
+
+// Resizes, mattes and encodes one output image on a background worker thread.
+static void run_image_encode_job(void *context) {
+  ImageEncodeJob *job = context;
+  job->data = encode_output(job->canvas, job->canvas_w, job->canvas_h,
+                            job->plan, &job->len, job->error, job->error_cap);
+}
+
+// Encodes canvas_rgb according to plan, running on a background thread when
+// inside a cooperative engine pass so other models keep full GPU power.
+static uint8_t *encode_output_async(const uint8_t *canvas, int canvas_w,
+                                    int canvas_h, const OutputPlan *plan,
+                                    size_t *len, char *error,
+                                    size_t error_cap) {
+  ImageEncodeJob job = {.canvas = canvas,
+                        .canvas_w = canvas_w,
+                        .canvas_h = canvas_h,
+                        .plan = plan,
+                        .error = error,
+                        .error_cap = error_cap};
+  if (pass_current()) {
+    ThreadsGroup *group = threads_group_new();
+    threads_async(group, THREADS_INITIATED, &job, run_image_encode_job);
+    pass_wait_background(group);
+    threads_group_free(group);
+  } else {
+    run_image_encode_job(&job);
+  }
+  *len = job.len;
+  return job.data;
+}
+
 // What sending a request's partial images needs.
 typedef struct {
   // The request, whose receiver takes the partial images.
@@ -693,8 +744,8 @@ static int send_partial_image(void *context, const float *latents,
     return 0;
   size_t len = 0;
   char error[IMAGE_ERROR_BYTES];
-  uint8_t *file = encode_output(run->canvas, run->canvas_w, run->canvas_h,
-                                run->plan, &len, error, sizeof error);
+  uint8_t *file = encode_output_async(run->canvas, run->canvas_w, run->canvas_h,
+                                      run->plan, &len, error, sizeof error);
   if (file)
     run->req->on_partial_image(run->req->partial_image_context, file, len,
                                run->sent++);
@@ -836,6 +887,8 @@ static int minimax_h3_image_generate(const ImageRequest *req,
   }
 
   MinimaxH3RunHooks hooks = {.yield_wait = wait,
+                             .other_passes = &other_passes,
+                             .turn_budget = &turn_budget,
                              .cancelled = cancelled,
                              .prefill_layer = &active_prefill_layer,
                              .prefill_rows_now = &active_prefill_rows,
@@ -1061,8 +1114,8 @@ static int minimax_h3_image_generate(const ImageRequest *req,
     return 0;
   }
 
-  out->data = encode_output(canvas_rgb, canvas_w, canvas_h, &plan, &out->len,
-                            out->error, sizeof out->error);
+  out->data = encode_output_async(canvas_rgb, canvas_w, canvas_h, &plan,
+                                  &out->len, out->error, sizeof out->error);
   free(canvas_rgb);
   free(original);
   free(mask_alpha);
@@ -1111,6 +1164,16 @@ static void minimax_h3_image_pass_begin(void) {}
 // Ends a cooperative image pass (no per-pass bindings to release).
 static void minimax_h3_image_pass_end(void) {}
 
+// Records how many other active GPU passes contend with the image pass.
+static void minimax_h3_image_set_other_passes(int passes) {
+  other_passes = passes;
+}
+
+// Records the remaining measured turn budget in seconds while contending.
+static void minimax_h3_image_set_turn_budget(double seconds) {
+  turn_budget = seconds;
+}
+
 // Checkpoint _class_name and model_type identifiers handled by
 // MiniMax-H3-Image.
 static const char *const minimax_h3_image_types[] = {"MiniMaxH3ImagePipeline",
@@ -1132,4 +1195,6 @@ const ModelOps minimax_h3_image_ops = {
     .run_idle_work = minimax_h3_image_run_idle_work,
     .pass_new = minimax_h3_image_pass_new,
     .pass_begin = minimax_h3_image_pass_begin,
-    .pass_end = minimax_h3_image_pass_end};
+    .pass_end = minimax_h3_image_pass_end,
+    .set_other_passes = minimax_h3_image_set_other_passes,
+    .set_turn_budget = minimax_h3_image_set_turn_budget};

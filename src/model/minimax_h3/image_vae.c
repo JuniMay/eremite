@@ -1314,8 +1314,13 @@ static int encode_one_tile(MinimaxH3ImageVae *vae, const EncWorkspace *ws,
       alt = swap;
     }
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait_hooks(vae->gpu, prev_cmd, hooks);
-    prev_cmd = cmd.number;
+    if (minimax_h3_hooks_contended(hooks)) {
+      minimax_h3_gpu_wait_hooks(vae->gpu, cmd.number, hooks);
+      prev_cmd = 0;
+    } else {
+      minimax_h3_gpu_wait_hooks(vae->gpu, prev_cmd, hooks);
+      prev_cmd = cmd.number;
+    }
   }
 
   cmd = gpu_begin(vae->gpu);

@@ -258,8 +258,10 @@ needs more than the model may ever use gets HTTP 400: more than the model's
 `memory`, the server's `memory`, or the machine's RAM less `reserve`. A
 request that does not fit now gets HTTP 503.
 
-During a pass, the image model yields between layers to any running
-text-decoding calls so decoding latency is not degraded.
+When an image model runs alone, it uses full GPU throughput without slicing.
+When another model runs alongside it, the engine balances GPU time evenly
+between active models, slicing heavy DiT stages to match the peer's measured
+turn duration and running final image encoding on a background thread.
 
 ## Video models
 
@@ -322,6 +324,8 @@ In full residence, the text encoder, DiT, optional LoRA, Video VAE decoder and
 Audio VAE decoder stay resident together, and the vision tower and Video/Audio
 VAE encoders load on demand. When available memory cannot hold all core groups
 at once, the model runs staged and pins only the active stage's weights in
-turn. Each request reserves its planned memory before Qwen3-VL runs, yields
-between layers to running text-decoding calls, and reports prompt encoding as
+turn. Each request reserves its planned memory before Qwen3-VL runs, uses full
+GPU throughput when running alone, balances GPU time evenly with other active
+models by slicing heavy DiT stages to the peer's measured turn duration and
+offloading MP4 encoding to a background thread, and reports prompt encoding as
 prefill and denoising/VAE/MP4 work in dedicated video counters.

@@ -814,8 +814,13 @@ static int encode_vision_pair(
     }
 
     gpu_commit(&cmd);
-    minimax_h3_gpu_wait_hooks(vis->gpu, prev_cmd, hooks);
-    prev_cmd = cmd.number;
+    if (minimax_h3_hooks_contended(hooks)) {
+      minimax_h3_gpu_wait_hooks(vis->gpu, cmd.number, hooks);
+      prev_cmd = 0;
+    } else {
+      minimax_h3_gpu_wait_hooks(vis->gpu, prev_cmd, hooks);
+      prev_cmd = cmd.number;
+    }
   }
 
   if (stopped) {
