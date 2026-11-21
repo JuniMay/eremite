@@ -299,7 +299,6 @@ int main(int argc, char **argv) {
         "stream edit produces 512x512 PNG and counts reference vision tokens");
     free(dec);
     eremite_image_result_free(&res);
-    free(rdata);
 
     eremite_refresh_stats();
     eremite_read_stats(m, &st);
@@ -386,6 +385,9 @@ int main(int argc, char **argv) {
     free(mask_px);
     free(orig);
     eremite_image_result_free(&res);
+    // The masked edits above read the reference's bytes, so they stay until
+    // here.
+    free(rdata);
   }
 
   // A transparent background: the key-colored background turns clear, so the
