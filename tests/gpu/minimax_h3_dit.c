@@ -72,8 +72,8 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_attend.
 typedef struct {
-  // Active sequence length and padded head stride.
-  uint32_t rows, padded;
+  // Active sequence length, padded head stride and query tile offset.
+  uint32_t rows, padded, tile_offset;
 } DitAttendParam;
 
 // Deterministic PRNG for synthetic test inputs.
@@ -534,7 +534,7 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
     }
   }
 
-  DitAttendParam p = {(uint32_t)rows, padded};
+  DitAttendParam p = {(uint32_t)rows, padded, 0u};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_attend);
   gpu_bind_buffer(&cmd, 0, &qh, 0);
@@ -546,6 +546,31 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
                  1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
+
+  // Verify sliced tile_offset dispatches match the single-dispatch output
+  // bit-for-bit across tile boundaries.
+  Buf out_sliced =
+      gpu_alloc(gpu, slot, (size_t)rows * (size_t)DIT_INNER * sizeof(float));
+  memset(out_sliced.ptr, 0, (size_t)rows * (size_t)DIT_INNER * sizeof(float));
+  uint32_t total_tiles = padded / TILE_M;
+  for (uint32_t t = 0; t < total_tiles; t++) {
+    DitAttendParam sp = {(uint32_t)rows, padded, t};
+    GpuCommandBuffer scmd = gpu_begin(gpu);
+    gpu_select_kernel(&scmd, k_attend);
+    gpu_bind_buffer(&scmd, 0, &qh, 0);
+    gpu_bind_buffer(&scmd, 1, &kh, 0);
+    gpu_bind_buffer(&scmd, 2, &vh, 0);
+    gpu_bind_buffer(&scmd, 3, &out_sliced, 0);
+    gpu_copy_bytes(&scmd, 4, &sp, sizeof sp);
+    gpu_run_kernel(&scmd, 1u, (uint32_t)DIT_HEADS, 1, MM_THREADS, 1, 1);
+    gpu_commit(&scmd);
+    gpu_sync(gpu);
+  }
+  check(memcmp(out.ptr, out_sliced.ptr,
+               (size_t)rows * (size_t)DIT_INNER * sizeof(float)) == 0,
+        "minimax_h3_dit_attend sliced tile_offset matches full dispatch "
+        "bit-for-bit");
+  gpu_free(&out_sliced);
 
   const float *op = (const float *)out.ptr;
   float scale = 1.0f / sqrtf((float)DIT_HEAD_DIM);

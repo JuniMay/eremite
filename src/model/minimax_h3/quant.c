@@ -186,23 +186,35 @@ int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks) {
          (hooks && hooks->cancelled && *hooks->cancelled);
 }
 
-void minimax_h3_gpu_wait_hooks(Gpu *gpu, uint64_t number,
-                               const MinimaxH3RunHooks *hooks) {
-  if (number) {
-    if (!pass_current()) {
-      gpu_wait_until_finished(gpu, number);
-    } else {
-      GpuWaitContext context = {.gpu = gpu, .number = number};
-      pass_wait(&(PassWait){gpu_wait_ready, gpu_wait_block, &context,
-                            PASS_WAIT_GPU, NULL});
-      gpu_check_finished(gpu);
-    }
-  }
+int minimax_h3_hooks_contended(const MinimaxH3RunHooks *hooks) {
+  return hooks && ((hooks->other_passes && *hooks->other_passes > 0) ||
+                   (hooks->turn_budget && *hooks->turn_budget > 0.0));
+}
+
+double minimax_h3_hooks_turn_budget(const MinimaxH3RunHooks *hooks) {
+  return (hooks && hooks->turn_budget) ? *hooks->turn_budget : 0.0;
+}
+
+void minimax_h3_yield_hooks(const MinimaxH3RunHooks *hooks) {
   if (pass_current() && hooks && hooks->yield_wait &&
       !minimax_h3_should_stop(hooks))
     pass_wait(hooks->yield_wait);
 }
 
 void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number) {
-  minimax_h3_gpu_wait_hooks(gpu, number, NULL);
+  if (!number) return;
+  if (!pass_current()) {
+    gpu_wait_until_finished(gpu, number);
+  } else {
+    GpuWaitContext context = {.gpu = gpu, .number = number};
+    pass_wait(&(PassWait){gpu_wait_ready, gpu_wait_block, &context,
+                          PASS_WAIT_GPU, NULL});
+    gpu_check_finished(gpu);
+  }
+}
+
+void minimax_h3_gpu_wait_hooks(Gpu *gpu, uint64_t number,
+                               const MinimaxH3RunHooks *hooks) {
+  minimax_h3_gpu_wait(gpu, number);
+  minimax_h3_yield_hooks(hooks);
 }

@@ -86,9 +86,18 @@ const MinimaxH3LoraBlock *minimax_h3_lora_dit_block(const MinimaxH3Lora *lora,
                                                     int index);
 
 // Encodes the low-rank BF16 residual y += (strength * scale) * (B @ (A @ x))
-// into cmd. When xb_ready is non-zero, xb already holds padded BF16 rows of x;
-// otherwise x_f32 is converted into xb first. lora_mid must hold padded_rows by
+// into cmd for rows starting at byte offsets x_off in x_f32 and y_off in y.
+// When xb_ready is non-zero, xb already holds padded BF16 rows of x; otherwise
+// x_f32 is converted into xb first. lora_mid must hold padded_rows by
 // target->rank BF16 values. No-op when lora or target is null or absent.
+void minimax_h3_lora_apply_at(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
+                              const MinimaxH3LoraTarget *target,
+                              const Buf *x_f32, size_t x_off, const Buf *xb,
+                              const Buf *lora_mid, const Buf *y, size_t y_off,
+                              int rows, int xb_ready);
+
+// Encodes the low-rank BF16 residual y += (strength * scale) * (B @ (A @ x))
+// into cmd at zero buffer offsets.
 void minimax_h3_lora_apply(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
                            const MinimaxH3LoraTarget *target, const Buf *x_f32,
                            const Buf *xb, const Buf *lora_mid, const Buf *y,

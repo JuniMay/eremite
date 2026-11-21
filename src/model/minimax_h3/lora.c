@@ -251,10 +251,11 @@ const MinimaxH3LoraBlock *minimax_h3_lora_dit_block(const MinimaxH3Lora *lora,
   return &lora->blocks[index];
 }
 
-void minimax_h3_lora_apply(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
-                           const MinimaxH3LoraTarget *target, const Buf *x_f32,
-                           const Buf *xb, const Buf *lora_mid, const Buf *y,
-                           int rows, int xb_ready) {
+void minimax_h3_lora_apply_at(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
+                              const MinimaxH3LoraTarget *target,
+                              const Buf *x_f32, size_t x_off, const Buf *xb,
+                              const Buf *lora_mid, const Buf *y, size_t y_off,
+                              int rows, int xb_ready) {
   if (!lora || !target || !target->present || rows <= 0 ||
       lora->strength == 0.0f)
     return;
@@ -264,7 +265,7 @@ void minimax_h3_lora_apply(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
     LoraBf16XParam xp = {(uint32_t)rows, (uint32_t)target->k,
                          (uint32_t)target->k, 0};
     gpu_select_kernel(cmd, lora->k_x_bf16);
-    gpu_bind_buffer(cmd, 0, x_f32, 0);
+    gpu_bind_buffer(cmd, 0, x_f32, x_off);
     gpu_bind_buffer(cmd, 1, &target->a, 0);
     gpu_bind_buffer(cmd, 2, xb, 0);
     gpu_copy_bytes(cmd, 3, &xp, sizeof xp);
@@ -291,8 +292,16 @@ void minimax_h3_lora_apply(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
   gpu_select_kernel(cmd, lora->k_mm_bf16_add);
   gpu_bind_buffer(cmd, 0, &target->b, 0);
   gpu_bind_buffer(cmd, 1, lora_mid, 0);
-  gpu_bind_buffer(cmd, 2, y, 0);
+  gpu_bind_buffer(cmd, 2, y, y_off);
   gpu_copy_bytes(cmd, 3, &bp, sizeof bp);
   gpu_run_kernel(cmd, ((uint32_t)target->n + TILE_N - 1) / TILE_N,
                  padded / TILE_M, 1, MM_THREADS, 1, 1);
+}
+
+void minimax_h3_lora_apply(const MinimaxH3Lora *lora, GpuCommandBuffer *cmd,
+                           const MinimaxH3LoraTarget *target, const Buf *x_f32,
+                           const Buf *xb, const Buf *lora_mid, const Buf *y,
+                           int rows, int xb_ready) {
+  minimax_h3_lora_apply_at(lora, cmd, target, x_f32, 0, xb, lora_mid, y, 0,
+                           rows, xb_ready);
 }

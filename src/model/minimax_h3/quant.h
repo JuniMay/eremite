@@ -61,8 +61,15 @@ void minimax_h3_nvfp4_scales_add(WeightGroup *group, Buf *target, Tensor tensor,
 // Cooperative scheduling, cancellation and progress hooks for MiniMax-H3 GPU
 // loops.
 typedef struct {
-  // Optional wait checked between GPU layers to let decoding calls run first.
+  // Optional wait checked between GPU layers or slices for balanced multi-model
+  // turn sharing.
   const PassWait *yield_wait;
+  // Optional pointer to the count of other active GPU passes (> 0 while
+  // sharing the GPU with another model, 0 when running alone).
+  const int *other_passes;
+  // Optional pointer to the remaining measured turn budget in seconds while
+  // sharing the GPU, or 0 when alone or before a peer turn is measured.
+  const double *turn_budget;
   // Optional pointer to a nonzero flag set on the engine thread to cancel.
   const int *cancelled;
   // Optional pointer updated with the running 1-based text-encoder layer.
@@ -89,9 +96,20 @@ typedef struct {
 // Returns nonzero when process shutdown was requested or hooks request cancel.
 int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks);
 
+// Returns nonzero when hooks indicate other active passes or external GPU work
+// shares the GPU and heavy kernels should drain and slice to the turn budget.
+int minimax_h3_hooks_contended(const MinimaxH3RunHooks *hooks);
+
+// Returns the remaining measured turn budget in seconds from hooks, or 0.
+double minimax_h3_hooks_turn_budget(const MinimaxH3RunHooks *hooks);
+
 // Waits for the GPU command buffer numbered number to finish, yielding when
 // called inside a cooperative engine pass.
 void minimax_h3_gpu_wait(Gpu *gpu, uint64_t number);
+
+// Yields to hooks->yield_wait when running inside an engine pass without a
+// stop request.
+void minimax_h3_yield_hooks(const MinimaxH3RunHooks *hooks);
 
 // Waits for command buffer number to finish and then yields to
 // hooks->yield_wait when running inside an engine pass without a stop request.

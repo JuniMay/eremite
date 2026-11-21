@@ -182,8 +182,8 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_attend.
 typedef struct {
-  // Active sequence length and padded head stride.
-  uint32_t rows, padded;
+  // Active sequence length, padded head stride and query tile offset.
+  uint32_t rows, padded, tile_offset;
 } DitAttendParam;
 
 // One BF16 linear projection (with optional FP32 bias).
@@ -1019,7 +1019,7 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
   RmsNormParam np = {(uint32_t)DIT_DIM, DIT_NORM_EPS};
   SwigluChunkedParam swp = {(uint32_t)text_len, (uint32_t)DIT_FFN_DIM};
   DitHeadsParam hp = {(uint32_t)text_len, padded, 0, DIT_NORM_EPS};
-  DitAttendParam ap = {(uint32_t)text_len, padded};
+  DitAttendParam ap = {(uint32_t)text_len, padded, 0u};
 
   GpuCommandBuffer cmd = gpu_begin(dit->gpu);
   run_bf16_linear(dit, &cmd, text_hidden, &ws->xb, &dit->condition_proj,
@@ -1142,7 +1142,7 @@ static int run_dit_blocks(const MinimaxH3Dit *dit, const DitWorkspace *ws,
   DitGateAddParam mlp_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
                                 (uint32_t)DIT_ADALN_STRIDE, OFF_GATE_MLP};
   DitHeadsParam heads_p = {(uint32_t)seq_len, padded_seq, 1u, DIT_NORM_EPS};
-  DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq};
+  DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq, 0u};
   SwigluChunkedParam swiglu_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
 
   for (int i = 0; i < DIT_LAYERS; i++) {

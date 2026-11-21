@@ -62,8 +62,10 @@ struct MinimaxH3DitHeads {
 };
 
 // Parameters for DiT/Refiner bidirectional 56-head FlashAttention.
+// tile_offset shifts the 64-query-row threadgroup index when slicing across
+// multiple command buffers.
 struct MinimaxH3DitAttend {
-  uint rows, padded;
+  uint rows, padded, tile_offset;
 };
 
 // Native BF16 matrix product accumulating in FP32, with optional FP32 bias.
@@ -336,7 +338,7 @@ kernel void minimax_h3_dit_attend(device const bfloat *qh [[buffer(0)]],
   threadgroup bfloat probs[MINIMAX_H3_DIT_ATTN_SGROUPS][rows * keys];
 
   uint h = tg.y;
-  uint first = (tg.x * MINIMAX_H3_DIT_ATTN_SGROUPS + sg) * rows;
+  uint first = ((tg.x + p.tile_offset) * MINIMAX_H3_DIT_ATTN_SGROUPS + sg) * rows;
   if (first >= p.rows) return;
 
   threadgroup float *ss = scores[sg], *rescale = rescales[sg], *sum = sums[sg];
