@@ -290,10 +290,10 @@ int main(void) {
             use_full == 0 && acct.minimum == mem_huge.staged_bytes,
         "4896x4896 falls back to staged when only staged_bytes fits");
 
-  // Under a 22 GiB limit, 4896x4896 can never fit: it is refused early with a
-  // clear message, and the account's baseline minimum stays.
+  // Under a limit below staged_bytes, 4896x4896 can never fit: it is refused
+  // early with a clear message, and the account's baseline minimum stays.
   memory_set_minimum(&acct, mem_default.staged_bytes, MEMORY_REQUIRED);
-  memory_set_limit(mem, 22ull << 30);
+  memory_set_limit(mem, mem_huge.staged_bytes - (1ull << 30));
   uint64_t min_before = acct.minimum;
   err[0] = '\0';
   check(minimax_h3_image_admit_request(&acct, 0, mem_default.staged_bytes, 4896,
@@ -303,12 +303,15 @@ int main(void) {
             strstr(err, "more than") != NULL,
         "4896x4896 never fits when staged_bytes exceeds the limit");
 
-  // Under a 40 GiB limit with 20 GiB reserved by another model, 4896x4896
-  // does not fit now, but it would fit once the other model frees its memory.
+  // Under a 40 GiB limit when another model reserves enough memory to leave
+  // less than staged_bytes free, 4896x4896 does not fit now, but it would fit
+  // once the other model frees its memory.
   MemoryAccount other;
   memory_account_init(mem, &other, "other-model", 0);
-  memory_set_limit(mem, 40ull << 30);
-  int other_reserved = memory_set_minimum(&other, 20ull << 30, MEMORY_REQUIRED);
+  uint64_t shared_limit = 40ull << 30;
+  uint64_t other_hold = shared_limit - (mem_huge.staged_bytes - (1ull << 30));
+  memory_set_limit(mem, shared_limit);
+  int other_reserved = memory_set_minimum(&other, other_hold, MEMORY_REQUIRED);
   err[0] = '\0';
   check(other_reserved &&
             minimax_h3_image_admit_request(&acct, 0, mem_default.staged_bytes,
