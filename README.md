@@ -52,13 +52,15 @@ DeepSeek V4.1 Flash's checkpoint (510 GB) into
 UD-IQ2_XXS GGUF quantization (165 GB) into
 `FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, LiquidAI's
 d1-2B decision model (3.9 GB) into `FOLDER/LiquidAI/d1-2B`, and
-MiniMax-H3-Image's metadata and tokenizer (23 MB) into
-`FOLDER/MiniMaxAI/MiniMax-H3-Image` with Comfy-Org's quantized checkpoints into
-`FOLDER/Comfy-Org/MiniMax-H3` (15.7 GB text and vision encoder) and
-`FOLDER/Comfy-Org/MiniMax-H3-Image` (21.0 GB DiT and 1.2 GB VAE). Other
-quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists the
-files without downloading them. It needs Python 3.10 or later, and runs again
-from where an interrupted download stopped.
+MiniMax-H3's image and video metadata and tokenizers into
+`FOLDER/MiniMaxAI/MiniMax-H3-Image` and `FOLDER/MiniMaxAI/MiniMax-H3` with
+Comfy-Org's quantized checkpoints into `FOLDER/Comfy-Org/MiniMax-H3` (15.7 GB
+text and vision encoder, 21.0 GB FL2VA and REF2VA video DiTs, 2.8 GB Video VAE,
+0.6 GB Audio VAE, and 2.0 GB BF16 Turbo LoRAs) and
+`FOLDER/Comfy-Org/MiniMax-H3-Image` (21.0 GB image DiT and 1.2 GB image VAE).
+Other quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists
+the files without downloading them. It needs Python 3.10 or later, and runs
+again from where an interrupted download stopped.
 
 ## Run
 
@@ -72,8 +74,9 @@ model memory, state memory included. `build/eremite` alone lists the options.
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
 Completions and Responses APIs at `http://HOST:PORT/v1`, OpenAI's Decisions API
 at `POST /v1/decisions`, OpenAI's Images API at `POST /v1/images/generations`
-and `POST /v1/images/edits`, Codex's model catalog at `/v1/codex/models`, and
-standalone web search at `POST /v1/alpha/search`.
+and `POST /v1/images/edits`, OpenAI's Videos API at `/v1/videos`, Codex's model
+catalog at `/v1/codex/models`, and standalone web search at
+`POST /v1/alpha/search`.
 
 Its settings are in a JSON file: `build/eremite-server --config FILE`, or
 `~/.config/eremite/server.json` without `--config`. For example:
@@ -95,6 +98,16 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
       "text_encoder": "/path/to/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
       "dit": "/path/to/minimax_h3_image_pruned_int8_convrot.safetensors",
       "vae": "/path/to/minimax_h3_image_vae_fp16.safetensors"
+    },
+    {
+      "model": "/path/to/MiniMax-H3",
+      "text_encoder": "/path/to/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "dit": "/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "vae": "/path/to/minimax_h3_video_vae_int8_convrot.safetensors",
+      "audio_vae": "/path/to/minimax_h3_audio_vae_fp32.safetensors",
+      "lora": "/path/to/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+      "steps": 4,
+      "variant": "fl2va"
     }
   ]
 }
@@ -105,7 +118,7 @@ Without `api_key_file`, the server takes the key from the environment variable
 `EREMITE_API_KEY`.
 
 `docs/server.md` lists every setting, and explains how the server handles
-requests, memory, decision models and image models. `docs/codex.md` explains
+requests, memory, decision models, image models and video models. `docs/codex.md` explains
 how to use eremite with Codex: its configuration, model catalog, image tool
 and web search. `skills/README.md` describes eremite's agent skills.
 
@@ -121,8 +134,8 @@ local inference engine for DeepSeek 4 Flash and Pro. It also builds on:
 - [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash,
   [Liquid AI](https://www.liquid.ai)'s d1 decision models (with Liquid AI's
   prompt for reranking), and [MiniMax](https://huggingface.co/MiniMaxAI)'s
-  MiniMax-H3-Image with [Comfy-Org](https://huggingface.co/Comfy-Org)'s
-  quantized checkpoints.
+  MiniMax-H3-Image and MiniMax-H3 Video with
+  [Comfy-Org](https://huggingface.co/Comfy-Org)'s quantized checkpoints.
 - The ggml library of [llama.cpp](https://github.com/ggml-org/llama.cpp): the
   GGUF format and the codebooks of its i-quants. Their MIT license is in
   `src/kernels/gguf_grids.metal`.

@@ -2,7 +2,7 @@
 
 `build/eremite-server` serves the models that its configuration file lists
 (README.md, Serve). This document lists every setting, and explains how the
-server handles requests, memory, decision models and image models.
+server handles requests, memory, decision models, image models and video models.
 `docs/codex.md` describes Codex configuration, the Codex model catalog, Codex's
 image tool and Codex's web search.
 
@@ -30,6 +30,7 @@ The file's root holds the server-wide settings:
 | `searxng_dir` | the folder of eremite's SearXNG, for Codex's web tool | `~/.local/share/eremite/searxng` |
 | `searxng_socket` | the Unix socket that SearXNG runs on | `eremite.sock` in `searxng_dir` |
 | `search_dir` | the folder of the web tool's turn counters | `~/.local/share/eremite/web-search` when `HOME` is set, otherwise memory only |
+| `video_dir` | the folder where completed video MP4 clips are stored | `~/.local/share/eremite/videos` |
 | `search_timeout` | seconds that each fetch, search and health check of the web tool may take, and SearXNG's start | 30 |
 | `searxng_idle` | seconds without a search before SearXNG stops | 600 |
 | `search_session_idle` | seconds without a web call before the server discards the session's cached references | 7200 |
@@ -47,13 +48,20 @@ Each entry under `models` holds one model's settings:
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `model` | the checkpoint's folder | required |
-| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image` |
+| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image`; MiniMax-H3 Video: `minimax-h3-video` |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
-| `text_encoder` | MiniMax-H3-Image: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3-Image |
-| `dit` | MiniMax-H3-Image: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3-Image |
-| `vae` | MiniMax-H3-Image: the safetensors file of the FP16 image VAE | required for MiniMax-H3-Image |
+| `text_encoder` | MiniMax-H3: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3 image and video models |
+| `dit` | MiniMax-H3: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3 image and video models |
+| `vae` | MiniMax-H3: the safetensors file of the FP16 image VAE or INT8-ConvRot 3D video VAE | required for MiniMax-H3 image and video models |
+| `audio_vae` | MiniMax-H3 Video: the safetensors file of the FP32 stereo Audio VAE | required for MiniMax-H3 Video |
+| `lora` | MiniMax-H3 Video: optional safetensors file of a BF16 Turbo LoRA adapter | none |
+| `lora_strength` | MiniMax-H3 Video: positive scaling multiplier for `lora` | `1.0` |
+| `steps` | MiniMax-H3 Video: default Euler denoising step count (1 to 100) | `50` |
+| `shift_video` | MiniMax-H3 Video: default video flow-matching shift factor | `12.0` |
+| `shift_audio` | MiniMax-H3 Video: default audio flow-matching shift factor | `3.0` |
+| `variant` | MiniMax-H3 Video: checkpoint task variant, `"fl2va"` or `"ref2va"` | `"fl2va"` |
 | `default_size` | MiniMax-H3-Image: the `WIDTHxHEIGHT` of a text-to-image request whose `size` is `auto` or omitted; it must fit the model as it is | `2048x2048`, the default generation canvas |
-| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3-Image: 4096 |
+| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3 image and video: 4096 |
 | `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
@@ -67,8 +75,8 @@ Each entry under `models` holds one model's settings:
 
 A request names its model by its `id` in `model`. A request that names no
 served model goes to the only model that answers its endpoint: a chat request
-to the model that generates text, a decision to the decision model, and an
-image request to the image model.
+to the model that generates text, a decision to the decision model, an image
+request to the image model, and a video request to the video model.
 
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
@@ -238,3 +246,68 @@ request that does not fit now gets HTTP 503.
 
 During a pass, the image model yields between layers to any running
 text-decoding calls so decoding latency is not degraded.
+
+## Video models
+
+MiniMax-H3 Video generates synchronized 24 fps H.264 video and 32 kHz stereo
+AAC audio muxed into MP4 using macOS AVFoundation and VideoToolbox. Its `model`
+folder holds `model_index.json` (`_class_name` `MiniMaxH3ModularPipeline` or
+`MiniMaxH3Pipeline`) and `processor/tokenizer.json`. Its entry sets
+`text_encoder`, `dit`, `vae` and `audio_vae` to the quantized Comfy-Org
+safetensors files, with optional `lora`, `lora_strength`, `steps`,
+`shift_video`, `shift_audio` and `variant` (`"fl2va"` or `"ref2va"`).
+
+A video model serves the OpenAI Videos API (and refuses chat, decision and
+image endpoints; Codex's catalog leaves it out):
+
+- `POST /v1/videos` (JSON or `multipart/form-data`, up to 256 MiB): queues a
+  video generation job and returns the job object immediately (`id`, `status`:
+  `"queued"`, `progress`: `0`, `size`, `seconds`, `created_at`).
+- `GET /v1/videos`: lists stored video jobs (`limit` 1 to 100, default 20;
+  `after`; `order` `"desc"` or `"asc"`).
+- `GET /v1/videos/{id}`: returns the job's current `status` (`"queued"`,
+  `"in_progress"`, `"completed"` or `"failed"`), live `progress` (0 to 100),
+  actual `size`, `seconds`, `frames`, `fps`, `completed_at` and `error`.
+- `GET /v1/videos/{id}/content`: downloads the finished MP4 (`video/mp4`) once
+  completed. Returns HTTP 409 before completion and HTTP 400 for unsupported
+  `variant` values other than `"video"`.
+- `DELETE /v1/videos/{id}`: cancels the job cooperatively if queued or running,
+  deletes its metadata and removes its MP4 file from `video_dir`.
+
+Request fields accepted by `POST /v1/videos`:
+
+- `prompt`: required string, passed verbatim and truncated to 4096 tokens. In
+  REF2VA requests, reference tags `<Picture 1>`, `<Video 1>`, `<Audio 1>`, and
+  so on address uploaded conditioning media in upload order.
+- `size`: `auto` (default) or `WIDTHxHEIGHT` (each 1 to 2048, area at most
+  2048 x 1152 = 2,359,296 pixels; rounded to 32-pixel multiples). With `auto`,
+  a request adapts its aspect ratio to `first_frame` or the first reference
+  image at 768p short edge, or uses `1344x768` for text-to-video.
+- `seconds`: optional duration in whole seconds, 1 to 15 (string or integer,
+  default 5). Mutually exclusive with `frames`.
+- `frames`: optional explicit frame count, 1 to 362 (aligned to the Video VAE
+  17k + 5 grid, default 124). Mutually exclusive with `seconds`.
+- `steps` (or `num_inference_steps`): optional Euler denoising steps, 1 to 100
+  (default is the model's `steps`, or 50).
+- `shift_video` and `shift_audio`: optional positive flow-matching shift
+  overrides.
+- `seed`: optional nonnegative integer (random when omitted).
+- `guidance_scale`: omit or `1` (released MiniMax-H3 video checkpoints are
+  CFG-distilled). `negative_prompt` is unsupported.
+- `input_reference`: optional OpenAI standard reference file (base64/data URL
+  in JSON or file part in multipart); maps to `first_frame` on FL2VA models and
+  prepends to `ref_images` on REF2VA models.
+- `first_frame` and `last_frame`: optional FL2VA keyframe images (refused on
+  REF2VA models).
+- `ref_images` (up to 9), `ref_videos` (up to 3), `ref_video_audios` (optional
+  explicit soundtracks paired with `ref_videos`) and `ref_audios` (up to 3),
+  total references at most 12, plus `ref_image_size` (`"auto"` or `"max"` for
+  2048-pixel short edge): REF2VA only (refused on FL2VA models).
+
+In full residence, the text encoder, DiT, optional LoRA, Video VAE decoder and
+Audio VAE decoder stay resident together, and the vision tower and Video/Audio
+VAE encoders load on demand. When available memory cannot hold all core groups
+at once, the model runs staged and pins only the active stage's weights in
+turn. Each request reserves its planned memory before Qwen3-VL runs, yields
+between layers to running text-decoding calls, and reports prompt encoding as
+prefill and denoising/VAE/MP4 work in dedicated video counters.
