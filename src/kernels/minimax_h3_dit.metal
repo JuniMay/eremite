@@ -26,6 +26,12 @@ struct MinimaxH3Bf16MM {
   uint m, n, k, ldy, has_bias;
 };
 
+// Parameters for scaled BF16 matrix multiply-accumulate: y += scale * (xb @ w^T).
+struct MinimaxH3Bf16MMAdd {
+  uint m, n, k, ldy;
+  float scale;
+};
+
 // Parameters for FP32 matrix multiplication with bias (patch embed and PDD out).
 struct MinimaxH3F32MM {
   uint m, n, k, ldy;
@@ -90,6 +96,73 @@ kernel void minimax_h3_mm_bf16(device const bfloat *w [[buffer(0)]],
       uint col = n0 + at[0], row = m0 + at[1];
       if (col < p.n && row < p.m)
         y[row * p.ldy + col] = c[i] + (p.has_bias ? bias[col] : 0.0f);
+    }
+}
+
+// Native BF16 matrix product writing directly to padded BF16 rows (zeroing
+// rows past m). Used for the low-rank intermediate in runtime BF16 LoRA.
+kernel void minimax_h3_mm_bf16_out_bf16(
+    device const bfloat *w [[buffer(0)]],
+    device const bfloat *xb [[buffer(1)]],
+    device bfloat *y [[buffer(2)]],
+    constant MinimaxH3Bf16MM &p [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc =
+      matmul2d_descriptor(MINIMAX_H3_DIT_TILE_M, MINIMAX_H3_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
+  uint padded_m = (p.m + MINIMAX_H3_DIT_TILE_M - 1u) / MINIMAX_H3_DIT_TILE_M *
+                  MINIMAX_H3_DIT_TILE_M;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tx(
+      (device bfloat *)xb, dextents<int32_t, 2>(p.k, padded_m));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tw(
+      (device bfloat *)w, dextents<int32_t, 2>(p.k, p.n));
+  uint m0 = tg.y * MINIMAX_H3_DIT_TILE_M, n0 = tg.x * MINIMAX_H3_TILE_N;
+  auto a = tx.slice(0, m0);
+  auto b = tw.slice(0, n0);
+  auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
+                                                 float>();
+  op.run(a, b, c);
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (col < p.n && row < padded_m)
+        y[row * p.ldy + col] = row < p.m ? bfloat(c[i]) : bfloat(0.0f);
+    }
+}
+
+// Native BF16 matrix multiply-accumulate into FP32:
+// y[r, c] += scale * dot(xb[r], w[c]). Used to add runtime BF16 LoRA deltas
+// without re-quantizing base INT8-ConvRot weights.
+kernel void minimax_h3_mm_bf16_add(device const bfloat *w [[buffer(0)]],
+                                   device const bfloat *xb [[buffer(1)]],
+                                   device float *y [[buffer(2)]],
+                                   constant MinimaxH3Bf16MMAdd &p [[buffer(3)]],
+                                   uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc =
+      matmul2d_descriptor(MINIMAX_H3_DIT_TILE_M, MINIMAX_H3_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
+  uint padded_m = (p.m + MINIMAX_H3_DIT_TILE_M - 1u) / MINIMAX_H3_DIT_TILE_M *
+                  MINIMAX_H3_DIT_TILE_M;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tx(
+      (device bfloat *)xb, dextents<int32_t, 2>(p.k, padded_m));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tw(
+      (device bfloat *)w, dextents<int32_t, 2>(p.k, p.n));
+  uint m0 = tg.y * MINIMAX_H3_DIT_TILE_M, n0 = tg.x * MINIMAX_H3_TILE_N;
+  auto a = tx.slice(0, m0);
+  auto b = tw.slice(0, n0);
+  auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
+                                                 float>();
+  op.run(a, b, c);
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (col < p.n && row < p.m) y[row * p.ldy + col] += p.scale * c[i];
     }
 }
 
