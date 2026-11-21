@@ -5,10 +5,10 @@
 #include "gpu/gpu.h"
 #include <stdint.h>
 
-// Optional BF16 LoRA adapter for MiniMax-H3 DiT and TokenRefiner projections
-// (such as the 4-step and 8-step Turbo LoRAs). Deltas run at inference time as
-// low-rank BF16 residuals y += (strength * alpha / rank) * (B @ (A @ x)) on
-// unrotated activations so INT8-ConvRot base weights are never re-quantized.
+// Optional BF16 LoRA adapter for MiniMax-H3 DiT and TokenRefiner projections.
+// Deltas run at inference time as low-rank BF16 residuals
+// y += (strength * alpha / rank) * (B @ (A @ x)) on unrotated activations so
+// INT8-ConvRot base weights are never re-quantized.
 
 // Number of TokenRefiner and DiT blocks that a MiniMax-H3 LoRA may patch.
 static constexpr int MINIMAX_H3_LORA_REFINER_LAYERS = 2,

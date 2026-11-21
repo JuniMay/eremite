@@ -6,9 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-// MiniMax-H3 DiT and TokenRefiner projection dimensions verified against
-// Comfy-Org/MiniMax-H3 Turbo LoRA checkpoints (624 tensors across 2
-// TokenRefiner blocks and 50 DiT blocks).
+// MiniMax-H3 DiT and TokenRefiner projection dimensions across 2 TokenRefiner
+// blocks and 50 DiT blocks (624 adapter tensors).
 static constexpr int LORA_DIM = 5376, LORA_INNER = 7168,
                      LORA_QKV_WIDTH = MINIMAX_H3_QKV_PARTS * LORA_INNER,
                      LORA_FFN_DIM = 14336, LORA_FC1_WIDTH = 2 * LORA_FFN_DIM;

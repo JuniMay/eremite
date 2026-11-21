@@ -22,8 +22,7 @@
 #   tokenizer (23 MB).
 #   FOLDER/Comfy-Org/MiniMax-H3 gets its Qwen3-VL-32B NVFP4 text and vision
 #   encoder (15.7 GB), FL2VA and REF2VA pruned INT8-ConvRot DiTs (21.0 GB
-#   each), INT8-ConvRot Video VAE (2.8 GB), FP32 Audio VAE (0.6 GB), and BF16
-#   Turbo LoRAs (2.0 GB each).
+#   each), INT8-ConvRot Video VAE (2.8 GB), and FP32 Audio VAE (0.6 GB).
 #   FOLDER/Comfy-Org/MiniMax-H3-Image gets its pruned INT8-ConvRot DiT
 #   (21.0 GB) and FP16 image VAE (1.2 GB).
 #   --dry-run lists the files that the download would fetch, and fetches none.
@@ -49,9 +48,6 @@ MINIMAX_H3_VIDEO_FL2VA_DIT=diffusion_models/minimax_h3_fl2va_pruned_int8_convrot
 MINIMAX_H3_VIDEO_REF2VA_DIT=diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
 MINIMAX_H3_VIDEO_VAE=vae/minimax_h3_video_vae_int8_convrot.safetensors
 MINIMAX_H3_AUDIO_VAE=vae/minimax_h3_audio_vae_fp32.safetensors
-MINIMAX_H3_FL2V_LORA_4=loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors
-MINIMAX_H3_FL2V_LORA_8=loras/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
-MINIMAX_H3_REF2V_LORA_4=loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
 
 fail() {
   echo "download-models: $*" >&2
@@ -118,9 +114,6 @@ set -f
   --include "$MINIMAX_H3_VIDEO_REF2VA_DIT" \
   --include "$MINIMAX_H3_VIDEO_VAE" \
   --include "$MINIMAX_H3_AUDIO_VAE" \
-  --include "$MINIMAX_H3_FL2V_LORA_4" \
-  --include "$MINIMAX_H3_FL2V_LORA_8" \
-  --include "$MINIMAX_H3_REF2V_LORA_4" \
   --local-dir "$folder/$MINIMAX_H3_COMFY" $dry_run
 "$hf" download "$MINIMAX_H3_IMAGE_COMFY" \
   --include "$MINIMAX_H3_IMAGE_DIT" \

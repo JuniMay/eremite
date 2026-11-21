@@ -11,7 +11,7 @@
 // 2-layer BF16 token refiner, pruned curve-form AdaLN and partial 3D
 // split-half RoPE. Supports both MiniMax-H3-Image (6-step PDD head bank) and
 // MiniMax-H3 Video FL2VA/REF2VA (joint video + stereo audio streams with
-// optional runtime BF16 Turbo LoRA).
+// optional runtime BF16 LoRA).
 
 // Maximum number of PDD sampling steps supported by the head bank.
 static constexpr int MINIMAX_H3_DIT_MAX_PDD_STEPS = 16;
@@ -27,7 +27,8 @@ static constexpr int MINIMAX_H3_VIDEO_FPS = 24;
 static constexpr double MINIMAX_H3_VIDEO_SIGMA_SHIFT = 12.0,
                         MINIMAX_H3_AUDIO_SIGMA_SHIFT = 3.0;
 
-// Default base-model denoising step count when no Turbo LoRA overrides it.
+// Default base-model denoising step count when no request or model override is
+// set.
 static constexpr int MINIMAX_H3_VIDEO_DEFAULT_STEPS = 20;
 
 // One optional encoded reference image latent passed during image editing.
@@ -225,7 +226,7 @@ typedef struct {
   double shift_video, shift_audio;
   // Deterministic RNG seed for initial video/audio noise and cond noise aug.
   uint64_t seed;
-  // Optional runtime BF16 LoRA adapter (e.g., 4-step or 8-step Turbo LoRA).
+  // Optional runtime BF16 LoRA adapter.
   const MinimaxH3Lora *lora;
   // Caller-allocated output buffer for video latents [24, t_lat, h_lat, w_lat].
   float *out_video_latents;

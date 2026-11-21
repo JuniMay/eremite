@@ -14,10 +14,10 @@
 #include <string.h>
 
 // Real-checkpoint MiniMax-H3 Video test: runs T2VA and FL2VA generation with
-// optional Turbo LoRA, verifies decoded H.264/AAC MP4 frames and stereo audio,
+// optional BF16 LoRA, verifies decoded H.264/AAC MP4 frames and stereo audio,
 // and checks that prefill and video generation counters stay strictly separate.
 
-// Test clip geometry (512x288, 22 frames ~= 0.92 s at 24 fps, 4 Turbo steps).
+// Test clip geometry (512x288, 22 frames ~= 0.92 s at 24 fps, 4 steps).
 static constexpr int TEST_W = 512, TEST_H = 288, TEST_FRAMES = 22,
                      TEST_STEPS = 4;
 

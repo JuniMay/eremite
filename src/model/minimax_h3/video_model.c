@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 // MiniMax-H3 Video behind ModelOps: supports T2VA, FL2VA and REF2VA with
-// optional BF16 Turbo LoRA, native H.264/AAC MP4 output, exact per-request
+// optional BF16 LoRA, native H.264/AAC MP4 output, exact per-request
 // memory planning and strict stage separation (Qwen3-VL is prefill; DiT and
 // VAEs are video generation, never reported as prefill or token decoding).
 

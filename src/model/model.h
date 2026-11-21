@@ -63,7 +63,7 @@ typedef struct {
   const char *vae;
   // Safetensors file of the FP32 stereo audio VAE.
   const char *audio_vae;
-  // Optional safetensors file of a BF16 Turbo LoRA adapter; null for none.
+  // Optional safetensors file of a BF16 LoRA adapter; null for none.
   const char *lora;
   // Runtime LoRA multiplier; <= 0 uses 1.0.
   float lora_strength;

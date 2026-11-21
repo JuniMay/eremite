@@ -69,7 +69,7 @@ MiniMax-H3's image and video metadata and tokenizers into
 `FOLDER/MiniMaxAI/MiniMax-H3-Image` and `FOLDER/MiniMaxAI/MiniMax-H3` with
 Comfy-Org's quantized checkpoints into `FOLDER/Comfy-Org/MiniMax-H3` (15.7 GB
 text and vision encoder, 21.0 GB FL2VA and REF2VA video DiTs, 2.8 GB Video VAE,
-0.6 GB Audio VAE, and 2.0 GB BF16 Turbo LoRAs) and
+and 0.6 GB Audio VAE) and
 `FOLDER/Comfy-Org/MiniMax-H3-Image` (21.0 GB image DiT and 1.2 GB image VAE).
 Other quantizations, such as `UD-IQ1_M`, can follow FOLDER. `--dry-run` lists
 the files without downloading them. It needs Python 3.10 or later, and runs
@@ -124,8 +124,6 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
       "dit": "/path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
       "vae": "/path/to/minimax_h3_video_vae_int8_convrot.safetensors",
       "audio_vae": "/path/to/minimax_h3_audio_vae_fp32.safetensors",
-      "lora": "/path/to/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
-      "steps": 4,
       "variant": "fl2va"
     }
   ]

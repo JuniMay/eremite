@@ -1014,8 +1014,7 @@ pub struct MinimaxH3Options {
     pub vae: Option<String>,
     /// Safetensors file of the FP32 stereo Audio VAE (video models only).
     pub audio_vae: Option<String>,
-    /// Optional safetensors file of a BF16 Turbo LoRA adapter (video models
-    /// only).
+    /// Optional safetensors file of a BF16 LoRA adapter (video models only).
     pub lora: Option<String>,
     /// Optional LoRA scaling multiplier (video models only).
     pub lora_strength: Option<f32>,

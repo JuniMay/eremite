@@ -8,7 +8,7 @@
 
 // MiniMax-H3 Video model integration: wraps the Qwen3-VL-32B NVFP4 text and
 // vision encoders, pruned INT8-ConvRot 50-layer FL2VA/REF2VA DiT (with
-// optional BF16 Turbo LoRA), INT8-ConvRot 3D Video VAE, FP32 Stereo Audio VAE
+// optional BF16 LoRA), INT8-ConvRot 3D Video VAE, FP32 Stereo Audio VAE
 // and native macOS H.264/AAC MP4 muxer behind ModelOps.
 
 // Spatial multiple in pixels required by the Video VAE (16x) and DiT (2x2
@@ -70,7 +70,7 @@ typedef struct {
   uint64_t vision;
   // Pruned INT8-ConvRot DiT weight bytes.
   uint64_t dit;
-  // Optional BF16 Turbo LoRA weight bytes (0 when unused).
+  // Optional BF16 LoRA weight bytes (0 when unused).
   uint64_t lora;
   // INT8-ConvRot 3D Video VAE decoder weight bytes.
   uint64_t video_vae;

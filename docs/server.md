@@ -54,7 +54,7 @@ Each entry under `models` holds one model's settings:
 | `dit` | MiniMax-H3: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3 image and video models |
 | `vae` | MiniMax-H3: the safetensors file of the FP16 image VAE or INT8-ConvRot 3D video VAE | required for MiniMax-H3 image and video models |
 | `audio_vae` | MiniMax-H3 Video: the safetensors file of the FP32 stereo Audio VAE | required for MiniMax-H3 Video |
-| `lora` | MiniMax-H3 Video: optional safetensors file of a BF16 Turbo LoRA adapter | none |
+| `lora` | MiniMax-H3 Video: optional safetensors file of a BF16 LoRA adapter | none |
 | `lora_strength` | MiniMax-H3 Video: positive scaling multiplier for `lora` | `1.0` |
 | `steps` | MiniMax-H3 Video: default Euler denoising step count (1 to 100) | `50` |
 | `shift_video` | MiniMax-H3 Video: default video flow-matching shift factor | `12.0` |

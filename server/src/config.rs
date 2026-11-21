@@ -1383,7 +1383,7 @@ mod tests {
             "dit": "/m/dit.safetensors",
             "vae": "/m/vvae.safetensors",
             "audio_vae": "/m/avae.safetensors",
-            "lora": "/m/turbo.safetensors",
+            "lora": "/m/adapter.safetensors",
             "lora_strength": 1.0,
             "steps": 4,
             "shift_video": 12.0,
@@ -1397,7 +1397,7 @@ mod tests {
         );
         let h3 = model.engine.minimax_h3().unwrap();
         assert_eq!(h3.audio_vae.as_deref(), Some("/m/avae.safetensors"));
-        assert_eq!(h3.lora.as_deref(), Some("/m/turbo.safetensors"));
+        assert_eq!(h3.lora.as_deref(), Some("/m/adapter.safetensors"));
         assert_eq!(h3.steps, Some(4));
         assert_eq!(h3.variant, Some(engine::VideoVariant::Ref2va));
 
