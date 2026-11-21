@@ -44,6 +44,18 @@ static constexpr int AUDIO_CHUNK_SAMPLES = 1024;
 // Float32 bits per sample for linear PCM CoreAudio descriptors.
 static constexpr int PCM_FLOAT_BITS = 32;
 
+// Half-frame rounding offset for resampling decoded video frames.
+static constexpr double HALF_STEP = 0.5;
+
+// Minimum input byte count and container header tag lengths for format
+// sniffing.
+static constexpr size_t MAGIC_MIN_BYTES = 12, FOURCC_BYTES = 4,
+                        RIFF_TAG_OFFSET = 8, ID3_TAG_BYTES = 3;
+
+// MPEG audio frame sync header bytes used to identify raw MP3 streams.
+static constexpr uint8_t MP3_SYNC_BYTE0 = 0xff, MP3_SYNC_MASK = 0xe0,
+                         MP3_LAYER_MASK = 0x06;
+
 // Temporary file path buffer capacity.
 static constexpr size_t TEMP_PATH_CAP = 512;
 
@@ -73,6 +85,31 @@ static int make_temp_file(const char *suffix, char *out_path, size_t cap) {
   return mkstemps(out_path, (int)strlen(suffix));
 }
 
+// Writes len bytes of data into a new temporary file with suffix and closes
+// its descriptor. Returns 1 on success or 0 on failure.
+static int write_temp_file(const void *data, size_t len, const char *suffix,
+                           char *out_path, size_t cap) {
+  int fd = make_temp_file(suffix, out_path, cap);
+  if (fd < 0) return 0;
+  const uint8_t *p = data;
+  size_t left = len;
+  while (left > 0) {
+    ssize_t wrote = write(fd, p, left);
+    if (wrote <= 0) {
+      close(fd);
+      unlink(out_path);
+      return 0;
+    }
+    p += wrote;
+    left -= (size_t)wrote;
+  }
+  if (close(fd) != 0) {
+    unlink(out_path);
+    return 0;
+  }
+  return 1;
+}
+
 // Reads all bytes of path into a newly allocated buffer and sets *out_len.
 static uint8_t *read_whole_file(const char *path, size_t *out_len) {
   FILE *f = fopen(path, "rb");
@@ -99,6 +136,48 @@ static uint8_t *read_whole_file(const char *path, size_t *out_len) {
   fclose(f);
   *out_len = (size_t)size;
   return buf;
+}
+
+// Picks a file extension hint for AVURLAsset from container magic bytes.
+static const char *sniff_media_suffix(const void *data, size_t len,
+                                      int is_video) {
+  const uint8_t *b = data;
+  if (len >= MAGIC_MIN_BYTES) {
+    if (memcmp(b, "RIFF", FOURCC_BYTES) == 0 &&
+        memcmp(b + RIFF_TAG_OFFSET, "WAVE", FOURCC_BYTES) == 0)
+      return ".wav";
+    if (memcmp(b, "fLaC", FOURCC_BYTES) == 0) return ".flac";
+    if (memcmp(b, "FORM", FOURCC_BYTES) == 0 &&
+        (memcmp(b + RIFF_TAG_OFFSET, "AIFF", FOURCC_BYTES) == 0 ||
+         memcmp(b + RIFF_TAG_OFFSET, "AIFC", FOURCC_BYTES) == 0))
+      return ".aiff";
+    if (memcmp(b, "caff", FOURCC_BYTES) == 0) return ".caf";
+    if (memcmp(b + FOURCC_BYTES, "ftyp", FOURCC_BYTES) == 0)
+      return is_video ? ".mp4" : ".m4a";
+    if (memcmp(b, "ID3", ID3_TAG_BYTES) == 0 ||
+        (b[0] == MP3_SYNC_BYTE0 && (b[1] & MP3_SYNC_MASK) == MP3_SYNC_MASK &&
+         (b[1] & MP3_LAYER_MASK) != 0))
+      return ".mp3";
+  }
+  return is_video ? ".mp4" : ".m4a";
+}
+
+// Synchronously loads asset's tracks of media_type using AVFoundation's async
+// loader. Returns a retained NSArray or nil on failure.
+static NSArray<AVAssetTrack *> *load_tracks(AVAsset *asset,
+                                            AVMediaType media_type) {
+  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+  __block NSArray<AVAssetTrack *> *result = nil;
+  [asset
+      loadTracksWithMediaType:media_type
+            completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *err) {
+              (void)err;
+              if (tracks) result = [tracks retain];
+              dispatch_semaphore_signal(sem);
+            }];
+  dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  dispatch_release(sem);
+  return result;
 }
 
 // Creates a CoreVideo BGRA pixel buffer populated from one RGB24 frame.
@@ -183,6 +262,166 @@ static CMSampleBufferRef make_audio_sample_buffer(const float *planar_pcm,
   CFRelease(block);
   CFRelease(fmt);
   return st == noErr ? sb : NULL;
+}
+
+// Copies a 32-bit BGRA CVPixelBuffer into an RGB24 frame buffer.
+static void copy_bgra_to_rgb(CVPixelBufferRef px, uint8_t *dst, int width,
+                             int height) {
+  CVPixelBufferLockBaseAddress(px, kCVPixelBufferLock_ReadOnly);
+  const uint8_t *src = CVPixelBufferGetBaseAddress(px);
+  size_t stride = CVPixelBufferGetBytesPerRow(px);
+  for (int y = 0; y < height; y++) {
+    const uint8_t *srow = src + (size_t)y * stride;
+    uint8_t *drow = dst + (size_t)y * (size_t)width * VIDEO_RGB_CHANNELS;
+    for (int x = 0; x < width; x++) {
+      drow[x * VIDEO_RGB_CHANNELS + 0] = srow[x * BGRA_BYTES + 2];
+      drow[x * VIDEO_RGB_CHANNELS + 1] = srow[x * BGRA_BYTES + 1];
+      drow[x * VIDEO_RGB_CHANNELS + 2] = srow[x * BGRA_BYTES + 0];
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(px, kCVPixelBufferLock_ReadOnly);
+}
+
+// Reads all stereo FP32 PCM samples from an audio track of asset at
+// target_sample_rate into a planar buffer [2, *out_samples].
+static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
+                               int target_sample_rate, int *out_samples,
+                               const char **error) {
+  NSError *ns_err = nil;
+  AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset
+                                                         error:&ns_err];
+  if (!reader) {
+    set_error(error, "cannot open audio reader");
+    return NULL;
+  }
+  NSDictionary *settings = @{
+    AVFormatIDKey : @(kAudioFormatLinearPCM),
+    AVSampleRateKey : @(target_sample_rate),
+    AVNumberOfChannelsKey : @(VIDEO_AUDIO_CHANNELS),
+    AVLinearPCMBitDepthKey : @(PCM_FLOAT_BITS),
+    AVLinearPCMIsFloatKey : @YES,
+    AVLinearPCMIsBigEndianKey : @NO,
+    AVLinearPCMIsNonInterleaved : @NO,
+  };
+  AVAssetReaderTrackOutput *output =
+      [[AVAssetReaderTrackOutput alloc] initWithTrack:track
+                                       outputSettings:settings];
+  output.alwaysCopiesSampleData = NO;
+  if (![reader canAddOutput:output]) {
+    [output release];
+    [reader release];
+    set_error(error, "cannot configure audio decoder");
+    return NULL;
+  }
+  [reader addOutput:output];
+  if (![reader startReading]) {
+    [output release];
+    [reader release];
+    set_error(error, "cannot decode audio track");
+    return NULL;
+  }
+
+  size_t max_samples =
+      (size_t)target_sample_rate * (size_t)VIDEO_MAX_DECODE_AUDIO_SECONDS;
+  size_t cap = (size_t)target_sample_rate;
+  size_t count = 0;
+  float *left = malloc(cap * sizeof(float));
+  float *right = malloc(cap * sizeof(float));
+  if (!left || !right) {
+    free(left);
+    free(right);
+    [reader cancelReading];
+    [output release];
+    [reader release];
+    set_error(error, "audio buffer allocation failed");
+    return NULL;
+  }
+
+  int overflow = 0;
+  CMSampleBufferRef sb = NULL;
+  while ((sb = [output copyNextSampleBuffer]) != NULL) {
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sb);
+    size_t n_frames = (size_t)CMSampleBufferGetNumSamples(sb);
+    if (block && n_frames > 0) {
+      size_t byte_len = 0;
+      char *raw = NULL;
+      if (CMBlockBufferGetDataPointer(block, 0, NULL, &byte_len, &raw) ==
+          kCMBlockBufferNoErr) {
+        size_t avail = byte_len / (VIDEO_AUDIO_CHANNELS * sizeof(float));
+        if (n_frames > avail) n_frames = avail;
+        if (count + n_frames > max_samples) {
+          overflow = 1;
+          CFRelease(sb);
+          break;
+        }
+        if (count + n_frames > cap) {
+          size_t next = cap * 2;
+          while (next < count + n_frames) next *= 2;
+          float *nl = realloc(left, next * sizeof(float));
+          float *nr = realloc(right, next * sizeof(float));
+          if (!nl || !nr) {
+            if (nl) left = nl;
+            if (nr) right = nr;
+            free(left);
+            free(right);
+            CFRelease(sb);
+            [reader cancelReading];
+            [output release];
+            [reader release];
+            set_error(error, "audio buffer allocation failed");
+            return NULL;
+          }
+          left = nl;
+          right = nr;
+          cap = next;
+        }
+        const float *inter = (const float *)raw;
+        for (size_t i = 0; i < n_frames; i++) {
+          left[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 0]);
+          right[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 1]);
+        }
+        count += n_frames;
+      }
+    }
+    CFRelease(sb);
+  }
+
+  AVAssetReaderStatus status = reader.status;
+  [output release];
+  [reader release];
+  if (overflow) {
+    free(left);
+    free(right);
+    set_error(error, "audio clip exceeds maximum supported duration");
+    return NULL;
+  }
+  if (status == AVAssetReaderStatusFailed || count == 0) {
+    free(left);
+    free(right);
+    set_error(error, "cannot decode audio track");
+    return NULL;
+  }
+
+  float *planar = malloc(count * VIDEO_AUDIO_CHANNELS * sizeof(float));
+  if (!planar) {
+    free(left);
+    free(right);
+    set_error(error, "audio buffer allocation failed");
+    return NULL;
+  }
+  memcpy(planar, left, count * sizeof(float));
+  memcpy(planar + count, right, count * sizeof(float));
+  free(left);
+  free(right);
+  *out_samples = (int)count;
+  return planar;
+}
+
+void video_decoded_free(VideoDecoded *decoded) {
+  if (!decoded) return;
+  free(decoded->rgb);
+  free(decoded->audio_pcm);
+  memset(decoded, 0, sizeof *decoded);
 }
 
 uint8_t *video_encode_mp4(const uint8_t *rgb, int frame_count, int width,
@@ -388,4 +627,242 @@ uint8_t *video_encode_mp4(const uint8_t *rgb, int frame_count, int width,
   [writer release];
   objc_autoreleasePoolPop(pool);
   return result;
+}
+
+int video_decode_mp4(const void *data, size_t len, int target_fps,
+                     int target_sample_rate, VideoDecoded *out,
+                     const char **error) {
+  if (!out) {
+    set_error(error, "missing video output buffer");
+    return 0;
+  }
+  memset(out, 0, sizeof *out);
+  if (!data || len == 0) {
+    set_error(error, "video data is empty");
+    return 0;
+  }
+  if (target_fps < VIDEO_MIN_FPS || target_fps > VIDEO_MAX_FPS) {
+    set_error(error, "target video frame rate is out of range");
+    return 0;
+  }
+  if (target_sample_rate != 0 && (target_sample_rate < VIDEO_MIN_SAMPLE_RATE ||
+                                  target_sample_rate > VIDEO_MAX_SAMPLE_RATE)) {
+    set_error(error, "target audio sample rate is out of range");
+    return 0;
+  }
+
+  char path[TEMP_PATH_CAP];
+  const char *suffix = sniff_media_suffix(data, len, 1);
+  if (!write_temp_file(data, len, suffix, path, sizeof path)) {
+    set_error(error, "cannot stage video data");
+    return 0;
+  }
+
+  void *pool = objc_autoreleasePoolPush();
+  int ok = 0;
+  NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+  AVURLAsset *asset = [[AVURLAsset alloc] initWithURL:url options:nil];
+  NSArray<AVAssetTrack *> *v_tracks = load_tracks(asset, AVMediaTypeVideo);
+  if (!v_tracks || v_tracks.count == 0) {
+    [v_tracks release];
+    set_error(error, "file contains no video track");
+    goto done;
+  }
+  AVAssetTrack *v_track = v_tracks[0];
+  CGSize nat = v_track.naturalSize;
+  int width = (int)llround(fabs(nat.width));
+  int height = (int)llround(fabs(nat.height));
+  if (width < 1 || height < 1 || width > MAX_VIDEO_DIM ||
+      height > MAX_VIDEO_DIM) {
+    [v_tracks release];
+    set_error(error, "video dimensions are out of range");
+    goto done;
+  }
+
+  NSError *ns_err = nil;
+  AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset
+                                                         error:&ns_err];
+  if (!reader) {
+    [v_tracks release];
+    set_error(error, "cannot open video reader");
+    goto done;
+  }
+  NSDictionary *v_settings = @{
+    (NSString *)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (NSString *)kCVPixelBufferWidthKey : @(width),
+    (NSString *)kCVPixelBufferHeightKey : @(height),
+  };
+  AVAssetReaderTrackOutput *v_out =
+      [[AVAssetReaderTrackOutput alloc] initWithTrack:v_track
+                                       outputSettings:v_settings];
+  [v_tracks release];
+  v_out.alwaysCopiesSampleData = NO;
+  if (![reader canAddOutput:v_out] ||
+      ([reader addOutput:v_out], ![reader startReading])) {
+    [v_out release];
+    [reader release];
+    set_error(error, "cannot start decoding video track");
+    goto done;
+  }
+
+  size_t frame_bytes = (size_t)width * (size_t)height * VIDEO_RGB_CHANNELS;
+  int cap = target_fps;
+  int count = 0;
+  uint8_t *frames = malloc((size_t)cap * frame_bytes);
+  uint8_t *prev = malloc(frame_bytes);
+  if (!frames || !prev) {
+    free(frames);
+    free(prev);
+    [reader cancelReading];
+    [v_out release];
+    [reader release];
+    set_error(error, "video buffer allocation failed");
+    goto done;
+  }
+
+  int have_prev = 0;
+  double prev_pts = 0.0;
+  double first_pts = 0.0;
+  int overflow = 0;
+  CMSampleBufferRef sb = NULL;
+  while ((sb = [v_out copyNextSampleBuffer]) != NULL) {
+    CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+    CMTime pts_t = CMSampleBufferGetPresentationTimeStamp(sb);
+    double pts = CMTIME_IS_VALID(pts_t) ? CMTimeGetSeconds(pts_t) : 0.0;
+    if (img) {
+      if (!have_prev) {
+        first_pts = pts;
+        prev_pts = 0.0;
+        copy_bgra_to_rgb(img, prev, width, height);
+        have_prev = 1;
+        memcpy(frames, prev, frame_bytes);
+        count = 1;
+      } else {
+        double rel = pts - first_pts;
+        if (rel < prev_pts) rel = prev_pts;
+        while ((double)count / (double)target_fps <=
+               rel + HALF_STEP / target_fps) {
+          if (count >= VIDEO_MAX_DECODE_FRAMES) {
+            overflow = 1;
+            break;
+          }
+          if (count >= cap) {
+            int next = cap * 2;
+            if (next > VIDEO_MAX_DECODE_FRAMES) next = VIDEO_MAX_DECODE_FRAMES;
+            uint8_t *nf = realloc(frames, (size_t)next * frame_bytes);
+            if (!nf) {
+              free(frames);
+              free(prev);
+              CFRelease(sb);
+              [reader cancelReading];
+              [v_out release];
+              [reader release];
+              set_error(error, "video buffer allocation failed");
+              goto done;
+            }
+            frames = nf;
+            cap = next;
+          }
+          double target_t = (double)count / (double)target_fps;
+          if (fabs(target_t - prev_pts) < fabs(rel - target_t))
+            memcpy(frames + (size_t)count * frame_bytes, prev, frame_bytes);
+          else
+            copy_bgra_to_rgb(img, frames + (size_t)count * frame_bytes, width,
+                             height);
+          count++;
+        }
+        copy_bgra_to_rgb(img, prev, width, height);
+        prev_pts = rel;
+      }
+    }
+    CFRelease(sb);
+    if (overflow) break;
+  }
+
+  AVAssetReaderStatus status = reader.status;
+  [v_out release];
+  [reader release];
+  free(prev);
+
+  if (overflow) {
+    free(frames);
+    set_error(error, "video clip exceeds maximum supported frame count");
+    goto done;
+  }
+  if (status == AVAssetReaderStatusFailed || count == 0) {
+    free(frames);
+    set_error(error, "cannot decode video frames");
+    goto done;
+  }
+
+  out->rgb = frames;
+  out->frame_count = count;
+  out->width = width;
+  out->height = height;
+
+  if (target_sample_rate > 0) {
+    NSArray<AVAssetTrack *> *a_tracks = load_tracks(asset, AVMediaTypeAudio);
+    if (a_tracks && a_tracks.count > 0) {
+      int a_samples = 0;
+      float *pcm = read_audio_track(asset, a_tracks[0], target_sample_rate,
+                                    &a_samples, error);
+      [a_tracks release];
+      if (!pcm) {
+        video_decoded_free(out);
+        goto done;
+      }
+      out->audio_pcm = pcm;
+      out->audio_samples = a_samples;
+      out->audio_sample_rate = target_sample_rate;
+    } else {
+      [a_tracks release];
+    }
+  }
+  ok = 1;
+
+done:
+  [asset release];
+  objc_autoreleasePoolPop(pool);
+  unlink(path);
+  return ok;
+}
+
+float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
+                        int *out_samples, const char **error) {
+  if (out_samples) *out_samples = 0;
+  if (!data || len == 0) {
+    set_error(error, "audio data is empty");
+    return NULL;
+  }
+  if (target_sample_rate < VIDEO_MIN_SAMPLE_RATE ||
+      target_sample_rate > VIDEO_MAX_SAMPLE_RATE) {
+    set_error(error, "target audio sample rate is out of range");
+    return NULL;
+  }
+
+  char path[TEMP_PATH_CAP];
+  const char *suffix = sniff_media_suffix(data, len, 0);
+  if (!write_temp_file(data, len, suffix, path, sizeof path)) {
+    set_error(error, "cannot stage audio data");
+    return NULL;
+  }
+
+  void *pool = objc_autoreleasePoolPush();
+  float *pcm = NULL;
+  NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+  AVURLAsset *asset = [[AVURLAsset alloc] initWithURL:url options:nil];
+  NSArray<AVAssetTrack *> *a_tracks = load_tracks(asset, AVMediaTypeAudio);
+  if (!a_tracks || a_tracks.count == 0) {
+    set_error(error, "file contains no audio track");
+  } else {
+    int samples = 0;
+    pcm = read_audio_track(asset, a_tracks[0], target_sample_rate, &samples,
+                           error);
+    if (pcm && out_samples) *out_samples = samples;
+  }
+  [a_tracks release];
+  [asset release];
+  objc_autoreleasePoolPop(pool);
+  unlink(path);
+  return pcm;
 }

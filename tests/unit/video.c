@@ -32,5 +32,25 @@ int main(void) {
                 NULL &&
             err != NULL,
         "bad audio sample rate refused");
+
+  err = NULL;
+  VideoDecoded dec = {0};
+  check(video_decode_mp4(NULL, 0, 24, 32000, &dec, &err) == 0 && err != NULL,
+        "empty video refused");
+  err = NULL;
+  check(video_decode_mp4(pixel, sizeof pixel, 0, 32000, &dec, &err) == 0 &&
+            err != NULL,
+        "bad decode fps refused");
+
+  err = NULL;
+  int samples = 0;
+  check(audio_decode_pcm(NULL, 0, 32000, &samples, &err) == NULL && err != NULL,
+        "empty audio refused");
+  err = NULL;
+  check(audio_decode_pcm(pixel, sizeof pixel, 100, &samples, &err) == NULL &&
+            err != NULL,
+        "bad decode sample rate refused");
+
+  video_decoded_free(&dec);
   return failures != 0;
 }
