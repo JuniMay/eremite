@@ -890,6 +890,9 @@ pub fn log(line: &str) {
 pub enum Architecture {
     /// DeepSeek V4.1, model_type deepseek_v41.
     DeepSeek,
+    /// Thinking Machines Inkling-2-Mini, model_type inkling2_loop or
+    /// inkling2_loop_text.
+    Inkling2,
     /// LiquidAI's d1 decision models: model_type lfm3_vl, with d1's question
     /// layout (d1_attention "set").
     D1,
@@ -925,6 +928,7 @@ impl Architecture {
             serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         match config.get(key).and_then(serde_json::Value::as_str) {
             Some("deepseek_v41") => Ok(Architecture::DeepSeek),
+            Some("inkling2_loop" | "inkling2_loop_text") => Ok(Architecture::Inkling2),
             Some("lfm3_vl") if config["d1_attention"] == "set" => Ok(Architecture::D1),
             Some("MiniMaxH3ImagePipeline" | "minimax_h3_image") => Ok(Architecture::MinimaxH3Image),
             Some("MiniMaxH3ModularPipeline" | "MiniMaxH3Pipeline" | "minimax_h3_video") => {
@@ -1076,6 +1080,19 @@ impl Options {
             (BackendOptions::MinimaxH3(_), Architecture::DeepSeek) => {
                 return Err(format!(
                     "{}: MiniMax-H3 checkpoint paths do not apply to DeepSeek",
+                    self.model
+                ));
+            }
+            (BackendOptions::Unspecified, Architecture::Inkling2) => BackendOptions::Unspecified,
+            (BackendOptions::DeepSeek(_), Architecture::Inkling2) => {
+                return Err(format!(
+                    "{}: DeepSeek's settings do not apply to Inkling-2-Mini",
+                    self.model
+                ));
+            }
+            (BackendOptions::MinimaxH3(_), Architecture::Inkling2) => {
+                return Err(format!(
+                    "{}: MiniMax-H3 checkpoint paths do not apply to Inkling-2-Mini",
                     self.model
                 ));
             }
@@ -1261,6 +1278,9 @@ pub struct Model {
     /// Explicit safetensors files for multi-file models (MiniMax-H3-Image);
     /// empty for directory-indexed checkpoints.
     weight_files: Vec<String>,
+    /// Optional auxiliary safetensors file to validate alongside a
+    /// directory-indexed checkpoint (such as Inkling-2-Mini's mtp.safetensors).
+    extra_weight_file: Option<String>,
     /// Whether the weight files passed validation.
     validated: std::cell::Cell<bool>,
 }
@@ -1401,7 +1421,11 @@ impl Model {
                 substitute: 0.0,
                 draft: o.draft,
                 ced: deepseek.ced,
-                prefill_prune: deepseek.prunes_prefill().into(),
+                prefill_prune: if architecture == Architecture::DeepSeek {
+                    deepseek.prunes_prefill().into()
+                } else {
+                    0
+                },
                 packed_state_rows: deepseek.packed_state_rows.into(),
             },
             minimax_h3: if is_image {
@@ -1454,11 +1478,18 @@ impl Model {
                 weight_files.push(path.clone());
             }
         }
+        let extra_weight_file = if architecture == Architecture::Inkling2 && o.draft > 0 {
+            let mtp = std::path::Path::new(&o.model).join("mtp.safetensors");
+            mtp.exists().then(|| mtp.to_string_lossy().into_owned())
+        } else {
+            None
+        };
         let m = unsafe { eremite_open(&raw) };
         (!m.is_null()).then_some(Model {
             raw: m,
             directory: o.model.clone(),
             weight_files,
+            extra_weight_file,
             validated: std::cell::Cell::new(false),
         })
     }
@@ -1474,6 +1505,9 @@ impl Model {
                 for path in &self.weight_files {
                     validate_safetensors_file(std::path::Path::new(path), path, &[])?;
                 }
+            }
+            if let Some(ref extra) = self.extra_weight_file {
+                validate_safetensors_file(std::path::Path::new(extra), extra, &[])?;
             }
             self.validated.set(true);
         }
@@ -2883,6 +2917,10 @@ mod tests {
         assert!(error.starts_with("cannot read"), "{error}");
         std::fs::write(&config, r#"{"model_type": "deepseek_v41"}"#).unwrap();
         assert_eq!(Architecture::of(dir.path()), Ok(Architecture::DeepSeek));
+        for kind in ["inkling2_loop", "inkling2_loop_text"] {
+            std::fs::write(&config, format!(r#"{{"model_type": "{kind}"}}"#)).unwrap();
+            assert_eq!(Architecture::of(dir.path()), Ok(Architecture::Inkling2));
+        }
         std::fs::write(
             &config,
             r#"{"model_type": "lfm3_vl", "d1_attention": "set"}"#,
@@ -2997,6 +3035,25 @@ mod tests {
             change(&mut options);
             assert!(options.configure(Architecture::D1).is_err(), "{options:?}");
         }
+    }
+
+    #[test]
+    fn inkling2_allows_drafts_and_lookup_and_rejects_other_family_settings() {
+        let mut options = Options {
+            draft: 7,
+            lookup: 15,
+            ..Default::default()
+        };
+        options.configure(Architecture::Inkling2).unwrap();
+        assert_eq!(options.backend, BackendOptions::Unspecified);
+
+        let mut ds = Options::default();
+        ds.deepseek_mut().unwrap().ced = 512;
+        assert!(ds.configure(Architecture::Inkling2).is_err());
+
+        let mut h3 = Options::default();
+        h3.minimax_h3_mut().unwrap().dit = Some("/m/dit.safetensors".into());
+        assert!(h3.configure(Architecture::Inkling2).is_err());
     }
 
     #[test]

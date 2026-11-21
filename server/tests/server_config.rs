@@ -160,4 +160,28 @@ fn the_search_ranking_model_must_be_a_served_decision_model() {
         assert!(error.contains(refusal), "{error}");
     }
     std::fs::remove_dir_all(&checkpoint).unwrap();
+
+    // Inkling-2-Mini also generates text and cannot rank search results.
+    let inkling =
+        std::env::temp_dir().join(format!("eremite-ranking-inkling2-{}", std::process::id()));
+    std::fs::create_dir_all(&inkling).unwrap();
+    std::fs::write(
+        inkling.join("config.json"),
+        json!({"model_type": "inkling2_loop"}).to_string(),
+    )
+    .unwrap();
+    let config = json!({"port": 0, "host": "127.0.0.1",
+                        "search_ranking_model": "inkling-2-mini",
+                        "models": [{"model": inkling}]});
+    let error = run(
+        "ranking-inkling2",
+        &["--config".into(), "/dev/stdin".into()],
+        Some(config),
+    );
+    assert!(
+        error
+            .contains("search_ranking_model: inkling-2-mini generates text: it makes no decisions"),
+        "{error}"
+    );
+    std::fs::remove_dir_all(&inkling).unwrap();
 }

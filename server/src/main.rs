@@ -39,7 +39,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use eremite_server::chat::{Api, Family, deepseek};
+use eremite_server::chat::{Api, Family, deepseek, inkling2};
 use eremite_server::decision::d1;
 
 /// The fewest characters that the API key has.
@@ -84,6 +84,8 @@ struct Served {
 enum Format {
     /// DeepSeek V4.1's format (chat/deepseek.rs).
     DeepSeek(deepseek::Defaults),
+    /// Inkling-2-Mini's format (chat/inkling2.rs).
+    Inkling2(inkling2::Defaults),
     /// d1's prompt (decision/d1.rs), with the checkpoint's d1 settings. A d1
     /// model is a decision model: it answers questions and generates no text.
     D1(d1::Checkpoint),
@@ -120,7 +122,7 @@ struct Shared {
 /// Returns whether `model` generates text: whether it answers the chat
 /// endpoints.
 fn generates_text(model: &Served) -> bool {
-    matches!(model.format, Format::DeepSeek(_))
+    matches!(model.format, Format::DeepSeek(_) | Format::Inkling2(_))
 }
 
 /// Returns whether `model` is a decision model: whether it answers POST
@@ -341,7 +343,7 @@ fn build_model_object(shared: &Shared, model: &Served) -> Value {
         "id": model.id, "object": "model", "created": shared.started, "owned_by": "eremite",
         "name": model.name, "context_length": model.ctx, "max_model_len": model.ctx,
     });
-    if let Format::DeepSeek(_) = model.format {
+    if matches!(model.format, Format::DeepSeek(_) | Format::Inkling2(_)) {
         object["max_output_tokens"] = (model.ctx as i64).min(chat::DEFAULT_MAX_TOKENS).into();
     }
     object
@@ -358,7 +360,7 @@ async fn list_served_models(State(shared): App) -> Response {
 }
 
 /// Answers GET /v1/codex/models with Codex's model catalog (codex/mod.rs) of
-/// the DeepSeek models. They answer the Responses API that Codex uses.
+/// the served text models that answer the Responses API.
 async fn list_codex_models(State(shared): App) -> Response {
     let models = shared
         .models
@@ -368,7 +370,15 @@ async fn list_codex_models(State(shared): App) -> Response {
                 model_id: &model.id,
                 display_name: &model.name,
                 context_window: model.ctx,
-                default_effort: defaults.is_thinking_on.then_some(defaults.effort),
+                reasoning: codex::CatalogReasoning::DeepSeek(
+                    defaults.is_thinking_on.then_some(defaults.effort),
+                ),
+            }),
+            Format::Inkling2(defaults) => Some(codex::CatalogModel {
+                model_id: &model.id,
+                display_name: &model.name,
+                context_window: model.ctx,
+                reasoning: codex::CatalogReasoning::Inkling2(defaults.effort),
             }),
             Format::D1(_) | Format::MinimaxH3Image(_) | Format::MinimaxH3Video(_) => None,
         });
@@ -503,7 +513,7 @@ async fn answer_decisions(
         let model = &handlers.models[index];
         let Format::D1(checkpoint) = &model.format else {
             let reason = match &model.format {
-                Format::DeepSeek(_) => {
+                Format::DeepSeek(_) | Format::Inkling2(_) => {
                     format!("{} generates text: it makes no decisions", model.id)
                 }
                 Format::MinimaxH3Image(_) => {
@@ -648,7 +658,32 @@ async fn answer_generation(
                 prepared.describe_thinking()
             );
             let (cancel, events) = submit_request(prepared.build_worker_request(index, note)?)?;
-            Ok::<_, chat::Error>((Prepared::DeepSeek(prepared), cancel, events))
+            Ok::<_, chat::Error>((Prepared::DeepSeek(Box::new(prepared)), cancel, events))
+        }
+        Format::Inkling2(defaults) => {
+            let prepared =
+                inkling2::prepare_request(&body, defaults, handlers.models[index].tokenizer, api)?;
+            let note = match api {
+                Api::ChatCompletions => format!(
+                    "{} messages, {} tools",
+                    prepared.message_count, prepared.tool_count
+                ),
+                Api::Responses => format!(
+                    "Responses API: {} input items, {} tools ({} not supported and left out)",
+                    prepared.message_count, prepared.tool_count, prepared.dropped_tool_count
+                ),
+            };
+            let note = format!(
+                "http {arrival} from {from}: {note}, {}; {}",
+                if prepared.is_streamed {
+                    "streamed"
+                } else {
+                    "one response"
+                },
+                prepared.describe_thinking()
+            );
+            let (cancel, events) = submit_request(prepared.build_worker_request(index, note)?)?;
+            Ok::<_, chat::Error>((Prepared::Inkling2(Box::new(prepared)), cancel, events))
         }
         Format::D1(_) => Err(chat::Error::new_bad_request(format!(
             "{} is a decision model: it answers questions and generates no text",
@@ -667,9 +702,16 @@ async fn answer_generation(
     match queued {
         Ok(Ok((Prepared::DeepSeek(prepared), cancel, events))) => {
             if prepared.is_streamed {
-                deepseek::stream_response(prepared, cancel, events, shared.keepalive)
+                deepseek::stream_response(*prepared, cancel, events, shared.keepalive)
             } else {
-                deepseek::collect_response(prepared, cancel, events).await
+                deepseek::collect_response(*prepared, cancel, events).await
+            }
+        }
+        Ok(Ok((Prepared::Inkling2(prepared), cancel, events))) => {
+            if prepared.is_streamed {
+                inkling2::stream_response(*prepared, cancel, events, shared.keepalive)
+            } else {
+                inkling2::collect_response(*prepared, cancel, events).await
             }
         }
         Ok(Err(error)) => refuse_request(&peer, error),
@@ -684,7 +726,9 @@ async fn answer_generation(
 /// A request that its family's chat format prepared for the worker.
 enum Prepared {
     /// A request in DeepSeek V4.1's format.
-    DeepSeek(deepseek::PreparedRequest),
+    DeepSeek(Box<deepseek::PreparedRequest>),
+    /// A request in Inkling-2-Mini's format.
+    Inkling2(Box<inkling2::PreparedRequest>),
 }
 
 /// Finds the served image model named `name` (or the default image model) and
@@ -1347,6 +1391,7 @@ fn main() {
             .unwrap_or_else(|error| die(&error));
         let id = model.id.clone().unwrap_or_else(|| match family {
             Family::DeepSeek => deepseek::DEFAULT_MODEL_ID.into(),
+            Family::Inkling2 => inkling2::DEFAULT_MODEL_ID.into(),
             Family::D1 => d1::derive_model_names(&model.engine.model).0,
             Family::MinimaxH3Image => image::DEFAULT_MODEL_ID.into(),
             Family::MinimaxH3Video => video::DEFAULT_MODEL_ID.into(),
@@ -1381,7 +1426,7 @@ fn main() {
                 .unwrap_or_else(|| die(&format!("search_ranking_model: no model is named {id}")));
             match families[index] {
                 Family::D1 => index,
-                Family::DeepSeek => die(&format!(
+                Family::DeepSeek | Family::Inkling2 => die(&format!(
                     "search_ranking_model: {id} generates text: it makes no decisions"
                 )),
                 Family::MinimaxH3Image => die(&format!(
@@ -1445,6 +1490,7 @@ fn main() {
         let tokenizer = *tokenizer;
         let format = match family {
             Family::DeepSeek => Format::DeepSeek(deepseek::Defaults::new(id.clone())),
+            Family::Inkling2 => Format::Inkling2(inkling2::Defaults::new(id.clone())),
             Family::D1 => Format::D1(
                 d1::Checkpoint::read(&settings.options.model, tokenizer)
                     .unwrap_or_else(|error| die(&error)),
@@ -1460,6 +1506,7 @@ fn main() {
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
+            Family::Inkling2 => inkling2::DISPLAY_NAME.to_string(),
             Family::D1 => d1::derive_model_names(&settings.options.model).1,
             Family::MinimaxH3Image => image::DISPLAY_NAME.to_string(),
             Family::MinimaxH3Video => video::DISPLAY_NAME.to_string(),
@@ -1523,7 +1570,7 @@ fn main() {
                 info: ui::frame::ModelInfo {
                     name: model.id.clone(),
                     kind: match family {
-                        Family::DeepSeek => ui::frame::Kind::Llm,
+                        Family::DeepSeek | Family::Inkling2 => ui::frame::Kind::Llm,
                         Family::D1 => ui::frame::Kind::Decision,
                         Family::MinimaxH3Image => ui::frame::Kind::Image,
                         Family::MinimaxH3Video => ui::frame::Kind::Video,
@@ -1532,6 +1579,7 @@ fn main() {
                 tokenizer: model.tokenizer,
                 find_role: match family {
                     Family::DeepSeek => deepseek::find_role_of_token,
+                    Family::Inkling2 => inkling2::find_role_of_token,
                     // Decision, image and video models keep no sessions whose
                     // text the view shows.
                     Family::D1 | Family::MinimaxH3Image | Family::MinimaxH3Video => |_| None,

@@ -6,23 +6,33 @@
 //! Codex has defaults for a model without catalog metadata. It assumes a
 //! context window of 272,000 tokens. It caps `model_context_window` there. It
 //! offers no `apply_patch` tool to such a model. The catalog gives each
-//! DeepSeek model its served context and Codex's reasoning levels. The server
-//! maps each level to a DeepSeek effort. The catalog also gives Codex's own
-//! instructions and the `apply_patch` tool. Every catalog entry must carry
-//! instructions. Codex rejects a catalog in which an entry has none.
+//! served text model its served context and Codex's reasoning levels. The
+//! server maps each level to that model family's thinking effort. The catalog
+//! also gives Codex's own instructions and the `apply_patch` tool. Every
+//! catalog entry must carry instructions. Codex rejects a catalog in which an
+//! entry has none.
 
 pub mod search;
 
 use serde_json::{Value, json};
 
 use crate::chat::deepseek::{EFFORT_HIGH, EFFORT_LOW, EFFORT_MAX};
+use crate::chat::inkling2;
 
 /// Codex's instructions for a model without its own: `prompt.md` of Codex
 /// 0.167.2. assets/codex/README.md says where the file comes from and how to
 /// update it.
 pub const INSTRUCTIONS: &str = include_str!("../../assets/codex/prompt.md");
 
-/// A model in the catalog: a DeepSeek model that answers the Responses API.
+/// A served model family's reasoning effort settings for Codex's catalog.
+pub enum CatalogReasoning {
+    /// DeepSeek V4.1 reasoning effort (1 to 100, or None when thinking is off).
+    DeepSeek(Option<u32>),
+    /// Inkling-2-Mini reasoning effort in 0.0..=0.99.
+    Inkling2(f64),
+}
+
+/// A model in the catalog: a text model that answers the Responses API.
 pub struct CatalogModel<'a> {
     /// The model's id. Codex calls it the slug.
     pub model_id: &'a str,
@@ -30,9 +40,8 @@ pub struct CatalogModel<'a> {
     pub display_name: &'a str,
     /// The number of tokens in the model's context.
     pub context_window: usize,
-    /// The effort that a request without one gets. None means thinking is off
-    /// by default.
-    pub default_effort: Option<u32>,
+    /// The model family's default reasoning effort and supported levels.
+    pub reasoning: CatalogReasoning,
 }
 
 /// Chooses Codex's reasoning level for a DeepSeek effort.
@@ -48,19 +57,53 @@ fn choose_reasoning_level(effort: Option<u32>) -> &'static str {
     }
 }
 
+/// Chooses Codex's reasoning level for an Inkling-2-Mini effort in 0.0..=0.99.
+fn choose_inkling2_reasoning_level(effort: f64) -> &'static str {
+    if effort <= inkling2::EFFORT_NONE {
+        "none"
+    } else if effort <= inkling2::EFFORT_MINIMAL {
+        "minimal"
+    } else if effort <= inkling2::EFFORT_LOW {
+        "low"
+    } else if effort <= inkling2::EFFORT_MEDIUM {
+        "medium"
+    } else if effort <= inkling2::EFFORT_HIGH {
+        "high"
+    } else {
+        "xhigh"
+    }
+}
+
 /// Builds the catalog entry of `model` in the form of Codex's `ModelInfo`.
 pub fn build_catalog_entry(model: &CatalogModel) -> Value {
+    let (default_level, supported_levels) = match model.reasoning {
+        CatalogReasoning::DeepSeek(effort) => (
+            choose_reasoning_level(effort),
+            json!([
+                {"effort": "none", "description": "Thinking off"},
+                {"effort": "low", "description": format!("DeepSeek reasoning effort {EFFORT_LOW}")},
+                {"effort": "high", "description": format!("DeepSeek reasoning effort {EFFORT_HIGH}")},
+                {"effort": "max", "description": format!("DeepSeek reasoning effort {EFFORT_MAX}")},
+            ]),
+        ),
+        CatalogReasoning::Inkling2(effort) => (
+            choose_inkling2_reasoning_level(effort),
+            json!([
+                {"effort": "none", "description": "Thinking off"},
+                {"effort": "minimal", "description": format!("Inkling-2-Mini reasoning effort {}", inkling2::EFFORT_MINIMAL)},
+                {"effort": "low", "description": format!("Inkling-2-Mini reasoning effort {}", inkling2::EFFORT_LOW)},
+                {"effort": "medium", "description": format!("Inkling-2-Mini reasoning effort {}", inkling2::EFFORT_MEDIUM)},
+                {"effort": "high", "description": format!("Inkling-2-Mini reasoning effort {}", inkling2::EFFORT_HIGH)},
+                {"effort": "xhigh", "description": format!("Inkling-2-Mini reasoning effort {}", inkling2::EFFORT_MAX)},
+            ]),
+        ),
+    };
     json!({
         "slug": model.model_id,
         "display_name": model.display_name,
         "description": "Served by eremite",
-        "default_reasoning_level": choose_reasoning_level(model.default_effort),
-        "supported_reasoning_levels": [
-            {"effort": "none", "description": "Thinking off"},
-            {"effort": "low", "description": format!("DeepSeek reasoning effort {EFFORT_LOW}")},
-            {"effort": "high", "description": format!("DeepSeek reasoning effort {EFFORT_HIGH}")},
-            {"effort": "max", "description": format!("DeepSeek reasoning effort {EFFORT_MAX}")},
-        ],
+        "default_reasoning_level": default_level,
+        "supported_reasoning_levels": supported_levels,
         // The fields below keep the values of Codex's fallback model.
         // The model gives no reason to change them.
         "shell_type": "unified_exec",
@@ -116,7 +159,7 @@ mod tests {
             model_id: "deepseek-v4.1-flash",
             display_name: "DeepSeek V4.1 Flash (eremite)",
             context_window: 1_048_576,
-            default_effort: Some(75),
+            reasoning: CatalogReasoning::DeepSeek(Some(75)),
         }]);
         let entry = &catalog["models"][0];
         assert_eq!(entry["slug"], "deepseek-v4.1-flash");
@@ -156,5 +199,35 @@ mod tests {
         assert_eq!(choose_reasoning_level(Some(75)), "high");
         assert_eq!(choose_reasoning_level(Some(62)), "high");
         assert_eq!(choose_reasoning_level(Some(100)), "max");
+    }
+
+    #[test]
+    fn inkling2_catalog_entry_carries_its_reasoning_levels_and_apply_patch() {
+        let catalog = build_catalog([CatalogModel {
+            model_id: inkling2::DEFAULT_MODEL_ID,
+            display_name: inkling2::DISPLAY_NAME,
+            context_window: 1_048_576,
+            reasoning: CatalogReasoning::Inkling2(inkling2::EFFORT_HIGH),
+        }]);
+        let entry = &catalog["models"][0];
+        assert_eq!(entry["slug"], "inkling-2-mini");
+        assert_eq!(entry["default_reasoning_level"], "high");
+        assert_eq!(entry["apply_patch_tool_type"], "freeform");
+        let levels: Vec<&str> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            levels,
+            ["none", "minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(choose_inkling2_reasoning_level(0.0), "none");
+        assert_eq!(choose_inkling2_reasoning_level(0.1), "minimal");
+        assert_eq!(choose_inkling2_reasoning_level(0.2), "low");
+        assert_eq!(choose_inkling2_reasoning_level(0.7), "medium");
+        assert_eq!(choose_inkling2_reasoning_level(0.9), "high");
+        assert_eq!(choose_inkling2_reasoning_level(0.99), "xhigh");
     }
 }

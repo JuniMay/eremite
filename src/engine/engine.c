@@ -301,6 +301,10 @@ eremite_model *eremite_open(const eremite_config *c) {
           ? "video default_steps is out of range"
       : !ops->generate_video && has_minimax_h3_video
           ? "video checkpoint paths apply to video models only"
+      : ops != &deepseek_ops && !ops->decide && !ops->generate_image &&
+              !ops->generate_video && has_deepseek
+          ? "experts, ced, substitute and packed state rows apply to "
+            "DeepSeek models only"
       : options.draft < 0 || options.draft > ops->max_drafts
           ? "draft exceeds this model's proposal limit"
       : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
