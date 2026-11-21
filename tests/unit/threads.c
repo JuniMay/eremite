@@ -90,6 +90,11 @@ int main(void) {
   threads_async(NULL, THREADS_INITIATED, event, signal_event);
   threads_event_wait(event);
   check(1, "a wait ends when another thread signals the event");
+  check(!threads_event_wait_for(event, 0.005),
+        "a timed wait returns 0 when no signal arrives");
+  threads_event_signal(event);
+  check(threads_event_wait_for(event, 1.0) && !threads_event_take(event),
+        "a timed wait takes a pending signal and returns 1 immediately");
 
   ThreadsGroup *notified = threads_group_new();
   threads_group_notify(notified, event);
