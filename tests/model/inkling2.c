@@ -2,6 +2,8 @@
 #include "base/clock.h"
 #include "base/error.h"
 #include "eremite.h"
+#include "platform/image.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +49,26 @@ static const char GOLDEN_COMPLETION[] =
     "<|message_model|><|content_thinking|>The user asks for one sentence "
     "explanation why sky is usually blue. Need answer concise. Need ensure "
     "accuracy: Rayleigh scattering: shorter blue";
+static const char IMAGE_PROMPT[] =
+    "<|message_system|><|content_text|>Thinking effort level: 0"
+    "<|end_message|><|message_user|><|content_image|><|unused_200054|>"
+    "<|end_message|><|message_user|><|content_text|>"
+    "What color is this image? Answer in one word.<|end_message|>";
+static constexpr int IMAGE_SIDE = 160;
+static constexpr int IMAGE_GEN_STEPS = 48;
+
+// Returns whether haystack contains needle case-insensitively.
+static int contains_ci(const char *haystack, const char *needle) {
+  size_t nlen = strlen(needle);
+  for (const char *p = haystack; *p; p++) {
+    size_t k = 0;
+    while (k < nlen &&
+           tolower((unsigned char)p[k]) == tolower((unsigned char)needle[k]))
+      k++;
+    if (k == nlen) return 1;
+  }
+  return 0;
+}
 
 // Returns the token ID with the largest logit.
 static int32_t argmax(const float *logits, int vocab) {
@@ -206,7 +228,61 @@ int main(int argc, char **argv) {
   check(argmax(after_acc, vocab) == gen[3],
         "accept + rewind continues with matching next token");
 
-  // 6. Measure 512-token prefill and 32-token single-stream decode speed.
+  // 6. Live multimodal vision check on a synthetic 160x160 solid red PNG.
+  uint8_t *red_rgb = xmalloc((size_t)IMAGE_SIDE * IMAGE_SIDE * 3);
+  for (int i = 0; i < IMAGE_SIDE * IMAGE_SIDE; i++) {
+    red_rgb[i * 3 + 0] = 255;
+    red_rgb[i * 3 + 1] = 0;
+    red_rgb[i * 3 + 2] = 0;
+  }
+  size_t png_len = 0;
+  const char *ierr = NULL;
+  uint8_t *png =
+      image_encode_png(red_rgb, IMAGE_SIDE, IMAGE_SIDE, &png_len, &ierr);
+  free(red_rgb);
+  check(png != NULL, "synthetic red PNG encodes");
+  const uint8_t *png_arr[1] = {png};
+  size_t len_arr[1] = {png_len};
+  char merr[128] = "";
+  eremite_media *med =
+      eremite_media_open(m, png_arr, len_arr, 1, merr, sizeof merr);
+  check(med != NULL, "eremite_media_open accepts PNG for Inkling-2-Mini");
+  int32_t img_raw[MAX_TOKENS], img_exp[MAX_TOKENS];
+  int n_iraw = eremite_tokenize(tk, IMAGE_PROMPT, strlen(IMAGE_PROMPT), 1,
+                                img_raw, MAX_TOKENS);
+  int n_iexp = eremite_media_expand(med, img_raw, n_iraw, img_exp, MAX_TOKENS);
+  check(n_iexp == n_iraw + 15,
+        "160x160 image expands 1 placeholder into 16 (4x4) image tokens");
+  double tv0 = now();
+  int encoded = eremite_media_encode(med, 0);
+  double tv = now() - tv0;
+  check(encoded == 1, "eremite_media_encode runs 23-layer ViT + projector");
+  eremite_state *s_vis = eremite_state_new(m);
+  const float *v_lg =
+      eremite_prefill(m, s_vis, img_exp, n_iexp, 0, 0, -1, NULL, NULL, med);
+  char vtext[1024] = "";
+  size_t vlen = 0;
+  for (int step = 0; step < IMAGE_GEN_STEPS; step++) {
+    int32_t id = argmax(v_lg, vocab);
+    if (eremite_is_stop_token(m, id)) break;
+    size_t plen = 0;
+    const char *piece = eremite_token_bytes(tk, id, &plen);
+    if (piece && plen > 0 && vlen + plen < sizeof vtext) {
+      memcpy(vtext + vlen, piece, plen);
+      vlen += plen;
+      vtext[vlen] = '\0';
+    }
+    int32_t pos = n_iexp + step;
+    v_lg = eremite_decode_rows(m, &s_vis, &id, &pos, 1);
+  }
+  printf("vision encode %.3f s, reply: %s\n", tv, vtext);
+  check(contains_ci(vtext, "red"),
+        "multimodal vision reply identifies solid red image");
+  eremite_state_free(m, s_vis);
+  eremite_media_close(med);
+  free(png);
+
+  // 7. Measure 512-token prefill and 32-token single-stream decode speed.
   int32_t bench_ids[BENCH_PROMPT_TOKENS];
   for (int i = 0; i < BENCH_PROMPT_TOKENS; i++)
     bench_ids[i] = prompt_ids[i % n_prompt];

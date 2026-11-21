@@ -1,4 +1,5 @@
 #include "model/inkling2/model.h"
+#include "model/inkling2/vision.h"
 #include "base/clock.h"
 #include "base/error.h"
 #include "base/file.h"
@@ -53,6 +54,7 @@ static constexpr int LOGITS_STRIDE = 200064;
 static constexpr int DEFAULT_CTX = 8192;
 static constexpr size_t ALIGN_READ_MIN_BYTES = 1u << 20;
 static constexpr size_t ALIGN_MASK = 15u;
+static constexpr uint32_t BF16_SHIFT = 16;
 static constexpr size_t PASS_STACK_BYTES = 4u << 20;
 static constexpr size_t PATH_CAP = 1024;
 
@@ -354,6 +356,8 @@ static Ink2Work work;
 static uint64_t last_committed;
 static float *logits_compact;
 static int logits_compact_rows;
+static const Media *prefill_media;
+static int prefill_media_count;
 
 // Compiled Metal kernel handles.
 static int K_mv_bf16, K_mv_bf16_3, K_mvm_bf16, K_mvm_bf16_3, K_mm_bf16;
@@ -1937,6 +1941,34 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   run_add(cmd, &work.residual, &work.cur, &work.cur, (uint32_t)row_floats, 1);
 }
 
+// Returns the encoded BF16 feature row for prompt position `pos` inside an
+// image span.
+static const uint16_t *find_media_row(int pos) {
+  for (int i = 0; i < prefill_media_count; i++) {
+    const Media *im = &prefill_media[i];
+    int j = pos - im->start;
+    if (j < 0 || j >= im->ntokens) continue;
+    if (!im->rows) die("image at position %d was not encoded", im->start);
+    return im->rows + (size_t)j * INK2_DIM;
+  }
+  die("position %d: negative media token outside registered images", pos);
+}
+
+// Unpacks encoded BF16 image feature rows into work.cur for any negative
+// placeholder tokens in [pos0, pos0 + rows). ink2_embed_norm skips id < 0.
+static void inject_media_rows(const int *tokens, int pos0, int rows) {
+  float *cur = (float *)work.cur.ptr;
+  for (int r = 0; r < rows; r++) {
+    if (tokens[r] >= 0) continue;
+    const uint16_t *src = find_media_row(pos0 + r);
+    float *dst = cur + (size_t)r * INK2_DIM;
+    for (int d = 0; d < INK2_DIM; d++) {
+      uint32_t bits = (uint32_t)src[d] << BF16_SHIFT;
+      memcpy(&dst[d], &bits, sizeof(float));
+    }
+  }
+}
+
 // Runs the complete 48-visit Inkling-2-Mini forward pass over `rows` tokens.
 // Computes logits for all `rows` rows when `logits_mode == 2`, for the last
 // row only when `logits_mode == 1`, or skips unembed when `logits_mode == 0`.
@@ -1989,6 +2021,7 @@ static void run_forward(Ink2State *const *states, const int *tokens,
   } else {
     state_ensure_cap(states[0], pos0 + rows);
     max_pos = pos0 + rows - 1;
+    inject_media_rows(tokens, pos0, rows);
   }
 
   size_t row_floats = (size_t)rows * INK2_DIM;
@@ -2143,6 +2176,7 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     text_weights =
         weight_group_new(gpu, work_mem->account, "Inkling-2-Mini weights");
     register_text_weights();
+    inkling2_vision_init(gpu, work_mem, checkpoint, text_weights);
     required_bytes = weight_group_required_bytes(text_weights) +
                      estimate_work_bytes(PREFILL_CHUNK);
   }
@@ -2322,6 +2356,12 @@ static void ink2_render_chat_turn(char *text, size_t cap, const char *prompt,
            "<|message_user|><|content_text|>%s<|end_message|>", prompt);
 }
 
+// Records the encoded media items whose spans appear in subsequent prefills.
+static void ink2_set_prefill_media(const Media *im, int n) {
+  prefill_media = im;
+  prefill_media_count = n;
+}
+
 // Creates a cooperative pass with its own workspace, submission sequence and
 // packed logits buffer.
 static Pass *ink2_pass_new(void (*body)(void *), void *argument) {
@@ -2329,7 +2369,9 @@ static Pass *ink2_pass_new(void (*body)(void *), void *argument) {
       {&work, sizeof work},
       {&last_committed, sizeof last_committed},
       {&logits_compact, sizeof logits_compact},
-      {&logits_compact_rows, sizeof logits_compact_rows}};
+      {&logits_compact_rows, sizeof logits_compact_rows},
+      {&prefill_media, sizeof prefill_media},
+      {&prefill_media_count, sizeof prefill_media_count}};
   Pass *pass = pass_new(body, argument, PASS_STACK_BYTES);
   pass_set_variables(pass, variables, sizeof variables / sizeof *variables);
   return pass;
@@ -2341,6 +2383,8 @@ static void ink2_pass_begin(void) {
   last_committed = 0;
   logits_compact = NULL;
   logits_compact_rows = 0;
+  prefill_media = NULL;
+  prefill_media_count = 0;
 }
 
 // Syncs and releases pass-local scratch buffers when a pass ends.
@@ -2388,6 +2432,9 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .verify = ink2_verify,
                                .accept = ink2_accept,
                                .run_idle_work = ink2_run_idle_work,
+                               .prepare_media = inkling2_prepare_media,
+                               .encode_media = inkling2_encode_media,
+                               .set_prefill_media = ink2_set_prefill_media,
                                .render_chat_turn = ink2_render_chat_turn,
                                .pass_new = ink2_pass_new,
                                .pass_begin = ink2_pass_begin,

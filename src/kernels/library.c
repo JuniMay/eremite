@@ -32,6 +32,8 @@ static const char source[] = {
 #embed "minimax_h3_video_vae.metal"
     , '\n',
 #embed "inkling2.metal"
+    , '\n',
+#embed "inkling2_vision.metal"
 };
 
 const char *kernel_library_source(size_t *length) {
