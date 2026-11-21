@@ -105,6 +105,10 @@ pub struct Request {
     pub images_requested: u64,
     /// The images finished so far for an image request.
     pub generated_images: u64,
+    /// The videos requested by a video request; 0 for other requests.
+    pub videos_requested: u64,
+    /// The videos finished so far for a video request.
+    pub generated_videos: u64,
     /// The experts of its latest tokens, the oldest first.
     pub routes: Vec<Route>,
 }
@@ -199,6 +203,11 @@ pub struct Totals {
     /// The seconds that the ended requests spent denoising, decoding and
     /// encoding images.
     pub image_seconds: f64,
+    /// The videos that the ended requests generated.
+    pub generated_videos: u64,
+    /// The seconds that the ended requests spent denoising, VAE decoding and
+    /// muxing videos.
+    pub video_seconds: f64,
 }
 
 /// A model's decoding counters since the start.
@@ -253,6 +262,18 @@ pub struct Counters {
     pub image_step: u64,
     /// Total denoising steps in the active image call, or 0 outside denoising.
     pub image_steps_total: u64,
+    /// Videos generated since the model opened.
+    pub generated_videos: u64,
+    /// Video denoising steps finished since the model opened.
+    pub video_steps: u64,
+    /// Seconds spent denoising, VAE decoding and muxing videos.
+    pub video_seconds: f64,
+    /// Active video generation stage (0 none, 1 prefill, 2 generating).
+    pub video_stage: u64,
+    /// Active 1-based video denoising step, or 0 outside denoising.
+    pub video_step: u64,
+    /// Total denoising steps in the active video call, or 0 outside denoising.
+    pub video_steps_total: u64,
     /// The bytes of experts read since the start, counted as each read ends.
     pub expert_read_bytes: u64,
     /// The bytes of the experts mapped for the GPU.

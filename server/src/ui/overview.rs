@@ -184,6 +184,16 @@ fn build_request_lines(screen: &Screen, width: usize, rows: usize) -> Vec<Line<'
                 "{} of {} {unit}",
                 request.generated_images, request.images_requested
             )
+        } else if request.videos_requested > 0 {
+            let unit = if request.videos_requested == 1 {
+                "video"
+            } else {
+                "videos"
+            };
+            format!(
+                "{} of {} {unit}",
+                request.generated_videos, request.videos_requested
+            )
         } else {
             format!("{} tokens", format_count(tokens as f64))
         };
@@ -219,6 +229,13 @@ fn describe_activity(theme: &Theme, status: &ModelStatus, request: &Request) -> 
             plain(counters.image_step.to_string()),
             label(theme, " of "),
             plain(counters.image_steps_total.to_string()),
+        ],
+        Activity::Generating if counters.video_step > 0 && counters.video_steps_total > 0 => vec![
+            colored(theme, theme.green, "generating"),
+            label(theme, ", step "),
+            plain(counters.video_step.to_string()),
+            label(theme, " of "),
+            plain(counters.video_steps_total.to_string()),
         ],
         Activity::Generating => vec![colored(theme, theme.green, "generating")],
     }
@@ -792,6 +809,67 @@ mod tests {
             .collect();
         assert!(row.contains("generating, step 3 of 6"), "{row}");
         assert!(row.contains("2 of 4 images"), "{row}");
+        assert!(!row.contains("tok/s"), "{row}");
+        assert!(!row.contains("tokens"), "{row}");
+    }
+
+    #[test]
+    fn video_requests_show_generating_step_and_video_progress_not_tokens() {
+        let models = [ModelInfo {
+            name: "minimax-h3-video".into(),
+            kind: Kind::Video,
+        }];
+        let status: ModelStatus = serde_json::from_str(
+            r#"{
+                "loaded": true,
+                "phase": "generating",
+                "requests": [{
+                    "request": 12,
+                    "status": "generating",
+                    "session": null,
+                    "prompt_tokens": 158,
+                    "reused_tokens": 0,
+                    "generated_tokens": 0,
+                    "images_requested": 0,
+                    "generated_images": 0,
+                    "videos_requested": 1,
+                    "generated_videos": 0,
+                    "routes": []
+                }],
+                "engine_counters": {
+                    "layers": 64,
+                    "video_stage": 2,
+                    "video_step": 2,
+                    "video_steps_total": 4
+                }
+            }"#,
+        )
+        .expect("video model status JSON");
+        let statuses = [status];
+        let mut samples = Samples::new(WINDOWS);
+        samples.add_sample(0.0, &statuses);
+        samples.add_sample(0.5, &statuses);
+        let latest = samples.samples.back().unwrap();
+        assert_eq!(latest.models[0].decoding, None);
+        assert_eq!(latest.models[0].prefill, None);
+        let screen = Screen {
+            theme: &DARK,
+            address: "127.0.0.1:8008",
+            uptime_seconds: 12.0,
+            models: &models,
+            statuses: &statuses,
+            samples: &samples,
+            home: "",
+            session_text: None,
+        };
+        let lines = build_request_lines(&screen, 140, 10);
+        let row: String = lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(row.contains("generating, step 2 of 4"), "{row}");
+        assert!(row.contains("0 of 1 video"), "{row}");
         assert!(!row.contains("tok/s"), "{row}");
         assert!(!row.contains("tokens"), "{row}");
     }

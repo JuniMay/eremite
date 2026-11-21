@@ -187,13 +187,17 @@ static char *copy(const char *s) { return s ? strdup(s) : 0; }
 // Maximum path buffer length in bytes when locating a model's tokenizer.
 static constexpr size_t MODEL_PATH_CAP = 2048;
 
-// Resolves dir or dir/tokenizer for a model whose tokenizer.json sits in a
-// tokenizer subfolder.
+// Resolves dir, dir/tokenizer or dir/processor for a model's tokenizer.json.
 static Tokenizer *open_model_tokenizer(const char *dir, const char *media) {
   char path[MODEL_PATH_CAP];
   snprintf(path, sizeof path, "%s/tokenizer.json", dir);
   if (access(path, R_OK) == 0) return tokenizer_open(dir, media);
-  snprintf(path, sizeof path, "%s/tokenizer", dir);
+  snprintf(path, sizeof path, "%s/tokenizer/tokenizer.json", dir);
+  if (access(path, R_OK) == 0) {
+    snprintf(path, sizeof path, "%s/tokenizer", dir);
+    return tokenizer_open(path, media);
+  }
+  snprintf(path, sizeof path, "%s/processor", dir);
   return tokenizer_open(path, media);
 }
 
@@ -202,9 +206,14 @@ eremite_model *eremite_open(const eremite_config *c) {
   const ModelOps *ops = model_find_family(c->model);
   const eremite_deepseek_config *d = &c->deepseek;
   const eremite_minimax_h3_config *h3 = &c->minimax_h3;
+  const eremite_minimax_h3_video_config *hv = &c->minimax_h3_video;
   int has_deepseek =
       d->experts || d->ced || d->substitute != 0 || d->packed_state_rows;
   int has_minimax_h3 = h3->text_encoder || h3->dit || h3->vae;
+  int has_minimax_h3_video =
+      hv->text_encoder || hv->dit || hv->vae || hv->audio_vae || hv->lora ||
+      hv->lora_strength != 0 || hv->default_steps != 0 ||
+      hv->shift_video != 0 || hv->shift_audio != 0 || hv->variant != 0;
   Options options = {.ctx = c->ctx,
                      .lookup = c->lookup,
                      .dump_fd = -1,
@@ -218,9 +227,28 @@ eremite_model *eremite_open(const eremite_config *c) {
     has_image_limits = 1;
     if (options.ctx == 0) options.ctx = img_limits.max_prompt_tokens;
   }
+  VideoLimits vid_limits = {0};
+  int has_video_limits = 0;
+  if (ops->read_video_limits) {
+    ops->read_video_limits(&vid_limits);
+    has_video_limits = 1;
+    if (options.ctx == 0) options.ctx = vid_limits.max_prompt_tokens;
+  }
   if (ops->generate_image) {
     options.minimax_h3_image = (MinimaxH3ImageOptions){
         .text_encoder = h3->text_encoder, .dit = h3->dit, .vae = h3->vae};
+  } else if (ops->generate_video) {
+    options.minimax_h3_video =
+        (MinimaxH3VideoOptions){.text_encoder = hv->text_encoder,
+                                .dit = hv->dit,
+                                .vae = hv->vae,
+                                .audio_vae = hv->audio_vae,
+                                .lora = hv->lora,
+                                .lora_strength = hv->lora_strength,
+                                .default_steps = hv->default_steps,
+                                .shift_video = hv->shift_video,
+                                .shift_audio = hv->shift_audio,
+                                .variant = (VideoVariant)hv->variant};
   } else {
     options.deepseek =
         (DeepSeekOptions){.substitute = d->substitute,
@@ -233,24 +261,52 @@ eremite_model *eremite_open(const eremite_config *c) {
       options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"
       : has_image_limits && options.ctx > img_limits.max_prompt_tokens
           ? "ctx exceeds this model's prompt token limit"
+      : has_video_limits && options.ctx > vid_limits.max_prompt_tokens
+          ? "ctx exceeds this model's prompt token limit"
       : ops->decide && (options.draft || options.lookup || has_deepseek ||
-                        has_minimax_h3)
+                        has_minimax_h3 || has_minimax_h3_video)
           ? "a decision model takes no drafts, lookup, experts, "
-            "ced, substitute, packed state rows or image checkpoint paths"
-      : ops->generate_image && (options.draft || options.lookup || has_deepseek)
+            "ced, substitute, packed state rows or media checkpoint paths"
+      : ops->generate_image && (options.draft || options.lookup ||
+                                has_deepseek || has_minimax_h3_video)
           ? "an image model takes no drafts, lookup, experts, "
-            "ced, substitute or packed state rows"
+            "ced, substitute, packed state rows or video checkpoint paths"
       : ops->generate_image &&
               (!h3->text_encoder || !h3->text_encoder[0] || !h3->dit ||
                !h3->dit[0] || !h3->vae || !h3->vae[0])
           ? "an image model requires text_encoder, dit and vae paths"
       : !ops->generate_image && has_minimax_h3
-          ? "text_encoder, dit and vae apply to image models only"
+          ? "image text_encoder, dit and vae apply to image models only"
+      : ops->generate_video && (options.draft || options.lookup ||
+                                has_deepseek || has_minimax_h3)
+          ? "a video model takes no drafts, lookup, experts, "
+            "ced, substitute, packed state rows or image checkpoint paths"
+      : ops->generate_video &&
+              (!hv->text_encoder || !hv->text_encoder[0] || !hv->dit ||
+               !hv->dit[0] || !hv->vae || !hv->vae[0] || !hv->audio_vae ||
+               !hv->audio_vae[0])
+          ? "a video model requires text_encoder, dit, vae and audio_vae paths"
+      : ops->generate_video && (hv->variant != EREMITE_VIDEO_VARIANT_FL2VA &&
+                                hv->variant != EREMITE_VIDEO_VARIANT_REF2VA)
+          ? "video variant must be FL2VA or REF2VA"
+      : ops->generate_video &&
+              (!isfinite(hv->lora_strength) || hv->lora_strength < 0 ||
+               !isfinite(hv->shift_video) || hv->shift_video < 0 ||
+               !isfinite(hv->shift_audio) || hv->shift_audio < 0)
+          ? "video lora_strength, shift_video and shift_audio must be "
+            "non-negative"
+      : ops->generate_video && hv->default_steps != 0 &&
+              (hv->default_steps < vid_limits.min_steps ||
+               hv->default_steps > vid_limits.max_steps)
+          ? "video default_steps is out of range"
+      : !ops->generate_video && has_minimax_h3_video
+          ? "video checkpoint paths apply to video models only"
       : options.draft < 0 || options.draft > BLOCK
           ? "draft exceeds this model's proposal limit"
       : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
           ? "lookup takes off or 1 to 15 proposals"
-      : !ops->generate_image && d->ced && (d->ced < WINDOW || d->ced > 1 << 20)
+      : !ops->generate_image && !ops->generate_video && d->ced &&
+              (d->ced < WINDOW || d->ced > 1 << 20)
           ? "ced takes off or 128 to 1048576 replay tokens"
       : !isfinite(c->memory_gb) || c->memory_gb < 0
           ? "memory takes 0 (none) or a GiB limit"
@@ -273,6 +329,14 @@ eremite_model *eremite_open(const eremite_config *c) {
         copy(options.minimax_h3_image.text_encoder);
     x->opt.minimax_h3_image.dit = copy(options.minimax_h3_image.dit);
     x->opt.minimax_h3_image.vae = copy(options.minimax_h3_image.vae);
+  } else if (ops->generate_video) {
+    x->opt.minimax_h3_video.text_encoder =
+        copy(options.minimax_h3_video.text_encoder);
+    x->opt.minimax_h3_video.dit = copy(options.minimax_h3_video.dit);
+    x->opt.minimax_h3_video.vae = copy(options.minimax_h3_video.vae);
+    x->opt.minimax_h3_video.audio_vae =
+        copy(options.minimax_h3_video.audio_vae);
+    x->opt.minimax_h3_video.lora = copy(options.minimax_h3_video.lora);
   } else {
     x->opt.deepseek.experts = copy(options.deepseek.experts);
   }
@@ -322,6 +386,9 @@ int eremite_load(eremite_model *m) {
         m->opt.ctx);
   else if (!was_loaded && m->ops->generate_image)
     say("%s: %s image model, prompt limit %d tokens", m->dir, m->ops->family,
+        m->opt.ctx);
+  else if (!was_loaded && m->ops->generate_video)
+    say("%s: %s video model, prompt limit %d tokens", m->dir, m->ops->family,
         m->opt.ctx);
   else if (!was_loaded)
     say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
@@ -496,7 +563,108 @@ void eremite_image_result_free(eremite_image_result *result) {
   memset(result, 0, sizeof *result);
 }
 
-// Ends the program for a decision or image model: neither keeps attention
+int eremite_is_video_model(const eremite_model *m) {
+  return m->ops->generate_video != NULL;
+}
+
+int eremite_video_model_limits(const eremite_model *m,
+                               eremite_video_limits *out) {
+  if (!m || !out || !m->ops->read_video_limits) return 0;
+  VideoLimits lim = {0};
+  m->ops->read_video_limits(&lim);
+  const MinimaxH3VideoOptions *vo = &m->opt.minimax_h3_video;
+  lim.variant = vo->variant;
+  if (vo->default_steps > 0) lim.default_steps = vo->default_steps;
+  if (vo->shift_video > 0.0) lim.default_shift_video = vo->shift_video;
+  if (vo->shift_audio > 0.0) lim.default_shift_audio = vo->shift_audio;
+  *out = (eremite_video_limits){.max_prompt_tokens = lim.max_prompt_tokens,
+                                .patch_px = lim.patch_px,
+                                .max_dim = lim.max_dim,
+                                .default_width = lim.default_width,
+                                .default_height = lim.default_height,
+                                .max_canvas_area = lim.max_canvas_area,
+                                .fps = lim.fps,
+                                .min_frames = lim.min_frames,
+                                .max_frames = lim.max_frames,
+                                .default_frames = lim.default_frames,
+                                .min_seconds = lim.min_seconds,
+                                .max_seconds = lim.max_seconds,
+                                .default_seconds = lim.default_seconds,
+                                .min_steps = lim.min_steps,
+                                .max_steps = lim.max_steps,
+                                .default_steps = lim.default_steps,
+                                .max_ref_images = lim.max_ref_images,
+                                .max_ref_videos = lim.max_ref_videos,
+                                .max_ref_audios = lim.max_ref_audios,
+                                .max_total_refs = lim.max_total_refs,
+                                .variant = (int)lim.variant,
+                                .guidance_scale = lim.guidance_scale,
+                                .default_shift_video = lim.default_shift_video,
+                                .default_shift_audio = lim.default_shift_audio};
+  return 1;
+}
+
+// Converts an eremite_video_request and runs the video model's generation pass.
+static int run_video_generation(eremite_model *m,
+                                const eremite_video_request *request,
+                                const PassWait *wait, const int *cancelled,
+                                eremite_video_result *out) {
+  if (!m->ops->generate_video) die("%s: not a video model", m->dir);
+  static_assert(sizeof(eremite_video_media_input) == sizeof(VideoMediaInput),
+                "video media input structs match");
+  static_assert(sizeof(out->error) == VIDEO_ERROR_BYTES,
+                "video error buffers match");
+  VideoRequest req = {
+      .prompt = request->prompt,
+      .width = request->width,
+      .height = request->height,
+      .seconds = request->seconds,
+      .frames = request->frames,
+      .steps = request->steps,
+      .shift_video = request->shift_video,
+      .shift_audio = request->shift_audio,
+      .seed = request->seed,
+      .first_frame = {.data = request->first_frame.data,
+                      .len = request->first_frame.len},
+      .last_frame = {.data = request->last_frame.data,
+                     .len = request->last_frame.len},
+      .ref_images = (const VideoMediaInput *)request->ref_images,
+      .ref_image_count = request->ref_image_count,
+      .ref_videos = (const VideoMediaInput *)request->ref_videos,
+      .ref_video_audios = (const VideoMediaInput *)request->ref_video_audios,
+      .ref_video_count = request->ref_video_count,
+      .ref_audios = (const VideoMediaInput *)request->ref_audios,
+      .ref_audio_count = request->ref_audio_count,
+      .ref_image_max = request->ref_image_max};
+  VideoResult res = {0};
+  int ok = m->ops->generate_video(&req, wait, cancelled, &res);
+  out->data = res.data;
+  out->len = res.len;
+  out->width = res.width;
+  out->height = res.height;
+  out->frames = res.frames;
+  out->fps = res.fps;
+  memcpy(out->error, res.error, sizeof out->error);
+  out->invalid_input = res.invalid_input;
+  out->prompt_tokens = res.prompt_tokens;
+  out->prefill_seconds = res.prefill_seconds;
+  out->video_seconds = res.video_seconds;
+  return ok;
+}
+
+int eremite_generate_video(eremite_model *m,
+                           const eremite_video_request *request,
+                           eremite_video_result *out) {
+  return run_video_generation(m, request, NULL, NULL, out);
+}
+
+void eremite_video_result_free(eremite_video_result *result) {
+  if (!result) return;
+  free(result->data);
+  memset(result, 0, sizeof *result);
+}
+
+// Ends the program for a decision, image or video model: none keeps attention
 // states or runs prefills, decoding or drafts.
 static void require_states(const eremite_model *m) {
   if (m->ops->decide)
@@ -505,6 +673,9 @@ static void require_states(const eremite_model *m) {
         m->dir);
   if (m->ops->generate_image)
     die("%s: an image model keeps no states and runs no prefills or decoding",
+        m->dir);
+  if (m->ops->generate_video)
+    die("%s: a video model keeps no states and runs no prefills or decoding",
         m->dir);
 }
 
@@ -667,6 +838,7 @@ typedef enum {
   STREAM_VERIFY,
   STREAM_DECIDE,
   STREAM_IMAGE,
+  STREAM_VIDEO,
   STREAM_QUIT
 } StreamCall;
 
@@ -702,6 +874,9 @@ struct eremite_stream {
   // An image call's request, cooperative cancellation flag and result.
   eremite_image_request image_request;
   eremite_image_result image_result;
+  // A video call's request and result.
+  eremite_video_request video_request;
+  eremite_video_result video_result;
   int cancelled;
   // its results
   const float *logits;
@@ -848,6 +1023,10 @@ static void stream_run(eremite_stream *x) {
     run_image_generation(m, &x->image_request, &x->wait_for_decoding,
                          &x->cancelled, &x->image_result);
     break;
+  case STREAM_VIDEO:
+    run_video_generation(m, &x->video_request, &x->wait_for_decoding,
+                         &x->cancelled, &x->video_result);
+    break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
     const double *q =
@@ -901,6 +1080,7 @@ void eremite_stream_free(eremite_stream *x) {
   pass_run(x->pass);
   pass_free(x->pass);
   eremite_image_result_free(&x->image_result);
+  eremite_video_result_free(&x->video_result);
   free(x);
 }
 
@@ -963,6 +1143,15 @@ void eremite_stream_generate_image(eremite_stream *x,
   x->image_request = *request;
   x->cancelled = 0;
   post_call(x, STREAM_IMAGE);
+}
+
+void eremite_stream_generate_video(eremite_stream *x,
+                                   const eremite_video_request *request) {
+  if (!x->m->ops->generate_video) die("%s: not a video model", x->m->dir);
+  eremite_video_result_free(&x->video_result);
+  x->video_request = *request;
+  x->cancelled = 0;
+  post_call(x, STREAM_VIDEO);
 }
 
 void eremite_stream_cancel(eremite_stream *x) {
@@ -1055,6 +1244,12 @@ int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted) {
 int eremite_stream_image_result(eremite_stream *x, eremite_image_result *out) {
   *out = x->image_result;
   memset(&x->image_result, 0, sizeof x->image_result);
+  return out->data != NULL;
+}
+
+int eremite_stream_video_result(eremite_stream *x, eremite_video_result *out) {
+  *out = x->video_result;
+  memset(&x->video_result, 0, sizeof x->video_result);
   return out->data != NULL;
 }
 
@@ -1326,6 +1521,12 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->image_stage = c.image_stage;
   s->image_step = c.image_step;
   s->image_steps_total = c.image_steps_total;
+  s->generated_videos = c.generated_videos;
+  s->video_steps = c.video_steps;
+  s->video_seconds = c.video_seconds;
+  s->video_stage = c.video_stage;
+  s->video_step = c.video_step;
+  s->video_steps_total = c.video_steps_total;
   s->dense_bytes = model.dense_bytes;
   s->layers = model.layers;
   s->experts_per_row = model.experts_per_row;

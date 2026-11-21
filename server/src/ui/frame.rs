@@ -49,6 +49,9 @@ pub enum Kind {
     /// An image model: it generates or edits images from a prompt, and keeps
     /// no sessions.
     Image,
+    /// A video model: it generates audio-video clips from a prompt, and keeps
+    /// no sessions.
+    Video,
 }
 
 /// A sub-view of Models.
@@ -67,7 +70,7 @@ impl Kind {
     pub fn list_sub_views(self) -> &'static [SubView] {
         match self {
             Kind::Llm => &[SubView::States, SubView::Experts],
-            Kind::Decision | Kind::Image => &[],
+            Kind::Decision | Kind::Image | Kind::Video => &[],
         }
     }
 }

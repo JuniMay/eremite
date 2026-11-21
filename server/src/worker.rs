@@ -43,7 +43,8 @@ use crate::disk::{EngineState, LoadError, Store};
 use crate::engine::{
     self, CacheCounts, DraftChoice, ExpandError, ImageBackground, ImageCallParams, ImageError,
     ImageFormat, ImageInputs, Logits, Lookup, Media, Model, PartialImageReceiver, PrefillInfo,
-    Sampler, SnapshotHandle, StateHandle, Stream,
+    Sampler, SnapshotHandle, StateHandle, Stream, VideoCallOutput, VideoCallParams, VideoError,
+    VideoInputs, VideoStage,
 };
 use crate::state_cache::{
     self, Cache, Entry, Evicted, ModelLimits, Plan, PlanLimits, Snapshot, SnapshotKind,
@@ -127,6 +128,11 @@ pub enum Event {
     /// An image request finished: all its images came in Image events. This
     /// is the last event.
     ImagesDone,
+    /// A video request left the queue and started running on the engine.
+    VideoStarted,
+    /// A video request finished with its encoded MP4 clip and timings. This is
+    /// the last event.
+    Video(VideoCallOutput),
 }
 
 /// How a request samples its tokens.
@@ -247,6 +253,46 @@ pub struct ImageRequest {
     /// An edit's mask image bytes, whose alpha marks what changes; None for
     /// no mask.
     pub mask: Option<Vec<u8>>,
+    /// The log shows "req ID NOTE" with this note when the request is queued.
+    pub note: String,
+}
+
+/// A video model's audio-video generation request (T2VA, FL2VA or REF2VA).
+pub struct VideoRequest {
+    /// The index of the request's model, in the configured order.
+    pub model_index: usize,
+    /// Raw prompt text passed verbatim to the model.
+    pub prompt: String,
+    /// Requested output width in pixels; 0 adapts or uses the default.
+    pub width: i32,
+    /// Requested output height in pixels; 0 adapts or uses the default.
+    pub height: i32,
+    /// Requested duration in whole seconds; 0 uses frames or the default.
+    pub seconds: i32,
+    /// Requested frame count; 0 uses seconds or the default.
+    pub frames: i32,
+    /// Requested denoising step count; 0 uses the model's default.
+    pub steps: i32,
+    /// Video flow-matching shift override; 0.0 uses the model's default.
+    pub shift_video: f64,
+    /// Audio flow-matching shift override; 0.0 uses the model's default.
+    pub shift_audio: f64,
+    /// Deterministic RNG seed for initial video/audio noise.
+    pub seed: u64,
+    /// Optional FL2VA first keyframe image bytes.
+    pub first_frame: Option<Vec<u8>>,
+    /// Optional FL2VA last keyframe image bytes.
+    pub last_frame: Option<Vec<u8>>,
+    /// Optional REF2VA reference image buffers (`<Picture 1>`, ...).
+    pub ref_images: Vec<Vec<u8>>,
+    /// Optional REF2VA reference video buffers (`<Video 1>`, ...).
+    pub ref_videos: Vec<Vec<u8>>,
+    /// Optional soundtracks paired by index with `ref_videos`.
+    pub ref_video_audios: Vec<Option<Vec<u8>>>,
+    /// Optional REF2VA standalone reference audio buffers (`<Audio 1>`, ...).
+    pub ref_audios: Vec<Vec<u8>>,
+    /// True in REF2VA to scale reference images to a 2048 short edge.
+    pub ref_image_max: bool,
     /// The log shows "req ID NOTE" with this note when the request is queued.
     pub note: String,
 }
@@ -379,6 +425,8 @@ struct Queue {
     decisions: Vec<VecDeque<Job<DecisionRequest>>>,
     /// Each model's waiting image requests, the oldest first.
     images: Vec<VecDeque<Job<ImageRequest>>>,
+    /// Each model's waiting video requests, the oldest first.
+    videos: Vec<VecDeque<Job<VideoRequest>>>,
     /// Set at the stop. No request is queued after it.
     closed: bool,
     /// The id of the last queued request. The first request gets 1.
@@ -435,6 +483,11 @@ struct ModelStatus {
     /// The seconds that the ended requests spent denoising, decoding and
     /// encoding images.
     total_image_seconds: f64,
+    /// The number of videos that the ended requests generated.
+    total_generated_videos: u64,
+    /// The seconds that the ended requests spent denoising, VAE decoding and
+    /// muxing videos.
+    total_video_seconds: f64,
     /// The number of requests that started with each kind of plan, by the
     /// plan's word in the log.
     plan_counts: HashMap<&'static str, u64>,
@@ -479,6 +532,10 @@ struct RequestStatus {
     images_requested: usize,
     /// The images finished so far for an image request.
     generated_images: usize,
+    /// The videos requested by a video request; 0 for other requests.
+    videos_requested: usize,
+    /// The videos finished so far for a video request.
+    generated_videos: usize,
     /// The experts of the request's latest tokens, the oldest first.
     routes: Vec<Route>,
 }
@@ -506,6 +563,8 @@ impl RequestStatus {
             generated_tokens: 0,
             images_requested: 0,
             generated_images: 0,
+            videos_requested: 0,
+            generated_videos: 0,
             routes: Vec::new(),
         }
     }
@@ -527,6 +586,31 @@ impl RequestStatus {
             generated_tokens: 0,
             images_requested: job.request.count,
             generated_images,
+            videos_requested: 0,
+            generated_videos: 0,
+            routes: Vec::new(),
+        }
+    }
+
+    /// Returns the status of a video request `job` with `prompt_tokens`
+    /// encoded prompt tokens and `generated_videos` finished outputs.
+    fn for_video(
+        job: &Job<VideoRequest>,
+        status: &'static str,
+        prompt_tokens: usize,
+        generated_videos: usize,
+    ) -> RequestStatus {
+        RequestStatus {
+            id: job.id,
+            status,
+            session: None,
+            prompt_tokens,
+            reused_tokens: 0,
+            generated_tokens: 0,
+            images_requested: 0,
+            generated_images: 0,
+            videos_requested: 1,
+            generated_videos,
             routes: Vec::new(),
         }
     }
@@ -542,6 +626,8 @@ impl RequestStatus {
             generated_tokens: 0,
             images_requested: 0,
             generated_images: 0,
+            videos_requested: 0,
+            generated_videos: 0,
             routes: Vec::new(),
         }
     }
@@ -575,9 +661,12 @@ pub struct SharedModel {
     pub settings: ModelSettings,
     /// The model's tokenizer.
     pub tokenizer: engine::Tokenizer,
-    /// Image generation limits reported by the opened model, or None for text
-    /// and decision models.
+    /// Image generation limits reported by the opened model, or None for text,
+    /// decision and video models.
     pub image_limits: Option<engine::ImageLimits>,
+    /// Video generation limits reported by the opened model, or None for text,
+    /// decision and image models.
+    pub video_limits: Option<engine::VideoLimits>,
     /// The model's status. The worker updates it.
     status: Mutex<ModelStatus>,
 }
@@ -798,6 +887,27 @@ pub fn image_limits(model_index: usize) -> Option<engine::ImageLimits> {
     clone_shared().models.get(model_index)?.image_limits
 }
 
+/// Returns the video generation limits of the served model at `model_index`, or
+/// None when it generates no videos.
+pub fn video_limits(model_index: usize) -> Option<engine::VideoLimits> {
+    clone_shared().models.get(model_index)?.video_limits
+}
+
+/// Returns the live stage, 1-based step and total step count of an active
+/// video request `request_id` on `model_index`, or None when not running.
+pub fn video_progress(model_index: usize, request_id: u64) -> Option<(VideoStage, usize, usize)> {
+    let shared = clone_shared();
+    let shared_model = shared.models.get(model_index)?;
+    let status = lock(&shared_model.status);
+    if status.shown_request_id != request_id {
+        return None;
+    }
+    let stage = VideoStage::from_raw(status.stats.video_stage);
+    let step = status.stats.video_step.max(0) as usize;
+    let total = status.stats.video_steps_total.max(0) as usize;
+    Some((stage, step, total))
+}
+
 /// Returns the size that an image model's text-to-image requests with size
 /// auto get: the settings' `default_size`, or else `model`'s own default.
 /// Err says why a given default_size does not fit the model as it is.
@@ -856,6 +966,7 @@ pub fn start(
                     return;
                 };
                 let image_limits = model.image_limits();
+                let video_limits = model.video_limits();
                 let mut resolved = settings.clone();
                 if let Some(lim) = image_limits {
                     if resolved.options.ctx == 0 {
@@ -870,10 +981,16 @@ pub fn start(
                         }
                     }
                 }
+                if let Some(lim) = video_limits
+                    && resolved.options.ctx == 0
+                {
+                    resolved.options.ctx = lim.max_prompt_tokens;
+                }
                 models.push(SharedModel {
                     settings: resolved,
                     tokenizer: model.tokenizer(),
                     image_limits,
+                    video_limits,
                     status: Mutex::new(ModelStatus {
                         stats: model.read_stats(),
                         drafts_per_pass: model.drafts_per_pass(),
@@ -888,6 +1005,7 @@ pub fn start(
                     waiting: (0..model_count).map(|_| VecDeque::new()).collect(),
                     decisions: (0..model_count).map(|_| VecDeque::new()).collect(),
                     images: (0..model_count).map(|_| VecDeque::new()).collect(),
+                    videos: (0..model_count).map(|_| VecDeque::new()).collect(),
                     control: Control::new(engine::read_memory().limit),
                     ..Queue::default()
                 }),
@@ -1040,6 +1158,21 @@ pub fn submit_image(
     })
 }
 
+/// Submits the video `request` to its model's queue, as submit does.
+pub fn submit_video(
+    request: VideoRequest,
+) -> Result<(CancelGuard, mpsc::UnboundedReceiver<Event>), SubmitError> {
+    let refs = request.ref_images.len() + request.ref_videos.len() + request.ref_audios.len();
+    let counts = format!(
+        "size={}x{}, seconds={}, frames={}, refs={refs}",
+        request.width, request.height, request.seconds, request.frames
+    );
+    let (model_index, note) = (request.model_index, request.note.clone());
+    queue_job(request, model_index, &note, &counts, |queue| {
+        &mut queue.videos
+    })
+}
+
 /// Queues `request` for the model at `model_index` in the queues that
 /// `waiting` picks. The log shows its `note` and its `counts`. Returns the
 /// guard and the receiver of its events, or Busy when too many requests wait
@@ -1163,6 +1296,11 @@ pub fn build_model_status_json(model_index: usize) -> Value {
                     .iter()
                     .map(|job| RequestStatus::for_image(job, "waiting", 0, 0)),
             )
+            .chain(
+                queue.videos[model_index]
+                    .iter()
+                    .map(|job| RequestStatus::for_video(job, "waiting", 0, 0)),
+            )
             .collect();
         (queued.len(), queue.control.phase, queued)
     };
@@ -1243,6 +1381,8 @@ pub fn build_model_status_json(model_index: usize) -> Value {
             "prefill_seconds": status.total_prefill_seconds,
             "generated_images": status.total_generated_images,
             "image_seconds": status.total_image_seconds,
+            "generated_videos": status.total_generated_videos,
+            "video_seconds": status.total_video_seconds,
         },
         "plans": status.plan_counts,
         "ced_depth": options.deepseek().map_or(0, |deepseek| deepseek.ced),
@@ -1299,6 +1439,8 @@ fn build_requests_json(requests: &[RequestStatus]) -> Value {
                 "generated_tokens": request.generated_tokens,
                 "images_requested": request.images_requested,
                 "generated_images": request.generated_images,
+                "videos_requested": request.videos_requested,
+                "generated_videos": request.generated_videos,
                 "routes": request
                     .routes
                     .iter()
@@ -1340,6 +1482,12 @@ fn build_engine_counters_json(stats: &engine::Stats) -> Value {
         "image_stage": stats.image_stage,
         "image_step": stats.image_step,
         "image_steps_total": stats.image_steps_total,
+        "generated_videos": stats.generated_videos,
+        "video_steps": stats.video_steps,
+        "video_seconds": stats.video_seconds,
+        "video_stage": stats.video_stage,
+        "video_step": stats.video_step,
+        "video_steps_total": stats.video_steps_total,
         "expert_read_bytes": stats.cache.bytes,
         "mapped_expert_bytes": stats.mapped.max(0) as u64 * stats.slot_bytes,
         "memory": {
@@ -1574,6 +1722,26 @@ struct ImageTask {
     started_at: Instant,
 }
 
+/// A video generation request from its start to its finished MP4 clip.
+struct VideoTask {
+    /// The submitted video request.
+    job: Job<VideoRequest>,
+    /// Prompt C string and encoded media kept alive across the stream call.
+    _inputs: VideoInputs,
+    /// Encoded prompt tokens of this request, including reference media tokens.
+    prompt_tokens: usize,
+    /// Engine prefill_rows counter when the video pass started.
+    pass_start_prefill_rows: u64,
+    /// Finished MP4 output when the call succeeded.
+    output: Option<VideoCallOutput>,
+    /// Error from the failed call, if any.
+    failure: Option<VideoError>,
+    /// Whether the video generation call is currently running on a stream.
+    in_call: bool,
+    /// When the video started generating.
+    started_at: Instant,
+}
+
 /// An engine call that runs on a stream, and what to do when it ends.
 enum Call {
     /// One prefill call of the request. It prefills the prompt up to `end`.
@@ -1602,6 +1770,8 @@ enum Call {
     Decide { request_id: u64 },
     /// One image generation or editing call of an image model's request.
     GenerateImage { request_id: u64 },
+    /// One audio-video generation call of a video model's request.
+    GenerateVideo { request_id: u64 },
 }
 
 /// A running call and the stream it runs on.
@@ -1642,6 +1812,13 @@ struct WorkerModel {
     admitted_images: VecDeque<Job<ImageRequest>>,
     /// The image request currently running.
     image: Option<ImageTask>,
+    /// Whether the model is a video generation model: it generates videos,
+    /// not text, decisions or images.
+    is_video_model: bool,
+    /// Admitted video requests that wait for their turn.
+    admitted_videos: VecDeque<Job<VideoRequest>>,
+    /// The video request currently running.
+    video: Option<VideoTask>,
     /// The token that starts a think block, if the model has one.
     think_start_token: Option<i32>,
     /// The token that ends a think block, if the model has one.
@@ -2069,6 +2246,9 @@ impl Worker {
                     is_image_model: model.is_image_model(),
                     admitted_images: VecDeque::new(),
                     image: None,
+                    is_video_model: model.is_video_model(),
+                    admitted_videos: VecDeque::new(),
+                    video: None,
                     think_start_token: model.tokenizer().find_added_token("<think>"),
                     think_end_token: model.tokenizer().find_added_token("</think>"),
                     logged_decoding_count: 0,
@@ -2340,6 +2520,23 @@ impl Worker {
                     request.generated_images = image.done;
                 }
             }
+            if let Some(video) = &worker_model.video {
+                let live_phase = WorkerModel::active_video_phase(&stats);
+                let live_prompt = WorkerModel::live_video_prompt_tokens(video, &stats);
+                if status.phase != "loading" {
+                    if status.phase != live_phase || status.phase_since.is_none() {
+                        status.phase_since = Some(Instant::now());
+                    }
+                    status.phase = live_phase;
+                }
+                status.shown_prompt_tokens = live_prompt;
+                status.shown_generated_tokens = 0;
+                if let Some(request) = status.requests.iter_mut().find(|r| r.id == video.job.id) {
+                    request.status = live_phase;
+                    request.prompt_tokens = live_prompt;
+                    request.generated_videos = usize::from(video.output.is_some());
+                }
+            }
         }
         let memory_in_use = engine::read_memory();
         lock(&self.shared.queue).control.retained = control::MemoryBytes {
@@ -2444,6 +2641,13 @@ impl Worker {
                         invalid_input: false,
                     });
                     worker_model.end_image(&self.shared, image);
+                }
+                if let Some(mut video) = worker_model.video.take() {
+                    video.failure = Some(VideoError {
+                        message: error.clone(),
+                        invalid_input: false,
+                    });
+                    worker_model.end_video(&self.shared, video);
                 }
                 continue;
             }
@@ -2616,6 +2820,7 @@ impl Worker {
                 queue.waiting.iter().all(|jobs| jobs.is_empty())
                     && queue.decisions.iter().all(|jobs| jobs.is_empty())
                     && queue.images.iter().all(|jobs| jobs.is_empty())
+                    && queue.videos.iter().all(|jobs| jobs.is_empty())
                     && queue.states_to_delete.is_empty()
                     && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
@@ -2656,6 +2861,8 @@ impl Worker {
                 decisions: Vec<Job<DecisionRequest>>,
                 /// Queued image requests for the model.
                 images: Vec<Job<ImageRequest>>,
+                /// Queued video requests for the model.
+                videos: Vec<Job<VideoRequest>>,
             }
             let mut admitted_by_model = Vec::with_capacity(self.models.len());
             for worker_model in &self.models {
@@ -2665,25 +2872,32 @@ impl Worker {
                         generations: Vec::new(),
                         decisions: Vec::new(),
                         images: Vec::new(),
+                        videos: Vec::new(),
                     }
                 } else {
                     AdmittedModelJobs {
                         generations: queue.waiting[index].drain(..).collect(),
                         decisions: queue.decisions[index].drain(..).collect(),
                         images: queue.images[index].drain(..).collect(),
+                        videos: queue.videos[index].drain(..).collect(),
                     }
                 };
                 if !batch.generations.is_empty()
                     || !batch.decisions.is_empty()
                     || !batch.images.is_empty()
+                    || !batch.videos.is_empty()
                 {
                     worker_model.log_line(&format!(
                         "{}: admitted={}, running={}",
                         worker_model.settings.id,
-                        batch.generations.len() + batch.decisions.len() + batch.images.len(),
+                        batch.generations.len()
+                            + batch.decisions.len()
+                            + batch.images.len()
+                            + batch.videos.len(),
                         worker_model.generations.len()
                             + usize::from(worker_model.decision.is_some())
                             + usize::from(worker_model.image.is_some())
+                            + usize::from(worker_model.video.is_some())
                     ));
                 }
                 admitted_by_model.push(batch);
@@ -2694,6 +2908,7 @@ impl Worker {
                     generations: admitted,
                     decisions,
                     images,
+                    videos,
                 } = batch;
                 if worker_model.is_decision_model {
                     for job in images {
@@ -2702,9 +2917,23 @@ impl Worker {
                             "the model is a decision model: it generates no images",
                         );
                     }
+                    for job in videos {
+                        worker_model.refuse_video(
+                            job,
+                            "the model is a decision model: it generates no videos",
+                        );
+                    }
                     worker_model.run_decision_step(&shared, admitted, decisions);
                 } else if worker_model.is_image_model {
+                    for job in videos {
+                        worker_model.refuse_video(
+                            job,
+                            "the model is an image model: it generates no videos",
+                        );
+                    }
                     worker_model.run_image_step(&shared, admitted, decisions, images);
+                } else if worker_model.is_video_model {
+                    worker_model.run_video_step(&shared, admitted, decisions, images, videos);
                 } else {
                     for job in decisions {
                         worker_model.refuse_decision(
@@ -2715,6 +2944,10 @@ impl Worker {
                     for job in images {
                         worker_model
                             .refuse_image(job, "the model generates text: it generates no images");
+                    }
+                    for job in videos {
+                        worker_model
+                            .refuse_video(job, "the model generates text: it generates no videos");
                     }
                     worker_model.run_step(&shared, admitted, &mut self.states);
                 }
@@ -2740,10 +2973,14 @@ impl Worker {
             if let Some(image) = worker_model.image.take() {
                 worker_model.end_image(&shared, image);
             }
+            if let Some(video) = worker_model.video.take() {
+                worker_model.end_video(&shared, video);
+            }
         }
         let mut waiting: Vec<Job>;
         let decisions: Vec<Vec<Job<DecisionRequest>>>;
         let images: Vec<Vec<Job<ImageRequest>>>;
+        let videos: Vec<Vec<Job<VideoRequest>>>;
         {
             let mut queue = lock(&shared.queue);
             queue.closed = true;
@@ -2762,12 +2999,22 @@ impl Worker {
                 .iter_mut()
                 .map(|jobs| jobs.drain(..).collect())
                 .collect();
+            videos = queue
+                .videos
+                .iter_mut()
+                .map(|jobs| jobs.drain(..).collect())
+                .collect();
         }
         // The deletions asked before the stop run before the stop saves the
         // states. No request runs now, and the closed queue takes no more.
         let states_to_delete = std::mem::take(&mut lock(&shared.queue).states_to_delete);
         self.delete_session_states(states_to_delete);
-        for ((worker_model, decisions), images) in self.models.iter_mut().zip(decisions).zip(images)
+        for (((worker_model, decisions), images), videos) in self
+            .models
+            .iter_mut()
+            .zip(decisions)
+            .zip(images)
+            .zip(videos)
         {
             waiting.extend(worker_model.admitted.drain(..));
             let ended_decisions: Vec<Job<DecisionRequest>> = worker_model
@@ -2785,6 +3032,14 @@ impl Worker {
                 .collect();
             for job in ended_images {
                 worker_model.end_waiting_image(job, FinishReason::ServerStop);
+            }
+            let ended_videos: Vec<Job<VideoRequest>> = worker_model
+                .admitted_videos
+                .drain(..)
+                .chain(videos)
+                .collect();
+            for job in ended_videos {
+                worker_model.end_waiting_video(job, FinishReason::ServerStop);
             }
         }
         for job in waiting {
@@ -2839,18 +3094,22 @@ impl WorkerModel {
         self.view.write_model_line(self.model_index, line);
     }
 
-    /// Returns whether the model runs requests: generations, a decision or an
-    /// image task.
+    /// Returns whether the model runs requests: generations, a decision, an
+    /// image task or a video task.
     fn runs_requests(&self) -> bool {
-        !self.generations.is_empty() || self.decision.is_some() || self.image.is_some()
+        !self.generations.is_empty()
+            || self.decision.is_some()
+            || self.image.is_some()
+            || self.video.is_some()
     }
 
-    /// Returns whether admitted requests, decisions or image tasks wait for
-    /// their turn.
+    /// Returns whether admitted requests, decisions, image tasks or video tasks
+    /// wait for their turn.
     fn has_admitted_requests(&self) -> bool {
         !self.admitted.is_empty()
             || !self.admitted_decisions.is_empty()
             || !self.admitted_images.is_empty()
+            || !self.admitted_videos.is_empty()
     }
 
     /// Lists the ways `prompt` can resume from this model's states, the
@@ -3115,28 +3374,35 @@ impl WorkerModel {
             .find(|generation| !generation.is_decoding())
             .or(self.generations.first());
         let image_stats = self.image.as_ref().map(|_| self.model.read_stats());
+        let video_stats = self.video.as_ref().map(|_| self.model.read_stats());
         (
             status.shown_request_id,
             status.shown_prompt_tokens,
             status.shown_reused_tokens,
             status.shown_generated_tokens,
-        ) = match (first, &self.decision, &self.image) {
-            (Some(generation), _, _) => (
+        ) = match (first, &self.decision, &self.image, &self.video) {
+            (Some(generation), _, _, _) => (
                 generation.job.id,
                 generation.prompt_tokens,
                 generation.reused_tokens,
                 generation.generated,
             ),
-            (None, Some(decision), _) => {
+            (None, Some(decision), _, _) => {
                 (decision.job.id, decision.job.request.count_tokens(), 0, 0)
             }
-            (None, None, Some(image)) => (
+            (None, None, Some(image), _) => (
                 image.job.id,
                 Self::live_image_prompt_tokens(image, image_stats.as_ref().unwrap()),
                 0,
                 0,
             ),
-            (None, None, None) => (0, 0, 0, 0),
+            (None, None, None, Some(video)) => (
+                video.job.id,
+                Self::live_video_prompt_tokens(video, video_stats.as_ref().unwrap()),
+                0,
+                0,
+            ),
+            (None, None, None, None) => (0, 0, 0, 0),
         };
         status.requests = self
             .generations
@@ -3154,6 +3420,8 @@ impl WorkerModel {
                 generated_tokens: generation.generated,
                 images_requested: 0,
                 generated_images: 0,
+                videos_requested: 0,
+                generated_videos: 0,
                 routes: generation.routes.iter().cloned().collect(),
             })
             .chain(
@@ -3170,6 +3438,15 @@ impl WorkerModel {
                     image.done,
                 )
             }))
+            .chain(self.video.iter().map(|video| {
+                let stats = video_stats.as_ref().unwrap();
+                RequestStatus::for_video(
+                    &video.job,
+                    Self::active_video_phase(stats),
+                    Self::live_video_prompt_tokens(video, stats),
+                    usize::from(video.output.is_some()),
+                )
+            }))
             .chain(self.admitted.iter().map(RequestStatus::for_waiting_job))
             .chain(
                 self.admitted_decisions
@@ -3180,6 +3457,11 @@ impl WorkerModel {
                 self.admitted_images
                     .iter()
                     .map(|job| RequestStatus::for_image(job, "waiting", 0, 0)),
+            )
+            .chain(
+                self.admitted_videos
+                    .iter()
+                    .map(|job| RequestStatus::for_video(job, "waiting", 0, 0)),
             )
             .collect();
     }
@@ -3866,6 +4148,7 @@ impl WorkerModel {
             } => self.finish_verify_call(stream, request_id, rows, proposed_count, states),
             Call::Decide { request_id } => self.finish_decide_call(stream, request_id),
             Call::GenerateImage { request_id } => self.finish_image_call(stream, request_id),
+            Call::GenerateVideo { request_id } => self.finish_video_call(stream, request_id),
         }
     }
 
@@ -5151,6 +5434,277 @@ impl WorkerModel {
         self.log_line(&format!("req {}: refused: {message}", job.id));
         job.send_last_event(Event::Refused(message.into()));
     }
+
+    // ---- a video model's requests ----
+
+    /// Returns the status phase for a running video request from engine stats:
+    /// "prefill" only while the prompt encoder runs, and "generating" while
+    /// conditioning VAEs, DiT, Video/Audio VAEs or the MP4 muxer run.
+    fn active_video_phase(stats: &engine::Stats) -> &'static str {
+        if VideoStage::from_raw(stats.video_stage) == VideoStage::Prefill {
+            "prefill"
+        } else {
+            "generating"
+        }
+    }
+
+    /// Returns the encoded prompt token count for an active video task, using
+    /// live engine counters while the pass is still in flight.
+    fn live_video_prompt_tokens(task: &VideoTask, stats: &engine::Stats) -> usize {
+        if stats.prefill_rows_now > 0 {
+            stats.prefill_rows_now as usize
+        } else if stats.prefill_rows > task.pass_start_prefill_rows {
+            (stats.prefill_rows - task.pass_start_prefill_rows) as usize
+        } else {
+            task.prompt_tokens
+        }
+    }
+
+    /// Runs one step of a video generation model. Refuses chat, decision and
+    /// image requests, queues admitted video jobs, advances any running video
+    /// task, and starts the next waiting video job when idle.
+    fn run_video_step(
+        &mut self,
+        shared: &Shared,
+        replies: Vec<Job>,
+        decisions: Vec<Job<DecisionRequest>>,
+        images: Vec<Job<ImageRequest>>,
+        videos: Vec<Job<VideoRequest>>,
+    ) {
+        for job in replies {
+            refuse(job, "the model is a video model: it generates no text");
+        }
+        for job in decisions {
+            self.refuse_decision(job, "the model is a video model: it makes no decisions");
+        }
+        for job in images {
+            self.refuse_image(job, "the model is a video model: it generates no images");
+        }
+        self.admitted_videos.extend(videos);
+        if let Some(video) = self.video.take() {
+            self.continue_video(shared, video);
+        }
+        while self.video.is_none() {
+            let Some(job) = self.admitted_videos.pop_front() else {
+                break;
+            };
+            self.start_video(shared, job);
+        }
+        let phase = if self.video.is_some() {
+            Self::active_video_phase(&self.model.read_stats())
+        } else {
+            "idle"
+        };
+        self.update_status(shared, phase);
+    }
+
+    /// Advances the running `video` task: forwards cooperative cancellation if
+    /// the caller cancelled the job while a GPU call is in flight, or finishes
+    /// the task once the stream call returns.
+    fn continue_video(&mut self, shared: &Shared, video: VideoTask) {
+        if video.in_call {
+            if video.job.flags.cancelled.load(Ordering::SeqCst) {
+                for running in &self.running_calls {
+                    if matches!(running.call, Call::GenerateVideo { request_id } if request_id == video.job.id)
+                    {
+                        running.stream.cancel();
+                    }
+                }
+            }
+            self.video = Some(video);
+        } else {
+            self.end_video(shared, video);
+        }
+    }
+
+    /// Starts the admitted video request `job`: loads weights on first use,
+    /// packages stable C FFI input buffers, notifies the caller that generation
+    /// started, and posts the video stream call.
+    fn start_video(&mut self, shared: &Shared, mut job: Job<VideoRequest>) {
+        if engine::is_stopping() {
+            return self.end_waiting_video(job, FinishReason::ServerStop);
+        }
+        if job.flags.cancelled.load(Ordering::SeqCst) {
+            return self.end_waiting_video(job, FinishReason::Cancelled);
+        }
+        let was_loaded = self.model.is_loaded();
+        if !was_loaded {
+            self.update_status(shared, "loading");
+        }
+        if let Err(error) = load_model(shared, &self.model) {
+            if engine::is_stopping() {
+                return self.end_waiting_video(job, FinishReason::ServerStop);
+            }
+            lock(&shared.models[self.model_index].status).load_error = Some(error.clone());
+            self.log_line(&format!("{}: {error}", self.settings.id));
+            job.send_last_event(Event::Failed(error));
+            return;
+        }
+        lock(&shared.models[self.model_index].status).load_error = None;
+        if !was_loaded {
+            self.log_line(&format!("{}: loaded", self.settings.id));
+        }
+        self.last_used_at = Instant::now();
+        let first_frame = job.request.first_frame.take();
+        let last_frame = job.request.last_frame.take();
+        let ref_images = std::mem::take(&mut job.request.ref_images);
+        let ref_videos = std::mem::take(&mut job.request.ref_videos);
+        let ref_video_audios = std::mem::take(&mut job.request.ref_video_audios);
+        let ref_audios = std::mem::take(&mut job.request.ref_audios);
+        let inputs = VideoInputs::new(
+            &job.request.prompt,
+            first_frame,
+            last_frame,
+            ref_images,
+            ref_videos,
+            ref_video_audios,
+            ref_audios,
+        );
+        let _ = job.events.send(Event::VideoStarted);
+        let params = VideoCallParams {
+            width: job.request.width,
+            height: job.request.height,
+            seconds: job.request.seconds,
+            frames: job.request.frames,
+            steps: job.request.steps,
+            shift_video: job.request.shift_video,
+            shift_audio: job.request.shift_audio,
+            seed: job.request.seed,
+            ref_image_max: job.request.ref_image_max,
+        };
+        let pass_start_prefill_rows = self.model.read_stats().prefill_rows;
+        let stream = Stream::new(&self.model);
+        stream.generate_video(&inputs, params);
+        let request_id = job.id;
+        self.running_calls.push(RunningCall {
+            stream,
+            call: Call::GenerateVideo { request_id },
+        });
+        self.video = Some(VideoTask {
+            job,
+            _inputs: inputs,
+            prompt_tokens: 0,
+            pass_start_prefill_rows,
+            output: None,
+            failure: None,
+            in_call: true,
+            started_at: Instant::now(),
+        });
+    }
+
+    /// Collects the finished MP4 bytes or error from `stream` into the active
+    /// video task.
+    fn finish_video_call(&mut self, stream: Stream, request_id: u64) {
+        let Some(task) = self.video.as_mut().filter(|task| task.job.id == request_id) else {
+            return;
+        };
+        task.in_call = false;
+        match stream.take_video_result() {
+            Ok(output) => {
+                task.prompt_tokens = output.prompt_tokens;
+                task.output = Some(output);
+            }
+            Err(error) => {
+                if !task.job.flags.cancelled.load(Ordering::SeqCst) && !engine::is_stopping() {
+                    task.failure = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Ends `task`, updating prefill and video counters separately and sending
+    /// the final worker event.
+    fn end_video(&mut self, shared: &Shared, task: VideoTask) {
+        let seconds = task.started_at.elapsed().as_secs_f64();
+        let (done, prompt_tokens, prefill_s, video_s, summary, event) =
+            if let Some(output) = task.output {
+                let summary = format!(
+                    "generated ({}x{}, {} frames @ {} fps, {} bytes)",
+                    output.width,
+                    output.height,
+                    output.frames,
+                    output.fps,
+                    output.bytes.len()
+                );
+                let pt = output.prompt_tokens;
+                let ps = output.prefill_seconds;
+                let vs = output.video_seconds;
+                (1u64, pt, ps, vs, summary, Event::Video(output))
+            } else if let Some(error) = task.failure {
+                if error.invalid_input {
+                    (
+                        0,
+                        0,
+                        0.0,
+                        0.0,
+                        format!("refused: {}", error.message),
+                        Event::Refused(error.message),
+                    )
+                } else {
+                    (
+                        0,
+                        0,
+                        0.0,
+                        0.0,
+                        format!("failed: {}", error.message),
+                        Event::Failed(error.message),
+                    )
+                }
+            } else if task.job.flags.cancelled.load(Ordering::SeqCst) {
+                (
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    "cancelled".to_string(),
+                    Event::Done {
+                        reason: FinishReason::Cancelled,
+                    },
+                )
+            } else {
+                (
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    "stopped by the server's stop".to_string(),
+                    Event::Done {
+                        reason: FinishReason::ServerStop,
+                    },
+                )
+            };
+        self.log_line(&format!("req {}: {summary} in {seconds:.2} s", task.job.id));
+        let mut status = lock(&shared.models[self.model_index].status);
+        status.total_requests += 1;
+        status.total_prompt_tokens += prompt_tokens as u64;
+        status.total_prefilled_tokens += prompt_tokens as u64;
+        status.total_prefill_seconds += prefill_s;
+        status.total_generated_videos += done;
+        status.total_video_seconds += video_s;
+        drop(status);
+        task.job.send_last_event(event);
+    }
+
+    /// Ends a video request `job` before it started running.
+    fn end_waiting_video(&self, job: Job<VideoRequest>, reason: FinishReason) {
+        self.log_line(&format!(
+            "req {}: ended before video generation ({}), waited {:.3} s",
+            job.id,
+            if reason == FinishReason::Cancelled {
+                "cancelled"
+            } else {
+                "shutdown"
+            },
+            job.queued_at.elapsed().as_secs_f64()
+        ));
+        job.send_last_event(Event::Done { reason });
+    }
+
+    /// Refuses the video request `job` with `message`.
+    fn refuse_video(&self, job: Job<VideoRequest>, message: &str) {
+        self.log_line(&format!("req {}: refused: {message}", job.id));
+        job.send_last_event(Event::Refused(message.into()));
+    }
 }
 
 /// Puts the spans of the images of `media` in place of their places in the
@@ -5352,6 +5906,8 @@ mod tests {
             generated_tokens: 516,
             images_requested: 0,
             generated_images: 0,
+            videos_requested: 0,
+            generated_videos: 0,
             routes: vec![Route {
                 experts: vec![17, 300],
                 sources: vec![0, 4],
@@ -5393,14 +5949,17 @@ mod tests {
                 {"request": 5, "status": "decoding", "session": 5,
                  "prompt_tokens": 23, "reused_tokens": 2, "generated_tokens": 516,
                  "images_requested": 0, "generated_images": 0,
+                 "videos_requested": 0, "generated_videos": 0,
                  "routes": [{"experts": [17, 300], "sources": [0, 4]}]},
                 {"request": 7, "status": "waiting", "session": null,
                  "prompt_tokens": 3, "reused_tokens": 0, "generated_tokens": 0,
                  "images_requested": 0, "generated_images": 0,
+                 "videos_requested": 0, "generated_videos": 0,
                  "routes": []},
                 {"request": 8, "status": "generating", "session": null,
                  "prompt_tokens": 19, "reused_tokens": 0, "generated_tokens": 0,
                  "images_requested": 4, "generated_images": 2,
+                 "videos_requested": 0, "generated_videos": 0,
                  "routes": []},
             ])
         );

@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 12
+#define EREMITE_ABI 13
 
 // ---- the process ----
 
@@ -119,6 +119,31 @@ typedef struct {
   const char *vae;
 } eremite_minimax_h3_config;
 
+// MiniMax-H3 Video checkpoint files and sampling defaults.
+typedef struct {
+  // Safetensors file of the Qwen3-VL text and vision encoder.
+  const char *text_encoder;
+  // Safetensors file of the pruned INT8-ConvRot FL2VA or REF2VA DiT.
+  const char *dit;
+  // Safetensors file of the INT8-ConvRot 3D Video VAE.
+  const char *vae;
+  // Safetensors file of the FP32 stereo Audio VAE.
+  const char *audio_vae;
+  // Optional safetensors file of a BF16 Turbo LoRA adapter, or null.
+  const char *lora;
+  // LoRA scaling multiplier (<= 0 uses 1.0).
+  float lora_strength;
+  // Default Euler denoising steps (<= 0 uses 50).
+  int default_steps;
+  // Default video flow-matching shift factor (<= 0 uses 12.0).
+  double shift_video;
+  // Default audio flow-matching shift factor (<= 0 uses 3.0).
+  double shift_audio;
+  // Checkpoint task variant: EREMITE_VIDEO_VARIANT_FL2VA or
+  // EREMITE_VIDEO_VARIANT_REF2VA.
+  int variant;
+} eremite_minimax_h3_video_config;
+
 // Common settings and family-specific options.
 typedef struct {
   int abi;
@@ -130,6 +155,7 @@ typedef struct {
   double memory_gb;
   eremite_deepseek_config deepseek;
   eremite_minimax_h3_config minimax_h3;
+  eremite_minimax_h3_video_config minimax_h3_video;
 } eremite_config;
 
 typedef struct eremite_model eremite_model;
@@ -383,6 +409,185 @@ int eremite_generate_image(eremite_model *m,
 // Frees the encoded image buffer held by result and clears its fields.
 void eremite_image_result_free(eremite_image_result *result);
 
+// ---- video models ----
+
+// A video model, such as MiniMax-H3 Video, generates one audio-video MP4 clip
+// per call from a text prompt and optional keyframe or reference media, and
+// keeps no attention states between calls. It runs no states, snapshots,
+// prefills, decoding, drafts, decisions or image calls: those calls end the
+// program.
+
+// Running stage of a video generation call.
+enum {
+  // No video call is running.
+  EREMITE_VIDEO_STAGE_NONE = 0,
+  // The prompt encoder runs over text and reference media tokens.
+  EREMITE_VIDEO_STAGE_PREFILL = 1,
+  // Conditioning VAEs, DiT denoiser, Video/Audio VAEs and MP4 muxer run.
+  EREMITE_VIDEO_STAGE_GENERATING = 2
+};
+
+// Task variant of a MiniMax-H3 Video checkpoint.
+enum {
+  // First/last keyframe-to-video-and-audio (and text-to-video-and-audio).
+  EREMITE_VIDEO_VARIANT_FL2VA = 0,
+  // Reference image, video and audio conditioning (and
+  // text-to-video-and-audio).
+  EREMITE_VIDEO_VARIANT_REF2VA = 1
+};
+
+// Capacity in bytes of eremite_video_result.error, including its NUL
+// terminator.
+enum { EREMITE_VIDEO_ERROR_BYTES = 256 };
+
+// One encoded conditioning image, video or audio buffer passed to a video call.
+typedef struct {
+  // Encoded media bytes (PNG/JPEG/WebP, MP4/MOV or WAV/M4A/MP3).
+  const uint8_t *data;
+  // Byte length of data.
+  size_t len;
+} eremite_video_media_input;
+
+// Parameters of one audio-video generation call.
+typedef struct {
+  // Prompt text (UTF-8, NUL-terminated).
+  const char *prompt;
+  // Requested output width in pixels (0 uses adapted or default width).
+  int width;
+  // Requested output height in pixels (0 uses adapted or default height).
+  int height;
+  // Requested duration in whole seconds (0 uses frames or default duration).
+  int seconds;
+  // Explicit requested frame count (0 uses seconds or default duration).
+  int frames;
+  // Requested Euler denoising steps (0 uses the model's configured default).
+  int steps;
+  // Video flow-matching shift override (<= 0 uses model default).
+  double shift_video;
+  // Audio flow-matching shift override (<= 0 uses model default).
+  double shift_audio;
+  // Deterministic RNG seed for initial video/audio noise and cond noise aug.
+  uint64_t seed;
+  // Optional FL2VA first keyframe image (data null when omitted).
+  eremite_video_media_input first_frame;
+  // Optional FL2VA last keyframe image (data null when omitted).
+  eremite_video_media_input last_frame;
+  // Optional REF2VA reference images; null when ref_image_count is 0.
+  const eremite_video_media_input *ref_images;
+  // Number of reference images in ref_images.
+  int ref_image_count;
+  // Optional REF2VA reference video clips; null when ref_video_count is 0.
+  const eremite_video_media_input *ref_videos;
+  // Optional explicit soundtracks index-paired with ref_videos; null or zero
+  // len falls back to the video container's own audio track.
+  const eremite_video_media_input *ref_video_audios;
+  // Number of reference videos in ref_videos.
+  int ref_video_count;
+  // Optional REF2VA standalone reference audio clips; null when
+  // ref_audio_count is 0.
+  const eremite_video_media_input *ref_audios;
+  // Number of standalone audio clips in ref_audios.
+  int ref_audio_count;
+  // Nonzero in REF2VA to scale reference images to 2048 short edge instead of
+  // matching the generation pixel area.
+  int ref_image_max;
+} eremite_video_request;
+
+// Output of one audio-video generation call.
+typedef struct {
+  // Heap-allocated MP4 bytes (H.264 + 32 kHz stereo AAC); null on failure.
+  uint8_t *data;
+  // Byte length of data.
+  size_t len;
+  // Actual generated video width in pixels.
+  int width;
+  // Actual generated video height in pixels.
+  int height;
+  // Actual generated video frame count.
+  int frames;
+  // Actual generated video frame rate in frames per second.
+  int fps;
+  // Error message when data is null; empty on success.
+  char error[EREMITE_VIDEO_ERROR_BYTES];
+  // Nonzero when the request inputs were invalid; zero for load, memory or
+  // stop failures.
+  int invalid_input;
+  // Encoded prompt tokens processed by the text encoder, including reference
+  // media tokens.
+  int prompt_tokens;
+  // Seconds spent in the prompt encoder stage.
+  double prefill_seconds;
+  // Seconds spent denoising, VAE decoding and MP4 muxing.
+  double video_seconds;
+} eremite_video_result;
+
+// Input and output limits of a video generation model.
+typedef struct {
+  // Maximum prompt tokens retained before encoding.
+  int max_prompt_tokens;
+  // Spatial multiple in pixels required for width and height.
+  int patch_px;
+  // Maximum single-axis output dimension in pixels.
+  int max_dim;
+  // Default output width in pixels.
+  int default_width;
+  // Default output height in pixels.
+  int default_height;
+  // Maximum generation canvas area in pixels.
+  int64_t max_canvas_area;
+  // Output frame rate in frames per second.
+  int fps;
+  // Minimum video frame count.
+  int min_frames;
+  // Maximum video frame count.
+  int max_frames;
+  // Default video frame count.
+  int default_frames;
+  // Minimum duration in whole seconds.
+  int min_seconds;
+  // Maximum duration in whole seconds.
+  int max_seconds;
+  // Default duration in whole seconds.
+  int default_seconds;
+  // Minimum denoising step count.
+  int min_steps;
+  // Maximum denoising step count.
+  int max_steps;
+  // Default denoising step count configured on the model.
+  int default_steps;
+  // Maximum reference images accepted by one REF2VA request.
+  int max_ref_images;
+  // Maximum reference videos accepted by one REF2VA request.
+  int max_ref_videos;
+  // Maximum standalone reference audios accepted by one REF2VA request.
+  int max_ref_audios;
+  // Maximum total reference files accepted by one REF2VA request.
+  int max_total_refs;
+  // Active checkpoint task variant (EREMITE_VIDEO_VARIANT_*).
+  int variant;
+  // Required guidance scale for CFG-free checkpoints.
+  double guidance_scale;
+  // Default video flow-matching shift factor configured on the model.
+  double default_shift_video;
+  // Default audio flow-matching shift factor configured on the model.
+  double default_shift_audio;
+} eremite_video_limits;
+
+// Returns whether the model is a video generation model.
+int eremite_is_video_model(const eremite_model *m);
+// Writes the video limits of m into out and returns 1, or returns 0 when m is
+// null, out is null, or m generates no videos.
+int eremite_video_model_limits(const eremite_model *m,
+                               eremite_video_limits *out);
+// Runs one audio-video generation call synchronously and writes the result
+// into out. Caller releases out->data with eremite_video_result_free. Returns
+// 1 on success or 0 on failure.
+int eremite_generate_video(eremite_model *m,
+                           const eremite_video_request *request,
+                           eremite_video_result *out);
+// Frees the encoded MP4 buffer held by result and clears its fields.
+void eremite_video_result_free(eremite_video_result *result);
+
 // ---- attention states and snapshots ----
 
 // One sequence's state, of one model.
@@ -573,6 +778,11 @@ void eremite_stream_decide(eremite_stream *x, const int32_t *tokens, int n,
 // from eremite_stream_image_result.
 void eremite_stream_generate_image(eremite_stream *x,
                                    const eremite_image_request *request);
+// Posts a video model's generation call (eremite_generate_video). Pointers in
+// request stay valid until the call finishes. Its result comes from
+// eremite_stream_video_result.
+void eremite_stream_generate_video(eremite_stream *x,
+                                   const eremite_video_request *request);
 // Requests cooperative cancellation of a running stream call at its next
 // layer boundary.
 void eremite_stream_cancel(eremite_stream *x);
@@ -602,6 +812,9 @@ int32_t eremite_stream_next_token(const eremite_stream *x, int *accepted);
 // Moves the finished image call's result into out. Caller releases out->data
 // with eremite_image_result_free. Returns 1 when out->data is non-null.
 int eremite_stream_image_result(eremite_stream *x, eremite_image_result *out);
+// Moves the finished video call's result into out. Caller releases out->data
+// with eremite_video_result_free. Returns 1 when out->data is non-null.
+int eremite_stream_video_result(eremite_stream *x, eremite_video_result *out);
 
 // ---- sampling ----
 
@@ -697,6 +910,18 @@ typedef struct {
   int image_step;
   // Total denoising steps in the active image call, or 0 outside denoising.
   int image_steps_total;
+  // Videos generated since the model opened.
+  uint64_t generated_videos;
+  // Video denoising steps finished since the model opened.
+  uint64_t video_steps;
+  // Seconds spent denoising, VAE decoding and muxing videos.
+  double video_seconds;
+  // Active video generation stage (EREMITE_VIDEO_STAGE_*).
+  int video_stage;
+  // Active 1-based video denoising step, or 0 outside denoising.
+  int video_step;
+  // Total denoising steps in the active video call, or 0 outside denoising.
+  int video_steps_total;
   // The expert cache's slots, and experts on the SSD only.
   int slots, mapped, cap, max_slots, experts, uncached;
   uint64_t slot_bytes, uncached_bytes, cache_bytes, dense_bytes;

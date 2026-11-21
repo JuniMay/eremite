@@ -49,6 +49,7 @@ pub fn draw_screen(
                 (Kind::Llm, SubView::Experts) => draw_experts(buf, view_area, screen, choices),
                 (Kind::Decision, _) => draw_decision_model(buf, view_area, model),
                 (Kind::Image, _) => draw_image_model(buf, view_area, model),
+                (Kind::Video, _) => draw_video_model(buf, view_area, model),
             }
         }
     }
@@ -78,6 +79,18 @@ fn draw_image_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
+/// Draws the one line of a video model in 4 Models in `area`.
+fn draw_video_model(buf: &mut Buffer, area: Rect, model: &ModelInfo) {
+    if area.height == 0 {
+        return;
+    }
+    let line = Line::from(plain(format!(
+        " {} is a video model: it keeps no sessions and has no experts.",
+        model.name
+    )));
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
 /// Returns the keys of the keys row for `choices` in `columns`: the chrome's
 /// first keys, the model's keys in 4 Models, the view's own keys, and the
 /// chrome's last keys. A view that shows only its one line, such as the
@@ -98,7 +111,7 @@ fn list_keys(screen: &Screen, choices: &Choices, columns: usize) -> Keys {
     let has_no_sub_views = screen
         .models
         .get(choices.model)
-        .is_some_and(|model| matches!(model.kind, Kind::Decision | Kind::Image));
+        .is_some_and(|model| matches!(model.kind, Kind::Decision | Kind::Image | Kind::Video));
     let shows_one_line = choices.view == View::Models
         && (has_no_sub_views
             || choices.sub_view == SubView::Experts

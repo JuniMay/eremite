@@ -747,7 +747,9 @@ fn convert_events_to_inference_chunks(
                 | Event::Decided { .. }
                 | Event::PartialImage { .. }
                 | Event::Image { .. }
-                | Event::ImagesDone => {
+                | Event::ImagesDone
+                | Event::VideoStarted
+                | Event::Video(_) => {
                     break;
                 }
             }

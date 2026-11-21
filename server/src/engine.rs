@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 12;
+const ABI: c_int = 13;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -55,6 +55,23 @@ struct RawMinimaxH3Config {
     vae: *const c_char,
 }
 
+/// MiniMax-H3 Video's checkpoint paths and sampling defaults
+/// (eremite_minimax_h3_video_config).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawMinimaxH3VideoConfig {
+    text_encoder: *const c_char,
+    dit: *const c_char,
+    vae: *const c_char,
+    audio_vae: *const c_char,
+    lora: *const c_char,
+    lora_strength: f32,
+    default_steps: c_int,
+    shift_video: f64,
+    shift_audio: f64,
+    variant: c_int,
+}
+
 /// A model's settings (eremite_config).
 #[repr(C)]
 struct RawConfig {
@@ -65,6 +82,7 @@ struct RawConfig {
     memory_gb: f64,
     deepseek: RawDeepSeekConfig,
     minimax_h3: RawMinimaxH3Config,
+    minimax_h3_video: RawMinimaxH3VideoConfig,
 }
 
 /// A registered model (eremite_model).
@@ -210,6 +228,91 @@ struct RawImageResult {
     image_seconds: f64,
 }
 
+/// Size of the fixed error message buffer in eremite_video_result.
+const VIDEO_ERROR_BYTES: usize = 256;
+
+/// One encoded conditioning media buffer passed to a video model
+/// (eremite_video_media_input).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawVideoMediaInput {
+    /// Pointer to the encoded media bytes.
+    data: *const u8,
+    /// Byte length of the encoded media.
+    len: usize,
+}
+
+/// Parameters of one audio-video generation call (eremite_video_request).
+#[repr(C)]
+struct RawVideoRequest {
+    /// NUL-terminated UTF-8 prompt string.
+    prompt: *const c_char,
+    /// Requested output width in pixels; 0 adapts or uses the default.
+    width: c_int,
+    /// Requested output height in pixels; 0 adapts or uses the default.
+    height: c_int,
+    /// Requested duration in whole seconds; 0 uses frames or the default.
+    seconds: c_int,
+    /// Requested frame count; 0 uses seconds or the default.
+    frames: c_int,
+    /// Requested denoising step count; 0 uses the model's default.
+    steps: c_int,
+    /// Video flow-matching shift override; <= 0 uses the model's default.
+    shift_video: f64,
+    /// Audio flow-matching shift override; <= 0 uses the model's default.
+    shift_audio: f64,
+    /// Deterministic RNG seed.
+    seed: u64,
+    /// Optional FL2VA first keyframe image; null data when omitted.
+    first_frame: RawVideoMediaInput,
+    /// Optional FL2VA last keyframe image; null data when omitted.
+    last_frame: RawVideoMediaInput,
+    /// Array of REF2VA reference image descriptors, or null when empty.
+    ref_images: *const RawVideoMediaInput,
+    /// Number of entries in `ref_images`.
+    ref_image_count: c_int,
+    /// Array of REF2VA reference video descriptors, or null when empty.
+    ref_videos: *const RawVideoMediaInput,
+    /// Optional soundtracks index-paired with `ref_videos`, or null.
+    ref_video_audios: *const RawVideoMediaInput,
+    /// Number of entries in `ref_videos`.
+    ref_video_count: c_int,
+    /// Array of REF2VA standalone reference audio descriptors, or null.
+    ref_audios: *const RawVideoMediaInput,
+    /// Number of entries in `ref_audios`.
+    ref_audio_count: c_int,
+    /// Nonzero in REF2VA to size reference images to a 2048 short edge.
+    ref_image_max: c_int,
+}
+
+/// Output of one audio-video generation call (eremite_video_result).
+#[repr(C)]
+struct RawVideoResult {
+    /// Heap-allocated MP4 bytes, or null on failure.
+    data: *mut u8,
+    /// Byte length of `data`.
+    len: usize,
+    /// Actual generated video width in pixels.
+    width: c_int,
+    /// Actual generated video height in pixels.
+    height: c_int,
+    /// Actual generated video frame count.
+    frames: c_int,
+    /// Actual generated video frame rate in frames per second.
+    fps: c_int,
+    /// NUL-terminated error message on failure.
+    error: [c_char; VIDEO_ERROR_BYTES],
+    /// Nonzero when the failure came from invalid caller input.
+    invalid_input: c_int,
+    /// Encoded prompt tokens processed by the text encoder, including
+    /// reference media tokens.
+    prompt_tokens: c_int,
+    /// Seconds spent in the prompt encoder stage.
+    prefill_seconds: f64,
+    /// Seconds spent denoising, VAE decoding and MP4 muxing.
+    video_seconds: f64,
+}
+
 /// What a prefill ran (eremite_prefill_info).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -305,6 +408,18 @@ pub struct Stats {
     pub image_step: c_int,
     /// Total denoising steps in the active image call, or 0 outside denoising.
     pub image_steps_total: c_int,
+    /// Videos generated since the model opened.
+    pub generated_videos: u64,
+    /// Video denoising steps finished since the model opened.
+    pub video_steps: u64,
+    /// Seconds spent denoising, VAE decoding and muxing videos.
+    pub video_seconds: f64,
+    /// Active video generation stage (EREMITE_VIDEO_STAGE_*).
+    pub video_stage: c_int,
+    /// Active 1-based video denoising step, or 0 outside denoising.
+    pub video_step: c_int,
+    /// Total denoising steps in the active video call, or 0 outside denoising.
+    pub video_steps_total: c_int,
     /// The expert cache's slots.
     pub slots: c_int,
     /// The slots that hold an expert.
@@ -477,6 +592,9 @@ unsafe extern "C" {
         error_cap: usize,
     ) -> c_int;
     fn eremite_image_result_free(result: *mut RawImageResult);
+    fn eremite_is_video_model(m: *const RawModel) -> c_int;
+    fn eremite_video_model_limits(m: *const RawModel, out: *mut VideoLimits) -> c_int;
+    fn eremite_video_result_free(result: *mut RawVideoResult);
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
     fn eremite_state_bytes(m: *const RawModel, s: *const RawState, positions: c_int) -> usize;
@@ -564,8 +682,10 @@ unsafe extern "C" {
         images: *const RawMedia,
     );
     fn eremite_stream_generate_image(x: *mut RawStream, request: *const RawImageRequest);
+    fn eremite_stream_generate_video(x: *mut RawStream, request: *const RawVideoRequest);
     fn eremite_stream_cancel(x: *mut RawStream);
     fn eremite_stream_image_result(x: *mut RawStream, out: *mut RawImageResult) -> c_int;
+    fn eremite_stream_video_result(x: *mut RawStream, out: *mut RawVideoResult) -> c_int;
     fn eremite_stream_next_token(x: *const RawStream, accepted: *mut c_int) -> i32;
     fn eremite_run_streams(streams: *const *mut RawStream, n: c_int) -> c_int;
     fn eremite_stream_logits(x: *const RawStream) -> *const f32;
@@ -776,6 +896,10 @@ pub enum Architecture {
     /// MiniMax-H3-Image text-to-image and image editing model
     /// (_class_name MiniMaxH3ImagePipeline or model_type minimax_h3_image).
     MinimaxH3Image,
+    /// MiniMax-H3 Video audio-video generation model
+    /// (_class_name MiniMaxH3ModularPipeline, MiniMaxH3Pipeline or model_type
+    /// minimax_h3_video).
+    MinimaxH3Video,
 }
 
 impl Architecture {
@@ -803,6 +927,9 @@ impl Architecture {
             Some("deepseek_v41") => Ok(Architecture::DeepSeek),
             Some("lfm3_vl") if config["d1_attention"] == "set" => Ok(Architecture::D1),
             Some("MiniMaxH3ImagePipeline" | "minimax_h3_image") => Ok(Architecture::MinimaxH3Image),
+            Some("MiniMaxH3ModularPipeline" | "MiniMaxH3Pipeline" | "minimax_h3_video") => {
+                Ok(Architecture::MinimaxH3Video)
+            }
             Some(t) => Err(format!(
                 "{}: {key} {t} is not one this server runs",
                 path.display()
@@ -839,19 +966,76 @@ pub enum BackendOptions {
     Unspecified,
     /// DeepSeek's settings.
     DeepSeek(DeepSeekOptions),
-    /// MiniMax-H3-Image's checkpoint paths.
-    MinimaxH3Image(MinimaxH3Options),
+    /// MiniMax-H3 image or video checkpoint paths and sampling defaults.
+    MinimaxH3(MinimaxH3Options),
 }
 
-/// MiniMax-H3-Image's own settings.
+/// Task variant of a MiniMax-H3 Video checkpoint (EREMITE_VIDEO_VARIANT_*).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoVariant {
+    /// First/last keyframe-to-video-and-audio (and text-to-video-and-audio).
+    #[default]
+    Fl2va = 0,
+    /// Reference image, video and audio conditioning (and
+    /// text-to-video-and-audio).
+    Ref2va = 1,
+}
+
+impl VideoVariant {
+    /// Converts a raw C variant code from `VideoLimits::variant`.
+    pub fn from_raw(raw: c_int) -> VideoVariant {
+        match raw {
+            1 => VideoVariant::Ref2va,
+            _ => VideoVariant::Fl2va,
+        }
+    }
+
+    /// Returns the configuration and API name of this variant.
+    pub fn name(self) -> &'static str {
+        match self {
+            VideoVariant::Fl2va => "fl2va",
+            VideoVariant::Ref2va => "ref2va",
+        }
+    }
+}
+
+/// MiniMax-H3 image and video settings.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct MinimaxH3Options {
     /// Safetensors file of the Qwen3-VL text and vision encoder.
     pub text_encoder: Option<String>,
     /// Safetensors file of the pruned INT8-ConvRot DiT.
     pub dit: Option<String>,
-    /// Safetensors file of the FP16 image VAE.
+    /// Safetensors file of the image or video VAE.
     pub vae: Option<String>,
+    /// Safetensors file of the FP32 stereo Audio VAE (video models only).
+    pub audio_vae: Option<String>,
+    /// Optional safetensors file of a BF16 Turbo LoRA adapter (video models
+    /// only).
+    pub lora: Option<String>,
+    /// Optional LoRA scaling multiplier (video models only).
+    pub lora_strength: Option<f32>,
+    /// Optional default Euler denoising steps (video models only).
+    pub steps: Option<i32>,
+    /// Optional default video flow-matching shift factor (video models only).
+    pub shift_video: Option<f64>,
+    /// Optional default audio flow-matching shift factor (video models only).
+    pub shift_audio: Option<f64>,
+    /// Optional checkpoint task variant (video models only).
+    pub variant: Option<VideoVariant>,
+}
+
+impl MinimaxH3Options {
+    /// Returns whether any video-only setting is populated.
+    pub fn has_video_settings(&self) -> bool {
+        self.audio_vae.is_some()
+            || self.lora.is_some()
+            || self.lora_strength.is_some()
+            || self.steps.is_some()
+            || self.shift_video.is_some()
+            || self.shift_audio.is_some()
+            || self.variant.is_some()
+    }
 }
 
 /// DeepSeek's own settings.
@@ -879,8 +1063,8 @@ impl DeepSeekOptions {
 
 impl Options {
     /// Sets the family's own settings to the checkpoint's family. Returns an
-    /// error if they were set for another family, or if required image paths
-    /// are missing, or for a decision/image model with drafts or lookup.
+    /// error if they were set for another family, or if required media paths
+    /// are missing, or for a decision/image/video model with drafts or lookup.
     pub fn configure(&mut self, architecture: Architecture) -> Result<(), String> {
         self.backend = match (&self.backend, architecture) {
             (BackendOptions::Unspecified, Architecture::DeepSeek) => {
@@ -889,9 +1073,9 @@ impl Options {
             (BackendOptions::DeepSeek(d), Architecture::DeepSeek) => {
                 BackendOptions::DeepSeek(d.clone())
             }
-            (BackendOptions::MinimaxH3Image(_), Architecture::DeepSeek) => {
+            (BackendOptions::MinimaxH3(_), Architecture::DeepSeek) => {
                 return Err(format!(
-                    "{}: MiniMax-H3-Image checkpoint paths do not apply to DeepSeek",
+                    "{}: MiniMax-H3 checkpoint paths do not apply to DeepSeek",
                     self.model
                 ));
             }
@@ -910,16 +1094,22 @@ impl Options {
                     self.model
                 ));
             }
-            (BackendOptions::MinimaxH3Image(_), Architecture::D1) => {
+            (BackendOptions::MinimaxH3(_), Architecture::D1) => {
                 return Err(format!(
-                    "{}: MiniMax-H3-Image checkpoint paths for a decision model",
+                    "{}: MiniMax-H3 checkpoint paths for a decision model",
                     self.model
                 ));
             }
-            (BackendOptions::MinimaxH3Image(h3), Architecture::MinimaxH3Image) => {
+            (BackendOptions::MinimaxH3(h3), Architecture::MinimaxH3Image) => {
                 if self.draft != 0 || self.lookup != 0 {
                     return Err(format!(
                         "{}: an image model takes no drafts and no lookup",
+                        self.model
+                    ));
+                }
+                if h3.has_video_settings() {
+                    return Err(format!(
+                        "{}: video settings do not apply to MiniMax-H3-Image",
                         self.model
                     ));
                 }
@@ -929,7 +1119,7 @@ impl Options {
                         self.model
                     ));
                 }
-                BackendOptions::MinimaxH3Image(h3.clone())
+                BackendOptions::MinimaxH3(h3.clone())
             }
             (BackendOptions::Unspecified, Architecture::MinimaxH3Image) => {
                 return Err(format!(
@@ -943,6 +1133,37 @@ impl Options {
                     self.model
                 ));
             }
+            (BackendOptions::MinimaxH3(h3), Architecture::MinimaxH3Video) => {
+                if self.draft != 0 || self.lookup != 0 {
+                    return Err(format!(
+                        "{}: a video model takes no drafts and no lookup",
+                        self.model
+                    ));
+                }
+                if h3.text_encoder.is_none()
+                    || h3.dit.is_none()
+                    || h3.vae.is_none()
+                    || h3.audio_vae.is_none()
+                {
+                    return Err(format!(
+                        "{}: MiniMax-H3 Video requires text_encoder, dit, vae and audio_vae paths",
+                        self.model
+                    ));
+                }
+                BackendOptions::MinimaxH3(h3.clone())
+            }
+            (BackendOptions::Unspecified, Architecture::MinimaxH3Video) => {
+                return Err(format!(
+                    "{}: MiniMax-H3 Video requires text_encoder, dit, vae and audio_vae paths",
+                    self.model
+                ));
+            }
+            (BackendOptions::DeepSeek(_), Architecture::MinimaxH3Video) => {
+                return Err(format!(
+                    "{}: DeepSeek's settings for a video model",
+                    self.model
+                ));
+            }
         };
         Ok(())
     }
@@ -951,7 +1172,7 @@ impl Options {
     pub fn deepseek(&self) -> Option<&DeepSeekOptions> {
         match &self.backend {
             BackendOptions::DeepSeek(d) => Some(d),
-            BackendOptions::Unspecified | BackendOptions::MinimaxH3Image(_) => None,
+            BackendOptions::Unspecified | BackendOptions::MinimaxH3(_) => None,
         }
     }
 
@@ -963,31 +1184,31 @@ impl Options {
         }
         match &mut self.backend {
             BackendOptions::DeepSeek(d) => Ok(d),
-            BackendOptions::MinimaxH3Image(_) => {
-                Err("DeepSeek's settings cannot be combined with MiniMax-H3-Image paths".into())
+            BackendOptions::MinimaxH3(_) => {
+                Err("DeepSeek's settings cannot be combined with MiniMax-H3 paths".into())
             }
             BackendOptions::Unspecified => unreachable!("set above"),
         }
     }
 
-    /// Returns MiniMax-H3-Image's settings, or None for another family.
+    /// Returns MiniMax-H3's settings, or None for another family.
     pub fn minimax_h3(&self) -> Option<&MinimaxH3Options> {
         match &self.backend {
-            BackendOptions::MinimaxH3Image(h3) => Some(h3),
+            BackendOptions::MinimaxH3(h3) => Some(h3),
             BackendOptions::Unspecified | BackendOptions::DeepSeek(_) => None,
         }
     }
 
-    /// Returns MiniMax-H3-Image's settings to change. Settings not set yet
-    /// become MiniMax-H3-Image's.
+    /// Returns MiniMax-H3's settings to change. Settings not set yet become
+    /// MiniMax-H3's.
     pub fn minimax_h3_mut(&mut self) -> Result<&mut MinimaxH3Options, String> {
         if matches!(self.backend, BackendOptions::Unspecified) {
-            self.backend = BackendOptions::MinimaxH3Image(MinimaxH3Options::default());
+            self.backend = BackendOptions::MinimaxH3(MinimaxH3Options::default());
         }
         match &mut self.backend {
-            BackendOptions::MinimaxH3Image(h3) => Ok(h3),
+            BackendOptions::MinimaxH3(h3) => Ok(h3),
             BackendOptions::DeepSeek(_) => {
-                Err("MiniMax-H3-Image paths cannot be combined with DeepSeek's settings".into())
+                Err("MiniMax-H3 paths cannot be combined with DeepSeek's settings".into())
             }
             BackendOptions::Unspecified => unreachable!("set above"),
         }
@@ -1163,6 +1384,10 @@ impl Model {
         let text_encoder = minimax_h3.text_encoder.as_deref().map(c_string);
         let dit = minimax_h3.dit.as_deref().map(c_string);
         let vae = minimax_h3.vae.as_deref().map(c_string);
+        let audio_vae = minimax_h3.audio_vae.as_deref().map(c_string);
+        let lora = minimax_h3.lora.as_deref().map(c_string);
+        let is_video = architecture == Architecture::MinimaxH3Video;
+        let is_image = architecture == Architecture::MinimaxH3Image;
         let raw = RawConfig {
             abi: ABI,
             model: model.as_ptr(),
@@ -1179,15 +1404,53 @@ impl Model {
                 prefill_prune: deepseek.prunes_prefill().into(),
                 packed_state_rows: deepseek.packed_state_rows.into(),
             },
-            minimax_h3: RawMinimaxH3Config {
-                text_encoder: text_encoder.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-                dit: dit.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-                vae: vae.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            minimax_h3: if is_image {
+                RawMinimaxH3Config {
+                    text_encoder: text_encoder.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    dit: dit.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    vae: vae.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                }
+            } else {
+                RawMinimaxH3Config {
+                    text_encoder: ptr::null(),
+                    dit: ptr::null(),
+                    vae: ptr::null(),
+                }
+            },
+            minimax_h3_video: if is_video {
+                RawMinimaxH3VideoConfig {
+                    text_encoder: text_encoder.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    dit: dit.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    vae: vae.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    audio_vae: audio_vae.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    lora: lora.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                    lora_strength: minimax_h3.lora_strength.unwrap_or(0.0),
+                    default_steps: minimax_h3.steps.unwrap_or(0) as c_int,
+                    shift_video: minimax_h3.shift_video.unwrap_or(0.0),
+                    shift_audio: minimax_h3.shift_audio.unwrap_or(0.0),
+                    variant: minimax_h3.variant.unwrap_or_default() as c_int,
+                }
+            } else {
+                RawMinimaxH3VideoConfig {
+                    text_encoder: ptr::null(),
+                    dit: ptr::null(),
+                    vae: ptr::null(),
+                    audio_vae: ptr::null(),
+                    lora: ptr::null(),
+                    lora_strength: 0.0,
+                    default_steps: 0,
+                    shift_video: 0.0,
+                    shift_audio: 0.0,
+                    variant: 0,
+                }
             },
         };
         let mut weight_files = Vec::new();
         if let Some(h3) = o.minimax_h3() {
-            for path in [&h3.text_encoder, &h3.dit, &h3.vae].into_iter().flatten() {
+            for path in [&h3.text_encoder, &h3.dit, &h3.vae, &h3.audio_vae, &h3.lora]
+                .into_iter()
+                .flatten()
+            {
                 weight_files.push(path.clone());
             }
         }
@@ -1321,6 +1584,19 @@ impl Model {
     /// Returns whether the model is an image generation model.
     pub fn is_image_model(&self) -> bool {
         unsafe { eremite_is_image_model(self.raw) != 0 }
+    }
+
+    /// Returns whether the model is a video generation model.
+    pub fn is_video_model(&self) -> bool {
+        unsafe { eremite_is_video_model(self.raw) != 0 }
+    }
+
+    /// Returns this model's video generation limits, or None when the model
+    /// generates no videos.
+    pub fn video_limits(&self) -> Option<VideoLimits> {
+        let mut out = VideoLimits::default();
+        let ok = unsafe { eremite_video_model_limits(self.raw, &mut out) };
+        (ok != 0).then_some(out)
     }
 
     /// Returns this model's image generation limits, or None when the model
@@ -2001,6 +2277,236 @@ impl ImageInputs {
     }
 }
 
+/// Input and output limits of a video generation model (eremite_video_limits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VideoLimits {
+    /// Maximum prompt tokens retained before encoding.
+    pub max_prompt_tokens: c_int,
+    /// Spatial multiple in pixels required for width and height.
+    pub patch_px: c_int,
+    /// Maximum single-axis output dimension in pixels.
+    pub max_dim: c_int,
+    /// Default output width in pixels.
+    pub default_width: c_int,
+    /// Default output height in pixels.
+    pub default_height: c_int,
+    /// Maximum generation canvas area in pixels.
+    pub max_canvas_area: i64,
+    /// Output frame rate in frames per second.
+    pub fps: c_int,
+    /// Minimum video frame count.
+    pub min_frames: c_int,
+    /// Maximum video frame count.
+    pub max_frames: c_int,
+    /// Default video frame count.
+    pub default_frames: c_int,
+    /// Minimum duration in whole seconds.
+    pub min_seconds: c_int,
+    /// Maximum duration in whole seconds.
+    pub max_seconds: c_int,
+    /// Default duration in whole seconds.
+    pub default_seconds: c_int,
+    /// Minimum denoising step count.
+    pub min_steps: c_int,
+    /// Maximum denoising step count.
+    pub max_steps: c_int,
+    /// Default denoising step count configured on the model.
+    pub default_steps: c_int,
+    /// Maximum reference images accepted by one REF2VA request.
+    pub max_ref_images: c_int,
+    /// Maximum reference videos accepted by one REF2VA request.
+    pub max_ref_videos: c_int,
+    /// Maximum standalone reference audios accepted by one REF2VA request.
+    pub max_ref_audios: c_int,
+    /// Maximum total reference files accepted by one REF2VA request.
+    pub max_total_refs: c_int,
+    /// Active checkpoint task variant (EREMITE_VIDEO_VARIANT_*).
+    pub variant: c_int,
+    /// Required guidance scale for CFG-free checkpoints.
+    pub guidance_scale: f64,
+    /// Default video flow-matching shift factor configured on the model.
+    pub default_shift_video: f64,
+    /// Default audio flow-matching shift factor configured on the model.
+    pub default_shift_audio: f64,
+}
+
+impl VideoLimits {
+    /// Returns the active checkpoint task variant.
+    pub fn task_variant(&self) -> VideoVariant {
+        VideoVariant::from_raw(self.variant)
+    }
+}
+
+/// Running stage of a video generation call (EREMITE_VIDEO_STAGE_*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoStage {
+    /// No video call is running.
+    None = 0,
+    /// The prompt encoder runs over text and reference media tokens.
+    Prefill = 1,
+    /// Conditioning VAEs, DiT denoiser, Video/Audio VAEs and MP4 muxer run.
+    Generating = 2,
+}
+
+impl VideoStage {
+    /// Converts a raw C stage code from `Stats::video_stage`.
+    pub fn from_raw(raw: c_int) -> VideoStage {
+        match raw {
+            1 => VideoStage::Prefill,
+            2 => VideoStage::Generating,
+            _ => VideoStage::None,
+        }
+    }
+}
+
+/// Output MP4 bytes, actual geometry and per-stage timings from one video call.
+#[derive(Clone, Debug)]
+pub struct VideoCallOutput {
+    /// Encoded H.264/AAC MP4 bytes.
+    pub bytes: Vec<u8>,
+    /// Actual generated video width in pixels.
+    pub width: i32,
+    /// Actual generated video height in pixels.
+    pub height: i32,
+    /// Actual generated video frame count.
+    pub frames: i32,
+    /// Actual generated video frame rate in frames per second.
+    pub fps: i32,
+    /// Encoded prompt tokens processed by the text encoder, including
+    /// reference media tokens.
+    pub prompt_tokens: usize,
+    /// Seconds spent in the prompt encoder stage.
+    pub prefill_seconds: f64,
+    /// Seconds spent denoising, VAE decoding and MP4 muxing.
+    pub video_seconds: f64,
+}
+
+/// Scalar parameters of one audio-video generation call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoCallParams {
+    /// Requested output width in pixels; 0 adapts or uses the default.
+    pub width: i32,
+    /// Requested output height in pixels; 0 adapts or uses the default.
+    pub height: i32,
+    /// Requested duration in whole seconds; 0 uses frames or the default.
+    pub seconds: i32,
+    /// Requested frame count; 0 uses seconds or the default.
+    pub frames: i32,
+    /// Requested denoising step count; 0 uses the model's default.
+    pub steps: i32,
+    /// Video flow-matching shift override; 0.0 uses the model's default.
+    pub shift_video: f64,
+    /// Audio flow-matching shift override; 0.0 uses the model's default.
+    pub shift_audio: f64,
+    /// Deterministic RNG seed.
+    pub seed: u64,
+    /// True in REF2VA to size reference images to a 2048 short edge.
+    pub ref_image_max: bool,
+}
+
+/// Error returned when a video generation call fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoError {
+    /// Human-readable error message from the engine.
+    pub message: String,
+    /// True when the client supplied invalid inputs (HTTP 400); false for
+    /// runtime, memory or cancellation errors.
+    pub invalid_input: bool,
+}
+
+/// Owned prompt C string and encoded conditioning media kept alive across an
+/// asynchronous video stream call.
+pub struct VideoInputs {
+    /// NUL-terminated UTF-8 prompt passed to C.
+    prompt: CString,
+    /// Optional FL2VA first keyframe bytes pointed into by `raw_first_frame`.
+    _first_frame: Option<Vec<u8>>,
+    /// C descriptor for `first_frame`.
+    raw_first_frame: RawVideoMediaInput,
+    /// Optional FL2VA last keyframe bytes pointed into by `raw_last_frame`.
+    _last_frame: Option<Vec<u8>>,
+    /// C descriptor for `last_frame`.
+    raw_last_frame: RawVideoMediaInput,
+    /// REF2VA reference image buffers pointed into by `raw_ref_images`.
+    _ref_images: Vec<Vec<u8>>,
+    /// Heap-allocated C descriptors for `ref_images`.
+    raw_ref_images: Box<[RawVideoMediaInput]>,
+    /// REF2VA reference video buffers pointed into by `raw_ref_videos`.
+    _ref_videos: Vec<Vec<u8>>,
+    /// Heap-allocated C descriptors for `ref_videos`.
+    raw_ref_videos: Box<[RawVideoMediaInput]>,
+    /// Optional explicit soundtracks paired with `ref_videos`.
+    _ref_video_audios: Vec<Option<Vec<u8>>>,
+    /// Heap-allocated C descriptors for `ref_video_audios`.
+    raw_ref_video_audios: Box<[RawVideoMediaInput]>,
+    /// REF2VA standalone reference audio buffers pointed into by
+    /// `raw_ref_audios`.
+    _ref_audios: Vec<Vec<u8>>,
+    /// Heap-allocated C descriptors for `ref_audios`.
+    raw_ref_audios: Box<[RawVideoMediaInput]>,
+}
+
+/// Builds a C media descriptor for an optional owned byte vector.
+fn media_input_from_opt(bytes: &Option<Vec<u8>>) -> RawVideoMediaInput {
+    RawVideoMediaInput {
+        data: bytes.as_ref().map_or(ptr::null(), |b| b.as_ptr()),
+        len: bytes.as_ref().map_or(0, Vec::len),
+    }
+}
+
+/// Builds a boxed slice of C media descriptors from owned byte vectors.
+fn media_inputs_from_vec(items: &[Vec<u8>]) -> Box<[RawVideoMediaInput]> {
+    items
+        .iter()
+        .map(|b| RawVideoMediaInput {
+            data: b.as_ptr(),
+            len: b.len(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+impl VideoInputs {
+    /// Packages prompt and conditioning media into stable heap memory for C FFI.
+    pub fn new(
+        prompt: &str,
+        first_frame: Option<Vec<u8>>,
+        last_frame: Option<Vec<u8>>,
+        ref_images: Vec<Vec<u8>>,
+        ref_videos: Vec<Vec<u8>>,
+        mut ref_video_audios: Vec<Option<Vec<u8>>>,
+        ref_audios: Vec<Vec<u8>>,
+    ) -> VideoInputs {
+        ref_video_audios.resize(ref_videos.len(), None);
+        let raw_first_frame = media_input_from_opt(&first_frame);
+        let raw_last_frame = media_input_from_opt(&last_frame);
+        let raw_ref_images = media_inputs_from_vec(&ref_images);
+        let raw_ref_videos = media_inputs_from_vec(&ref_videos);
+        let raw_ref_video_audios = ref_video_audios
+            .iter()
+            .map(media_input_from_opt)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let raw_ref_audios = media_inputs_from_vec(&ref_audios);
+        VideoInputs {
+            prompt: c_string(prompt),
+            _first_frame: first_frame,
+            raw_first_frame,
+            _last_frame: last_frame,
+            raw_last_frame,
+            _ref_images: ref_images,
+            raw_ref_images,
+            _ref_videos: ref_videos,
+            raw_ref_videos,
+            _ref_video_audios: ref_video_audios,
+            raw_ref_video_audios,
+            _ref_audios: ref_audios,
+            raw_ref_audios,
+        }
+    }
+}
+
 /// One model's calls, one after another, on their own stack and working
 /// buffers (eremite_stream). The calls of several streams run at the same
 /// time. A posted call runs when run_streams advances its stream. What the
@@ -2201,6 +2707,95 @@ impl Stream {
         result
     }
 
+    /// Posts one audio-video generation call on this stream. `inputs` must
+    /// remain alive until the call finishes.
+    pub fn generate_video(&self, inputs: &VideoInputs, params: VideoCallParams) {
+        let req = RawVideoRequest {
+            prompt: inputs.prompt.as_ptr(),
+            width: params.width as c_int,
+            height: params.height as c_int,
+            seconds: params.seconds as c_int,
+            frames: params.frames as c_int,
+            steps: params.steps as c_int,
+            shift_video: params.shift_video,
+            shift_audio: params.shift_audio,
+            seed: params.seed,
+            first_frame: inputs.raw_first_frame,
+            last_frame: inputs.raw_last_frame,
+            ref_images: if inputs.raw_ref_images.is_empty() {
+                ptr::null()
+            } else {
+                inputs.raw_ref_images.as_ptr()
+            },
+            ref_image_count: inputs.raw_ref_images.len() as c_int,
+            ref_videos: if inputs.raw_ref_videos.is_empty() {
+                ptr::null()
+            } else {
+                inputs.raw_ref_videos.as_ptr()
+            },
+            ref_video_audios: if inputs.raw_ref_video_audios.is_empty() {
+                ptr::null()
+            } else {
+                inputs.raw_ref_video_audios.as_ptr()
+            },
+            ref_video_count: inputs.raw_ref_videos.len() as c_int,
+            ref_audios: if inputs.raw_ref_audios.is_empty() {
+                ptr::null()
+            } else {
+                inputs.raw_ref_audios.as_ptr()
+            },
+            ref_audio_count: inputs.raw_ref_audios.len() as c_int,
+            ref_image_max: params.ref_image_max.into(),
+        };
+        unsafe { eremite_stream_generate_video(self.0, &req) }
+    }
+
+    /// Takes the finished video call's encoded MP4 bytes and timings, or its
+    /// error.
+    pub fn take_video_result(&self) -> Result<VideoCallOutput, VideoError> {
+        let mut raw = RawVideoResult {
+            data: ptr::null_mut(),
+            len: 0,
+            width: 0,
+            height: 0,
+            frames: 0,
+            fps: 0,
+            error: [0; VIDEO_ERROR_BYTES],
+            invalid_input: 0,
+            prompt_tokens: 0,
+            prefill_seconds: 0.0,
+            video_seconds: 0.0,
+        };
+        let ok = unsafe { eremite_stream_video_result(self.0, &mut raw) != 0 };
+        let result = if ok && !raw.data.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(raw.data, raw.len) }.to_vec();
+            Ok(VideoCallOutput {
+                bytes,
+                width: raw.width,
+                height: raw.height,
+                frames: raw.frames,
+                fps: raw.fps,
+                prompt_tokens: raw.prompt_tokens.max(0) as usize,
+                prefill_seconds: raw.prefill_seconds.max(0.0),
+                video_seconds: raw.video_seconds.max(0.0),
+            })
+        } else {
+            let message = unsafe { std::ffi::CStr::from_ptr(raw.error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            Err(VideoError {
+                message: if message.is_empty() {
+                    "video generation failed".into()
+                } else {
+                    message
+                },
+                invalid_input: raw.invalid_input != 0,
+            })
+        };
+        unsafe { eremite_video_result_free(&mut raw) };
+        result
+    }
+
     /// Returns the finished verify call's next token, and how many of its
     /// drafts it kept.
     pub fn next_token(&self) -> (i32, usize) {
@@ -2317,6 +2912,50 @@ mod tests {
             Architecture::of(dir.path()),
             Ok(Architecture::MinimaxH3Image)
         );
+        for class in ["MiniMaxH3ModularPipeline", "MiniMaxH3Pipeline"] {
+            std::fs::write(&index, format!(r#"{{"_class_name": "{class}"}}"#)).unwrap();
+            assert_eq!(
+                Architecture::of(dir.path()),
+                Ok(Architecture::MinimaxH3Video)
+            );
+        }
+    }
+
+    #[test]
+    fn a_video_model_requires_paths_and_rejects_drafts_lookup_and_wrong_family() {
+        let mut options = Options::default();
+        assert!(options.configure(Architecture::MinimaxH3Video).is_err());
+        let h3 = options.minimax_h3_mut().unwrap();
+        h3.text_encoder = Some("/m/te.safetensors".into());
+        h3.dit = Some("/m/dit.safetensors".into());
+        h3.vae = Some("/m/vvae.safetensors".into());
+        assert!(
+            options.configure(Architecture::MinimaxH3Video).is_err(),
+            "audio_vae is required"
+        );
+        options.minimax_h3_mut().unwrap().audio_vae = Some("/m/avae.safetensors".into());
+        options.minimax_h3_mut().unwrap().lora = Some("/m/lora.safetensors".into());
+        options.minimax_h3_mut().unwrap().steps = Some(4);
+        options.minimax_h3_mut().unwrap().variant = Some(VideoVariant::Ref2va);
+        options.configure(Architecture::MinimaxH3Video).unwrap();
+
+        assert!(
+            options
+                .clone()
+                .configure(Architecture::MinimaxH3Image)
+                .is_err(),
+            "video-only fields must not apply to image models"
+        );
+        assert!(options.clone().configure(Architecture::DeepSeek).is_err());
+        assert!(options.clone().configure(Architecture::D1).is_err());
+        for change in [
+            |o: &mut Options| o.draft = 1,
+            |o: &mut Options| o.lookup = 3,
+        ] {
+            let mut bad = options.clone();
+            change(&mut bad);
+            assert!(bad.configure(Architecture::MinimaxH3Video).is_err());
+        }
     }
 
     #[test]

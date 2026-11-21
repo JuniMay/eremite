@@ -66,6 +66,32 @@ const GENERATING_KEYS: [&str; 7] = [
 /// The keys of a model's entry that only an image generation model takes.
 pub const IMAGE_KEYS: [&str; 4] = ["text_encoder", "dit", "vae", "default_size"];
 
+/// The keys of a model's entry that only a video generation model takes.
+pub const VIDEO_ONLY_KEYS: [&str; 7] = [
+    "audio_vae",
+    "lora",
+    "lora_strength",
+    "steps",
+    "shift_video",
+    "shift_audio",
+    "variant",
+];
+
+/// The keys of a model's entry that apply to image or video models only.
+pub const MEDIA_MODEL_KEYS: [&str; 11] = [
+    "text_encoder",
+    "dit",
+    "vae",
+    "default_size",
+    "audio_vae",
+    "lora",
+    "lora_strength",
+    "steps",
+    "shift_video",
+    "shift_audio",
+    "variant",
+];
+
 impl ModelConfig {
     /// Creates the settings of the model in the directory `model`. The context
     /// holds the most tokens, the context lookup gives up to the most
@@ -95,7 +121,7 @@ impl ModelConfig {
     pub fn fit_decision_model(&mut self, context: i32) -> Result<(), String> {
         let model = &self.engine.model;
         if let Some(key) = self.keys.iter().find(|key| {
-            GENERATING_KEYS.contains(&key.as_str()) || IMAGE_KEYS.contains(&key.as_str())
+            GENERATING_KEYS.contains(&key.as_str()) || MEDIA_MODEL_KEYS.contains(&key.as_str())
         }) {
             return Err(format!(
                 "{model}: {key} is not a setting of a decision model"
@@ -114,16 +140,14 @@ impl ModelConfig {
     }
 
     /// Fits the settings to an image generation model. Rejects
-    /// text-generation-only keys, requires `text_encoder`, `dit` and `vae`,
-    /// leaves an omitted `ctx` as 0 so the engine uses the model's prompt
-    /// limit, and disables context lookup.
+    /// text-generation-only and video-only keys, requires `text_encoder`,
+    /// `dit` and `vae`, leaves an omitted `ctx` as 0 so the engine uses the
+    /// model's prompt limit, and disables context lookup.
     pub fn fit_image_model(&mut self) -> Result<(), String> {
         let model = &self.engine.model;
-        if let Some(key) = self
-            .keys
-            .iter()
-            .find(|key| GENERATING_KEYS.contains(&key.as_str()))
-        {
+        if let Some(key) = self.keys.iter().find(|key| {
+            GENERATING_KEYS.contains(&key.as_str()) || VIDEO_ONLY_KEYS.contains(&key.as_str())
+        }) {
             return Err(format!("{model}: {key} is not a setting of an image model"));
         }
         if !self.keys.iter().any(|key| key == "ctx") {
@@ -133,6 +157,34 @@ impl ModelConfig {
         if h3.is_none_or(|o| o.text_encoder.is_none() || o.dit.is_none() || o.vae.is_none()) {
             return Err(format!(
                 "{model}: an image model requires text_encoder, dit and vae paths"
+            ));
+        }
+        self.engine.lookup = 0;
+        Ok(())
+    }
+
+    /// Fits the settings to a video generation model. Rejects
+    /// text-generation-only and image-only keys, requires `text_encoder`,
+    /// `dit`, `vae` and `audio_vae`, leaves an omitted `ctx` as 0 so the
+    /// engine uses the model's prompt limit, and disables context lookup.
+    pub fn fit_video_model(&mut self) -> Result<(), String> {
+        let model = &self.engine.model;
+        if let Some(key) = self
+            .keys
+            .iter()
+            .find(|key| GENERATING_KEYS.contains(&key.as_str()) || key.as_str() == "default_size")
+        {
+            return Err(format!("{model}: {key} is not a setting of a video model"));
+        }
+        if !self.keys.iter().any(|key| key == "ctx") {
+            self.engine.ctx = 0;
+        }
+        let h3 = self.engine.minimax_h3();
+        if h3.is_none_or(|o| {
+            o.text_encoder.is_none() || o.dit.is_none() || o.vae.is_none() || o.audio_vae.is_none()
+        }) {
+            return Err(format!(
+                "{model}: a video model requires text_encoder, dit, vae and audio_vae paths"
             ));
         }
         self.engine.lookup = 0;
@@ -166,6 +218,44 @@ impl ModelConfig {
             "text_encoder" => options.minimax_h3_mut()?.text_encoder = Some(text()?),
             "dit" => options.minimax_h3_mut()?.dit = Some(text()?),
             "vae" => options.minimax_h3_mut()?.vae = Some(text()?),
+            "audio_vae" => options.minimax_h3_mut()?.audio_vae = Some(text()?),
+            "lora" => options.minimax_h3_mut()?.lora = Some(text()?),
+            "lora_strength" => {
+                let s = value
+                    .as_f64()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or("lora_strength takes a positive number")?;
+                options.minimax_h3_mut()?.lora_strength = Some(s as f32);
+            }
+            "steps" => {
+                let n = integer()?;
+                if n < 1 {
+                    return Err("steps takes a positive integer".into());
+                }
+                options.minimax_h3_mut()?.steps = Some(n);
+            }
+            "shift_video" => {
+                let s = value
+                    .as_f64()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or("shift_video takes a positive number")?;
+                options.minimax_h3_mut()?.shift_video = Some(s);
+            }
+            "shift_audio" => {
+                let s = value
+                    .as_f64()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or("shift_audio takes a positive number")?;
+                options.minimax_h3_mut()?.shift_audio = Some(s);
+            }
+            "variant" => {
+                let v = match value.as_str() {
+                    Some("fl2va") => engine::VideoVariant::Fl2va,
+                    Some("ref2va") => engine::VideoVariant::Ref2va,
+                    _ => return Err("variant takes \"fl2va\" or \"ref2va\"".into()),
+                };
+                options.minimax_h3_mut()?.variant = Some(v);
+            }
             "ctx" => options.ctx = integer()?,
             "ced" => options.deepseek_mut()?.ced = match value {
                 Value::String(text) if text == "off" => 0,
@@ -202,6 +292,7 @@ impl ModelConfig {
             | "snapshot_interval"
             | "state_dir"
             | "search_dir"
+            | "video_dir"
             | "port"
             | "host"
             | "api_key_file"
@@ -242,6 +333,9 @@ pub struct Server {
     pub state_dir: Option<String>,
     /// The folder for the web tool's turn counters. None uses the default.
     pub search_dir: Option<String>,
+    /// The folder where generated video MP4 files are stored. None uses the
+    /// default under HOME.
+    pub video_dir: Option<String>,
     /// The SearXNG for Codex's web tool (codex/search.rs), as
     /// scripts/setup-searxng.sh sets it up; None: [`default_searxng_dir`].
     pub searxng_dir: Option<String>,
@@ -293,6 +387,7 @@ impl Default for Server {
             api_key_file: None,
             state_dir: None,
             search_dir: None,
+            video_dir: None,
             searxng_dir: None,
             searxng_socket: None,
             http_timeout_s: 60.0,
@@ -338,6 +433,15 @@ impl Server {
         })
     }
 
+    /// Returns the configured generated-videos folder or its default under
+    /// HOME (`~/.local/share/eremite/videos`).
+    pub fn video_folder(&self, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        self.video_dir.as_ref().map(PathBuf::from).or_else(|| {
+            let home = home.filter(|home| !home.is_empty())?;
+            Some(PathBuf::from(home).join(".local/share/eremite/videos"))
+        })
+    }
+
     /// Sets the server setting `name` to `value`. Returns the setting's message
     /// when either is invalid.
     pub fn set(&mut self, name: &str, value: &Value) -> Result<(), String> {
@@ -366,6 +470,7 @@ impl Server {
             "api_key_file" => self.api_key_file = Some(text()?.into()),
             "state_dir" => self.state_dir = Some(text()?.into()),
             "search_dir" => self.search_dir = Some(text()?.into()),
+            "video_dir" => self.video_dir = Some(text()?.into()),
             "searxng_dir" => self.searxng_dir = Some(text()?.into()),
             "searxng_socket" => self.searxng_socket = Some(text()?.into()),
             "search_ranking_model" => self.search_ranking_model = Some(text()?.into()),
@@ -624,6 +729,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "snapshot_interval",
             "state_dir",
             "search_dir",
+            "video_dir",
             "idle_unload",
             "port",
             "host",
@@ -671,6 +777,7 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "api_key_file",
         "state_dir",
         "search_dir",
+        "video_dir",
         "searxng_dir",
         "searxng_socket",
         "http_timeout",
@@ -1262,5 +1369,81 @@ mod tests {
                 .models[0]
                 .clone();
         assert!(decision.fit_decision_model(4096).is_err());
+    }
+
+    #[test]
+    fn a_video_model_requires_its_four_checkpoints_and_accepts_video_options() {
+        let fit = |model: Value| {
+            let mut model = parse(&json!({"models": [model]})).unwrap().models[0].clone();
+            model.fit_video_model().map(|()| model)
+        };
+        let model = fit(json!({
+            "model": "/m/minimax-h3",
+            "text_encoder": "/m/te.safetensors",
+            "dit": "/m/dit.safetensors",
+            "vae": "/m/vvae.safetensors",
+            "audio_vae": "/m/avae.safetensors",
+            "lora": "/m/turbo.safetensors",
+            "lora_strength": 1.0,
+            "steps": 4,
+            "shift_video": 12.0,
+            "shift_audio": 3.0,
+            "variant": "ref2va"
+        }))
+        .unwrap();
+        assert_eq!(
+            (model.engine.ctx, model.engine.lookup, model.engine.draft),
+            (0, 0, 0)
+        );
+        let h3 = model.engine.minimax_h3().unwrap();
+        assert_eq!(h3.audio_vae.as_deref(), Some("/m/avae.safetensors"));
+        assert_eq!(h3.lora.as_deref(), Some("/m/turbo.safetensors"));
+        assert_eq!(h3.steps, Some(4));
+        assert_eq!(h3.variant, Some(engine::VideoVariant::Ref2va));
+
+        assert!(
+            fit(json!({
+                "model": "/m/minimax-h3",
+                "text_encoder": "/m/te.st",
+                "dit": "/m/dit.st",
+                "vae": "/m/vvae.st"
+            }))
+            .is_err(),
+            "audio_vae is required"
+        );
+        assert!(
+            fit(json!({
+                "model": "/m/minimax-h3",
+                "text_encoder": "/m/te.st",
+                "dit": "/m/dit.st",
+                "vae": "/m/vvae.st",
+                "audio_vae": "/m/avae.st",
+                "default_size": "1024x576"
+            }))
+            .is_err(),
+            "image-only default_size is rejected on video models"
+        );
+        for (k, v) in [
+            ("variant", json!("t2v")),
+            ("steps", json!(0)),
+            ("lora_strength", json!(0.0)),
+            ("shift_video", json!(-1.0)),
+            ("shift_audio", json!(0.0)),
+        ] {
+            assert!(
+                parse(&json!({"models": [{"model": "/m/h3", k: v}]})).is_err(),
+                "{k}={v} should be rejected"
+            );
+        }
+        let cfg = parse(&json!({
+            "video_dir": "/tmp/videos",
+            "models": [{"model": "/m/h3"}]
+        }))
+        .unwrap();
+        assert_eq!(cfg.server.video_dir.as_deref(), Some("/tmp/videos"));
+        assert_eq!(
+            Server::default().video_folder(Some("/home/user".into())),
+            Some(PathBuf::from("/home/user/.local/share/eremite/videos"))
+        );
     }
 }

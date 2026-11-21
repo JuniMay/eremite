@@ -88,6 +88,9 @@ enum Format {
     /// MiniMax-H3-Image: text-to-image generation and multi-reference editing,
     /// with the input and output limits reported by the opened engine model.
     MinimaxH3Image(engine::ImageLimits),
+    /// MiniMax-H3 Video: audio-video generation (T2VA, FL2VA and REF2VA), with
+    /// the input and output limits reported by the opened engine model.
+    MinimaxH3Video(engine::VideoLimits),
 }
 
 /// What the HTTP handlers share.
@@ -357,7 +360,7 @@ async fn list_codex_models(State(shared): App) -> Response {
                 context_window: model.ctx,
                 default_effort: defaults.is_thinking_on.then_some(defaults.effort),
             }),
-            Format::D1(_) | Format::MinimaxH3Image(_) => None,
+            Format::D1(_) | Format::MinimaxH3Image(_) | Format::MinimaxH3Video(_) => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -495,6 +498,9 @@ async fn answer_decisions(
                 }
                 Format::MinimaxH3Image(_) => {
                     format!("{} is an image model: it makes no decisions", model.id)
+                }
+                Format::MinimaxH3Video(_) => {
+                    format!("{} is a video model: it makes no decisions", model.id)
                 }
                 Format::D1(_) => unreachable!(),
             };
@@ -640,6 +646,10 @@ async fn answer_generation(
         ))),
         Format::MinimaxH3Image(_) => Err(chat::Error::new_bad_request(format!(
             "{} is an image model: it generates images and generates no text",
+            handlers.models[index].id
+        ))),
+        Format::MinimaxH3Video(_) => Err(chat::Error::new_bad_request(format!(
+            "{} is a video model: it generates videos and generates no text",
             handlers.models[index].id
         ))),
     })
@@ -1024,13 +1034,15 @@ fn main() {
                 .unwrap_or_else(|error| die(&error));
         } else if family == Family::MinimaxH3Image {
             model.fit_image_model().unwrap_or_else(|error| die(&error));
+        } else if family == Family::MinimaxH3Video {
+            model.fit_video_model().unwrap_or_else(|error| die(&error));
         } else if let Some(key) = model
             .keys
             .iter()
-            .find(|key| config::IMAGE_KEYS.contains(&key.as_str()))
+            .find(|key| config::MEDIA_MODEL_KEYS.contains(&key.as_str()))
         {
             die(&format!(
-                "{}: {key} is a setting of an image model",
+                "{}: {key} is a setting of an image or video model",
                 model.engine.model
             ));
         }
@@ -1042,6 +1054,7 @@ fn main() {
             Family::DeepSeek => deepseek::DEFAULT_MODEL_ID.into(),
             Family::D1 => d1::derive_model_names(&model.engine.model).0,
             Family::MinimaxH3Image => image::DEFAULT_MODEL_ID.into(),
+            Family::MinimaxH3Video => "minimax-h3-video".into(),
         });
         if served
             .iter()
@@ -1078,6 +1091,9 @@ fn main() {
                 )),
                 Family::MinimaxH3Image => die(&format!(
                     "search_ranking_model: {id} is an image model: it makes no decisions"
+                )),
+                Family::MinimaxH3Video => die(&format!(
+                    "search_ranking_model: {id} is a video model: it makes no decisions"
                 )),
             }
         });
@@ -1142,16 +1158,29 @@ fn main() {
                 worker::image_limits(index)
                     .unwrap_or_else(|| die(&format!("{id}: image model reported no limits"))),
             ),
+            Family::MinimaxH3Video => Format::MinimaxH3Video(
+                worker::video_limits(index)
+                    .unwrap_or_else(|| die(&format!("{id}: video model reported no limits"))),
+            ),
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
             Family::D1 => d1::derive_model_names(&settings.options.model).1,
             Family::MinimaxH3Image => image::DISPLAY_NAME.to_string(),
+            Family::MinimaxH3Video => "MiniMax-H3 Video".to_string(),
+        };
+        let extra = match &format {
+            Format::MinimaxH3Video(limits) => format!(
+                ", {}, {} steps",
+                limits.task_variant().name(),
+                limits.default_steps
+            ),
+            _ => String::new(),
         };
         worker::log_model_line(
             served_models.len(),
             &format!(
-                "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{})",
+                "serving {id} at http://{host}:{port}/v1 (context {ctx} tokens{}{}{extra})",
                 if settings
                     .options
                     .deepseek()
@@ -1202,14 +1231,15 @@ fn main() {
                         Family::DeepSeek => ui::frame::Kind::Llm,
                         Family::D1 => ui::frame::Kind::Decision,
                         Family::MinimaxH3Image => ui::frame::Kind::Image,
+                        Family::MinimaxH3Video => ui::frame::Kind::Video,
                     },
                 },
                 tokenizer: model.tokenizer,
                 find_role: match family {
                     Family::DeepSeek => deepseek::find_role_of_token,
-                    // Decision and image models keep no sessions whose text
-                    // the view shows.
-                    Family::D1 | Family::MinimaxH3Image => |_| None,
+                    // Decision, image and video models keep no sessions whose
+                    // text the view shows.
+                    Family::D1 | Family::MinimaxH3Image | Family::MinimaxH3Video => |_| None,
                 },
             })
             .collect();
