@@ -47,6 +47,19 @@ static constexpr int REF_LABEL_MAX_TOKENS = 16,
                          REF_LABEL_MAX_TOKENS + REF_VISION_DELIMITERS,
                      REF_SEQ_GUARD_TOKENS = 4;
 
+// Buffer capacity and per-label token bound for video presentation markers
+// ("<Picture %d>: ", "<Audio %d>: ", "<Video %d>: ", "<%.1f seconds>"). Every
+// ASCII byte produces at most one BPE token, so matching the byte cap prevents
+// truncation even on synthetic byte-level test tokenizers.
+static constexpr size_t VIDEO_LABEL_BUF_CAP = 48;
+static constexpr int VIDEO_LABEL_MAX_TOKENS = 48;
+
+// Default reference-video frame rate for Qwen3-VL conditioning (2 fps) and
+// pair-midpoint weight; Comfy-Org/ComfyUI
+// comfy/text_encoders/minimax.py:230,236.
+static constexpr double VIDEO_COND_SAMPLE_FPS = 2.0,
+                        VIDEO_TIMESTAMP_MIDPOINT = 0.5;
+
 // Working buffers of one activation's size in the vision tower: h, norm and
 // attn_out.
 static constexpr int VIS_ACTIVATION_BUFFERS = 3;
@@ -343,6 +356,11 @@ void minimax_h3_vision_ref_size(int width, int height, int *out_w, int *out_h) {
   smart_resize_32(rw, rh, out_w, out_h);
 }
 
+void minimax_h3_vision_smart_size(int width, int height, int *out_w,
+                                  int *out_h) {
+  smart_resize_32(width, height, out_w, out_h);
+}
+
 void minimax_h3_vae_ref_size(int width, int height, int *out_w, int *out_h) {
   size_short_edge(width, height, REF_VAE_MIN_SHORT_EDGE, REF_VAE_MAX_SHORT_EDGE,
                   out_w, out_h);
@@ -608,12 +626,15 @@ static void run_vis_merger(const MinimaxH3VisionEncoder *vis,
   run_vis_linear(vis, cmd, &ws->merge_mid, &ws->xb, &m->fc2, out_buf, n_merged);
 }
 
-int minimax_h3_vision_encoder_encode_image(
-    MinimaxH3VisionEncoder *vis, const uint8_t *rgb, int width, int height,
-    MemorySlot *out_slot, Buf *out_merged,
+// Encodes a pair of pre-sized RGB frames (rgb0 at temporal slot 0 and rgb1 at
+// temporal slot 1; identical pointers for a single image) through the 27-layer
+// vision tower, main merger and three DeepStack mergers.
+static int encode_vision_pair(
+    MinimaxH3VisionEncoder *vis, const uint8_t *rgb0, const uint8_t *rgb1,
+    int width, int height, MemorySlot *out_slot, Buf *out_merged,
     Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
     int *out_grid_w, const MinimaxH3RunHooks *hooks) {
-  if (!vis || !rgb || width <= 0 || height <= 0 ||
+  if (!vis || !rgb0 || !rgb1 || width <= 0 || height <= 0 ||
       width % REF_GRID_MULTIPLE != 0 || height % REF_GRID_MULTIPLE != 0 ||
       !out_merged || !out_deepstack || !out_grid_h || !out_grid_w)
     die("invalid vision encoder arguments");
@@ -650,9 +671,10 @@ int minimax_h3_vision_encoder_encode_image(
     return 0;
   }
 
-  // Patchify single RGB image into 2x2 merge-ordered rows [num_patches, 1536]
-  // with mean=0.5, std=0.5 normalization (processor/preprocessor_config.json:
-  // 9-18) and temporal repeat t=0,1.
+  // Patchify frame pair into 2x2 merge-ordered rows [num_patches, 1536] with
+  // mean=0.5, std=0.5 normalization (processor/preprocessor_config.json:9-18;
+  // comfy/text_encoders/minimax.py:69-72).
+  const uint8_t *frames[VIS_TEMPORAL_PATCH] = {rgb0, rgb1};
   float *pin = (float *)ws.patch_in.ptr;
   for (int by = 0; by < mh; by++) {
     for (int bx = 0; bx < mw; bx++) {
@@ -663,18 +685,19 @@ int minimax_h3_vision_encoder_encode_image(
           float *row = pin + (size_t)tok * (size_t)VIS_PATCH_DIM;
           int y0 = (by * VIS_MERGE_SIDE + my) * VIS_PATCH_SIDE;
           int x0 = (bx * VIS_MERGE_SIDE + mx) * VIS_PATCH_SIDE;
-          for (int py = 0; py < VIS_PATCH_SIDE; py++) {
-            const uint8_t *srow =
-                rgb + ((size_t)(y0 + py) * (size_t)width + (size_t)x0) *
-                          (size_t)MINIMAX_H3_RGB_CHANNELS;
-            for (int px = 0; px < VIS_PATCH_SIDE; px++) {
-              int sp = py * VIS_PATCH_SIDE + px;
-              for (int c = 0; c < MINIMAX_H3_RGB_CHANNELS; c++) {
-                float v = (float)srow[px * MINIMAX_H3_RGB_CHANNELS + c] *
-                              (2.0f / MINIMAX_H3_PIXEL_MAX) -
-                          1.0f;
-                for (int t = 0; t < VIS_TEMPORAL_PATCH; t++)
+          for (int t = 0; t < VIS_TEMPORAL_PATCH; t++) {
+            for (int py = 0; py < VIS_PATCH_SIDE; py++) {
+              const uint8_t *srow =
+                  frames[t] + ((size_t)(y0 + py) * (size_t)width + (size_t)x0) *
+                                  (size_t)MINIMAX_H3_RGB_CHANNELS;
+              for (int px = 0; px < VIS_PATCH_SIDE; px++) {
+                int sp = py * VIS_PATCH_SIDE + px;
+                for (int c = 0; c < MINIMAX_H3_RGB_CHANNELS; c++) {
+                  float v = (float)srow[px * MINIMAX_H3_RGB_CHANNELS + c] *
+                                (2.0f / MINIMAX_H3_PIXEL_MAX) -
+                            1.0f;
                   row[(c * VIS_TEMPORAL_PATCH + t) * VIS_PATCH_AREA + sp] = v;
+                }
               }
             }
           }
@@ -818,6 +841,25 @@ int minimax_h3_vision_encoder_encode_image(
   *out_grid_h = grid_h;
   *out_grid_w = grid_w;
   return 1;
+}
+
+int minimax_h3_vision_encoder_encode_image(
+    MinimaxH3VisionEncoder *vis, const uint8_t *rgb, int width, int height,
+    MemorySlot *out_slot, Buf *out_merged,
+    Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
+    int *out_grid_w, const MinimaxH3RunHooks *hooks) {
+  return encode_vision_pair(vis, rgb, rgb, width, height, out_slot, out_merged,
+                            out_deepstack, out_grid_h, out_grid_w, hooks);
+}
+
+int minimax_h3_vision_encoder_encode_video_block(
+    MinimaxH3VisionEncoder *vis, const uint8_t *rgb0, const uint8_t *rgb1,
+    int width, int height, MemorySlot *out_slot, Buf *out_merged,
+    Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
+    int *out_grid_w, const MinimaxH3RunHooks *hooks) {
+  return encode_vision_pair(vis, rgb0, rgb1, width, height, out_slot,
+                            out_merged, out_deepstack, out_grid_h, out_grid_w,
+                            hooks);
 }
 
 // Encoded vision embeddings and grid dimensions for one reference image.
@@ -1109,5 +1151,406 @@ int minimax_h3_encode_multimodal_prompt(
   }
   *out_seq_len = seq_len;
   *out_tags = tags;
+  return 1;
+}
+
+// Appends one formatted text label to ids and tags using TAG_TEXT.
+static void append_video_label(Tokenizer *tokenizer, const char *label,
+                               int *ids, int *tags, int *seq_len) {
+  int l_ids[VIDEO_LABEL_MAX_TOKENS];
+  int l_len = minimax_h3_tokenize_video_text(tokenizer, label, 1, l_ids,
+                                             VIDEO_LABEL_MAX_TOKENS);
+  for (int i = 0; i < l_len; i++) {
+    ids[*seq_len] = l_ids[i];
+    tags[*seq_len] = TAG_TEXT;
+    (*seq_len)++;
+  }
+}
+
+// Appends one vision block (VISION_START, merged slots, VISION_END) to a video
+// prompt layout.
+static void append_video_vision_block(MinimaxH3VideoPromptLayout *out,
+                                      int vis_w, int vis_h, int *vis_cursor,
+                                      int *blk_cursor) {
+  int grid_h = vis_h / VIS_PATCH_SIDE, grid_w = vis_w / VIS_PATCH_SIDE;
+  int n_merged = (grid_h / VIS_MERGE_SIDE) * (grid_w / VIS_MERGE_SIDE);
+  int b = (*blk_cursor)++;
+
+  out->ids[out->seq_len] = MINIMAX_H3_TEXT_VISION_START_TOKEN;
+  out->tags[out->seq_len] = TAG_VISUAL;
+  out->seq_len++;
+
+  out->block_starts[b] = out->seq_len;
+  out->block_merged[b] = n_merged;
+  out->block_grid_h[b] = grid_h;
+  out->block_grid_w[b] = grid_w;
+  for (int j = 0; j < n_merged; j++) {
+    out->ids[out->seq_len] = -1;
+    out->tags[out->seq_len] = TAG_VISUAL;
+    out->vis_indices[(*vis_cursor)++] = out->seq_len;
+    out->seq_len++;
+  }
+
+  out->ids[out->seq_len] = MINIMAX_H3_TEXT_VISION_END_TOKEN;
+  out->tags[out->seq_len] = TAG_VISUAL;
+  out->seq_len++;
+}
+
+// Builds Qwen3-VL MRoPE (t, h, w) coordinates across all vision blocks in a
+// video prompt layout.
+static void fill_video_mrope_positions(MinimaxH3VideoPromptLayout *out) {
+  out->pos_ids =
+      xmalloc((size_t)out->seq_len * (size_t)MINIMAX_H3_POS_AXES * sizeof(int));
+  for (int i = 0; i < out->seq_len; i++) {
+    out->pos_ids[MINIMAX_H3_POS_AXES * i] = i;
+    out->pos_ids[MINIMAX_H3_POS_AXES * i + 1] = i;
+    out->pos_ids[MINIMAX_H3_POS_AXES * i + 2] = i;
+  }
+  int offset = 0;
+  for (int b = 0; b < out->vision_blocks; b++) {
+    int start = out->block_starts[b];
+    int size = out->block_merged[b];
+    int end = start + size;
+    int mh = out->block_grid_h[b] / VIS_MERGE_SIDE;
+    int mw = out->block_grid_w[b] / VIS_MERGE_SIDE;
+    int len_max = mh > mw ? mh : mw;
+    int base = start + offset;
+    for (int k = 0; k < size; k++) {
+      int row = k / mw, col = k % mw;
+      int idx = start + k;
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx] = base;
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx + 1] = base + row;
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx + 2] = base + col;
+    }
+    int start_next = len_max + start + offset;
+    for (int idx = end; idx < out->seq_len; idx++) {
+      int p = start_next + (idx - end);
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx] = p;
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx + 1] = p;
+      out->pos_ids[MINIMAX_H3_POS_AXES * idx + 2] = p;
+    }
+    offset += len_max - size;
+  }
+}
+
+void minimax_h3_video_prompt_layout_free(MinimaxH3VideoPromptLayout *layout) {
+  if (!layout) return;
+  free(layout->ids);
+  free(layout->tags);
+  free(layout->pos_ids);
+  free(layout->vis_indices);
+  free(layout->block_starts);
+  free(layout->block_merged);
+  free(layout->block_grid_h);
+  free(layout->block_grid_w);
+  memset(layout, 0, sizeof *layout);
+}
+
+void minimax_h3_video_prompt_build_layout(Tokenizer *tokenizer,
+                                          const char *prompt,
+                                          const MinimaxH3VideoCondItem *items,
+                                          int item_count,
+                                          MinimaxH3VideoPromptLayout *out) {
+  if (!tokenizer || item_count < 0 || (item_count > 0 && !items) || !out)
+    die("invalid video prompt layout arguments");
+  memset(out, 0, sizeof *out);
+
+  int vision_blocks = 0, visual_tokens = 0, label_slots = 0;
+  for (int i = 0; i < item_count; i++) {
+    const MinimaxH3VideoCondItem *it = &items[i];
+    if (it->kind == MINIMAX_H3_VIDEO_COND_IMAGE) {
+      if (it->width <= 0 || it->height <= 0)
+        die("invalid image dimensions in video conditioning item");
+      int vis_w = 0, vis_h = 0;
+      smart_resize_32(it->width, it->height, &vis_w, &vis_h);
+      int n_merged = (vis_h / REF_GRID_MULTIPLE) * (vis_w / REF_GRID_MULTIPLE);
+      vision_blocks++;
+      visual_tokens += n_merged;
+      label_slots += VIDEO_LABEL_MAX_TOKENS + REF_VISION_DELIMITERS;
+    } else if (it->kind == MINIMAX_H3_VIDEO_COND_AUDIO) {
+      label_slots += VIDEO_LABEL_MAX_TOKENS;
+    } else if (it->kind == MINIMAX_H3_VIDEO_COND_VIDEO) {
+      if (it->width <= 0 || it->height <= 0 || it->frame_count <= 0)
+        die("invalid video dimensions or frame count in conditioning item");
+      int vis_w = 0, vis_h = 0;
+      smart_resize_32(it->width, it->height, &vis_w, &vis_h);
+      int n_merged = (vis_h / REF_GRID_MULTIPLE) * (vis_w / REF_GRID_MULTIPLE);
+      int pairs =
+          (it->frame_count + VIS_TEMPORAL_PATCH - 1) / VIS_TEMPORAL_PATCH;
+      vision_blocks += pairs;
+      visual_tokens += pairs * n_merged;
+      label_slots += VIDEO_LABEL_MAX_TOKENS +
+                     pairs * (VIDEO_LABEL_MAX_TOKENS + REF_VISION_DELIMITERS);
+    } else {
+      die("unknown video conditioning item kind %d", (int)it->kind);
+    }
+  }
+
+  int *prompt_ids =
+      xmalloc((size_t)MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS * sizeof(int));
+  int prompt_len = minimax_h3_tokenize_video_text(
+      tokenizer, prompt, item_count > 0, prompt_ids,
+      MINIMAX_H3_TEXT_MAX_PROMPT_TOKENS);
+
+  int max_seq = visual_tokens + label_slots + prompt_len + REF_SEQ_GUARD_TOKENS;
+  out->ids = xmalloc((size_t)max_seq * sizeof(int));
+  out->tags = xmalloc((size_t)max_seq * sizeof(int));
+  out->vision_blocks = vision_blocks;
+  out->visual_tokens = visual_tokens;
+  if (visual_tokens > 0)
+    out->vis_indices = xmalloc((size_t)visual_tokens * sizeof(int));
+  if (vision_blocks > 0) {
+    out->block_starts = xmalloc((size_t)vision_blocks * sizeof(int));
+    out->block_merged = xmalloc((size_t)vision_blocks * sizeof(int));
+    out->block_grid_h = xmalloc((size_t)vision_blocks * sizeof(int));
+    out->block_grid_w = xmalloc((size_t)vision_blocks * sizeof(int));
+  }
+
+  // Presentation order matches comfy/text_encoders/minimax.py:216-246.
+  int img_ord = 0, aud_ord = 0, vid_ord = 0;
+  int vis_cursor = 0, blk_cursor = 0;
+  for (int i = 0; i < item_count; i++) {
+    const MinimaxH3VideoCondItem *it = &items[i];
+    char label[VIDEO_LABEL_BUF_CAP];
+    if (it->kind == MINIMAX_H3_VIDEO_COND_IMAGE) {
+      snprintf(label, sizeof label, "<Picture %d>: ", ++img_ord);
+      append_video_label(tokenizer, label, out->ids, out->tags, &out->seq_len);
+      int vis_w = 0, vis_h = 0;
+      smart_resize_32(it->width, it->height, &vis_w, &vis_h);
+      append_video_vision_block(out, vis_w, vis_h, &vis_cursor, &blk_cursor);
+    } else if (it->kind == MINIMAX_H3_VIDEO_COND_AUDIO) {
+      snprintf(label, sizeof label, "<Audio %d>: ", ++aud_ord);
+      append_video_label(tokenizer, label, out->ids, out->tags, &out->seq_len);
+    } else {
+      snprintf(label, sizeof label, "<Video %d>: ", ++vid_ord);
+      append_video_label(tokenizer, label, out->ids, out->tags, &out->seq_len);
+      int vis_w = 0, vis_h = 0;
+      smart_resize_32(it->width, it->height, &vis_w, &vis_h);
+      int pairs =
+          (it->frame_count + VIS_TEMPORAL_PATCH - 1) / VIS_TEMPORAL_PATCH;
+      for (int p = 0; p < pairs; p++) {
+        int i0 = p * VIS_TEMPORAL_PATCH;
+        int i1 = i0 + 1 < it->frame_count ? i0 + 1 : it->frame_count - 1;
+        double ts0 = it->timestamps ? it->timestamps[i0]
+                                    : (double)i0 / VIDEO_COND_SAMPLE_FPS;
+        double ts1 = it->timestamps ? it->timestamps[i1]
+                                    : (double)i1 / VIDEO_COND_SAMPLE_FPS;
+        double block_ts = (ts0 + ts1) * VIDEO_TIMESTAMP_MIDPOINT;
+        snprintf(label, sizeof label, "<%.1f seconds>", block_ts);
+        append_video_label(tokenizer, label, out->ids, out->tags,
+                           &out->seq_len);
+        append_video_vision_block(out, vis_w, vis_h, &vis_cursor, &blk_cursor);
+      }
+    }
+  }
+  for (int j = 0; j < prompt_len; j++) {
+    out->ids[out->seq_len] = prompt_ids[j];
+    out->tags[out->seq_len] = TAG_TEXT;
+    out->seq_len++;
+  }
+  free(prompt_ids);
+
+  fill_video_mrope_positions(out);
+
+  // Peak GPU bytes held at once across all vision block runs and text layers.
+  uint64_t row = (uint64_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+  uint64_t hidden = (uint64_t)out->seq_len * row;
+  if (vision_blocks == 0) {
+    out->peak_bytes =
+        minimax_h3_text_encoder_workspace_bytes(out->seq_len, 0) + hidden;
+  } else {
+    uint64_t outputs = 0, peak = 0;
+    for (int b = 0; b < vision_blocks; b++) {
+      int patches = out->block_grid_h[b] * out->block_grid_w[b];
+      outputs += (uint64_t)(1 + MINIMAX_H3_TEXT_DEEPSTACK_LAYERS) *
+                 (uint64_t)out->block_merged[b] * row;
+      uint64_t run =
+          minimax_h3_vision_encoder_workspace_bytes(patches) + outputs;
+      if (run > peak) peak = run;
+    }
+    uint64_t deepstack = (uint64_t)MINIMAX_H3_TEXT_DEEPSTACK_LAYERS *
+                         (uint64_t)visual_tokens * row;
+    uint64_t prompt_buffers = hidden + deepstack + hidden;
+    if (outputs + prompt_buffers > peak) peak = outputs + prompt_buffers;
+    uint64_t layers =
+        minimax_h3_text_encoder_workspace_bytes(out->seq_len, visual_tokens) +
+        prompt_buffers;
+    out->peak_bytes = layers > peak ? layers : peak;
+  }
+}
+
+// Frees all GPU buffers held by encoded vision blocks 0..count-1.
+static void free_encoded_blocks(EncodedRefVis *blocks, int count) {
+  for (int k = 0; k < count; k++) {
+    gpu_free(&blocks[k].merged);
+    for (int d = 0; d < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; d++)
+      gpu_free(&blocks[k].deepstack[d]);
+  }
+}
+
+int minimax_h3_encode_video_prompt(
+    MinimaxH3TextEncoder *text_enc, MinimaxH3VisionEncoder *vis,
+    const char *prompt, const MinimaxH3VideoCondItem *items, int item_count,
+    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags,
+    const MinimaxH3RunHooks *hooks) {
+  if (!text_enc || item_count < 0 || (item_count > 0 && !items) ||
+      !out_hidden || !out_seq_len || !out_tags)
+    die("invalid video prompt encoding arguments");
+  *out_tags = NULL;
+
+  MinimaxH3VideoPromptLayout layout;
+  minimax_h3_video_prompt_build_layout(
+      minimax_h3_text_encoder_tokenizer(text_enc), prompt, items, item_count,
+      &layout);
+
+  Gpu *gpu = minimax_h3_text_encoder_gpu(text_enc);
+  size_t row_bytes = (size_t)MINIMAX_H3_TEXT_DIM * sizeof(float);
+
+  // Fast path when no visual conditioning blocks exist (T2VA or audio-only):
+  // run the text encoder directly without loading the vision tower.
+  if (layout.vision_blocks == 0) {
+    *out_hidden = gpu_try_alloc_required(gpu, out_slot,
+                                         (size_t)layout.seq_len * row_bytes);
+    int ok = out_hidden->obj && minimax_h3_text_encoder_encode_tokens(
+                                    text_enc, layout.ids, NULL, NULL, NULL,
+                                    NULL, 0, layout.seq_len, out_hidden, hooks);
+    if (!ok) {
+      gpu_free(out_hidden);
+      minimax_h3_video_prompt_layout_free(&layout);
+      return 0;
+    }
+    *out_seq_len = layout.seq_len;
+    *out_tags = layout.tags;
+    layout.tags = NULL;
+    minimax_h3_video_prompt_layout_free(&layout);
+    return 1;
+  }
+
+  if (!vis) die("vision encoder required for visual video conditioning");
+
+  EncodedRefVis *enc_blocks =
+      xmalloc((size_t)layout.vision_blocks * sizeof *enc_blocks);
+  memset(enc_blocks, 0, (size_t)layout.vision_blocks * sizeof *enc_blocks);
+
+  int blk = 0;
+  for (int i = 0; i < item_count; i++) {
+    const MinimaxH3VideoCondItem *it = &items[i];
+    if (it->kind == MINIMAX_H3_VIDEO_COND_AUDIO) continue;
+    if (!it->rgb) die("null RGB pixels in visual video conditioning item");
+
+    int vis_w = 0, vis_h = 0;
+    smart_resize_32(it->width, it->height, &vis_w, &vis_h);
+    size_t frame_bytes = (size_t)it->width * (size_t)it->height *
+                         (size_t)MINIMAX_H3_RGB_CHANNELS;
+
+    if (it->kind == MINIMAX_H3_VIDEO_COND_IMAGE) {
+      uint8_t *tmp = NULL;
+      const uint8_t *src = it->rgb;
+      if (vis_w != it->width || vis_h != it->height) {
+        tmp = image_resize_rgb_bilinear(it->rgb, it->width, it->height, vis_w,
+                                        vis_h);
+        src = tmp;
+      }
+      int ok = minimax_h3_vision_encoder_encode_image(
+          vis, src, vis_w, vis_h, out_slot, &enc_blocks[blk].merged,
+          enc_blocks[blk].deepstack, &enc_blocks[blk].grid_h,
+          &enc_blocks[blk].grid_w, hooks);
+      free(tmp);
+      if (!ok) {
+        free_encoded_blocks(enc_blocks, blk + 1);
+        free(enc_blocks);
+        minimax_h3_video_prompt_layout_free(&layout);
+        return 0;
+      }
+      blk++;
+    } else {
+      int pairs =
+          (it->frame_count + VIS_TEMPORAL_PATCH - 1) / VIS_TEMPORAL_PATCH;
+      for (int p = 0; p < pairs; p++) {
+        int i0 = p * VIS_TEMPORAL_PATCH;
+        int i1 = i0 + 1 < it->frame_count ? i0 + 1 : it->frame_count - 1;
+        const uint8_t *src0 = it->rgb + (size_t)i0 * frame_bytes;
+        const uint8_t *src1 = it->rgb + (size_t)i1 * frame_bytes;
+        uint8_t *tmp0 = NULL, *tmp1 = NULL;
+        if (vis_w != it->width || vis_h != it->height) {
+          tmp0 = image_resize_rgb_bilinear(src0, it->width, it->height, vis_w,
+                                           vis_h);
+          src0 = tmp0;
+          if (i1 == i0) {
+            src1 = tmp0;
+          } else {
+            tmp1 = image_resize_rgb_bilinear(src1, it->width, it->height, vis_w,
+                                             vis_h);
+            src1 = tmp1;
+          }
+        }
+        int ok = minimax_h3_vision_encoder_encode_video_block(
+            vis, src0, src1, vis_w, vis_h, out_slot, &enc_blocks[blk].merged,
+            enc_blocks[blk].deepstack, &enc_blocks[blk].grid_h,
+            &enc_blocks[blk].grid_w, hooks);
+        free(tmp1);
+        free(tmp0);
+        if (!ok) {
+          free_encoded_blocks(enc_blocks, blk + 1);
+          free(enc_blocks);
+          minimax_h3_video_prompt_layout_free(&layout);
+          return 0;
+        }
+        blk++;
+      }
+    }
+  }
+
+  Buf embeds_override =
+      gpu_try_alloc_required(gpu, out_slot, (size_t)layout.seq_len * row_bytes);
+  Buf cat_ds[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS] = {0};
+  for (int d = 0; d < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; d++)
+    cat_ds[d] = gpu_try_alloc_required(
+        gpu, out_slot, (size_t)layout.visual_tokens * row_bytes);
+  *out_hidden =
+      gpu_try_alloc_required(gpu, out_slot, (size_t)layout.seq_len * row_bytes);
+
+  int ok = embeds_override.obj && cat_ds[0].obj && cat_ds[1].obj &&
+           cat_ds[2].obj && out_hidden->obj;
+  if (ok) {
+    memset(embeds_override.ptr, 0, (size_t)layout.seq_len * row_bytes);
+    size_t ds_off = 0;
+    for (int b = 0; b < layout.vision_blocks; b++) {
+      size_t n_bytes = (size_t)layout.block_merged[b] * row_bytes;
+      memcpy((uint8_t *)embeds_override.ptr +
+                 (size_t)layout.block_starts[b] * row_bytes,
+             enc_blocks[b].merged.ptr, n_bytes);
+      for (int d = 0; d < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; d++)
+        memcpy((uint8_t *)cat_ds[d].ptr + ds_off,
+               enc_blocks[b].deepstack[d].ptr, n_bytes);
+      ds_off += n_bytes;
+    }
+  }
+
+  free_encoded_blocks(enc_blocks, layout.vision_blocks);
+  free(enc_blocks);
+
+  if (ok) {
+    const Buf *ds_ptrs[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS] = {
+        &cat_ds[0], &cat_ds[1], &cat_ds[2]};
+    ok = minimax_h3_text_encoder_encode_tokens(
+        text_enc, layout.ids, layout.pos_ids, &embeds_override, ds_ptrs,
+        layout.vis_indices, layout.visual_tokens, layout.seq_len, out_hidden,
+        hooks);
+  }
+
+  for (int d = 0; d < MINIMAX_H3_TEXT_DEEPSTACK_LAYERS; d++)
+    gpu_free(&cat_ds[d]);
+  gpu_free(&embeds_override);
+
+  if (!ok) {
+    gpu_free(out_hidden);
+    minimax_h3_video_prompt_layout_free(&layout);
+    return 0;
+  }
+  *out_seq_len = layout.seq_len;
+  *out_tags = layout.tags;
+  layout.tags = NULL;
+  minimax_h3_video_prompt_layout_free(&layout);
   return 1;
 }

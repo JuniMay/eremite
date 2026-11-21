@@ -279,6 +279,10 @@ Gpu *minimax_h3_text_encoder_gpu(const MinimaxH3TextEncoder *enc) {
   return enc->gpu;
 }
 
+Tokenizer *minimax_h3_text_encoder_tokenizer(const MinimaxH3TextEncoder *enc) {
+  return enc->tokenizer;
+}
+
 WeightGroup *minimax_h3_text_encoder_weights(MinimaxH3TextEncoder *enc) {
   return enc->weights;
 }
@@ -297,26 +301,115 @@ int minimax_h3_text_encoder_load(MinimaxH3TextEncoder *enc) {
   return weight_group_load(enc->weights);
 }
 
+// One extra MiniMax-H3 video control token spelling and fixed vocabulary ID.
+typedef struct {
+  // Exact ASCII spelling matched in raw video prompts.
+  const char *text;
+  // Length of text in bytes.
+  size_t len;
+  // Fixed token ID assigned by the released MiniMax-H3 tokenizer.
+  int id;
+} VideoExtraToken;
+
+// Extra MiniMax-H3 video control tokens; Comfy-Org/ComfyUI
+// comfy/text_encoders/minimax.py:41-43.
+static const VideoExtraToken VIDEO_EXTRA_TOKENS[] = {
+    {"<d>", 3, MINIMAX_H3_TEXT_DIALOGUE_START_TOKEN},
+    {"</d>", 4, MINIMAX_H3_TEXT_DIALOGUE_END_TOKEN},
+    {"<|cutoff|>", 10, MINIMAX_H3_TEXT_CUTOFF_TOKEN},
+    {"<|lyrics_start|>", 16, MINIMAX_H3_TEXT_LYRICS_START_TOKEN},
+    {"<|lyrics_end|>", 14, MINIMAX_H3_TEXT_LYRICS_END_TOKEN},
+    {"<|caption_start|>", 17, MINIMAX_H3_TEXT_CAPTION_START_TOKEN},
+    {"<|caption_end|>", 15, MINIMAX_H3_TEXT_CAPTION_END_TOKEN},
+};
+
+// Number of extra MiniMax-H3 video control tokens.
+static constexpr size_t VIDEO_EXTRA_TOKEN_COUNT =
+    sizeof(VIDEO_EXTRA_TOKENS) / sizeof(VIDEO_EXTRA_TOKENS[0]);
+
+// Extra slots added above a UTF-8 span's byte length when calling the BPE
+// tokenizer (byte-level BPE emits at most one token per byte).
+static constexpr int TOKEN_ENC_SLACK = 2;
+
+// Appends up to remaining plain-text tokens from text[0..len) into ids + *out.
+static void append_plain_tokens(Tokenizer *tokenizer, const char *text,
+                                size_t len, int *ids, int max_ids, int *out) {
+  if (len == 0 || *out >= max_ids) return;
+  int cap = (int)len + TOKEN_ENC_SLACK;
+  int *tmp = xmalloc((size_t)cap * sizeof *tmp);
+  int total =
+      tokenizer_encode_bytes(tokenizer, text, len, TOKENIZE_TEXT, tmp, cap);
+  int keep = max_ids - *out;
+  if (total < keep) keep = total;
+  if (keep > 0) {
+    memcpy(ids + *out, tmp, (size_t)keep * sizeof *ids);
+    *out += keep;
+  }
+  free(tmp);
+}
+
 int minimax_h3_text_encoder_tokenize(const MinimaxH3TextEncoder *enc,
                                      const char *prompt, int *ids,
                                      int max_ids) {
   if (max_ids <= 0) return 0;
   int n = 0;
-  if (prompt && prompt[0]) {
-    size_t len = strlen(prompt);
-    int cap = (int)len + 2;
-    int *tmp = xmalloc((size_t)cap * sizeof *tmp);
-    int total = tokenizer_encode_bytes(enc->tokenizer, prompt, len,
-                                       TOKENIZE_TEXT, tmp, cap);
-    n = total > max_ids ? max_ids : total;
-    if (n > 0) memcpy(ids, tmp, (size_t)n * sizeof *ids);
-    free(tmp);
-  }
+  if (prompt && prompt[0])
+    append_plain_tokens(enc->tokenizer, prompt, strlen(prompt), ids, max_ids,
+                        &n);
   if (n == 0) {
     ids[0] = MINIMAX_H3_TEXT_PAD_TOKEN;
     n = 1;
   }
   return n;
+}
+
+int minimax_h3_tokenize_video_text(Tokenizer *tokenizer, const char *text,
+                                   int allow_empty, int *ids, int max_ids) {
+  if (!tokenizer) die("null tokenizer for video text tokenization");
+  if (max_ids <= 0) return 0;
+  int n = 0;
+  if (text && text[0]) {
+    size_t len = strlen(text);
+    size_t seg_start = 0;
+    size_t pos = 0;
+    while (pos < len && n < max_ids) {
+      int matched = -1;
+      if (text[pos] == '<') {
+        for (size_t k = 0; k < VIDEO_EXTRA_TOKEN_COUNT; k++) {
+          size_t tlen = VIDEO_EXTRA_TOKENS[k].len;
+          if (pos + tlen <= len &&
+              memcmp(text + pos, VIDEO_EXTRA_TOKENS[k].text, tlen) == 0) {
+            matched = (int)k;
+            break;
+          }
+        }
+      }
+      if (matched >= 0) {
+        append_plain_tokens(tokenizer, text + seg_start, pos - seg_start, ids,
+                            max_ids, &n);
+        if (n < max_ids) ids[n++] = VIDEO_EXTRA_TOKENS[matched].id;
+        pos += VIDEO_EXTRA_TOKENS[matched].len;
+        seg_start = pos;
+      } else {
+        pos++;
+      }
+    }
+    if (pos > seg_start && n < max_ids)
+      append_plain_tokens(tokenizer, text + seg_start, pos - seg_start, ids,
+                          max_ids, &n);
+  }
+  if (n == 0 && !allow_empty) {
+    ids[0] = MINIMAX_H3_TEXT_PAD_TOKEN;
+    n = 1;
+  }
+  return n;
+}
+
+int minimax_h3_text_encoder_tokenize_video(const MinimaxH3TextEncoder *enc,
+                                           const char *prompt, int *ids,
+                                           int max_ids) {
+  return minimax_h3_tokenize_video_text(enc->tokenizer, prompt, 0, ids,
+                                        max_ids);
 }
 
 // Frees all buffers held by a transient workspace.

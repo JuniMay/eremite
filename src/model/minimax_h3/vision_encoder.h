@@ -27,6 +27,11 @@ typedef struct MinimaxH3VisionEncoder MinimaxH3VisionEncoder;
 // short edge to 1024 rounded to 32 px, then enforces smart_resize bounds.
 void minimax_h3_vision_ref_size(int width, int height, int *out_w, int *out_h);
 
+// Computes Qwen3-VL smart_resize dimensions for an image or video frame:
+// rounds both sides to 32 px and clamps area into [3136, 12845056] pixels.
+void minimax_h3_vision_smart_size(int width, int height, int *out_w,
+                                  int *out_h);
+
 // Computes the VAE encoder input size for a reference image: clamps the short
 // edge into [1024, 2048] while keeping aspect ratio, rounded to 32 px.
 void minimax_h3_vae_ref_size(int width, int height, int *out_w, int *out_h);
@@ -96,6 +101,95 @@ int minimax_h3_vision_encoder_encode_image(
     MemorySlot *out_slot, Buf *out_merged,
     Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
     int *out_grid_w, const MinimaxH3RunHooks *hooks);
+
+// Encodes a pair of pre-sized RGB video frames (width and height positive
+// multiples of 32) as one 2-frame temporal patch through the vision tower,
+// main merger and 3 DeepStack mergers. Allocates out_merged and
+// out_deepstack[0..2] in out_slot and sets *out_grid_h = height / 16,
+// *out_grid_w = width / 16. hooks may be null. Returns 1 on success or 0 on
+// failure or stop.
+int minimax_h3_vision_encoder_encode_video_block(
+    MinimaxH3VisionEncoder *vis, const uint8_t *rgb0, const uint8_t *rgb1,
+    int width, int height, MemorySlot *out_slot, Buf *out_merged,
+    Buf out_deepstack[MINIMAX_H3_TEXT_DEEPSTACK_LAYERS], int *out_grid_h,
+    int *out_grid_w, const MinimaxH3RunHooks *hooks);
+
+// Kind of one conditioning item in a MiniMax-H3 video prompt presentation.
+typedef enum {
+  // Single RGB image labeled "<Picture i>: " followed by one vision block.
+  MINIMAX_H3_VIDEO_COND_IMAGE,
+  // Audio reference labeled "<Audio j>: " with no vision tokens.
+  MINIMAX_H3_VIDEO_COND_AUDIO,
+  // Video clip sampled at 2 fps labeled "<Video k>: " plus per-pair
+  // "<T.T seconds>" timestamps and 2-frame vision blocks.
+  MINIMAX_H3_VIDEO_COND_VIDEO
+} MinimaxH3VideoCondKind;
+
+// One conditioning item passed to MiniMax-H3 video prompt planning or encoding.
+typedef struct {
+  // Conditioning modality kind.
+  MinimaxH3VideoCondKind kind;
+  // Packed 8-bit sRGB frames [frame_count, height, width, 3] for image or
+  // video items; may be null during planning or for audio items.
+  const uint8_t *rgb;
+  // Frame width and height in pixels for image or video items; 0 for audio.
+  int width, height;
+  // Frame count (1 for image, >= 1 for 2 fps video, 0 for audio).
+  int frame_count;
+  // Optional per-frame timestamps in seconds for video items; when null,
+  // frame i uses i / 2.0 seconds.
+  const double *timestamps;
+} MinimaxH3VideoCondItem;
+
+// Token, tag, MRoPE position and peak GPU memory plan for a MiniMax-H3 video
+// prompt presentation.
+typedef struct {
+  // Token IDs [seq_len]; -1 marks merged visual embedding slots.
+  int *ids;
+  // AdaLN modality tags [seq_len]: 0 on vision blocks (including delimiters),
+  // 1 on text and labels.
+  int *tags;
+  // Qwen3-VL MRoPE coordinates [seq_len * 3] as (t, h, w) triples.
+  int *pos_ids;
+  // Sequence indices [visual_tokens] of all merged visual embedding slots.
+  int *vis_indices;
+  // Start index in ids of each vision block [vision_blocks].
+  int *block_starts;
+  // Merged visual token count of each vision block [vision_blocks].
+  int *block_merged;
+  // Patch grid height and width of each vision block [vision_blocks].
+  int *block_grid_h, *block_grid_w;
+  // Total token count passed to Qwen3-VL.
+  int seq_len;
+  // Total vision blocks (one per image and one per 2-frame video pair).
+  int vision_blocks;
+  // Sum of merged visual tokens across all vision blocks.
+  int visual_tokens;
+  // Peak GPU bytes held while encoding all vision blocks and text layers.
+  uint64_t peak_bytes;
+} MinimaxH3VideoPromptLayout;
+
+// Frees all heap arrays owned by layout and resets its fields to zero.
+void minimax_h3_video_prompt_layout_free(MinimaxH3VideoPromptLayout *layout);
+
+// Builds the token, tag, MRoPE position and peak-memory layout for a
+// MiniMax-H3 video prompt (T2VA, FL2VA or REF2VA) without touching the GPU.
+void minimax_h3_video_prompt_build_layout(Tokenizer *tokenizer,
+                                          const char *prompt,
+                                          const MinimaxH3VideoCondItem *items,
+                                          int item_count,
+                                          MinimaxH3VideoPromptLayout *out);
+
+// Encodes a MiniMax-H3 video prompt (T2VA, FL2VA or REF2VA) with zero or more
+// image, audio and 2 fps video conditioning items through Qwen3-VL layers
+// 0..49. Allocates out_hidden in out_slot and *out_tags on the heap (caller
+// frees *out_tags with free() and out_hidden with gpu_free()). hooks may be
+// null. Returns 1 on success or 0 on failure or stop.
+int minimax_h3_encode_video_prompt(
+    MinimaxH3TextEncoder *text_enc, MinimaxH3VisionEncoder *vis,
+    const char *prompt, const MinimaxH3VideoCondItem *items, int item_count,
+    MemorySlot *out_slot, Buf *out_hidden, int *out_seq_len, int **out_tags,
+    const MinimaxH3RunHooks *hooks);
 
 // Encodes a MiniMax-H3-Image prompt with zero or more reference images:
 // resizes each reference image to Qwen3-VL vision size, runs the vision tower,

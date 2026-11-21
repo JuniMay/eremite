@@ -2,6 +2,7 @@
 #define EREMITE_MODEL_MINIMAX_H3_TEXT_ENCODER_H
 #include "engine/memory.h"
 #include "engine/safetensors.h"
+#include "engine/tokenizer.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
 #include "model/minimax_h3/quant.h"
@@ -33,6 +34,17 @@ static constexpr int MINIMAX_H3_TEXT_PAD_TOKEN = 151643,
                      MINIMAX_H3_TEXT_VISION_START_TOKEN = 151652,
                      MINIMAX_H3_TEXT_VISION_END_TOKEN = 151653;
 
+// Extra special token IDs added by the MiniMax-H3 video tokenizer for dialogue,
+// cutoff, lyrics and caption markers; Comfy-Org/ComfyUI
+// comfy/text_encoders/minimax.py:41-43.
+static constexpr int MINIMAX_H3_TEXT_DIALOGUE_START_TOKEN = 151669,
+                     MINIMAX_H3_TEXT_DIALOGUE_END_TOKEN = 151670,
+                     MINIMAX_H3_TEXT_CUTOFF_TOKEN = 151671,
+                     MINIMAX_H3_TEXT_LYRICS_START_TOKEN = 151672,
+                     MINIMAX_H3_TEXT_LYRICS_END_TOKEN = 151673,
+                     MINIMAX_H3_TEXT_CAPTION_START_TOKEN = 151674,
+                     MINIMAX_H3_TEXT_CAPTION_END_TOKEN = 151675;
+
 // Most tokens kept from a prompt's text; the rest is cut off. MiniMax's
 // MiniMax-H3-Image README, Specifications: content beyond 4,096 tokens is
 // truncated.
@@ -58,6 +70,9 @@ minimax_h3_text_encoder_tensors(const MinimaxH3TextEncoder *enc);
 // Returns the encoder's GPU handle.
 Gpu *minimax_h3_text_encoder_gpu(const MinimaxH3TextEncoder *enc);
 
+// Returns the encoder's open Qwen3-VL tokenizer.
+Tokenizer *minimax_h3_text_encoder_tokenizer(const MinimaxH3TextEncoder *enc);
+
 // Returns the encoder's weight group so dependent groups can share its account.
 WeightGroup *minimax_h3_text_encoder_weights(MinimaxH3TextEncoder *enc);
 
@@ -81,6 +96,21 @@ int minimax_h3_text_encoder_load(MinimaxH3TextEncoder *enc);
 // prompt produces a single pad token). Returns the token count.
 int minimax_h3_text_encoder_tokenize(const MinimaxH3TextEncoder *enc,
                                      const char *prompt, int *ids, int max_ids);
+
+// Encodes video prompt text with tokenizer into token IDs, matching the seven
+// MiniMax-H3 video control tokens (<d>, </d>, <|cutoff|>, <|lyrics_start|>,
+// <|lyrics_end|>, <|caption_start|>, <|caption_end|>) and encoding all other
+// spans as plain text. When allow_empty is zero, an empty result falls back to
+// a single pad token. Returns the token count.
+int minimax_h3_tokenize_video_text(Tokenizer *tokenizer, const char *text,
+                                   int allow_empty, int *ids, int max_ids);
+
+// Encodes raw MiniMax-H3 video prompt text into token IDs, matching the seven
+// MiniMax-H3 video control tokens (empty prompt produces a single pad token).
+// Returns the token count.
+int minimax_h3_text_encoder_tokenize_video(const MinimaxH3TextEncoder *enc,
+                                           const char *prompt, int *ids,
+                                           int max_ids);
 
 // Runs layers 0 through 49 on seq_len tokens and writes unnormalized FP32
 // hidden states (seq_len by MINIMAX_H3_TEXT_DIM) into out_hidden.
