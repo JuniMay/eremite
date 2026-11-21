@@ -390,13 +390,15 @@ int main(int argc, char **argv) {
     free(rdata);
   }
 
-  // A transparent background: the key-colored background turns clear, so the
-  // corners have alpha 0 and some pixels stay opaque.
+  // A transparent background at the size and canvas that the server gives a
+  // size of auto, which Codex always sends: the key-colored background turns
+  // clear, so the corners have alpha 0 and some pixels stay opaque.
+  enum { AUTO_SIDE = 2048 };  // the server's default size, 2048 by 2048
+
   eremite_image_request req_clear = {.prompt = "A red apple in the middle of "
                                                "the frame.",
-                                     .width = 512,
-                                     .height = 512,
-                                     .min_generation_area = 1024,
+                                     .width = AUTO_SIDE,
+                                     .height = AUTO_SIDE,
                                      .format = EREMITE_IMAGE_PNG,
                                      .background =
                                          EREMITE_IMAGE_BACKGROUND_TRANSPARENT,
@@ -411,11 +413,17 @@ int main(int argc, char **argv) {
   size_t opaque_pixels = 0;
   for (int i = 0; clear_alpha && i < clear_w * clear_h; i++)
     opaque_pixels += clear_alpha[i] == 255;
-  printf("transparent 512x512: ok=%d opaque pixels %zu %s\n", ok_clear,
-         opaque_pixels, ok_clear ? "" : res.error);
-  check(clear_alpha && clear_w == 512 && clear_h == 512 && !clear_alpha[0] &&
-            !clear_alpha[511] && !clear_alpha[511 * 512] &&
-            !clear_alpha[512 * 512 - 1] && opaque_pixels > 0,
+  size_t clear_pixels = 0;
+  for (int i = 0; clear_alpha && i < clear_w * clear_h; i++)
+    clear_pixels += clear_alpha[i] == 0;
+  printf("transparent %dx%d: ok=%d clear pixels %zu, opaque %zu %s\n", clear_w,
+         clear_h, ok_clear, clear_pixels, opaque_pixels,
+         ok_clear ? "" : res.error);
+  size_t last = (size_t)AUTO_SIDE * AUTO_SIDE - 1;
+  check(clear_alpha && clear_w == AUTO_SIDE && clear_h == AUTO_SIDE &&
+            !clear_alpha[0] && !clear_alpha[AUTO_SIDE - 1] &&
+            !clear_alpha[last - (AUTO_SIDE - 1)] && !clear_alpha[last] &&
+            opaque_pixels > 0,
         "a transparent background clears the corners and keeps the subject");
   free(clear_alpha);
   eremite_image_result_free(&res);
@@ -432,6 +440,7 @@ int main(int argc, char **argv) {
   long_clear[BALL_REPEATS * ball_len] = '\0';
   req_clear.prompt = long_clear;
   req_clear.width = req_clear.height = 256;
+  req_clear.min_generation_area = 1024;
   int ok_long_clear = eremite_generate_image(m, &req_clear, &res);
   free(long_clear);
   uint8_t *long_alpha = ok_long_clear
