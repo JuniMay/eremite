@@ -20,7 +20,7 @@
 //    concurrent MP4 decodes cleanly.
 //
 // usage: model-video_llm_turns LLM_DIR VIDEO_DIR TEXT_ENC DIT VVAE AVAE
-//        [GGUF] [--size W H FRAMES STEPS]
+//        [GGUF] [--size W H FRAMES STEPS] [--system-gpu-share SHARE]
 
 // Language-model context holding prompt prefill and all decoded tokens.
 static constexpr int CONTEXT = 4096;
@@ -79,16 +79,19 @@ static int32_t *make_long_prompt(const int32_t *seed, int seed_n,
 int main(int argc, char **argv) {
   int video_w = VIDEO_W, video_h = VIDEO_H, video_frames = VIDEO_FRAMES,
       video_steps = VIDEO_STEPS;
+  double system_gpu_share = 0.0;
   const char *gguf = NULL;
   if (argc < 7)
     die("usage: model-video_llm_turns LLM_DIR VIDEO_DIR TEXT_ENC DIT VVAE "
-        "AVAE [GGUF] [--size W H FRAMES STEPS]");
+        "AVAE [GGUF] [--size W H FRAMES STEPS] [--system-gpu-share SHARE]");
   for (int i = 7; i < argc; i++) {
     if (!strcmp(argv[i], "--size") && i + 4 < argc) {
       video_w = atoi(argv[++i]);
       video_h = atoi(argv[++i]);
       video_frames = atoi(argv[++i]);
       video_steps = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--system-gpu-share") && i + 1 < argc) {
+      system_gpu_share = atof(argv[++i]);
     } else if (!gguf) {
       gguf = argv[i];
     } else {
@@ -96,9 +99,11 @@ int main(int argc, char **argv) {
     }
   }
 
-  check(eremite_init(&(eremite_process){.abi = EREMITE_ABI,
-                                        .memory_gb = MEMORY_GB,
-                                        .reserve_gb = RESERVE_GB}) == 0,
+  check(eremite_init(
+            &(eremite_process){.abi = EREMITE_ABI,
+                               .memory_gb = MEMORY_GB,
+                               .reserve_gb = RESERVE_GB,
+                               .system_gpu_share = system_gpu_share}) == 0,
         "engine initializes");
 
   eremite_model *llm = eremite_open(&(eremite_config){

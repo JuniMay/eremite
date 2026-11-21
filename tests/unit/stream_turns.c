@@ -2,6 +2,7 @@
 #include "base/clock.h"
 #include "engine/pass.h"
 #include "gpu/gpu.h"
+#include "platform/system_gpu.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +37,40 @@ static int fake_polls[MAX_GPU_JOBS];
 
 // Engine-thread state transitions recorded by the test.
 static int saw_wait_read_state;
+
+// Synthetic macOS display, input and external GPU state for virtual-clock
+// adaptive GPU yielding tests.
+static SystemGpuActivity fake_system_gpu;
+
+// Total virtual seconds spent sleeping in timed system-GPU yield waits.
+static double fake_yield_sleep_s;
+
+// Number of timed system-GPU yield sleeps performed.
+static int fake_yield_sleeps;
+
+// Returns the synthetic system GPU snapshot.
+static SystemGpuActivity fake_system_gpu_read_activity(void) {
+  return fake_system_gpu;
+}
+
+// Returns the synthetic user-input idle seconds and display sleep flag.
+static double fake_system_gpu_input_idle_seconds(int *display_asleep) {
+  if (display_asleep) *display_asleep = fake_system_gpu.display_asleep;
+  return fake_system_gpu.display_asleep ? INFINITY
+                                        : fake_system_gpu.input_idle_seconds;
+}
+
+// Advances the virtual clock by seconds on timed yield waits unless event is
+// already signaled.
+static int fake_threads_event_wait_for(ThreadsEvent *event, double seconds) {
+  if (threads_event_take(event)) return 1;
+  if (seconds > 0.0) {
+    fake_clock += seconds;
+    fake_yield_sleep_s += seconds;
+    fake_yield_sleeps++;
+  }
+  return 0;
+}
 
 // Returns the virtual clock time in seconds.
 static double fake_now(void) { return fake_clock; }
@@ -122,12 +157,18 @@ static void mock_run_gpu(double duration) {
 #define gpu_has_finished fake_gpu_has_finished
 #define gpu_wait_until_finished fake_gpu_wait_until_finished
 #define gpu_set_thread_state fake_gpu_set_thread_state
+#define system_gpu_read_activity fake_system_gpu_read_activity
+#define system_gpu_input_idle_seconds fake_system_gpu_input_idle_seconds
+#define threads_event_wait_for fake_threads_event_wait_for
 #include "engine/engine.c"
 #undef now
 #undef gpu_last_committed
 #undef gpu_has_finished
 #undef gpu_wait_until_finished
 #undef gpu_set_thread_state
+#undef system_gpu_read_activity
+#undef system_gpu_input_idle_seconds
+#undef threads_event_wait_for
 
 // Role of a mock model in a test scenario.
 typedef enum {
@@ -155,6 +196,8 @@ typedef struct {
   int background_done;
   // Event registered by the background wait's notify callback.
   ThreadsEvent *background_event;
+  // Step index at which the test flips fake_system_gpu to idle/asleep, or 0.
+  int clear_system_gpu_at_step;
   // Total virtual GPU seconds executed by this model.
   double total_gpu_s;
   // Number of layers or decode calls completed by this model.
@@ -219,6 +262,12 @@ static void mock_read_notify(void *context, ThreadsEvent *event) {
 static void mock_run_steps(int idx, const PassWait *wait) {
   MockModel *mm = &mocks[idx];
   for (int i = 0; i < mm->steps; i++) {
+    if (mm->clear_system_gpu_at_step > 0 && i == mm->clear_system_gpu_at_step) {
+      fake_system_gpu.display_asleep = 1;
+      fake_system_gpu.input_idle_seconds = INFINITY;
+      fake_system_gpu.external_gpu_idle_seconds = INFINITY;
+      fake_system_gpu.display_frame_seconds = 0.0;
+    }
     if (mm->other_passes == 0 && mm->turn_budget <= 0.0) {
       mm->saw_solo = 1;
       if (mm->saw_contended) mm->saw_solo_after_contended = 1;
@@ -402,7 +451,20 @@ static void reset_world(int count, const MockRole *roles) {
   calls_posted = 0;
   turn_owner = NULL;
   turn_started_at = 0.0;
+  system_gpu_busy = 0;
+  system_frame_seconds = 0.0;
+  system_gpu_full_poll_at = 0.0;
+  system_gpu_fast_poll_at = 0.0;
+  system_gpu_work_s = 0.0;
+  system_work_started_at = 0.0;
+  system_last_run_ended_at = 0.0;
   proc = (eremite_process){0};
+  fake_system_gpu = (SystemGpuActivity){.display_frame_seconds = 0.0,
+                                        .input_idle_seconds = INFINITY,
+                                        .external_gpu_idle_seconds = INFINITY,
+                                        .display_asleep = 1};
+  fake_yield_sleep_s = 0.0;
+  fake_yield_sleeps = 0;
   atomic_store(&woken, 0);
   if (!wake) wake = threads_event_new();
   gpu = (Gpu *)&fake_gpu_sentinel;
@@ -803,6 +865,136 @@ static void test_background_wait_frees_gpu(void) {
   eremite_stream_free(sl);
 }
 
+// Tests passive external GPU activity without keyboard/mouse input (such as
+// watching video or desktop animations): the engine slices to the display frame
+// period and yields the configured GPU share.
+static void test_system_gpu_passive_use(void) {
+  MockRole roles[1] = {MOCK_ROLE_VIDEO};
+  reset_world(1, roles);
+  proc.system_gpu_share = 0.20;
+  proc.system_gpu_window_seconds = 2.0;
+  fake_system_gpu = (SystemGpuActivity){.display_frame_seconds = 1.0 / 60.0,
+                                        .input_idle_seconds = 300.0,
+                                        .external_gpu_idle_seconds = 0.010,
+                                        .display_asleep = 0};
+  mocks[0].steps = 30;
+  mocks[0].step_s = 0.020;
+
+  eremite_stream *sv = eremite_stream_new(&mock_models[0]);
+  eremite_video_request vreq = {.prompt = "test"};
+  eremite_stream_generate_video(sv, &vreq);
+  check(eremite_run_streams(&sv, 1) == 0, "solo video completes under passive "
+                                          "external GPU activity");
+
+  double wall = mocks[0].total_gpu_s + fake_yield_sleep_s;
+  double yielded_ratio = fake_yield_sleep_s / wall;
+  printf("system-gpu passive: gpu %.2f s, yielded %.2f s (%.1f%%), "
+         "max_budget %.2f ms\n",
+         mocks[0].total_gpu_s, fake_yield_sleep_s, yielded_ratio * 100.0,
+         mocks[0].max_turn_budget * 1e3);
+  check(mocks[0].saw_contended && mocks[0].other_passes == 0 &&
+            mocks[0].max_turn_budget > 0.0 &&
+            mocks[0].max_turn_budget <= (1.0 / 60.0) + 1e-6,
+        "passive external GPU activity caps turn budget to one display frame "
+        "without inflating other_passes");
+  check(yielded_ratio >= 0.14 && yielded_ratio <= 0.26,
+        "passive external GPU activity yields the configured GPU time share");
+  eremite_stream_free(sv);
+}
+
+// Tests interactive input transitioning dynamically to full 100% GPU capacity
+// once the display sleeps and external GPU activity stops.
+static void test_system_gpu_dynamic_return_to_full_power(void) {
+  MockRole roles[1] = {MOCK_ROLE_VIDEO};
+  reset_world(1, roles);
+  proc.system_gpu_share = 0.20;
+  proc.system_gpu_window_seconds = 0.5;
+  fake_system_gpu = (SystemGpuActivity){.display_frame_seconds = 1.0 / 120.0,
+                                        .input_idle_seconds = 0.05,
+                                        .external_gpu_idle_seconds = 300.0,
+                                        .display_asleep = 0};
+  mocks[0].steps = 40;
+  mocks[0].step_s = 0.020;
+  mocks[0].clear_system_gpu_at_step = 15;
+
+  eremite_stream *sv = eremite_stream_new(&mock_models[0]);
+  eremite_video_request vreq = {.prompt = "test"};
+  eremite_stream_generate_video(sv, &vreq);
+  check(eremite_run_streams(&sv, 1) == 0, "video completes after display "
+                                          "sleeps");
+  check(mocks[0].saw_contended && mocks[0].saw_solo_after_contended &&
+            mocks[0].other_passes == 0 && mocks[0].turn_budget == 0.0,
+        "solo video dynamically returns to 100% uncontended capacity when "
+        "system GPU becomes free");
+  eremite_stream_free(sv);
+
+  // Disabled (system_gpu_share == 0): zero yielding even with active input.
+  reset_world(1, roles);
+  proc.system_gpu_share = 0.0;
+  fake_system_gpu = (SystemGpuActivity){.display_frame_seconds = 1.0 / 120.0,
+                                        .input_idle_seconds = 0.0,
+                                        .external_gpu_idle_seconds = 0.0,
+                                        .display_asleep = 0};
+  mocks[0].steps = 10;
+  mocks[0].step_s = 0.020;
+  sv = eremite_stream_new(&mock_models[0]);
+  eremite_stream_generate_video(sv, &vreq);
+  eremite_run_streams(&sv, 1);
+  check(fake_yield_sleeps == 0 && !mocks[0].saw_contended &&
+            mocks[0].max_turn_budget == 0.0,
+        "system_gpu_share 0 leaves solo models untouched with zero sleeps");
+  eremite_stream_free(sv);
+}
+
+// Tests that two concurrent models remain balanced 50/50 with each other while
+// yielding the configured share to active external GPU work.
+static void test_system_gpu_with_two_models_balanced(void) {
+  MockRole roles[2] = {MOCK_ROLE_VIDEO, MOCK_ROLE_LLM};
+  reset_world(2, roles);
+  proc.system_gpu_share = 0.20;
+  proc.system_gpu_window_seconds = 2.0;
+  fake_system_gpu = (SystemGpuActivity){.display_frame_seconds = 1.0 / 60.0,
+                                        .input_idle_seconds = 100.0,
+                                        .external_gpu_idle_seconds = 0.008,
+                                        .display_asleep = 0};
+  mocks[0].steps = 40;
+  mocks[0].step_s = 0.020;
+  mocks[1].step_s = 0.030;
+
+  eremite_stream *sv = eremite_stream_new(&mock_models[0]);
+  eremite_stream *sl = eremite_stream_new(&mock_models[1]);
+  eremite_stream *streams[2] = {sv, sl};
+  eremite_video_request vreq = {.prompt = "test"};
+  eremite_state *st = (eremite_state *)&fake_gpu_sentinel;
+  int32_t tok = 1, pos = 0;
+
+  eremite_stream_generate_video(sv, &vreq);
+  eremite_stream_decode_rows(sl, &st, &tok, &pos, 1);
+  for (;;) {
+    int done = eremite_run_streams(streams, 2);
+    if (done == 0) break;
+    if (done == 1) eremite_stream_decode_rows(sl, &st, &tok, &pos, 1);
+  }
+  double engine_gpu = mocks[0].total_gpu_s + mocks[1].total_gpu_s;
+  double video_share = mocks[0].total_gpu_s / engine_gpu;
+  double yielded_share = fake_yield_sleep_s / (engine_gpu + fake_yield_sleep_s);
+  printf("system-gpu + 2 models: video %.1f%% of engine, yielded %.1f%% of "
+         "wall, video max_budget %.2f ms\n",
+         video_share * 100.0, yielded_share * 100.0,
+         mocks[0].max_turn_budget * 1e3);
+  check(video_share >= SHARE_TWO_LOW && video_share <= SHARE_TWO_HIGH,
+        "video and LLM remain balanced 50/50 while yielding to external GPU");
+  check(yielded_share >= 0.14 && yielded_share <= 0.26,
+        "multi-model run yields the configured share to external GPU");
+  check(mocks[0].max_turn_budget > 0.0 &&
+            mocks[0].max_turn_budget <= (1.0 / 60.0) + 1e-6,
+        "multi-model video turn budget stays capped to one display frame");
+
+  eremite_run_streams(&sl, 1);
+  eremite_stream_free(sv);
+  eremite_stream_free(sl);
+}
+
 int main(void) {
   test_video_heavy_vs_llm_decode();
   test_video_light_vs_llm_heavy();
@@ -811,6 +1003,9 @@ int main(void) {
   test_three_models_balanced();
   test_decision_and_intra_model_rules();
   test_background_wait_frees_gpu();
+  test_system_gpu_passive_use();
+  test_system_gpu_dynamic_return_to_full_power();
+  test_system_gpu_with_two_models_balanced();
   if (wake) threads_event_free(wake), wake = NULL;
   return failures != 0;
 }

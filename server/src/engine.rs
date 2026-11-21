@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 13;
+const ABI: c_int = 14;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -29,6 +29,8 @@ struct RawProcess {
     free_pages_only_after_swapout_seconds: f64,
     expert_cache_growth_margin_gb: f64,
     gpu_memory_limit_margin_gb: f64,
+    system_gpu_share: f64,
+    system_gpu_window_seconds: f64,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
     on_stop: Option<extern "C" fn()>,
@@ -792,6 +794,12 @@ pub struct ProcessSettings {
     pub reserve_gb: f64,
     /// Seconds that a wait for the GPU may last before the process ends.
     pub gpu_timeout_seconds: f64,
+    /// Fraction of GPU wall time (0 to 0.5) yielded while user input or another
+    /// GPU process is active; 0 disables yielding.
+    pub system_gpu_share: f64,
+    /// Lookback window in seconds for detecting recent user input or external
+    /// GPU work; 0 takes the engine's default.
+    pub system_gpu_window_seconds: f64,
 }
 
 /// Installs the log (on_log receives its lines, with their time, under the
@@ -818,6 +826,8 @@ pub fn init(
         free_pages_only_after_swapout_seconds: 0.0,
         expert_cache_growth_margin_gb: 0.0,
         gpu_memory_limit_margin_gb: 0.0,
+        system_gpu_share: settings.system_gpu_share,
+        system_gpu_window_seconds: settings.system_gpu_window_seconds,
         on_log,
         on_die,
         on_stop,

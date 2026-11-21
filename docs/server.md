@@ -24,6 +24,8 @@ The file's root holds the server-wide settings:
 | `idle_unload` | seconds without requests before a model's weights and experts unload; its states stay; 0: never | 600 |
 | `max_waiting_requests` | the most requests that wait for one model; another gets HTTP 429 | 16 |
 | `gpu_timeout` | seconds that a wait for the GPU may last before the server ends | 60 |
+| `system_gpu_share` | share of GPU wall time (0 to 0.5) yielded while user input or another GPU process is active; 0: off | 0.15 |
+| `system_gpu_window` | seconds of recent user input or external GPU submissions that keep adaptive system GPU yielding active | 2 |
 | `progress_log` | seconds between a decoding request's progress lines in the log; 0: none | 10 |
 | `http_timeout` | seconds that a request's head, each part of its body and a stalled write may take | 60 |
 | `keepalive` | seconds between the comment lines of a streamed response that waits for its first token | 15 |
@@ -117,6 +119,38 @@ compresses other memory instead while that file cache counts as free, the file
 cache at that moment becomes the part that macOS keeps. So a growing file cache
 does not make the models' memory shrink. The memory view shows the part that
 macOS keeps as file cache, and the rest as free file cache.
+
+## GPU sharing
+
+When one model runs alone and neither user input nor another GPU process has
+been active within `system_gpu_window`, the engine runs that model unthrottled
+at full GPU capacity without slicing.
+
+When two or more distinct models have active GPU requests at the same time, the
+engine measures each model's GPU time and balances GPU turns evenly across them
+(for example 50/50 across two models or 33/33/33 across three). Heavy
+MiniMax-H3 DiT stages dynamically slice to the peer's measured turn budget, and
+off-GPU stages such as MP4 and image encoding run on background threads so
+other models keep full GPU capacity while encoding finishes. Once peer models
+finish, the remaining model returns dynamically to full uncontended speed.
+
+When `system_gpu_share` is greater than 0, the engine also monitors macOS user
+input, display sleep state, display refresh period and non-eremite GPU
+accelerator submissions (including desktop animations, passive video playback
+and other GPU apps). While either user input or another GPU process was active
+within `system_gpu_window`:
+
+- Active models cap GPU slice budgets to one measured display refresh frame and
+  disable GPU clock-keeper spin loops.
+- After each display-frame quantum of GPU work finishes on the GPU, the engine
+  sleeps off-GPU for the matching `system_gpu_share` pause (waking immediately
+  when a new request arrives), leaving GPU breathing room for smooth system
+  animations and reducing idle power draw.
+- Multi-model runs keep their balanced GPU time split among models while
+  yielding `system_gpu_share` to external system GPU work.
+- When both user input and external GPU submissions stay quiet for
+  `system_gpu_window` (or the display sleeps with no external GPU work), the
+  engine returns automatically to full GPU capacity with zero sleeps.
 
 ## Decision models
 

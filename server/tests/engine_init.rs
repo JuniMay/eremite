@@ -37,6 +37,42 @@ fn a_logged_line_reaches_the_log_hook() {
                 "the engine refuses a negative GPU timeout"
             );
             assert!(
+                !engine::init(
+                    &engine::ProcessSettings {
+                        system_gpu_share: -0.1,
+                        ..Default::default()
+                    },
+                    Some(keep_line),
+                    None,
+                    None
+                ),
+                "the engine refuses a negative system GPU share"
+            );
+            assert!(
+                !engine::init(
+                    &engine::ProcessSettings {
+                        system_gpu_share: 0.6,
+                        ..Default::default()
+                    },
+                    Some(keep_line),
+                    None,
+                    None
+                ),
+                "the engine refuses a system GPU share above 0.5"
+            );
+            assert!(
+                !engine::init(
+                    &engine::ProcessSettings {
+                        system_gpu_window_seconds: -1.0,
+                        ..Default::default()
+                    },
+                    Some(keep_line),
+                    None,
+                    None
+                ),
+                "the engine refuses a negative system GPU window"
+            );
+            assert!(
                 engine::init(
                     &engine::ProcessSettings::default(),
                     Some(keep_line),
