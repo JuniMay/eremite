@@ -1,4 +1,5 @@
 #include "model/inkling2/model.h"
+#include "model/inkling2/mtp.h"
 #include "model/inkling2/vision.h"
 #include "base/clock.h"
 #include "base/error.h"
@@ -282,14 +283,16 @@ typedef struct {
   Buf slide_kv;
   // Rolling FP32 short-convolution rings for all 48 logical visits.
   Buf conv_ring;
+  // Optional MTP draft head context KV and Markov feature caches.
+  Ink2MtpState mtp;
 } Ink2State;
 
-// Saved rolling state (sliding KV rings, sconv rings and optional logits) at
-// one sequence position.
+// Saved rolling state (sliding KV rings, sconv rings, optional MTP rolling
+// rings and optional logits) at one sequence position.
 typedef struct {
   // Number of positions already processed when this snapshot was taken.
   int pos;
-  // Host buffer holding slide_kv followed by conv_ring.
+  // Host buffer holding slide_kv, conv_ring and optional MTP rolling rings.
   uint8_t *rows;
   // Optional host buffer of INK2_VOCAB FP32 logits, or null.
   float *logits;
@@ -319,6 +322,8 @@ typedef struct {
   Buf logits;
   // Batched per-row device-address target tables for multi-state decoding.
   Buf sconv_tgt, kv_tgt;
+  // Optional MTP tap capture, context injection and block drafting buffers.
+  Ink2MtpWork mtp;
 } Ink2Work;
 
 // Parameters passed to the NVFP4 per-expert scale factor fill callback.
@@ -922,6 +927,7 @@ static uint64_t estimate_work_bytes(int rows) {
                                  sizeof(uint16_t));
   bytes += gpu_round_up_to_pages((size_t)npairs * INK2_DIM * sizeof(float));
   bytes += gpu_round_up_to_pages((size_t)LOGITS_STRIDE * sizeof(float));
+  bytes += inkling2_mtp_estimate_work_bytes(rows);
   return bytes;
 }
 
@@ -941,6 +947,7 @@ static void free_work(Ink2Work *w) {
       &w->logits,       &w->sconv_tgt, &w->kv_tgt};
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     if (list[i]->obj) gpu_mark_to_free(list[i]);
+  inkling2_mtp_free_work(&w->mtp);
   *w = (Ink2Work){0};
 }
 
@@ -1024,6 +1031,7 @@ static void ensure_work(int rows, int logits_rows) {
         work_alloc((size_t)logits_rows * LOGITS_STRIDE * sizeof(float));
     work.logits_rows = logits_rows;
   }
+  inkling2_mtp_ensure_work(gpu, work_slot, &work.mtp, work.cap_rows);
 }
 
 // ---- state and snapshot management ----
@@ -1039,8 +1047,15 @@ static int grown_cap(int positions) {
   return cap;
 }
 
-// Resizes the 8 global KV buffer pairs of s to hold `new_cap` rows, preserving
-// the first `keep` rows. Returns 1 on success or 0 on memory refusal.
+// Returns the rolling snapshot byte size, including MTP rings when active.
+static size_t snap_rolling_bytes(void) {
+  return SNAP_ROLLING_BYTES +
+         (inkling2_mtp_active_drafts() ? INK2_MTP_SNAP_ROLLING_BYTES : 0);
+}
+
+// Resizes the 8 global KV buffer pairs (and MTP global KV when active) of s
+// to hold `new_cap` rows, preserving the first `keep` rows. Returns 1 on
+// success or 0 on memory refusal.
 static int state_resize_global(Ink2State *s, int new_cap, int keep) {
   size_t new_bytes = (size_t)new_cap * GLOBAL_KV_ROW_BYTES;
   size_t copy_bytes = (size_t)keep * GLOBAL_KV_ROW_BYTES;
@@ -1059,6 +1074,14 @@ static int state_resize_global(Ink2State *s, int new_cap, int keep) {
       memcpy(nk[i].ptr, s->gk[i].ptr, copy_bytes);
       memcpy(nv[i].ptr, s->gv[i].ptr, copy_bytes);
     }
+  }
+  if (!inkling2_mtp_state_resize_global(gpu, &state_slot, &s->mtp, new_cap,
+                                        keep)) {
+    for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
+      gpu_free(&nk[i]);
+      gpu_free(&nv[i]);
+    }
+    return 0;
   }
   for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
     if (s->gk[i].obj) gpu_mark_to_free(&s->gk[i]);
@@ -1083,11 +1106,15 @@ static void state_ensure_cap(Ink2State *s, int need) {
 static ModelState *ink2_state_new(void) {
   Ink2State *s = xmalloc(sizeof *s);
   *s = (Ink2State){0};
+  int init_cap = grown_cap(1);
   s->slide_kv = state_try_alloc(SLIDE_KV_BYTES);
   s->conv_ring = s->slide_kv.obj ? state_try_alloc(CONV_TOTAL_BYTES) : (Buf){0};
-  if (!s->conv_ring.obj || !state_resize_global(s, grown_cap(1), 0)) {
+  if (!s->conv_ring.obj ||
+      !inkling2_mtp_state_init(gpu, &state_slot, &s->mtp) ||
+      !state_resize_global(s, init_cap, 0)) {
     if (s->slide_kv.obj) gpu_free(&s->slide_kv);
     if (s->conv_ring.obj) gpu_free(&s->conv_ring);
+    inkling2_mtp_state_free(&s->mtp);
     free(s);
     return NULL;
   }
@@ -1106,6 +1133,7 @@ static void ink2_state_free(ModelState *ms) {
   }
   if (s->slide_kv.obj) gpu_mark_to_free(&s->slide_kv);
   if (s->conv_ring.obj) gpu_mark_to_free(&s->conv_ring);
+  inkling2_mtp_state_free(&s->mtp);
   free(s);
 }
 
@@ -1118,11 +1146,12 @@ static size_t ink2_state_bytes(const ModelState *ms, int positions) {
   size_t gk_one = gpu_round_up_to_pages((size_t)cap * GLOBAL_KV_ROW_BYTES);
   return (size_t)INK2_GLOBAL_COUNT * 2 * gk_one +
          gpu_round_up_to_pages(SLIDE_KV_BYTES) +
-         gpu_round_up_to_pages(CONV_TOTAL_BYTES);
+         gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
+         inkling2_mtp_state_bytes(cap);
 }
 
-// Writes the 16 growing global KV regions of s. When fill is nonzero, grows s
-// to hold `positions` tokens first.
+// Writes the growing global KV regions of s (16 base, plus 2 for MTP when
+// active). When fill is nonzero, grows s to hold `positions` tokens first.
 static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
                                     StateRegion *out) {
   Ink2State *s = (Ink2State *)ms;
@@ -1141,6 +1170,12 @@ static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
     out[n++] =
         (StateRegion){s->gv[i].ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
   }
+  if (inkling2_mtp_active_drafts()) {
+    out[n++] =
+        (StateRegion){s->mtp.gk.ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+    out[n++] =
+        (StateRegion){s->mtp.gv.ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+  }
   return n;
 }
 
@@ -1154,18 +1189,24 @@ static void ink2_state_copy(ModelState *dst_ms, const ModelState *src_ms,
   regions_copy(to, from, n, positions);
 }
 
-// Captures the rolling sliding-window KV and short-convolution state of s at
-// `pos`, along with optional logits.
+// Captures the rolling sliding-window KV, short-convolution and optional MTP
+// rings of s at `pos`, along with optional logits.
 static ModelSnapshot *ink2_snapshot_take(ModelState *ms, int pos,
                                          const float *lg) {
   Ink2State *s = (Ink2State *)ms;
   model_sync();
+  size_t rolling = snap_rolling_bytes();
   Ink2Snapshot *x = xmalloc(sizeof *x);
-  *x = (Ink2Snapshot){
-      .pos = pos,
-      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+  *x = (Ink2Snapshot){.pos = pos,
+                      .rows = memory_host_alloc_required(&state_slot, rolling)};
   memcpy(x->rows, s->slide_kv.ptr, SLIDE_KV_BYTES);
   memcpy(x->rows + SLIDE_KV_BYTES, s->conv_ring.ptr, CONV_TOTAL_BYTES);
+  if (inkling2_mtp_active_drafts()) {
+    memcpy(x->rows + SNAP_ROLLING_BYTES, s->mtp.slide_kv.ptr,
+           INK2_MTP_SLIDE_KV_BYTES);
+    memcpy(x->rows + SNAP_ROLLING_BYTES + INK2_MTP_SLIDE_KV_BYTES,
+           s->mtp.frnn.ptr, INK2_MTP_FRNN_BYTES);
+  }
   if (lg) {
     x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
     memcpy(x->logits, lg, LOGITS_BYTES);
@@ -1173,13 +1214,21 @@ static ModelSnapshot *ink2_snapshot_take(ModelState *ms, int pos,
   return (ModelSnapshot *)x;
 }
 
-// Restores rolling sliding-window KV and short-convolution state from x into s.
+// Restores rolling sliding-window KV, short-convolution and optional MTP rings
+// from x into s.
 static void ink2_snapshot_restore(ModelState *ms, const ModelSnapshot *mx) {
   Ink2State *s = (Ink2State *)ms;
   const Ink2Snapshot *x = (const Ink2Snapshot *)mx;
   model_sync();
   memcpy(s->slide_kv.ptr, x->rows, SLIDE_KV_BYTES);
   memcpy(s->conv_ring.ptr, x->rows + SLIDE_KV_BYTES, CONV_TOTAL_BYTES);
+  if (inkling2_mtp_active_drafts()) {
+    memcpy(s->mtp.slide_kv.ptr, x->rows + SNAP_ROLLING_BYTES,
+           INK2_MTP_SLIDE_KV_BYTES);
+    memcpy(s->mtp.frnn.ptr,
+           x->rows + SNAP_ROLLING_BYTES + INK2_MTP_SLIDE_KV_BYTES,
+           INK2_MTP_FRNN_BYTES);
+  }
 }
 
 // Frees a snapshot and its host buffers.
@@ -1193,7 +1242,7 @@ static void ink2_snapshot_free(ModelSnapshot *mx) {
 
 // Returns the byte footprint of one snapshot.
 static size_t ink2_snapshot_bytes(int with_logits) {
-  return SNAP_ROLLING_BYTES + (with_logits ? LOGITS_BYTES : 0);
+  return snap_rolling_bytes() + (with_logits ? LOGITS_BYTES : 0);
 }
 
 // Returns the saved logits of snapshot x, or null if none were saved.
@@ -1210,28 +1259,35 @@ static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
   model_sync();
   Ink2Snapshot *x = (Ink2Snapshot *)mx;
   Ink2State *s = (Ink2State *)ms;
-  *nmeta = 1;
+  int mtp_on = inkling2_mtp_active_drafts() ? 1 : 0;
+  *nmeta = 2;
+  meta[1] = mtp_on;
   int n = 0;
   if (x) {
     meta[0] = x->pos;
-    out[n++] = (SnapshotPart){x->rows, SNAP_ROLLING_BYTES};
+    out[n++] = (SnapshotPart){x->rows, snap_rolling_bytes()};
     if (x->logits) out[n++] = (SnapshotPart){x->logits, LOGITS_BYTES};
     return n;
   }
   meta[0] = pos;
   out[n++] = (SnapshotPart){s->slide_kv.ptr, SLIDE_KV_BYTES};
   out[n++] = (SnapshotPart){s->conv_ring.ptr, CONV_TOTAL_BYTES};
+  if (mtp_on) {
+    out[n++] = (SnapshotPart){s->mtp.slide_kv.ptr, INK2_MTP_SLIDE_KV_BYTES};
+    out[n++] = (SnapshotPart){s->mtp.frnn.ptr, INK2_MTP_FRNN_BYTES};
+  }
   return n;
 }
 
 // Allocates an empty snapshot matching the serialized metadata.
 static ModelSnapshot *ink2_snapshot_new_empty(const int32_t *meta, int nmeta,
                                               int with_logits) {
-  if (nmeta != 1 || meta[0] < 0) return NULL;
+  int mtp_on = inkling2_mtp_active_drafts() ? 1 : 0;
+  if (nmeta != 2 || meta[0] < 0 || meta[1] != mtp_on) return NULL;
   Ink2Snapshot *x = xmalloc(sizeof *x);
   *x = (Ink2Snapshot){
       .pos = meta[0],
-      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+      .rows = memory_host_alloc_required(&state_slot, snap_rolling_bytes())};
   if (with_logits)
     x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
   return (ModelSnapshot *)x;
@@ -1247,12 +1303,12 @@ static uint32_t pick_mv_split(int n, int k) {
              : 1u;
 }
 
-// Dispatches a single BF16 linear projection y = x @ w^T (optionally BF16-
-// rounded), choosing mv_bf16 (m = 1), mvm_bf16 (2 <= m <= 8, non-prefill), or
-// tiled mm_bf16 (m > 8 or prefill).
-static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
-                            const Buf *y, int m, int n, int k, int ldy,
-                            int round, int is_prefill) {
+// Dispatches a single BF16 linear projection y = x @ w^T starting at byte
+// offset x_off in x, choosing mv_bf16 (m = 1), mvm_bf16 (2 <= m <= 8,
+// non-prefill), or tiled mm_bf16 (m > 8 or prefill).
+static void run_bf16_linear_off(GpuCommandBuffer *c, const Buf *w, const Buf *x,
+                                size_t x_off, const Buf *y, int m, int n, int k,
+                                int ldy, int round, int is_prefill) {
   if (!is_prefill && m == 1) {
     uint32_t split = pick_mv_split(n, k);
     uint32_t rows_per_tg = (BF16_MV_SGS / split) * BF16_MV_ROWS_PER_SG;
@@ -1260,7 +1316,7 @@ static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
                  0,           (uint32_t)round, split};
     gpu_select_kernel(c, K_mv_bf16);
     gpu_bind_buffer(c, 0, w, 0);
-    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 2, x, x_off);
     gpu_bind_buffer(c, 3, y, 0);
     gpu_copy_bytes(c, 4, &p, sizeof p);
     gpu_run_kernel(c, ((uint32_t)n + rows_per_tg - 1u) / rows_per_tg, 1, 1,
@@ -1275,7 +1331,7 @@ static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
         (uint32_t)ldy};
     gpu_select_kernel(c, K_mvm_bf16);
     gpu_bind_buffer(c, 0, w, 0);
-    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 2, x, x_off);
     gpu_bind_buffer(c, 3, y, 0);
     gpu_copy_bytes(c, 4, &p, sizeof p);
     gpu_run_kernel(c, ((uint32_t)n + rows_per_tg - 1u) / rows_per_tg, 1, 1,
@@ -1285,13 +1341,20 @@ static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
                  (uint32_t)round, (uint32_t)k, (uint32_t)ldy};
     gpu_select_kernel(c, K_mm_bf16);
     gpu_bind_buffer(c, 0, w, 0);
-    gpu_bind_buffer(c, 2, x, 0);
+    gpu_bind_buffer(c, 2, x, x_off);
     gpu_bind_buffer(c, 3, y, 0);
     gpu_copy_bytes(c, 4, &p, sizeof p);
     gpu_run_kernel(c, ((uint32_t)n + MOE_MM_TILE - 1u) / MOE_MM_TILE,
                    ((uint32_t)m + MOE_MM_TILE - 1u) / MOE_MM_TILE, 1,
                    MM_THREADS, 1, 1);
   }
+}
+
+// Dispatches a single BF16 linear projection y = x @ w^T at offset 0 of x.
+static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
+                            const Buf *y, int m, int n, int k, int ldy,
+                            int round, int is_prefill) {
+  run_bf16_linear_off(c, w, x, 0, y, m, n, k, ldy, round, is_prefill);
 }
 
 // Dispatches 3 BF16 linear projections sharing the same input x and width k in
@@ -1411,7 +1474,8 @@ static void run_msg_gate(GpuCommandBuffer *c, const Buf *h, size_t h_off,
   gpu_copy_bytes(c, 6, &p, sizeof p);
   gpu_run_kernel(
       c, ((uint32_t)INK2_DIM + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG,
-      (uint32_t)rows, 1, ROW_THREADS, 1, 1);
+      ((uint32_t)rows + MOE_MV_MAX_M - 1u) / MOE_MV_MAX_M, 1, ROW_THREADS, 1,
+      1);
 }
 
 // Dispatches a float buffer copy of `count` floats on the GPU.
@@ -2042,6 +2106,8 @@ static void run_forward(Ink2State *const *states, const int *tokens,
   // Prelude visits 0..5.
   for (int v = 0; v < INK2_CORE_START; v++) {
     if (is_prefill) prefill_layer_now = v + 1;
+    if (v == INK2_MTP_TAP_0)
+      inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 0, rows);
     run_visit(&cmd, v, rows, pos0, max_pos, states[0], batched, is_prefill,
               &nblocks, wait);
   }
@@ -2063,6 +2129,10 @@ static void run_forward(Ink2State *const *states, const int *tokens,
     }
     for (int li = 0; li < INK2_CORE_LAYERS; li++, visit++) {
       if (is_prefill) prefill_layer_now = visit + 1;
+      if (visit == INK2_MTP_TAP_1)
+        inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 1, rows);
+      if (visit == INK2_MTP_TAP_2)
+        inkling2_mtp_capture_tap(&cmd, &work.cur, &work.mtp, 2, rows);
       run_visit(&cmd, visit, rows, pos0, max_pos, states[0], batched,
                 is_prefill, &nblocks, wait);
     }
@@ -2075,10 +2145,28 @@ static void run_forward(Ink2State *const *states, const int *tokens,
               &nblocks, wait);
   }
 
-  if (logits_mode > 0) {
+  int mtp_on = inkling2_mtp_active_drafts() > 0;
+  if (logits_mode > 0 || mtp_on) {
     run_attn_res(&cmd, &work.blk, &work.cur, &output_query, 0, &work.attn_in,
                  rows, work.cap_rows, nblocks, 1, work.cap_rows);
-    if (logits_mode == 1) {
+    if (mtp_on) {
+      run_rmsnorm(&cmd, &work.attn_in, 0, &final_norm, &work.q_in, rows, 1);
+      inkling2_mtp_capture_tap(&cmd, &work.q_in, &work.mtp, 3, rows);
+      Ink2MtpState *mtp_states[INK2_MAX_BATCH_ROWS];
+      int mcount = batched ? rows : 1;
+      for (int r = 0; r < mcount; r++) mtp_states[r] = &states[r]->mtp;
+      inkling2_mtp_inject(&cmd, &work.mtp, mtp_states, pos, rows, batched,
+                          is_prefill);
+      if (logits_mode == 1) {
+        size_t last_off = (size_t)(rows - 1) * INK2_DIM * sizeof(float);
+        run_bf16_linear_off(&cmd, &unembed_w, &work.q_in, last_off,
+                            &work.logits, 1, INK2_VOCAB, INK2_DIM,
+                            LOGITS_STRIDE, 0, 0);
+      } else if (logits_mode == 2) {
+        run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, rows,
+                        INK2_VOCAB, INK2_DIM, LOGITS_STRIDE, 0, is_prefill);
+      }
+    } else if (logits_mode == 1) {
       size_t last_off = (size_t)(rows - 1) * INK2_DIM * sizeof(float);
       run_rmsnorm(&cmd, &work.attn_in, last_off, &final_norm, &work.q_in, 1, 1);
       run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, 1, INK2_VOCAB,
@@ -2088,14 +2176,16 @@ static void run_forward(Ink2State *const *states, const int *tokens,
       run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, rows,
                       INK2_VOCAB, INK2_DIM, LOGITS_STRIDE, 0, is_prefill);
     }
-    SoftcapParam sp = {(uint32_t)need_logits, (uint32_t)INK2_VOCAB,
-                       (uint32_t)LOGITS_STRIDE, LOGIT_SOFTCAP};
-    gpu_select_kernel(&cmd, K_logit_softcap);
-    gpu_bind_buffer(&cmd, 0, &work.logits, 0);
-    gpu_copy_bytes(&cmd, 1, &sp, sizeof sp);
-    gpu_run_kernel(&cmd,
-                   ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
-                   (uint32_t)need_logits, 1, ELEM_THREADS, 1, 1);
+    if (logits_mode > 0) {
+      SoftcapParam sp = {(uint32_t)need_logits, (uint32_t)INK2_VOCAB,
+                         (uint32_t)LOGITS_STRIDE, LOGIT_SOFTCAP};
+      gpu_select_kernel(&cmd, K_logit_softcap);
+      gpu_bind_buffer(&cmd, 0, &work.logits, 0);
+      gpu_copy_bytes(&cmd, 1, &sp, sizeof sp);
+      gpu_run_kernel(&cmd,
+                     ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
+                     (uint32_t)need_logits, 1, ELEM_THREADS, 1, 1);
+    }
   }
 
   model_commit(&cmd);
@@ -2176,6 +2266,7 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     text_weights =
         weight_group_new(gpu, work_mem->account, "Inkling-2-Mini weights");
     register_text_weights();
+    inkling2_mtp_init(gpu, text_weights, dir, opt.draft);
     inkling2_vision_init(gpu, work_mem, checkpoint, text_weights);
     required_bytes = weight_group_required_bytes(text_weights) +
                      estimate_work_bytes(PREFILL_CHUNK);
@@ -2225,8 +2316,8 @@ static int ink2_max_rows(void) { return INK2_MAX_BATCH_ROWS; }
 // Returns the maximum rows verified in one speculative verification pass.
 static int ink2_max_verify(void) { return INK2_MAX_VERIFY; }
 
-// Returns the model's self-draft count per pass (0 until MTP support lands).
-static int ink2_drafts_per_pass(void) { return 0; }
+// Returns the active MTP draft count per pass, or 0 when MTP is disabled.
+static int ink2_drafts_per_pass(void) { return inkling2_mtp_active_drafts(); }
 
 // Returns how many positions a state can rewind safely without overwriting its
 // sliding KV or short-convolution rings.
@@ -2298,6 +2389,17 @@ static const float *ink2_decode_rows(ModelState *const *states,
   decode_seconds_total += now() - t0;
   decode_gpu_seconds_total += g1.busy_seconds - g0.busy_seconds;
   return pack_logits(m);
+}
+
+// Proposes `n` draft token IDs after `token` at `pos` via the MTP DSpark head.
+static const double *ink2_propose_drafts(ModelState *ms, int token, int pos,
+                                         int *drafts, int n, Sampler *sampler) {
+  (void)sampler;
+  const Ink2State *s = (const Ink2State *)ms;
+  inkling2_mtp_propose(gpu, work_slot, &work.mtp, &s->mtp, &embed_w,
+                       &embed_norm, &unembed_w, token, pos, drafts, n,
+                       &last_committed, model_sync);
+  return NULL;
 }
 
 // Verifies `m` contiguous candidate tokens starting at `pos` on state `ms`.
@@ -2403,6 +2505,7 @@ static const char *const ink2_model_types[] = {"inkling2_loop",
 const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .model_types = ink2_model_types,
                                .media_token = "<|unused_200054|>",
+                               .max_drafts = INK2_MTP_MAX_DRAFTS,
                                .load = ink2_load,
                                .dense_weight_slot = ink2_dense_weight_slot,
                                .read_counters = ink2_read_counters,
@@ -2429,6 +2532,7 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .prefill = ink2_prefill,
                                .replay_rows = ink2_replay_rows,
                                .decode_rows = ink2_decode_rows,
+                               .propose_drafts = ink2_propose_drafts,
                                .verify = ink2_verify,
                                .accept = ink2_accept,
                                .run_idle_work = ink2_run_idle_work,

@@ -101,9 +101,10 @@ static void usage(void) {
       "decoded beside another sequence\n"
       "                (and, with --draft, in a verify pass): the logits must "
       "be equal\n"
-      "  --draft N     at most N DSpark proposals per pass, 0-5; each pass "
-      "runs the count that has given the\n"
-      "                most tokens per second\n"
+      "  --draft N     at most N draft-head proposals per pass (0 to the "
+      "model's limit); each pass\n"
+      "                runs the count that has given the most tokens per "
+      "second\n"
       "  --lookup off|N  verify up to N (1-15) context-copy drafts; --draft "
       "supplies fallback (default off)\n"
       "  --substitute D  for tests only (the server does not offer it); "
@@ -372,7 +373,8 @@ int main(int argc, char **argv) {
     die("%s: an image model generates no text; eremite-server serves its "
         "images",
         dir);
-  if (o.draft > BLOCK) die("this model accepts at most %d proposals", BLOCK);
+  if (o.draft > ops->max_drafts)
+    die("this model accepts at most %d proposals", ops->max_drafts);
   if (nmedia && !ops->encode_media) die("this model does not encode images");
   if (bench && !ops->run_bench)
     die("--bench: this model has no kernel timings");

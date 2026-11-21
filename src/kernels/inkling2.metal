@@ -330,8 +330,9 @@ kernel void ink2_msg_cat_norm(device const float *h [[buffer(0)]],
 // out = (1 - tanh(forget_w @ g)) * h + tanh(gain_w @ g) * m.
 // `forget_w` and `gain_w` are BF16 [dim, rank] (rank a multiple of 8), `g` is
 // FP32 [rows, rank]. Each threadgroup (8 simdgroups, 256 threads) handles 32
-// channels (4 per simdgroup, 8 coalesced lanes per channel).
-// Grid: x = ceil(dim / 32), y = rows. Threadgroup: 256 threads.
+// channels (4 per simdgroup, 8 coalesced lanes per channel) across up to 8 rows,
+// reading forget_w and gain_w once per 8-row group.
+// Grid: x = ceil(dim / 32), y = ceil(rows / 8). Threadgroup: 256 threads.
 kernel void ink2_msg_gate_apply(device const float *h [[buffer(0)]],
                                 device const float *m [[buffer(1)]],
                                 device const float *g [[buffer(2)]],
@@ -344,12 +345,19 @@ kernel void ink2_msg_gate_apply(device const float *h [[buffer(0)]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint LANES_PER_CH = 8, CH_PER_SG = INK2_SIMD / LANES_PER_CH,
-                 CH_PER_TG = INK2_MV_SGS * CH_PER_SG, BF16_PER_UINT4 = 8;
-  threadgroup float gs[INK2_MAX_GATE_RANK];
-  uint row = tg.y;
-  if (row >= p.rows) return;
-  device const float *gr = g + (ulong)row * p.rank;
-  if (t < p.rank) gs[t] = gr[t];
+                 CH_PER_TG = INK2_MV_SGS * CH_PER_SG, BF16_PER_UINT4 = 8,
+                 ROWS_PER_TG = INK2_MV_MAX_M,
+                 TG_THREADS = INK2_MV_SGS * INK2_SIMD;
+  threadgroup float gs[ROWS_PER_TG * INK2_MAX_GATE_RANK];
+  uint row0 = tg.y * ROWS_PER_TG;
+  if (row0 >= p.rows) return;
+  uint nr = min(ROWS_PER_TG, p.rows - row0);
+  uint total_g = nr * p.rank;
+  for (uint idx = t; idx < total_g; idx += TG_THREADS) {
+    uint r = idx / p.rank;
+    uint c = idx % p.rank;
+    gs[r * INK2_MAX_GATE_RANK + c] = g[(ulong)(row0 + r) * p.rank + c];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   uint ch = tg.x * CH_PER_TG + sg * CH_PER_SG + lane / LANES_PER_CH;
@@ -359,24 +367,54 @@ kernel void ink2_msg_gate_apply(device const float *h [[buffer(0)]],
   uint chunks = p.rank / BF16_PER_UINT4;
   device const uint4 *fw = (device const uint4 *)(forget_w + (ulong)ch * p.rank);
   device const uint4 *gw = (device const uint4 *)(gain_w + (ulong)ch * p.rank);
-  float df = 0.0f, dg = 0.0f;
+  float df0 = 0.0f, df1 = 0.0f, df2 = 0.0f, df3 = 0.0f;
+  float df4 = 0.0f, df5 = 0.0f, df6 = 0.0f, df7 = 0.0f;
+  float dg0 = 0.0f, dg1 = 0.0f, dg2 = 0.0f, dg3 = 0.0f;
+  float dg4 = 0.0f, dg5 = 0.0f, dg6 = 0.0f, dg7 = 0.0f;
   for (uint c = chunk; c < chunks; c += LANES_PER_CH) {
-    float4 g0 = *(threadgroup const float4 *)(gs + c * BF16_PER_UINT4);
-    float4 g1 = *(threadgroup const float4 *)(gs + c * BF16_PER_UINT4 + 4u);
     uint4 fq = fw[c], gq = gw[c];
-    float4 fd = bf16x4(fq.xy) * g0 + bf16x4(fq.zw) * g1;
-    float4 gd = bf16x4(gq.xy) * g0 + bf16x4(gq.zw) * g1;
-    df += fd.x + fd.y + fd.z + fd.w;
-    dg += gd.x + gd.y + gd.z + gd.w;
+    float4 fw0 = bf16x4(fq.xy), fw1 = bf16x4(fq.zw);
+    float4 gw0 = bf16x4(gq.xy), gw1 = bf16x4(gq.zw);
+    uint coff = c * BF16_PER_UINT4;
+#define INK2_MG_STEP(idx, dfv, dgv)                                                 \
+  if (idx < nr) {                                                                   \
+    float4 g0 = *(threadgroup const float4 *)(gs + idx * INK2_MAX_GATE_RANK + coff);\
+    float4 g1 = *(threadgroup const float4 *)(gs + idx * INK2_MAX_GATE_RANK + coff + 4u); \
+    float4 fd = fw0 * g0 + fw1 * g1;                                                \
+    float4 gd = gw0 * g0 + gw1 * g1;                                                \
+    dfv += fd.x + fd.y + fd.z + fd.w;                                               \
+    dgv += gd.x + gd.y + gd.z + gd.w;                                               \
   }
-  for (uint off = LANES_PER_CH / 2u; off > 0u; off >>= 1u) {
-    df += simd_shuffle_xor(df, off);
-    dg += simd_shuffle_xor(dg, off);
+    INK2_MG_STEP(0u, df0, dg0);
+    INK2_MG_STEP(1u, df1, dg1);
+    INK2_MG_STEP(2u, df2, dg2);
+    INK2_MG_STEP(3u, df3, dg3);
+    INK2_MG_STEP(4u, df4, dg4);
+    INK2_MG_STEP(5u, df5, dg5);
+    INK2_MG_STEP(6u, df6, dg6);
+    INK2_MG_STEP(7u, df7, dg7);
+#undef INK2_MG_STEP
   }
-  if (chunk == 0u) {
-    ulong idx = (ulong)row * p.dim + ch;
-    out[idx] = (1.0f - tanh(df)) * h[idx] + tanh(dg) * m[idx];
+#define INK2_MG_EMIT(idx, dfv, dgv)                                                 \
+  if (idx < nr) {                                                                   \
+    for (uint off = LANES_PER_CH / 2u; off > 0u; off >>= 1u) {                      \
+      dfv += simd_shuffle_xor(dfv, off);                                            \
+      dgv += simd_shuffle_xor(dgv, off);                                            \
+    }                                                                               \
+    if (chunk == 0u) {                                                              \
+      ulong oidx = (ulong)(row0 + idx) * p.dim + ch;                                \
+      out[oidx] = (1.0f - tanh(dfv)) * h[oidx] + tanh(dgv) * m[oidx];               \
+    }                                                                               \
   }
+  INK2_MG_EMIT(0u, df0, dg0);
+  INK2_MG_EMIT(1u, df1, dg1);
+  INK2_MG_EMIT(2u, df2, dg2);
+  INK2_MG_EMIT(3u, df3, dg3);
+  INK2_MG_EMIT(4u, df4, dg4);
+  INK2_MG_EMIT(5u, df5, dg5);
+  INK2_MG_EMIT(6u, df6, dg6);
+  INK2_MG_EMIT(7u, df7, dg7);
+#undef INK2_MG_EMIT
 }
 
 // Static causal short convolution (modeling_inkling2.py Inkling2ShortConvolution):
@@ -1015,39 +1053,111 @@ kernel void ink2_moe_nvfp4_up_mv(device const uchar *w13 [[buffer(0)]],
     return;
   }
 
-  float4 acc[INK2_MV_MAX_M];
-  uint tok[INK2_MV_MAX_M];
-  for (uint j = 0; j < tl.count; j++) {
-    acc[j] = float4(0.0f);
-    tok[j] = uint(ptok[tl.start + j]);
+  if (tl.count == 2u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f);
+    device const float4 *xb0 = (device const float4 *)(x + (ulong)uint(ptok[tl.start]) * p.k);
+    device const float4 *xb1 = (device const float4 *)(x + (ulong)uint(ptok[tl.start + 1u]) * p.k);
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+      float4 x00 = xb0[4u * c], x01 = xb0[4u * c + 1u], x02 = xb0[4u * c + 2u],
+             x03 = xb0[4u * c + 3u];
+      float4 x10 = xb1[4u * c], x11 = xb1[4u * c + 1u], x12 = xb1[4u * c + 2u],
+             x13 = xb1[4u * c + 3u];
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
+        float sc = fp8(se[(ulong)r * blocks + c]);
+        float4 a, b, d0, d1;
+        fp4x8(q.x, a, b);
+        fp4x8(q.y, d0, d1);
+        float4 p0 = a * x00 + b * x01 + d0 * x02 + d1 * x03;
+        float4 p1 = a * x10 + b * x11 + d0 * x12 + d1 * x13;
+        acc0[r] += (p0.x + p0.y + p0.z + p0.w) * sc;
+        acc1[r] += (p1.x + p1.y + p1.z + p1.w) * sc;
+      }
+    }
+#define INK2_NV_UP_EMIT(j, av)                                                           \
+  {                                                                                      \
+    float g0 = bf(simd_sum(av.x) * ef), u0 = bf(simd_sum(av.y) * ef);                    \
+    float g1 = bf(simd_sum(av.z) * ef), u1 = bf(simd_sum(av.w) * ef);                    \
+    if (lane == 0) {                                                                     \
+      device bfloat *dst = h_out + (ulong)(tl.start + j) * inter + pair_col;             \
+      dst[0] = bfloat(ink2_softcapped_swiglu(g0, u0, p.gate_cap, p.up_cap));             \
+      dst[1] = bfloat(ink2_softcapped_swiglu(g1, u1, p.gate_cap, p.up_cap));             \
+    }                                                                                    \
+  }
+    INK2_NV_UP_EMIT(0u, acc0);
+    INK2_NV_UP_EMIT(1u, acc1);
+    return;
   }
 
+  // Zero-spill unrolled paths for count 3..4 (16 regs) and 5..8 (32 regs).
+  if (tl.count <= 4u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+    uint t0 = uint(ptok[tl.start]), t1 = uint(ptok[tl.start + 1u]),
+         t2 = uint(ptok[tl.start + 2u]), t3 = tl.count > 3u ? uint(ptok[tl.start + 3u]) : 0u;
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
+        float sc = fp8(se[(ulong)r * blocks + c]);
+        float4 a, b, d0, d1;
+        fp4x8(q.x, a, b);
+        fp4x8(q.y, d0, d1);
+#define INK2_NV_UP_DOT(tk, av)                                                           \
+  {                                                                                      \
+    device const float4 *xr = (device const float4 *)(x + (ulong)tk * p.k) + 4u * c;     \
+    float4 prod = a * xr[0] + b * xr[1] + d0 * xr[2] + d1 * xr[3];                       \
+    av[r] += (prod.x + prod.y + prod.z + prod.w) * sc;                                   \
+  }
+        INK2_NV_UP_DOT(t0, acc0);
+        INK2_NV_UP_DOT(t1, acc1);
+        INK2_NV_UP_DOT(t2, acc2);
+        if (tl.count > 3u) INK2_NV_UP_DOT(t3, acc3);
+      }
+    }
+    INK2_NV_UP_EMIT(0u, acc0);
+    INK2_NV_UP_EMIT(1u, acc1);
+    INK2_NV_UP_EMIT(2u, acc2);
+    if (tl.count > 3u) INK2_NV_UP_EMIT(3u, acc3);
+    return;
+  }
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+  float4 acc4 = float4(0.0f), acc5 = float4(0.0f), acc6 = float4(0.0f), acc7 = float4(0.0f);
+  uint t0 = uint(ptok[tl.start]), t1 = uint(ptok[tl.start + 1u]),
+       t2 = uint(ptok[tl.start + 2u]), t3 = uint(ptok[tl.start + 3u]),
+       t4 = uint(ptok[tl.start + 4u]),
+       t5 = tl.count > 5u ? uint(ptok[tl.start + 5u]) : 0u,
+       t6 = tl.count > 6u ? uint(ptok[tl.start + 6u]) : 0u,
+       t7 = tl.count > 7u ? uint(ptok[tl.start + 7u]) : 0u;
   for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
     for (uint r = 0; r < INK2_MV_ROWS; r++) {
       uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
       float sc = fp8(se[(ulong)r * blocks + c]);
       float4 a, b, d0, d1;
       fp4x8(q.x, a, b);
       fp4x8(q.y, d0, d1);
-      for (uint j = 0; j < tl.count; j++) {
-        device const float4 *xr = (device const float4 *)(x + (ulong)tok[j] * p.k) + 4u * c;
-        float4 prod = a * xr[0] + b * xr[1] + d0 * xr[2] + d1 * xr[3];
-        acc[j][r] += (prod.x + prod.y + prod.z + prod.w) * sc;
-      }
+      INK2_NV_UP_DOT(t0, acc0);
+      INK2_NV_UP_DOT(t1, acc1);
+      INK2_NV_UP_DOT(t2, acc2);
+      INK2_NV_UP_DOT(t3, acc3);
+      INK2_NV_UP_DOT(t4, acc4);
+      if (tl.count > 5u) INK2_NV_UP_DOT(t5, acc5);
+      if (tl.count > 6u) INK2_NV_UP_DOT(t6, acc6);
+      if (tl.count > 7u) INK2_NV_UP_DOT(t7, acc7);
     }
   }
-
-  for (uint j = 0; j < tl.count; j++) {
-    float g0 = bf(simd_sum(acc[j].x) * ef);
-    float u0 = bf(simd_sum(acc[j].y) * ef);
-    float g1 = bf(simd_sum(acc[j].z) * ef);
-    float u1 = bf(simd_sum(acc[j].w) * ef);
-    if (lane == 0) {
-      device bfloat *dst = h_out + (ulong)(tl.start + j) * inter + pair_col;
-      dst[0] = bfloat(ink2_softcapped_swiglu(g0, u0, p.gate_cap, p.up_cap));
-      dst[1] = bfloat(ink2_softcapped_swiglu(g1, u1, p.gate_cap, p.up_cap));
-    }
-  }
+  INK2_NV_UP_EMIT(0u, acc0);
+  INK2_NV_UP_EMIT(1u, acc1);
+  INK2_NV_UP_EMIT(2u, acc2);
+  INK2_NV_UP_EMIT(3u, acc3);
+  INK2_NV_UP_EMIT(4u, acc4);
+  if (tl.count > 5u) INK2_NV_UP_EMIT(5u, acc5);
+  if (tl.count > 6u) INK2_NV_UP_EMIT(6u, acc6);
+  if (tl.count > 7u) INK2_NV_UP_EMIT(7u, acc7);
+#undef INK2_NV_UP_DOT
+#undef INK2_NV_UP_EMIT
 }
 
 // Multi-vec NVFP4 w2 for tiles with count <= 8, reading BF16 intermediate
@@ -1098,34 +1208,102 @@ kernel void ink2_moe_nvfp4_down_mv(device const uchar *w2 [[buffer(0)]],
     return;
   }
 
-  float4 acc[INK2_MV_MAX_M];
-  for (uint j = 0; j < tl.count; j++) acc[j] = float4(0.0f);
+  if (tl.count == 2u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f);
+    device const bfloat4 *hb0 = (device const bfloat4 *)(h + (ulong)tl.start * p.k);
+    device const bfloat4 *hb1 = (device const bfloat4 *)(h + (ulong)(tl.start + 1u) * p.k);
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+      float4 x00 = float4(hb0[4u * c]), x01 = float4(hb0[4u * c + 1u]),
+             x02 = float4(hb0[4u * c + 2u]), x03 = float4(hb0[4u * c + 3u]);
+      float4 x10 = float4(hb1[4u * c]), x11 = float4(hb1[4u * c + 1u]),
+             x12 = float4(hb1[4u * c + 2u]), x13 = float4(hb1[4u * c + 3u]);
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
+        float sc = fp8(se[(ulong)r * blocks + c]);
+        float4 a, b, d0, d1;
+        fp4x8(q.x, a, b);
+        fp4x8(q.y, d0, d1);
+        float4 p0 = a * x00 + b * x01 + d0 * x02 + d1 * x03;
+        float4 p1 = a * x10 + b * x11 + d0 * x12 + d1 * x13;
+        acc0[r] += (p0.x + p0.y + p0.z + p0.w) * sc;
+        acc1[r] += (p1.x + p1.y + p1.z + p1.w) * sc;
+      }
+    }
+#define INK2_NV_DN_EMIT(j, av)                                                           \
+  {                                                                                      \
+    float4 s = float4(simd_sum(av.x), simd_sum(av.y), simd_sum(av.z), simd_sum(av.w)) *  \
+               ef;                                                                       \
+    float rw = pw[tl.start + j];                                                         \
+    if (lane < INK2_MV_ROWS && row + lane < p.n)                                         \
+      y_out[(ulong)(tl.start + j) * p.n + row + lane] = bf(s[lane]) * rw;                \
+  }
+    INK2_NV_DN_EMIT(0u, acc0);
+    INK2_NV_DN_EMIT(1u, acc1);
+    return;
+  }
 
+  if (tl.count <= 4u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
+        float sc = fp8(se[(ulong)r * blocks + c]);
+        float4 a, b, d0, d1;
+        fp4x8(q.x, a, b);
+        fp4x8(q.y, d0, d1);
+#define INK2_NV_DN_DOT(j, av)                                                            \
+  {                                                                                      \
+    device const bfloat4 *hr =                                                           \
+        (device const bfloat4 *)(h + (ulong)(tl.start + j) * p.k) + 4u * c;              \
+    float4 prod = a * float4(hr[0]) + b * float4(hr[1]) + d0 * float4(hr[2]) +           \
+                  d1 * float4(hr[3]);                                                    \
+    av[r] += (prod.x + prod.y + prod.z + prod.w) * sc;                                   \
+  }
+        INK2_NV_DN_DOT(0u, acc0);
+        INK2_NV_DN_DOT(1u, acc1);
+        INK2_NV_DN_DOT(2u, acc2);
+        if (tl.count > 3u) INK2_NV_DN_DOT(3u, acc3);
+      }
+    }
+    INK2_NV_DN_EMIT(0u, acc0);
+    INK2_NV_DN_EMIT(1u, acc1);
+    INK2_NV_DN_EMIT(2u, acc2);
+    if (tl.count > 3u) INK2_NV_DN_EMIT(3u, acc3);
+    return;
+  }
+
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+  float4 acc4 = float4(0.0f), acc5 = float4(0.0f), acc6 = float4(0.0f), acc7 = float4(0.0f);
   for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
     for (uint r = 0; r < INK2_MV_ROWS; r++) {
       uint2 q = ((device const uint2 *)(we + (ulong)r * w_row_bytes))[c];
       float sc = fp8(se[(ulong)r * blocks + c]);
       float4 a, b, d0, d1;
       fp4x8(q.x, a, b);
       fp4x8(q.y, d0, d1);
-      for (uint j = 0; j < tl.count; j++) {
-        device const bfloat4 *hr =
-            (device const bfloat4 *)(h + (ulong)(tl.start + j) * p.k) + 4u * c;
-        float4 prod = a * float4(hr[0]) + b * float4(hr[1]) + d0 * float4(hr[2]) +
-                      d1 * float4(hr[3]);
-        acc[j][r] += (prod.x + prod.y + prod.z + prod.w) * sc;
-      }
+      INK2_NV_DN_DOT(0u, acc0);
+      INK2_NV_DN_DOT(1u, acc1);
+      INK2_NV_DN_DOT(2u, acc2);
+      INK2_NV_DN_DOT(3u, acc3);
+      INK2_NV_DN_DOT(4u, acc4);
+      if (tl.count > 5u) INK2_NV_DN_DOT(5u, acc5);
+      if (tl.count > 6u) INK2_NV_DN_DOT(6u, acc6);
+      if (tl.count > 7u) INK2_NV_DN_DOT(7u, acc7);
     }
   }
-
-  for (uint j = 0; j < tl.count; j++) {
-    float4 s = float4(simd_sum(acc[j].x), simd_sum(acc[j].y), simd_sum(acc[j].z),
-                      simd_sum(acc[j].w)) *
-               ef;
-    float rw = pw[tl.start + j];
-    if (lane < INK2_MV_ROWS && row + lane < p.n)
-      y_out[(ulong)(tl.start + j) * p.n + row + lane] = bf(s[lane]) * rw;
-  }
+  INK2_NV_DN_EMIT(0u, acc0);
+  INK2_NV_DN_EMIT(1u, acc1);
+  INK2_NV_DN_EMIT(2u, acc2);
+  INK2_NV_DN_EMIT(3u, acc3);
+  INK2_NV_DN_EMIT(4u, acc4);
+  if (tl.count > 5u) INK2_NV_DN_EMIT(5u, acc5);
+  if (tl.count > 6u) INK2_NV_DN_EMIT(6u, acc6);
+  if (tl.count > 7u) INK2_NV_DN_EMIT(7u, acc7);
+#undef INK2_NV_DN_DOT
+#undef INK2_NV_DN_EMIT
 }
 
 // Multi-vec MXFP8 w13 + softcapped SwiGLU for layers 20..23 (tile count <= 8).
@@ -1178,41 +1356,86 @@ kernel void ink2_moe_mxfp8_up_mv(device const uchar *w13 [[buffer(0)]],
     return;
   }
 
-  float4 acc[INK2_MV_MAX_M];
-  uint tok[INK2_MV_MAX_M];
-  for (uint j = 0; j < tl.count; j++) {
-    acc[j] = float4(0.0f);
-    tok[j] = uint(ptok[tl.start + j]);
+  if (tl.count <= 4u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+    uint t0 = uint(ptok[tl.start]), t1 = uint(ptok[tl.start + 1u]),
+         t2 = tl.count > 2u ? uint(ptok[tl.start + 2u]) : 0u,
+         t3 = tl.count > 3u ? uint(ptok[tl.start + 3u]) : 0u;
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        device const uint4 *wr = (device const uint4 *)(we + (ulong)r * p.k);
+        uint4 q0 = wr[2u * c], q1 = wr[2u * c + 1u];
+        float sc = e8m0(se[(ulong)r * blocks + c]) * INK2_FP8_SCALE;
+        float4 w0 = fp8x4(q0.x), w1 = fp8x4(q0.y), w2 = fp8x4(q0.z), w3 = fp8x4(q0.w);
+        float4 w4 = fp8x4(q1.x), w5 = fp8x4(q1.y), w6 = fp8x4(q1.z), w7 = fp8x4(q1.w);
+#define INK2_MX_UP_DOT(tk, av)                                                           \
+  {                                                                                      \
+    device const float4 *xr =                                                            \
+        (device const float4 *)(x + (ulong)tk * p.k) + INK2_STAGE_VEC4S * c;             \
+    float4 prod = w0 * xr[0] + w1 * xr[1] + w2 * xr[2] + w3 * xr[3] + w4 * xr[4] +       \
+                  w5 * xr[5] + w6 * xr[6] + w7 * xr[7];                                  \
+    av[r] += (prod.x + prod.y + prod.z + prod.w) * sc;                                   \
+  }
+        INK2_MX_UP_DOT(t0, acc0);
+        INK2_MX_UP_DOT(t1, acc1);
+        if (tl.count > 2u) INK2_MX_UP_DOT(t2, acc2);
+        if (tl.count > 3u) INK2_MX_UP_DOT(t3, acc3);
+      }
+    }
+#define INK2_MX_UP_EMIT(j, av)                                                           \
+  {                                                                                      \
+    float g0 = bf(simd_sum(av.x)), u0 = bf(simd_sum(av.y));                              \
+    float g1 = bf(simd_sum(av.z)), u1 = bf(simd_sum(av.w));                              \
+    if (lane == 0) {                                                                     \
+      device bfloat *dst = h_out + (ulong)(tl.start + j) * inter + pair_col;             \
+      dst[0] = bfloat(ink2_softcapped_swiglu(g0, u0, p.gate_cap, p.up_cap));             \
+      dst[1] = bfloat(ink2_softcapped_swiglu(g1, u1, p.gate_cap, p.up_cap));             \
+    }                                                                                    \
+  }
+    INK2_MX_UP_EMIT(0u, acc0);
+    INK2_MX_UP_EMIT(1u, acc1);
+    if (tl.count > 2u) INK2_MX_UP_EMIT(2u, acc2);
+    if (tl.count > 3u) INK2_MX_UP_EMIT(3u, acc3);
+    return;
   }
 
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+  float4 acc4 = float4(0.0f), acc5 = float4(0.0f), acc6 = float4(0.0f), acc7 = float4(0.0f);
+  uint t0 = uint(ptok[tl.start]), t1 = uint(ptok[tl.start + 1u]),
+       t2 = uint(ptok[tl.start + 2u]), t3 = uint(ptok[tl.start + 3u]),
+       t4 = uint(ptok[tl.start + 4u]),
+       t5 = tl.count > 5u ? uint(ptok[tl.start + 5u]) : 0u,
+       t6 = tl.count > 6u ? uint(ptok[tl.start + 6u]) : 0u,
+       t7 = tl.count > 7u ? uint(ptok[tl.start + 7u]) : 0u;
   for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
     for (uint r = 0; r < INK2_MV_ROWS; r++) {
       device const uint4 *wr = (device const uint4 *)(we + (ulong)r * p.k);
       uint4 q0 = wr[2u * c], q1 = wr[2u * c + 1u];
       float sc = e8m0(se[(ulong)r * blocks + c]) * INK2_FP8_SCALE;
       float4 w0 = fp8x4(q0.x), w1 = fp8x4(q0.y), w2 = fp8x4(q0.z), w3 = fp8x4(q0.w);
       float4 w4 = fp8x4(q1.x), w5 = fp8x4(q1.y), w6 = fp8x4(q1.z), w7 = fp8x4(q1.w);
-      for (uint j = 0; j < tl.count; j++) {
-        device const float4 *xr =
-            (device const float4 *)(x + (ulong)tok[j] * p.k) + INK2_STAGE_VEC4S * c;
-        float4 prod = w0 * xr[0] + w1 * xr[1] + w2 * xr[2] + w3 * xr[3] + w4 * xr[4] +
-                      w5 * xr[5] + w6 * xr[6] + w7 * xr[7];
-        acc[j][r] += (prod.x + prod.y + prod.z + prod.w) * sc;
-      }
+      INK2_MX_UP_DOT(t0, acc0);
+      INK2_MX_UP_DOT(t1, acc1);
+      INK2_MX_UP_DOT(t2, acc2);
+      INK2_MX_UP_DOT(t3, acc3);
+      INK2_MX_UP_DOT(t4, acc4);
+      if (tl.count > 5u) INK2_MX_UP_DOT(t5, acc5);
+      if (tl.count > 6u) INK2_MX_UP_DOT(t6, acc6);
+      if (tl.count > 7u) INK2_MX_UP_DOT(t7, acc7);
     }
   }
-
-  for (uint j = 0; j < tl.count; j++) {
-    float g0 = bf(simd_sum(acc[j].x));
-    float u0 = bf(simd_sum(acc[j].y));
-    float g1 = bf(simd_sum(acc[j].z));
-    float u1 = bf(simd_sum(acc[j].w));
-    if (lane == 0) {
-      device bfloat *dst = h_out + (ulong)(tl.start + j) * inter + pair_col;
-      dst[0] = bfloat(ink2_softcapped_swiglu(g0, u0, p.gate_cap, p.up_cap));
-      dst[1] = bfloat(ink2_softcapped_swiglu(g1, u1, p.gate_cap, p.up_cap));
-    }
-  }
+  INK2_MX_UP_EMIT(0u, acc0);
+  INK2_MX_UP_EMIT(1u, acc1);
+  INK2_MX_UP_EMIT(2u, acc2);
+  INK2_MX_UP_EMIT(3u, acc3);
+  INK2_MX_UP_EMIT(4u, acc4);
+  if (tl.count > 5u) INK2_MX_UP_EMIT(5u, acc5);
+  if (tl.count > 6u) INK2_MX_UP_EMIT(6u, acc6);
+  if (tl.count > 7u) INK2_MX_UP_EMIT(7u, acc7);
+#undef INK2_MX_UP_DOT
+#undef INK2_MX_UP_EMIT
 }
 
 // Multi-vec MXFP8 w2 for layers 20..23 (tile count <= 8), reading BF16
@@ -1260,34 +1483,75 @@ kernel void ink2_moe_mxfp8_down_mv(device const uchar *w2 [[buffer(0)]],
     return;
   }
 
-  float4 acc[INK2_MV_MAX_M];
-  for (uint j = 0; j < tl.count; j++) acc[j] = float4(0.0f);
+  if (tl.count <= 4u) {
+    float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+    for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
+      for (uint r = 0; r < INK2_MV_ROWS; r++) {
+        device const uint4 *wr = (device const uint4 *)(we + (ulong)r * p.k);
+        uint4 q0 = wr[2u * c], q1 = wr[2u * c + 1u];
+        float sc = e8m0(se[(ulong)r * blocks + c]) * INK2_FP8_SCALE;
+        float4 w0 = fp8x4(q0.x), w1 = fp8x4(q0.y), w2 = fp8x4(q0.z), w3 = fp8x4(q0.w);
+        float4 w4 = fp8x4(q1.x), w5 = fp8x4(q1.y), w6 = fp8x4(q1.z), w7 = fp8x4(q1.w);
+#define INK2_MX_DN_DOT(j, av)                                                            \
+  {                                                                                      \
+    device const bfloat4 *hr =                                                           \
+        (device const bfloat4 *)(h + (ulong)(tl.start + j) * p.k) + INK2_STAGE_VEC4S * c;\
+    float4 prod = w0 * float4(hr[0]) + w1 * float4(hr[1]) + w2 * float4(hr[2]) +         \
+                  w3 * float4(hr[3]) + w4 * float4(hr[4]) + w5 * float4(hr[5]) +         \
+                  w6 * float4(hr[6]) + w7 * float4(hr[7]);                               \
+    av[r] += (prod.x + prod.y + prod.z + prod.w) * sc;                                   \
+  }
+        INK2_MX_DN_DOT(0u, acc0);
+        INK2_MX_DN_DOT(1u, acc1);
+        if (tl.count > 2u) INK2_MX_DN_DOT(2u, acc2);
+        if (tl.count > 3u) INK2_MX_DN_DOT(3u, acc3);
+      }
+    }
+#define INK2_MX_DN_EMIT(j, av)                                                           \
+  {                                                                                      \
+    float4 s = float4(simd_sum(av.x), simd_sum(av.y), simd_sum(av.z), simd_sum(av.w));   \
+    float rw = pw[tl.start + j];                                                         \
+    if (lane < INK2_MV_ROWS && row + lane < p.n)                                         \
+      y_out[(ulong)(tl.start + j) * p.n + row + lane] = bf(s[lane]) * rw;                \
+  }
+    INK2_MX_DN_EMIT(0u, acc0);
+    INK2_MX_DN_EMIT(1u, acc1);
+    if (tl.count > 2u) INK2_MX_DN_EMIT(2u, acc2);
+    if (tl.count > 3u) INK2_MX_DN_EMIT(3u, acc3);
+    return;
+  }
 
+  float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+  float4 acc4 = float4(0.0f), acc5 = float4(0.0f), acc6 = float4(0.0f), acc7 = float4(0.0f);
   for (uint c = lane; c < blocks; c += INK2_SIMD) {
+#pragma unroll
     for (uint r = 0; r < INK2_MV_ROWS; r++) {
       device const uint4 *wr = (device const uint4 *)(we + (ulong)r * p.k);
       uint4 q0 = wr[2u * c], q1 = wr[2u * c + 1u];
       float sc = e8m0(se[(ulong)r * blocks + c]) * INK2_FP8_SCALE;
       float4 w0 = fp8x4(q0.x), w1 = fp8x4(q0.y), w2 = fp8x4(q0.z), w3 = fp8x4(q0.w);
       float4 w4 = fp8x4(q1.x), w5 = fp8x4(q1.y), w6 = fp8x4(q1.z), w7 = fp8x4(q1.w);
-      for (uint j = 0; j < tl.count; j++) {
-        device const bfloat4 *hr =
-            (device const bfloat4 *)(h + (ulong)(tl.start + j) * p.k) + INK2_STAGE_VEC4S * c;
-        float4 prod = w0 * float4(hr[0]) + w1 * float4(hr[1]) + w2 * float4(hr[2]) +
-                      w3 * float4(hr[3]) + w4 * float4(hr[4]) + w5 * float4(hr[5]) +
-                      w6 * float4(hr[6]) + w7 * float4(hr[7]);
-        acc[j][r] += (prod.x + prod.y + prod.z + prod.w) * sc;
-      }
+      INK2_MX_DN_DOT(0u, acc0);
+      INK2_MX_DN_DOT(1u, acc1);
+      INK2_MX_DN_DOT(2u, acc2);
+      INK2_MX_DN_DOT(3u, acc3);
+      INK2_MX_DN_DOT(4u, acc4);
+      if (tl.count > 5u) INK2_MX_DN_DOT(5u, acc5);
+      if (tl.count > 6u) INK2_MX_DN_DOT(6u, acc6);
+      if (tl.count > 7u) INK2_MX_DN_DOT(7u, acc7);
     }
   }
-
-  for (uint j = 0; j < tl.count; j++) {
-    float4 s = float4(simd_sum(acc[j].x), simd_sum(acc[j].y), simd_sum(acc[j].z),
-                      simd_sum(acc[j].w));
-    float rw = pw[tl.start + j];
-    if (lane < INK2_MV_ROWS && row + lane < p.n)
-      y_out[(ulong)(tl.start + j) * p.n + row + lane] = bf(s[lane]) * rw;
-  }
+  INK2_MX_DN_EMIT(0u, acc0);
+  INK2_MX_DN_EMIT(1u, acc1);
+  INK2_MX_DN_EMIT(2u, acc2);
+  INK2_MX_DN_EMIT(3u, acc3);
+  INK2_MX_DN_EMIT(4u, acc4);
+  if (tl.count > 5u) INK2_MX_DN_EMIT(5u, acc5);
+  if (tl.count > 6u) INK2_MX_DN_EMIT(6u, acc6);
+  if (tl.count > 7u) INK2_MX_DN_EMIT(7u, acc7);
+#undef INK2_MX_DN_DOT
+#undef INK2_MX_DN_EMIT
 }
 
 // Stages one 64x64 NVFP4 weight tile (scaled by E4M3 block scale only, which is

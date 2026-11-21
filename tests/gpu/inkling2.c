@@ -429,8 +429,8 @@ static void test_attn_res_and_msg_gate(Gpu *gpu, MemorySlot *slot) {
   run_op(&cmd, k_cat, (Buf[]){h, m, cat}, 3, &mgp, sizeof mgp, rows, 1, 1,
          ROW_THREADS, 1, 1);
   run_op(&cmd, k_apply, (Buf[]){h, m, g, fw, gw, mixed}, 6, &mgp, sizeof mgp,
-         (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, rows, 1, ROW_THREADS, 1,
-         1);
+         (dim + MV_ROWS_PER_TG - 1) / MV_ROWS_PER_TG, (rows + 7) / 8, 1,
+         ROW_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 

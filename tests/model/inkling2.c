@@ -29,6 +29,9 @@ static constexpr int BENCH_PROMPT_TOKENS = 512;
 static constexpr int BENCH_DECODE_STEPS = 32;
 static constexpr int MAX_TOKENS = 1024;
 static constexpr int BATCH_M = 2;
+static constexpr int MTP_DRAFTS = 7;
+static constexpr int BENCH_MTP_STEPS = 256;
+static constexpr double MIN_MTP_KEPT_PER_PASS = 1.5;
 
 // Tolerances matching Hugging Face PR #51050 (atol=1.5 for 48-visit looped MoE
 // BF16 cross-hardware and cross-schedule comparisons) and bit-exact snapshot
@@ -94,14 +97,20 @@ int main(int argc, char **argv) {
                                         .memory_gb = MEMORY_GB,
                                         .reserve_gb = RESERVE_GB}) == 0,
         "engine initializes");
-  eremite_model *m = eremite_open(
-      &(eremite_config){.abi = EREMITE_ABI, .model = argv[1], .ctx = CONTEXT});
+  eremite_model *m =
+      eremite_open(&(eremite_config){.abi = EREMITE_ABI,
+                                     .model = argv[1],
+                                     .ctx = CONTEXT,
+                                     .deepseek = {.draft = MTP_DRAFTS}});
   double t_load0 = now();
   int loaded = m && eremite_load(m) && eremite_is_loaded(m);
   double t_load = now() - t_load0;
   check(loaded, "Inkling-2-Mini loads");
   if (!loaded) return 1;
-  printf("loaded Inkling-2-Mini in %.2f s\n", t_load);
+  printf("loaded Inkling-2-Mini in %.2f s (drafts_per_pass=%d)\n", t_load,
+         eremite_drafts_per_pass(m));
+  check(eremite_drafts_per_pass(m) == MTP_DRAFTS,
+        "MTP draft head loads with 7 drafts per pass");
 
   int vocab = eremite_vocab_size(m);
   eremite_tokenizer *tk = eremite_model_tokenizer(m);
@@ -213,7 +222,8 @@ int main(int argc, char **argv) {
   check(next0 == gen[1] && next1 == gen[1],
         "batched multi-state decode matches single-state argmax");
 
-  // 5. Speculative verify + accept vs sequential decode.
+  // 5. Speculative verify + accept vs sequential decode, plus live MTP
+  //    propose_drafts lossless equivalence and fork equivalence.
   eremite_state *s_ver = eremite_state_new(m);
   eremite_prefill(m, s_ver, prompt_ids, n_prompt, 0, 0, -1, NULL, NULL, NULL);
   int32_t vtoks[4] = {gen[0], gen[1], gen[2], gen[3]};
@@ -227,6 +237,69 @@ int main(int argc, char **argv) {
   const float *after_acc = eremite_decode_rows(m, &s_ver, &gen[2], &p2, 1);
   check(argmax(after_acc, vocab) == gen[3],
         "accept + rewind continues with matching next token");
+
+  // 5b. Check that snapshot + state_copy fork yields identical MTP proposals.
+  eremite_sampler *greedy = eremite_sampler_new(0.0, 1.0, 0, 1, 0);
+  int32_t drafts_cap[MTP_DRAFTS] = {0}, drafts_fork[MTP_DRAFTS] = {0};
+  eremite_propose_drafts(m, s_cap, gen[0], n_prompt, drafts_cap, MTP_DRAFTS,
+                         greedy);
+  // Restore s_fork back to cap_pos and re-prefill to n_prompt, then draft.
+  eremite_state *s_fork2 = eremite_state_new(m);
+  eremite_state_copy(m, s_fork2, s_cap, cap_pos);
+  eremite_snapshot_restore(m, s_fork2, snap);
+  eremite_prefill(m, s_fork2, prompt_ids, n_prompt, cap_pos, 0, -1, NULL, NULL,
+                  NULL);
+  eremite_propose_drafts(m, s_fork2, gen[0], n_prompt, drafts_fork, MTP_DRAFTS,
+                         greedy);
+  check(!memcmp(drafts_cap, drafts_fork, sizeof drafts_cap),
+        "MTP propose_drafts after snapshot fork matches original exactly");
+  eremite_state_free(m, s_fork2);
+
+  // 5c. End-to-end speculative decoding across the 30-token golden completion.
+  eremite_state *s_spec = eremite_state_new(m);
+  const float *slg = eremite_prefill(m, s_spec, prompt_ids, n_prompt, 0, 0, -1,
+                                     NULL, NULL, NULL);
+  int32_t spec_gen[GOLDEN_STEPS];
+  int spec_n = 0, spec_passes = 0, spec_kept = 0;
+  double t_prop = 0.0, t_ver = 0.0;
+  int32_t cur_tok = argmax(slg, vocab);
+  int32_t cur_pos = n_prompt;
+  while (spec_n < GOLDEN_STEPS) {
+    int room = GOLDEN_STEPS - spec_n - 1;
+    int k = room < MTP_DRAFTS ? room : MTP_DRAFTS;
+    if (k == 0) {
+      spec_gen[spec_n++] = cur_tok;
+      break;
+    }
+    int32_t rows[MTP_DRAFTS + 1] = {cur_tok};
+    double tp0 = now();
+    const double *q = eremite_propose_drafts(m, s_spec, cur_tok, cur_pos,
+                                             rows + 1, k, greedy);
+    t_prop += now() - tp0;
+    double tv0 = now();
+    const float *vl = eremite_verify(m, s_spec, rows, k + 1, cur_pos);
+    t_ver += now() - tv0;
+    int kept = 0;
+    int32_t nxt =
+        eremite_sample_verify_drafts(m, vl, rows + 1, k, q, greedy, &kept);
+    eremite_accept(m, s_spec, rows, kept + 1, cur_pos);
+    for (int i = 0; i <= kept && spec_n < GOLDEN_STEPS; i++)
+      spec_gen[spec_n++] = rows[i];
+    cur_pos += kept + 1;
+    cur_tok = nxt;
+    spec_passes++;
+    spec_kept += kept;
+  }
+  double mean_kept = spec_passes ? (double)spec_kept / spec_passes : 0.0;
+  printf("MTP golden: %d passes, %.2f of %d drafts kept/pass "
+         "(propose %.1f ms, verify %.1f ms)\n",
+         spec_passes, mean_kept, MTP_DRAFTS, 1000.0 * t_prop / spec_passes,
+         1000.0 * t_ver / spec_passes);
+  check(!memcmp(spec_gen, gen, sizeof gen),
+        "MTP speculative decoding matches 30-token B200 golden verbatim");
+  check(mean_kept >= MIN_MTP_KEPT_PER_PASS,
+        "MTP draft head achieves healthy draft acceptance rate");
+  eremite_state_free(m, s_spec);
 
   // 6. Live multimodal vision check on a synthetic 160x160 solid red PNG.
   uint8_t *red_rgb = xmalloc((size_t)IMAGE_SIDE * IMAGE_SIDE * 3);
@@ -303,6 +376,62 @@ int main(int argc, char **argv) {
          "decode %d tok in %.3f s (%.1f tok/s)\n",
          BENCH_PROMPT_TOKENS, t_prefill, BENCH_PROMPT_TOKENS / t_prefill,
          BENCH_DECODE_STEPS, t_decode, BENCH_DECODE_STEPS / t_decode);
+
+  // 7b. Measure MTP speculative decoding with DraftChoice on code generation.
+  {
+    const char *code_prompt =
+        "<|message_system|><|content_text|>Thinking effort level: 0"
+        "<|end_message|><|message_user|><|content_text|>"
+        "Write a complete Python implementation of merge sort with docstrings "
+        "and example usage.<|end_message|>";
+    int32_t cids[MAX_TOKENS];
+    int nc = eremite_tokenize(tk, code_prompt, strlen(code_prompt), 1, cids,
+                              MAX_TOKENS);
+    eremite_state *sc = eremite_state_new(m);
+    const float *clg =
+        eremite_prefill(m, sc, cids, nc, 0, 0, -1, NULL, NULL, NULL);
+    eremite_draft_choice *choice = eremite_draft_choice_new();
+    int32_t ctok = argmax(clg, vocab), cpos = nc;
+    int cgen = 0, cpasses = 0, ckept = 0;
+    double tc0 = now();
+    while (cgen < BENCH_MTP_STEPS) {
+      int room = BENCH_MTP_STEPS - cgen - 1;
+      int most = room < MTP_DRAFTS ? room : MTP_DRAFTS;
+      int k = most > 0 ? eremite_draft_choice_next_count(choice, most) : 0;
+      double p0 = now();
+      int kept = 0;
+      int32_t nxt = 0;
+      if (k > 0) {
+        int32_t rows[MTP_DRAFTS + 1] = {ctok};
+        const double *q =
+            eremite_propose_drafts(m, sc, ctok, cpos, rows + 1, k, greedy);
+        const float *vl = eremite_verify(m, sc, rows, k + 1, cpos);
+        nxt =
+            eremite_sample_verify_drafts(m, vl, rows + 1, k, q, greedy, &kept);
+        eremite_accept(m, sc, rows, kept + 1, cpos);
+        cpasses++;
+        ckept += kept;
+      } else {
+        const float *dl = eremite_decode_rows(m, &sc, &ctok, &cpos, 1);
+        nxt = argmax(dl, vocab);
+      }
+      if (most > 0)
+        eremite_draft_choice_record_pass(choice, k, kept, now() - p0);
+      cgen += kept + 1;
+      cpos += kept + 1;
+      ctok = nxt;
+    }
+    double tc = now() - tc0;
+    double mtp_tps = cgen / tc;
+    printf("measured MTP (DraftChoice): %d tok in %.3f s (%.1f tok/s, %.2f "
+           "kept/pass over %d spec passes)\n",
+           cgen, tc, mtp_tps, cpasses ? (double)ckept / cpasses : 0.0, cpasses);
+    check(mtp_tps > BENCH_DECODE_STEPS / t_decode,
+          "MTP speculative decoding beats plain decode speed");
+    eremite_draft_choice_free(choice);
+    eremite_state_free(m, sc);
+  }
+  eremite_sampler_free(greedy);
 
   free(first_logits);
   eremite_snapshot_free(m, snap);

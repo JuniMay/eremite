@@ -443,6 +443,9 @@ typedef struct {
   const char *const *model_types;
   // The model's encoded-media placeholder, or null.
   const char *media_token;
+  // Maximum draft proposals per pass this family's draft head produces, or 0
+  // without one.
+  int max_drafts;
   // Loads the model of dir on gpu, its workspace counted in work.
   int (*load)(Gpu *gpu, MemorySlot *work, const char *dir, const Options *o);
   // Returns the slot of its dense weights, which it loads again after an

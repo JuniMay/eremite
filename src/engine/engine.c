@@ -301,7 +301,7 @@ eremite_model *eremite_open(const eremite_config *c) {
           ? "video default_steps is out of range"
       : !ops->generate_video && has_minimax_h3_video
           ? "video checkpoint paths apply to video models only"
-      : options.draft < 0 || options.draft > BLOCK
+      : options.draft < 0 || options.draft > ops->max_drafts
           ? "draft exceeds this model's proposal limit"
       : options.lookup < 0 || options.lookup > VERIFY_DRAFTS
           ? "lookup takes off or 1 to 15 proposals"
