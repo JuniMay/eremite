@@ -75,6 +75,36 @@ uint64_t minimax_h3_video_vae_decode_workspace_bytes(void);
 // Returns 1 on success or 0 if memory did not fit or shutdown interrupted.
 int minimax_h3_video_vae_load(MinimaxH3VideoVae *vae);
 
+// Returns the video encoder's weight group.
+WeightGroup *minimax_h3_video_vae_encoder_weights(MinimaxH3VideoVae *vae);
+
+// Returns the GPU bytes required to keep the video encoder weights resident.
+uint64_t
+minimax_h3_video_vae_encoder_required_bytes(const MinimaxH3VideoVae *vae);
+
+// Returns the GPU bytes currently resident for the video encoder weights.
+uint64_t
+minimax_h3_video_vae_encoder_resident_bytes(const MinimaxH3VideoVae *vae);
+
+// Returns the GPU workspace bytes needed to encode frame_count frames of
+// width by height (positive multiples of 16).
+uint64_t minimax_h3_video_vae_encode_workspace_bytes(int frame_count, int width,
+                                                     int height);
+
+// Loads the video encoder weights into GPU memory if not already resident.
+// Returns 1 on success or 0 if memory did not fit or shutdown interrupted.
+int minimax_h3_video_vae_load_encoder(MinimaxH3VideoVae *vae);
+
+// Encodes interleaved 8-bit sRGB frames [frame_count, height, width, 3]
+// (width and height positive multiples of 16) into normalized channel-first
+// FP32 posterior mean latents [24, t_lat, height / 16, width / 16] written to
+// out_latents, where t_lat = encode_latent_t(frame_count). hooks may be null.
+// Returns 1 on success or 0 on load, workspace or stop failure.
+int minimax_h3_video_vae_encode(MinimaxH3VideoVae *vae, const uint8_t *rgb,
+                                int frame_count, int width, int height,
+                                float *out_latents,
+                                const MinimaxH3RunHooks *hooks);
+
 // Decodes normalized channel-first FP32 latents [24, t_lat, h_lat, w_lat] into
 // interleaved 8-bit sRGB frames [out_frames, h_lat * 16, w_lat * 16, 3]
 // written to out_rgb, where out_frames = decode_plan(t_lat).out_frames.

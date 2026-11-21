@@ -29,8 +29,23 @@ static constexpr int VVAE_LAYERS = 36, VVAE_DIM = 2048, VVAE_HEADS = 32,
                                              MINIMAX_H3_VVAE_TEMPORAL_RATIO;
 
 // Normalization epsilon and RoPE theta (comfy/ldm/minimax/vae.py:421-422).
-static constexpr float VVAE_NORM_EPS = 1e-5f;
+static constexpr float VVAE_NORM_EPS = 1e-5f, VVAE_ENC_GN_EPS = 1e-6f;
 static constexpr double VVAE_ROPE_THETA = 100.0;
+
+// 3D causal CNN encoder constants (comfy/ldm/minimax/vae.py:611-620).
+static constexpr int ENC_LEVELS = 6, ENC_BLOCKS = 2, ENC_GN_GROUPS = 32,
+                     ENC_MOMENT_CH = 2 * MINIMAX_H3_VAE_LATENT_CHANNELS,
+                     ENC_BASE_CH = 128, ENC_CONV_RANK = 5, ENC_CONV_K1 = 1,
+                     ENC_CONV_K3 = 3, ENC_FRONT_PAD_K3 = 2, ENC_ACT_BUFS = 3;
+
+// Encoder channel widths, spatial strides and temporal strides per level
+// (comfy/ldm/minimax/vae.py:617-620).
+static const int ENC_CH[ENC_LEVELS] = {128, 256, 256, 512, 512, 1024};
+static const int ENC_SPACE_DOWN[ENC_LEVELS] = {2, 2, 2, 2, 1, 1};
+static const int ENC_TIME_DOWN[ENC_LEVELS] = {1, 2, 2, 1, 1, 1};
+
+// FP16 3D im2col staging capacity in halfs (256 rows x 27648 K = 13.5 MiB).
+static constexpr size_t ENC_IM2COL_MAX_HALFS = 256u * 27648u;
 
 // ImageNet RGB mean and std (comfy/ldm/minimax/vae.py:59-60).
 static const float IMAGENET_MEAN[MINIMAX_H3_RGB_CHANNELS] = {0.485f, 0.456f,
@@ -44,7 +59,8 @@ static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
                           CONVROT_THREADS = 256, NORM_THREADS = 256,
                           EMBED_THREADS = 256, HEADS_THREADS = 32,
                           ATTN_GROUP_ROWS = 64, ATTN_THREADS = 128,
-                          ELEM_THREADS = 32, ADD_THREADS = 256;
+                          ELEM_THREADS = 32, ADD_THREADS = 256, IM2COL_TX = 32,
+                          IM2COL_TY = 8;
 
 // Parameters passed to minimax_h3_rmsnorm.
 typedef struct {
@@ -118,6 +134,67 @@ typedef struct {
   uint32_t rows, padded;
 } VvaeAttendParam;
 
+// Parameters passed to minimax_h3_vvae_gn_silu_3d.
+typedef struct {
+  // Pixels per frame, channels and group count.
+  uint32_t hw, channels, groups;
+  // GroupNorm epsilon.
+  float eps;
+} VvaeGn3dParam;
+
+// Parameters passed to minimax_h3_vvae_im2col_3d_f16.
+typedef struct {
+  // Input shape, channels, output width, frame index and strip geometry.
+  uint32_t in_t, in_h, in_w, cin, out_w, ot, out_y0, strip_h;
+  // Kernel sizes, strides, causal front pad, spatial pads and padded K width.
+  uint32_t kt, ks, time_stride, space_stride, front_pad, pad_h, pad_w, k_padded;
+} VvaeIm2Col3dParam;
+
+// Parameter block for repacking a 5D FP16 Conv3d weight into 2D FP16 im2col
+// matrix [cout_padded, k_padded] in (kt, ky, kx, ci) tap order.
+typedef struct {
+  // Source 5D F16 weight tensor in the checkpoint.
+  Tensor tensor;
+  // Output/input channel counts, kernel sizes and 64-aligned dimensions.
+  int cout, cin, kt, ks, cout_padded, k_padded;
+} EncConv3dParam;
+
+// One 3D causal CNN encoder convolution weight and bias.
+typedef struct {
+  // Repacked FP16 matrix [cout_padded, k_padded] and FP32 bias [cout].
+  Buf w, bias;
+  // Channel counts, kernel sizes, strides, causal front pad, spatial pads and
+  // padded K width.
+  int cin, cout, kt, ks, time_stride, space_stride, front_pad, pad_h, pad_w,
+      k_padded;
+} EncConv3d;
+
+// One 3D ResnetBlock in the causal CNN encoder.
+typedef struct {
+  // Pre-conv1 and pre-conv2 temporal-isolated GroupNorm weights and biases.
+  Buf norm1_w, norm1_b, norm2_w, norm2_b;
+  // Two 3x3x3 causal convolutions and optional 1x1x1 channel shortcut.
+  EncConv3d conv1, conv2, shortcut;
+  // Nonzero when cin != cout and shortcut is present.
+  int has_shortcut;
+} EncResBlock3d;
+
+// One downsampling level of the 3D causal CNN encoder.
+typedef struct {
+  // Two 3D residual blocks.
+  EncResBlock3d blocks[ENC_BLOCKS];
+  // Optional spatial/temporal downsampling convolution.
+  EncConv3d downsample;
+  // Nonzero when this level includes a downsampling convolution.
+  int has_downsample;
+} EncLevel3d;
+
+// Transient GPU buffers allocated for encoding one 3D clip tile.
+typedef struct {
+  // Three ping-pong NDHWC FP32 activation buffers and one FP16 im2col buffer.
+  Buf a, b, c, im2col;
+} VvaeEncodeWorkspace;
+
 // INT8-ConvRot linear layer (rotated INT8 weight, per-row F32 scale, F32 bias).
 typedef struct {
   // Rotated INT8 matrix [n, k], per-row scale [n] and bias [n].
@@ -163,8 +240,8 @@ struct MinimaxH3VideoVae {
   MemorySlot workspace_slot;
   // Open safetensors index.
   TensorIndex *tensors;
-  // Decoder weight group.
-  WeightGroup *dec_weights;
+  // Decoder and encoder weight groups.
+  WeightGroup *dec_weights, *enc_weights;
 
   // Per-channel latent mean and std read from checkpoint tensors [24].
   float latents_mean[MINIMAX_H3_VAE_LATENT_CHANNELS];
@@ -178,9 +255,17 @@ struct MinimaxH3VideoVae {
   // Final LayerNorm weights and FP16-converted patch output head.
   Buf norm_out_w, norm_out_b, proj_out_w, proj_out_b;
 
+  // 3D causal CNN encoder stem, 6 levels, output norm/conv and quant_conv.
+  EncConv3d enc_conv_in, enc_conv_out, enc_quant_conv;
+  // Six encoder resolution levels.
+  EncLevel3d enc_levels[ENC_LEVELS];
+  // Encoder output temporal-isolated GroupNorm weights and biases.
+  Buf enc_norm_out_w, enc_norm_out_b;
+
   // Cached Metal kernel indices.
   int k_rmsnorm, k_layernorm, k_convrot, k_mm_i8, k_x_f16, k_mm_f16,
-      k_add_scaled, k_swiglu, k_embed, k_heads, k_attend;
+      k_add_scaled, k_swiglu, k_embed, k_heads, k_attend, k_gn3d, k_im2col3d,
+      k_add;
 };
 
 // Returns ceil(a / b) for positive integers.
@@ -222,6 +307,156 @@ static void add_i8_lin(WeightGroup *group, const TensorIndex *tensors,
   weight_group_add_tensor(group, &lin->w, w, 1);
   weight_group_add_tensor(group, &lin->ws, ws, 0);
   weight_group_add_tensor(group, &lin->bias, b, 0);
+}
+
+// Repacks a 5D F16 Conv3d weight [cout, cin, kt, ks, ks] into padded 2D FP16
+// [cout_padded, k_padded] in (kt, ky, kx, ci) tap order.
+static void fill_enc_conv3d_weight(Buf *buffer, const void *context) {
+  const EncConv3dParam *p = context;
+  uint16_t *raw = xmalloc(p->tensor.size);
+  minimax_h3_read_tensor_bytes(p->tensor, raw);
+  size_t out_bytes =
+      (size_t)p->cout_padded * (size_t)p->k_padded * sizeof(uint16_t);
+  memset(buffer->ptr, 0, out_bytes);
+  uint16_t *dst = (uint16_t *)buffer->ptr;
+  for (int co = 0; co < p->cout; co++) {
+    uint16_t *drow = dst + (size_t)co * (size_t)p->k_padded;
+    for (int ci = 0; ci < p->cin; ci++) {
+      for (int tk = 0; tk < p->kt; tk++) {
+        for (int ky = 0; ky < p->ks; ky++) {
+          for (int kx = 0; kx < p->ks; kx++) {
+            size_t sidx =
+                (((((size_t)co * (size_t)p->cin + (size_t)ci) * (size_t)p->kt +
+                   (size_t)tk) *
+                      (size_t)p->ks +
+                  (size_t)ky) *
+                     (size_t)p->ks +
+                 (size_t)kx);
+            size_t tap =
+                ((size_t)tk * (size_t)p->ks + (size_t)ky) * (size_t)p->ks +
+                (size_t)kx;
+            drow[tap * (size_t)p->cin + (size_t)ci] = raw[sidx];
+          }
+        }
+      }
+    }
+  }
+  free(raw);
+}
+
+// Registers one 5D F16 causal Conv3d weight and FP32 bias into group.
+static void add_enc_conv3d(WeightGroup *group, const TensorIndex *tensors,
+                           EncConv3d *conv, int cin, int cout, int kt, int ks,
+                           int time_stride, int space_stride, int front_pad,
+                           int pad_h, int pad_w, const char *prefix) {
+  Tensor w = tensor_index_get(tensors, "%s.weight", prefix);
+  Tensor b = tensor_index_get(tensors, "%s.bias", prefix);
+  if (w.dtype != 'h' || w.ndim != ENC_CONV_RANK || w.shape[0] != cout ||
+      w.shape[1] != cin || w.shape[2] != kt || w.shape[3] != ks ||
+      w.shape[4] != ks)
+    die("unexpected video VAE encoder conv3d weight shape for %s", prefix);
+  if (b.ndim != 1 || b.shape[0] != cout)
+    die("unexpected video VAE encoder conv3d bias shape for %s", prefix);
+  int cout_padded = (int)ceil_div((uint32_t)cout, TILE_N) * (int)TILE_N;
+  int k_raw = kt * ks * ks * cin;
+  int k_padded = (int)ceil_div((uint32_t)k_raw, TILE_N) * (int)TILE_N;
+  conv->cin = cin;
+  conv->cout = cout;
+  conv->kt = kt;
+  conv->ks = ks;
+  conv->time_stride = time_stride;
+  conv->space_stride = space_stride;
+  conv->front_pad = front_pad;
+  conv->pad_h = pad_h;
+  conv->pad_w = pad_w;
+  conv->k_padded = k_padded;
+  EncConv3dParam param = {
+      .tensor = w,
+      .cout = cout,
+      .cin = cin,
+      .kt = kt,
+      .ks = ks,
+      .cout_padded = cout_padded,
+      .k_padded = k_padded,
+  };
+  weight_group_add_generated(group, &conv->w,
+                             (size_t)cout_padded * (size_t)k_padded *
+                                 sizeof(uint16_t),
+                             fill_enc_conv3d_weight, &param, sizeof param);
+  weight_group_add_vector(group, &conv->bias, b, 0.0f, 0);
+}
+
+// Registers all 3D causal CNN encoder weights into vae->enc_weights.
+static void register_encoder_weights(MinimaxH3VideoVae *vae) {
+  add_enc_conv3d(vae->enc_weights, vae->tensors, &vae->enc_conv_in,
+                 MINIMAX_H3_RGB_CHANNELS, ENC_BASE_CH, ENC_CONV_K3, ENC_CONV_K3,
+                 1, 1, ENC_FRONT_PAD_K3, 1, 1, "encoder.conv_in");
+
+  char name[MINIMAX_H3_NAME_CAP];
+  for (int lv = 0; lv < ENC_LEVELS; lv++) {
+    int in_ch = lv == 0 ? ENC_BASE_CH : ENC_CH[lv - 1];
+    int out_ch = ENC_CH[lv];
+    EncLevel3d *level = &vae->enc_levels[lv];
+    for (int bi = 0; bi < ENC_BLOCKS; bi++) {
+      int bc_in = bi == 0 ? in_ch : out_ch;
+      EncResBlock3d *rb = &level->blocks[bi];
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm1_w,
+          tensor_index_get(vae->tensors,
+                           "encoder.down.%d.block.%d.norm1.weight", lv, bi),
+          0.0f, 0);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm1_b,
+          tensor_index_get(vae->tensors, "encoder.down.%d.block.%d.norm1.bias",
+                           lv, bi),
+          0.0f, 0);
+      snprintf(name, sizeof name, "encoder.down.%d.block.%d.conv1", lv, bi);
+      add_enc_conv3d(vae->enc_weights, vae->tensors, &rb->conv1, bc_in, out_ch,
+                     ENC_CONV_K3, ENC_CONV_K3, 1, 1, ENC_FRONT_PAD_K3, 1, 1,
+                     name);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm2_w,
+          tensor_index_get(vae->tensors,
+                           "encoder.down.%d.block.%d.norm2.weight", lv, bi),
+          0.0f, 0);
+      weight_group_add_vector(
+          vae->enc_weights, &rb->norm2_b,
+          tensor_index_get(vae->tensors, "encoder.down.%d.block.%d.norm2.bias",
+                           lv, bi),
+          0.0f, 0);
+      snprintf(name, sizeof name, "encoder.down.%d.block.%d.conv2", lv, bi);
+      add_enc_conv3d(vae->enc_weights, vae->tensors, &rb->conv2, out_ch, out_ch,
+                     ENC_CONV_K3, ENC_CONV_K3, 1, 1, ENC_FRONT_PAD_K3, 1, 1,
+                     name);
+      if (bc_in != out_ch) {
+        rb->has_shortcut = 1;
+        snprintf(name, sizeof name, "encoder.down.%d.block.%d.nin_shortcut", lv,
+                 bi);
+        add_enc_conv3d(vae->enc_weights, vae->tensors, &rb->shortcut, bc_in,
+                       out_ch, ENC_CONV_K1, ENC_CONV_K1, 1, 1, 0, 0, 0, name);
+      }
+    }
+    if (ENC_SPACE_DOWN[lv] * ENC_TIME_DOWN[lv] > 1) {
+      level->has_downsample = 1;
+      int pad_s = ENC_SPACE_DOWN[lv] == 2 ? 0 : 1;
+      snprintf(name, sizeof name, "encoder.down.%d.downsample.conv", lv);
+      add_enc_conv3d(vae->enc_weights, vae->tensors, &level->downsample, out_ch,
+                     out_ch, ENC_CONV_K3, ENC_CONV_K3, ENC_TIME_DOWN[lv],
+                     ENC_SPACE_DOWN[lv], ENC_FRONT_PAD_K3, pad_s, pad_s, name);
+    }
+  }
+  weight_group_add_vector(
+      vae->enc_weights, &vae->enc_norm_out_w,
+      tensor_index_get(vae->tensors, "encoder.norm_out.weight"), 0.0f, 0);
+  weight_group_add_vector(
+      vae->enc_weights, &vae->enc_norm_out_b,
+      tensor_index_get(vae->tensors, "encoder.norm_out.bias"), 0.0f, 0);
+  add_enc_conv3d(vae->enc_weights, vae->tensors, &vae->enc_conv_out,
+                 ENC_CH[ENC_LEVELS - 1], ENC_MOMENT_CH, ENC_CONV_K3,
+                 ENC_CONV_K3, 1, 1, ENC_FRONT_PAD_K3, 1, 1, "encoder.conv_out");
+  add_enc_conv3d(vae->enc_weights, vae->tensors, &vae->enc_quant_conv,
+                 ENC_MOMENT_CH, ENC_MOMENT_CH, ENC_CONV_K1, ENC_CONV_K1, 1, 1,
+                 0, 0, 0, "quant_conv");
 }
 
 MinimaxH3VvaeTemporalPlan minimax_h3_video_vae_decode_plan(int z_len) {
@@ -298,6 +533,8 @@ MinimaxH3VideoVae *minimax_h3_video_vae_open(Gpu *gpu, MemoryAccount *account,
   vae->tensors = tensor_index_open_file(weights_path);
   vae->dec_weights =
       weight_group_new(gpu, account, "minimax-h3-video-vae-decoder");
+  vae->enc_weights =
+      weight_group_new(gpu, account, "minimax-h3-video-vae-encoder");
 
   Tensor lm = tensor_index_get(vae->tensors, "latents_mean");
   Tensor ls = tensor_index_get(vae->tensors, "latents_std");
@@ -318,6 +555,9 @@ MinimaxH3VideoVae *minimax_h3_video_vae_open(Gpu *gpu, MemoryAccount *account,
   vae->k_embed = gpu_find_kernel(gpu, "minimax_h3_vvae_embed");
   vae->k_heads = gpu_find_kernel(gpu, "minimax_h3_vvae_heads");
   vae->k_attend = gpu_find_kernel(gpu, "minimax_h3_vvae_attend");
+  vae->k_gn3d = gpu_find_kernel(gpu, "minimax_h3_vvae_gn_silu_3d");
+  vae->k_im2col3d = gpu_find_kernel(gpu, "minimax_h3_vvae_im2col_3d_f16");
+  vae->k_add = gpu_find_kernel(gpu, "minimax_h3_add");
 
   weight_group_add_vector(
       vae->dec_weights, &vae->pqc_w,
@@ -393,11 +633,13 @@ MinimaxH3VideoVae *minimax_h3_video_vae_open(Gpu *gpu, MemoryAccount *account,
   weight_group_add_vector(
       vae->dec_weights, &vae->proj_out_b,
       tensor_index_get(vae->tensors, "decoder.proj_out.bias"), 0.0f, 0);
+  register_encoder_weights(vae);
   return vae;
 }
 
 void minimax_h3_video_vae_close(MinimaxH3VideoVae *vae) {
   if (!vae) return;
+  weight_group_free(vae->enc_weights);
   weight_group_free(vae->dec_weights);
   memory_slot_remove(&vae->workspace_slot);
   tensor_index_close(vae->tensors);
@@ -418,6 +660,38 @@ uint64_t minimax_h3_video_vae_resident_bytes(const MinimaxH3VideoVae *vae) {
 
 int minimax_h3_video_vae_load(MinimaxH3VideoVae *vae) {
   return weight_group_load(vae->dec_weights);
+}
+
+WeightGroup *minimax_h3_video_vae_encoder_weights(MinimaxH3VideoVae *vae) {
+  return vae->enc_weights;
+}
+
+uint64_t
+minimax_h3_video_vae_encoder_required_bytes(const MinimaxH3VideoVae *vae) {
+  return weight_group_required_bytes(vae->enc_weights);
+}
+
+uint64_t
+minimax_h3_video_vae_encoder_resident_bytes(const MinimaxH3VideoVae *vae) {
+  return weight_group_resident_bytes(vae->enc_weights);
+}
+
+int minimax_h3_video_vae_load_encoder(MinimaxH3VideoVae *vae) {
+  return weight_group_load(vae->enc_weights);
+}
+
+uint64_t minimax_h3_video_vae_encode_workspace_bytes(int frame_count, int width,
+                                                     int height) {
+  if (frame_count <= 0 || width <= 0 || height <= 0) return 0;
+  MinimaxH3VaeTilePlan yp = minimax_h3_image_vae_split_tiles(height);
+  MinimaxH3VaeTilePlan xp = minimax_h3_image_vae_split_tiles(width);
+  int clip_t = frame_count == 1 ? 1 : MINIMAX_H3_VVAE_CLIP_LENGTH;
+  uint64_t act_bytes = gpu_round_up_to_pages(
+      (uint64_t)clip_t * (uint64_t)yp.len[0] * (uint64_t)xp.len[0] *
+      (uint64_t)ENC_BASE_CH * sizeof(float));
+  uint64_t im2col_bytes =
+      gpu_round_up_to_pages((uint64_t)ENC_IM2COL_MAX_HALFS * sizeof(uint16_t));
+  return act_bytes * (uint64_t)ENC_ACT_BUFS + im2col_bytes;
 }
 
 uint64_t minimax_h3_video_vae_decode_workspace_bytes(void) {
@@ -557,7 +831,6 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
   VvaeAttendParam ap = {rows, padded};
   AddScaledParam asp = {rows, VVAE_DIM};
   SwigluChunkedParam swp = {rows, VVAE_FFN_INNER};
-  uint32_t total_dim = rows * (uint32_t)VVAE_DIM;
 
   for (int li = 0; li < VVAE_LAYERS; li++) {
     if (minimax_h3_should_stop(hooks)) return 0;
@@ -601,8 +874,8 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
     gpu_bind_buffer(&cmd, 1, &ws->norm, 0);
     gpu_bind_buffer(&cmd, 2, &b->scale1, 0);
     gpu_copy_bytes(&cmd, 3, &asp, sizeof asp);
-    gpu_run_kernel(&cmd, ceil_div(total_dim, ADD_THREADS), 1, 1, ADD_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, ceil_div(VVAE_DIM, ELEM_THREADS), rows, 1,
+                   ELEM_THREADS, 1, 1);
 
     gpu_select_kernel(&cmd, vae->k_rmsnorm);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
@@ -629,8 +902,8 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
     gpu_bind_buffer(&cmd, 1, &ws->norm, 0);
     gpu_bind_buffer(&cmd, 2, &b->scale2, 0);
     gpu_copy_bytes(&cmd, 3, &asp, sizeof asp);
-    gpu_run_kernel(&cmd, ceil_div(total_dim, ADD_THREADS), 1, 1, ADD_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, ceil_div(VVAE_DIM, ELEM_THREADS), rows, 1,
+                   ELEM_THREADS, 1, 1);
 
     cb = cmd.number;
     gpu_commit(&cmd);
@@ -1049,5 +1322,445 @@ int minimax_h3_video_vae_decode(MinimaxH3VideoVae *vae, const float *latents,
   free(canvas);
   free(z_chunk);
   free_decode_ws(&ws);
+  return ok;
+}
+
+// Frees all GPU buffers in an encode workspace.
+static void free_encode_ws(VvaeEncodeWorkspace *ws) {
+  gpu_free(&ws->im2col);
+  gpu_free(&ws->c);
+  gpu_free(&ws->b);
+  gpu_free(&ws->a);
+}
+
+// Allocates a 3D encoder workspace sized for clip_t frames of max_h x max_w.
+static int alloc_encode_ws(MinimaxH3VideoVae *vae, VvaeEncodeWorkspace *ws,
+                           int clip_t, int max_h, int max_w) {
+  memset(ws, 0, sizeof *ws);
+  size_t act_bytes = (size_t)clip_t * (size_t)max_h * (size_t)max_w *
+                     (size_t)ENC_BASE_CH * sizeof(float);
+  size_t im_bytes = ENC_IM2COL_MAX_HALFS * sizeof(uint16_t);
+  MemorySlot *s = &vae->workspace_slot;
+  ws->a = gpu_try_alloc_required(vae->gpu, s, act_bytes);
+  ws->b = gpu_try_alloc_required(vae->gpu, s, act_bytes);
+  ws->c = gpu_try_alloc_required(vae->gpu, s, act_bytes);
+  ws->im2col = gpu_try_alloc_required(vae->gpu, s, im_bytes);
+  if (!ws->a.ptr || !ws->b.ptr || !ws->c.ptr || !ws->im2col.ptr) {
+    free_encode_ws(ws);
+    return 0;
+  }
+  return 1;
+}
+
+// Runs one 3D causal convolution on NDHWC src [in_t, in_h, in_w, cin] into
+// NDHWC dst [out_t, out_h, out_w, cout], tiled into spatial strips per frame.
+static int run_enc_conv3d(MinimaxH3VideoVae *vae, VvaeEncodeWorkspace *ws,
+                          const EncConv3d *conv, const Buf *src, int in_t,
+                          int in_h, int in_w, const Buf *dst, int *out_t_ptr,
+                          int *out_h_ptr, int *out_w_ptr,
+                          const MinimaxH3RunHooks *hooks) {
+  int out_t = (in_t + conv->front_pad - conv->kt) / conv->time_stride + 1;
+  int out_h = in_h / conv->space_stride;
+  int out_w = in_w / conv->space_stride;
+  if (out_t_ptr) *out_t_ptr = out_t;
+  if (out_h_ptr) *out_h_ptr = out_h;
+  if (out_w_ptr) *out_w_ptr = out_w;
+
+  uint32_t max_rows = (uint32_t)(ENC_IM2COL_MAX_HALFS / (size_t)conv->k_padded);
+  max_rows = (max_rows / TILE_M) * TILE_M;
+  if (max_rows < TILE_M) max_rows = TILE_M;
+  int max_strip_h = (int)(max_rows / (uint32_t)out_w);
+  if (max_strip_h < 1) max_strip_h = 1;
+
+  for (int ot = 0; ot < out_t; ot++) {
+    if (minimax_h3_should_stop(hooks)) return 0;
+    GpuCommandBuffer cmd = gpu_begin(vae->gpu);
+    for (int y0 = 0; y0 < out_h; y0 += max_strip_h) {
+      int strip_h = out_h - y0;
+      if (strip_h > max_strip_h) strip_h = max_strip_h;
+      uint32_t m = (uint32_t)(strip_h * out_w);
+      uint32_t m_pad = ceil_div(m, TILE_M) * TILE_M;
+      size_t dst_off = ((size_t)ot * (size_t)out_h + (size_t)y0) *
+                       (size_t)out_w * (size_t)conv->cout * sizeof(float);
+
+      VvaeIm2Col3dParam ip = {
+          .in_t = (uint32_t)in_t,
+          .in_h = (uint32_t)in_h,
+          .in_w = (uint32_t)in_w,
+          .cin = (uint32_t)conv->cin,
+          .out_w = (uint32_t)out_w,
+          .ot = (uint32_t)ot,
+          .out_y0 = (uint32_t)y0,
+          .strip_h = (uint32_t)strip_h,
+          .kt = (uint32_t)conv->kt,
+          .ks = (uint32_t)conv->ks,
+          .time_stride = (uint32_t)conv->time_stride,
+          .space_stride = (uint32_t)conv->space_stride,
+          .front_pad = (uint32_t)conv->front_pad,
+          .pad_h = (uint32_t)conv->pad_h,
+          .pad_w = (uint32_t)conv->pad_w,
+          .k_padded = (uint32_t)conv->k_padded,
+      };
+      F16MMParam mp = {m, (uint32_t)conv->cout, (uint32_t)conv->k_padded,
+                       (uint32_t)conv->cout, 1u};
+
+      gpu_select_kernel(&cmd, vae->k_im2col3d);
+      gpu_bind_buffer(&cmd, 0, src, 0);
+      gpu_bind_buffer(&cmd, 1, &ws->im2col, 0);
+      gpu_copy_bytes(&cmd, 2, &ip, sizeof ip);
+      gpu_run_kernel(&cmd, ceil_div((uint32_t)conv->k_padded, IM2COL_TX),
+                     ceil_div(m_pad, IM2COL_TY), 1, IM2COL_TX, IM2COL_TY, 1);
+
+      gpu_select_kernel(&cmd, vae->k_mm_f16);
+      gpu_bind_buffer(&cmd, 0, &conv->w, 0);
+      gpu_bind_buffer(&cmd, 1, &ws->im2col, 0);
+      gpu_bind_buffer(&cmd, 2, &conv->bias, 0);
+      gpu_bind_buffer(&cmd, 3, dst, dst_off);
+      gpu_copy_bytes(&cmd, 4, &mp, sizeof mp);
+      gpu_run_kernel(&cmd, ceil_div((uint32_t)conv->cout, TILE_N),
+                     m_pad / TILE_M, 1, MM_THREADS, 1, 1);
+    }
+    uint64_t cb = cmd.number;
+    gpu_commit(&cmd);
+    minimax_h3_gpu_wait_hooks(vae->gpu, cb, hooks);
+  }
+  return 1;
+}
+
+// Runs temporal-isolated GroupNorm + SiLU over NDHWC [t, h, w, ch].
+static void run_enc_gn_silu(MinimaxH3VideoVae *vae, const Buf *x, const Buf *w,
+                            const Buf *b, const Buf *y, int t, int h, int w_px,
+                            int ch, const MinimaxH3RunHooks *hooks) {
+  VvaeGn3dParam gp = {(uint32_t)(h * w_px), (uint32_t)ch, ENC_GN_GROUPS,
+                      VVAE_ENC_GN_EPS};
+  GpuCommandBuffer cmd = gpu_begin(vae->gpu);
+  gpu_select_kernel(&cmd, vae->k_gn3d);
+  gpu_bind_buffer(&cmd, 0, x, 0);
+  gpu_bind_buffer(&cmd, 1, w, 0);
+  gpu_bind_buffer(&cmd, 2, b, 0);
+  gpu_bind_buffer(&cmd, 3, y, 0);
+  gpu_copy_bytes(&cmd, 4, &gp, sizeof gp);
+  gpu_run_kernel(&cmd, ENC_GN_GROUPS, (uint32_t)t, 1, NORM_THREADS, 1, 1);
+  uint64_t cb = cmd.number;
+  gpu_commit(&cmd);
+  minimax_h3_gpu_wait_hooks(vae->gpu, cb, hooks);
+}
+
+// Encodes one ImageNet-normalized NDHWC tile [clip_t, tile_h, tile_w, 3] in
+// ws->a into channel-first posterior mean [24, t_lat, h_lat, w_lat] in out_z.
+static int encode_tile_3d(MinimaxH3VideoVae *vae, VvaeEncodeWorkspace *ws,
+                          int clip_t, int tile_h, int tile_w, float *out_z,
+                          const MinimaxH3RunHooks *hooks) {
+  int t = clip_t, h = tile_h, w = tile_w;
+  if (!run_enc_conv3d(vae, ws, &vae->enc_conv_in, &ws->a, t, h, w, &ws->b, &t,
+                      &h, &w, hooks))
+    return 0;
+  Buf cur = ws->b, tmp = ws->a, alt = ws->c;
+
+  for (int lv = 0; lv < ENC_LEVELS; lv++) {
+    const EncLevel3d *level = &vae->enc_levels[lv];
+    int in_ch = lv == 0 ? ENC_BASE_CH : ENC_CH[lv - 1];
+    int out_ch = ENC_CH[lv];
+    for (int bi = 0; bi < ENC_BLOCKS; bi++) {
+      if (minimax_h3_should_stop(hooks)) return 0;
+      const EncResBlock3d *rb = &level->blocks[bi];
+      int bc_in = bi == 0 ? in_ch : out_ch;
+
+      run_enc_gn_silu(vae, &cur, &rb->norm1_w, &rb->norm1_b, &tmp, t, h, w,
+                      bc_in, hooks);
+      if (!run_enc_conv3d(vae, ws, &rb->conv1, &tmp, t, h, w, &alt, NULL, NULL,
+                          NULL, hooks))
+        return 0;
+      run_enc_gn_silu(vae, &alt, &rb->norm2_w, &rb->norm2_b, &tmp, t, h, w,
+                      out_ch, hooks);
+      if (rb->has_shortcut) {
+        if (!run_enc_conv3d(vae, ws, &rb->shortcut, &cur, t, h, w, &alt, NULL,
+                            NULL, NULL, hooks))
+          return 0;
+        Buf swap = cur;
+        cur = alt;
+        alt = swap;
+      }
+      if (!run_enc_conv3d(vae, ws, &rb->conv2, &tmp, t, h, w, &alt, NULL, NULL,
+                          NULL, hooks))
+        return 0;
+
+      uint32_t count =
+          (uint32_t)((size_t)t * (size_t)h * (size_t)w * (size_t)out_ch);
+      GpuCommandBuffer cmd = gpu_begin(vae->gpu);
+      gpu_select_kernel(&cmd, vae->k_add);
+      gpu_bind_buffer(&cmd, 0, &cur, 0);
+      gpu_bind_buffer(&cmd, 1, &alt, 0);
+      gpu_copy_bytes(&cmd, 2, &count, sizeof count);
+      gpu_run_kernel(&cmd, ceil_div(count, ADD_THREADS), 1, 1, ADD_THREADS, 1,
+                     1);
+      uint64_t cb = cmd.number;
+      gpu_commit(&cmd);
+      minimax_h3_gpu_wait_hooks(vae->gpu, cb, hooks);
+    }
+    if (level->has_downsample) {
+      int nt = t, nh = h, nw = w;
+      if (!run_enc_conv3d(vae, ws, &level->downsample, &cur, t, h, w, &tmp, &nt,
+                          &nh, &nw, hooks))
+        return 0;
+      Buf swap = cur;
+      cur = tmp;
+      tmp = swap;
+      t = nt;
+      h = nh;
+      w = nw;
+    }
+  }
+
+  run_enc_gn_silu(vae, &cur, &vae->enc_norm_out_w, &vae->enc_norm_out_b, &tmp,
+                  t, h, w, ENC_CH[ENC_LEVELS - 1], hooks);
+  if (!run_enc_conv3d(vae, ws, &vae->enc_conv_out, &tmp, t, h, w, &alt, NULL,
+                      NULL, NULL, hooks))
+    return 0;
+  if (!run_enc_conv3d(vae, ws, &vae->enc_quant_conv, &alt, t, h, w, &cur, NULL,
+                      NULL, NULL, hooks))
+    return 0;
+
+  // Keep posterior mean (first 24 of 48 channels), converting NDHWC -> NCDHW.
+  const float *mom = (const float *)cur.ptr;
+  size_t plane = (size_t)t * (size_t)h * (size_t)w;
+  for (size_t p = 0; p < plane; p++) {
+    const float *mp = mom + p * (size_t)ENC_MOMENT_CH;
+    for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++)
+      out_z[(size_t)c * plane + p] = mp[c];
+  }
+  return 1;
+}
+
+// Encodes one clip of clip_t frames (padded by repeating the last frame when
+// avail_frames < clip_t) with spatial tiling into unnormalized posterior means
+// [24, t_lat, h_lat, w_lat] in clip_out.
+static int encode_clip_tiled(MinimaxH3VideoVae *vae, VvaeEncodeWorkspace *ws,
+                             const uint8_t *rgb_start, int avail_frames,
+                             int clip_t, int width, int height, float *clip_out,
+                             const MinimaxH3RunHooks *hooks) {
+  MinimaxH3VaeTilePlan yp = minimax_h3_image_vae_split_tiles(height);
+  MinimaxH3VaeTilePlan xp = minimax_h3_image_vae_split_tiles(width);
+  int t_lat = clip_t == 1 ? 1 : MINIMAX_H3_VVAE_CHUNK_TOKENS;
+  int h_lat = height / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int w_lat = width / MINIMAX_H3_VAE_SPATIAL_RATIO;
+
+  int n_tiles = yp.count * xp.count;
+  float **raw_tiles = xmalloc((size_t)n_tiles * sizeof(float *));
+  memset(raw_tiles, 0, (size_t)n_tiles * sizeof(float *));
+  size_t frame_bytes =
+      (size_t)height * (size_t)width * (size_t)MINIMAX_H3_RGB_CHANNELS;
+
+  int ok = 1;
+  for (int i = 0; i < yp.count && ok; i++) {
+    int th = yp.len[i], th_lat = th / MINIMAX_H3_VAE_SPATIAL_RATIO;
+    for (int j = 0; j < xp.count; j++) {
+      int tw = xp.len[j], tw_lat = tw / MINIMAX_H3_VAE_SPATIAL_RATIO;
+      // Load tile into ws->a in ImageNet-normalized NDHWC FP32.
+      float *dst = (float *)ws->a.ptr;
+      for (int f = 0; f < clip_t; f++) {
+        int sf = f < avail_frames ? f : avail_frames - 1;
+        const uint8_t *fr = rgb_start + (size_t)sf * frame_bytes;
+        for (int y = 0; y < th; y++) {
+          const uint8_t *sr = fr + ((size_t)(yp.start[i] + y) * (size_t)width +
+                                    (size_t)xp.start[j]) *
+                                       (size_t)MINIMAX_H3_RGB_CHANNELS;
+          float *dr = dst + ((size_t)f * (size_t)th + (size_t)y) * (size_t)tw *
+                                (size_t)MINIMAX_H3_RGB_CHANNELS;
+          for (int x = 0; x < tw; x++) {
+            for (int c = 0; c < MINIMAX_H3_RGB_CHANNELS; c++) {
+              float v = (float)sr[x * MINIMAX_H3_RGB_CHANNELS + c] /
+                        MINIMAX_H3_PIXEL_MAX;
+              dr[x * MINIMAX_H3_RGB_CHANNELS + c] =
+                  (v - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+            }
+          }
+        }
+      }
+      size_t tile_elems = (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS *
+                          (size_t)t_lat * (size_t)th_lat * (size_t)tw_lat;
+      raw_tiles[i * xp.count + j] = xmalloc(tile_elems * sizeof(float));
+      if (!encode_tile_3d(vae, ws, clip_t, th, tw, raw_tiles[i * xp.count + j],
+                          hooks)) {
+        ok = 0;
+        break;
+      }
+    }
+  }
+
+  if (ok) {
+    // Spatial blend in latent space matching comfy/ldm/minimax/vae.py:790-807.
+    size_t out_ct = (size_t)t_lat * (size_t)h_lat * (size_t)w_lat;
+    int out_y = 0;
+    for (int i = 0; i < yp.count; i++) {
+      int th_lat = yp.len[i] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+      int ov_top = i > 0 ? yp.overlap[i - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+      int ov_bot =
+          i < yp.count - 1 ? yp.overlap[i] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+      int keep_h = th_lat - ov_bot;
+      int out_x = 0;
+
+      for (int j = 0; j < xp.count; j++) {
+        int tw_lat = xp.len[j] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+        int ov_left =
+            j > 0 ? xp.overlap[j - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+        int ov_right =
+            j < xp.count - 1 ? xp.overlap[j] / MINIMAX_H3_VAE_SPATIAL_RATIO : 0;
+        int keep_w = tw_lat - ov_right;
+
+        size_t tile_ct = (size_t)t_lat * (size_t)th_lat * (size_t)tw_lat;
+        float *cur = xmalloc((size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * tile_ct *
+                             sizeof(float));
+        memcpy(cur, raw_tiles[i * xp.count + j],
+               (size_t)MINIMAX_H3_VAE_LATENT_CHANNELS * tile_ct *
+                   sizeof(float));
+
+        if (ov_top > 0) {
+          int prev_h = yp.len[i - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+          const float *above = raw_tiles[(i - 1) * xp.count + j];
+          size_t prev_ct = (size_t)t_lat * (size_t)prev_h * (size_t)tw_lat;
+          for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+            for (int pt = 0; pt < t_lat; pt++) {
+              for (int y = 0; y < ov_top; y++) {
+                float wb = (float)y / (float)ov_top, wa = 1.0f - wb;
+                const float *ap = above + (size_t)c * prev_ct +
+                                  ((size_t)pt * (size_t)prev_h +
+                                   (size_t)(prev_h - ov_top + y)) *
+                                      (size_t)tw_lat;
+                float *bp =
+                    cur + (size_t)c * tile_ct +
+                    ((size_t)pt * (size_t)th_lat + (size_t)y) * (size_t)tw_lat;
+                for (int x = 0; x < tw_lat; x++)
+                  bp[x] = ap[x] * wa + bp[x] * wb;
+              }
+            }
+          }
+        }
+        if (ov_left > 0) {
+          int prev_w = xp.len[j - 1] / MINIMAX_H3_VAE_SPATIAL_RATIO;
+          const float *left = raw_tiles[i * xp.count + (j - 1)];
+          size_t prev_ct = (size_t)t_lat * (size_t)th_lat * (size_t)prev_w;
+          for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+            for (int pt = 0; pt < t_lat; pt++) {
+              for (int y = 0; y < th_lat; y++) {
+                const float *ap =
+                    left + (size_t)c * prev_ct +
+                    ((size_t)pt * (size_t)th_lat + (size_t)y) * (size_t)prev_w +
+                    (size_t)(prev_w - ov_left);
+                float *bp =
+                    cur + (size_t)c * tile_ct +
+                    ((size_t)pt * (size_t)th_lat + (size_t)y) * (size_t)tw_lat;
+                for (int x = 0; x < ov_left; x++) {
+                  float wb = (float)x / (float)ov_left, wa = 1.0f - wb;
+                  bp[x] = ap[x] * wa + bp[x] * wb;
+                }
+              }
+            }
+          }
+        }
+
+        for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+          for (int pt = 0; pt < t_lat; pt++) {
+            for (int y = 0; y < keep_h; y++) {
+              const float *sp =
+                  cur + (size_t)c * tile_ct +
+                  ((size_t)pt * (size_t)th_lat + (size_t)y) * (size_t)tw_lat;
+              float *dp = clip_out + (size_t)c * out_ct +
+                          ((size_t)pt * (size_t)h_lat + (size_t)(out_y + y)) *
+                              (size_t)w_lat +
+                          (size_t)out_x;
+              memcpy(dp, sp, (size_t)keep_w * sizeof(float));
+            }
+          }
+        }
+        free(cur);
+        out_x += keep_w;
+      }
+      out_y += keep_h;
+    }
+  }
+
+  for (int k = 0; k < n_tiles; k++) free(raw_tiles[k]);
+  free(raw_tiles);
+  return ok;
+}
+
+int minimax_h3_video_vae_encode(MinimaxH3VideoVae *vae, const uint8_t *rgb,
+                                int frame_count, int width, int height,
+                                float *out_latents,
+                                const MinimaxH3RunHooks *hooks) {
+  if (!vae || !rgb || !out_latents || frame_count <= 0 || width <= 0 ||
+      height <= 0 || width % MINIMAX_H3_VAE_SPATIAL_RATIO != 0 ||
+      height % MINIMAX_H3_VAE_SPATIAL_RATIO != 0)
+    return 0;
+  if (!minimax_h3_video_vae_load_encoder(vae)) return 0;
+  if (minimax_h3_should_stop(hooks)) return 0;
+
+  MinimaxH3VaeTilePlan yp = minimax_h3_image_vae_split_tiles(height);
+  MinimaxH3VaeTilePlan xp = minimax_h3_image_vae_split_tiles(width);
+  int clip_t = frame_count == 1 ? 1 : MINIMAX_H3_VVAE_CLIP_LENGTH;
+  int h_lat = height / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int w_lat = width / MINIMAX_H3_VAE_SPATIAL_RATIO;
+  int total_t = minimax_h3_video_vae_encode_latent_t(frame_count);
+
+  VvaeEncodeWorkspace ws = {0};
+  if (!alloc_encode_ws(vae, &ws, clip_t, yp.len[0], xp.len[0])) return 0;
+
+  size_t hw_lat = (size_t)h_lat * (size_t)w_lat;
+  size_t frame_bytes =
+      (size_t)height * (size_t)width * (size_t)MINIMAX_H3_RGB_CHANNELS;
+  int ok = 1;
+
+  if (frame_count == 1) {
+    ok = encode_clip_tiled(vae, &ws, rgb, 1, 1, width, height, out_latents,
+                           hooks);
+    if (ok) {
+      for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+        float m = vae->latents_mean[c], inv_s = 1.0f / vae->latents_std[c];
+        float *zp = out_latents + (size_t)c * hw_lat;
+        for (size_t p = 0; p < hw_lat; p++) zp[p] = (zp[p] - m) * inv_s;
+      }
+    }
+    free_encode_ws(&ws);
+    return ok;
+  }
+
+  int clips = (frame_count + MINIMAX_H3_VVAE_CLIP_LENGTH - 1) /
+              MINIMAX_H3_VVAE_CLIP_LENGTH;
+  float *clip_z =
+      xmalloc((size_t)MINIMAX_H3_VAE_LATENT_CHANNELS *
+              (size_t)MINIMAX_H3_VVAE_CHUNK_TOKENS * hw_lat * sizeof(float));
+  for (int ci = 0; ci < clips && ok; ci++) {
+    int f0 = ci * MINIMAX_H3_VVAE_CLIP_LENGTH;
+    int avail = frame_count - f0;
+    if (avail > MINIMAX_H3_VVAE_CLIP_LENGTH)
+      avail = MINIMAX_H3_VVAE_CLIP_LENGTH;
+    if (!encode_clip_tiled(vae, &ws, rgb + (size_t)f0 * frame_bytes, avail,
+                           MINIMAX_H3_VVAE_CLIP_LENGTH, width, height, clip_z,
+                           hooks)) {
+      ok = 0;
+      break;
+    }
+    // Append clip latents and normalize, dropping the trailing token_drop=3.
+    int dst_t0 = ci * MINIMAX_H3_VVAE_CHUNK_TOKENS;
+    int keep_t = MINIMAX_H3_VVAE_CHUNK_TOKENS;
+    if (dst_t0 + keep_t > total_t) keep_t = total_t - dst_t0;
+    for (int c = 0; c < MINIMAX_H3_VAE_LATENT_CHANNELS; c++) {
+      float m = vae->latents_mean[c], inv_s = 1.0f / vae->latents_std[c];
+      for (int dt = 0; dt < keep_t; dt++) {
+        const float *src =
+            clip_z +
+            ((size_t)c * (size_t)MINIMAX_H3_VVAE_CHUNK_TOKENS + (size_t)dt) *
+                hw_lat;
+        float *dst =
+            out_latents +
+            ((size_t)c * (size_t)total_t + (size_t)(dst_t0 + dt)) * hw_lat;
+        for (size_t p = 0; p < hw_lat; p++) dst[p] = (src[p] - m) * inv_s;
+      }
+    }
+  }
+
+  free(clip_z);
+  free_encode_ws(&ws);
   return ok;
 }
