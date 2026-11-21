@@ -105,7 +105,8 @@ Without `api_key_file`, the server takes the key from the environment variable
 `EREMITE_API_KEY`.
 
 `docs/server.md` lists every setting, and explains how the server handles
-requests, memory, decision models, image models and Codex's web search.
+requests, memory, decision models, image models, Codex's image tool and
+Codex's web search. `skills/README.md` describes eremite's agent skills.
 
 `scripts/setup-searxng.sh` installs SearXNG in
 `~/.local/share/eremite/searxng`, the server's default `searxng_dir`. It needs

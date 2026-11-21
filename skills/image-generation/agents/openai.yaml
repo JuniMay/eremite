@@ -1,0 +1,4 @@
+interface:
+  display_name: "Image Generation"
+  short_description: "Make or edit images from prompts written in full"
+  default_prompt: "Use $image-generation to make or edit an image for this project."

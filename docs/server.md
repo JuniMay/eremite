@@ -2,8 +2,8 @@
 
 `build/eremite-server` serves the models that its configuration file lists
 (README.md, Serve). This document lists every setting, and explains how the
-server handles requests, memory, decision models, image models and Codex's
-web search.
+server handles requests, memory, decision models, image models, Codex's image
+tool and Codex's web search.
 
 ## Settings
 
@@ -237,6 +237,33 @@ request that does not fit now gets HTTP 503.
 
 During a pass, the image model yields between layers to any running
 text-decoding calls so decoding latency is not degraded.
+
+## Codex's image tool
+
+Codex's image tool, `image_gen`, calls the provider's
+`POST /v1/images/generations` and `POST /v1/images/edits` when the provider is
+OpenAI, signs in with OpenAI, or sends an `x-openai-actor-authorization`
+header. For eremite, the provider's entry in Codex's `config.toml` sends that
+header, and the `image_generation` feature turns the tool on:
+
+```toml
+[model_providers.eremite]
+http_headers = { "x-openai-actor-authorization" = "eremite" }
+
+[features]
+image_generation = true
+```
+
+The server ignores the header's value. The tool always sends `size` and
+`quality` as `auto`: a new image gets the image model's `default_size`, and an
+edit gets the size of its first image. It sends `background` as `transparent`
+or `opaque`, edits as JSON with data URLs, and no mask. It names the model
+`gpt-image-2`, which no served model has, so the request goes to the image
+model when the server serves only one. Its `gif` option sends
+`output_format: "gif"`, which gets HTTP 400: the server makes no GIFs.
+
+`skills/README.md` describes the `image-generation` skill for using this tool
+and calling the image API directly.
 
 ## Codex's web search
 
