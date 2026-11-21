@@ -1,6 +1,7 @@
 #include "engine/expert_store.h"
 #include "base/clock.h"
 #include "base/error.h"
+#include "base/shutdown.h"
 #include "engine/io.h"
 #include "platform/system_memory.h"
 #include "platform/threads.h"
@@ -1787,6 +1788,111 @@ void expert_store_age_and_resize(ExpertStore *st) {
 // between tokens, so it gives slots back when other programs need the memory
 // and leaves them as they are otherwise.
 void expert_store_resize_when_idle(ExpertStore *st) { resize(st, st->layers); }
+
+// Experts submitted in parallel per preload batch so NVMe bandwidth stays busy
+// without flooding the thread pool with every expert at once.
+static constexpr int PRELOAD_BATCH = 32;
+
+// Clears every fresh-slot flag after committing GPU residency sets.
+static void clear_fresh_slots(ExpertStore *st) {
+  if (!st->any_fresh) return;
+  for (int i = st->head; i >= 0; i = st->slots[i].next) st->slots[i].fresh = 0;
+  st->any_fresh = 0;
+}
+
+int expert_store_preload_if_fits(ExpertStore *st) {
+  if (!st || !st->slots) return 0;
+  int total_experts = st->scored_layers * st->experts;
+  if (st->max_slots < total_experts) return 0;
+  uint64_t all_bytes = 0, missing_bytes = 0;
+  for (int l = 0; l < st->scored_layers; l++) {
+    if (!st->spans[l]) continue;
+    uint64_t slot_sz = gpu_round_up_to_pages(slot_need(st, l));
+    all_bytes += (uint64_t)st->experts * slot_sz;
+    for (int e = 0; e < st->experts; e++)
+      if (WHERE(l, e) < 0) missing_bytes += slot_sz;
+  }
+  if (!all_bytes) return 0;
+  if (!missing_bytes) {
+    for (int l = 0; l < st->scored_layers; l++)
+      for (int e = 0; e < st->experts; e++) {
+        int i = WHERE(l, e);
+        if (i >= 0 && !st->slots[i].pinned) map_slot(st, i);
+      }
+    gpu_commit_residency(st->gpu);
+    clear_fresh_slots(st);
+    return 1;
+  }
+  uint64_t cap_bytes = (uint64_t)st->cap * st->SLOT_SIZE;
+  uint64_t mcap_bytes = (uint64_t)st->mcap * st->SLOT_SIZE;
+  if (st->sized ? (cap_bytes < all_bytes || mcap_bytes < all_bytes)
+                : (st->cap < total_experts || st->mcap < total_experts))
+    return 0;
+  if (st->cache_backbone &&
+      memory_room(st->cache_backbone->account) < missing_bytes)
+    return 0;
+
+  int loaded_all = 1;
+  int batch[PRELOAD_BATCH];
+  for (int l = 0; l < st->scored_layers && loaded_all; l++) {
+    if (!st->spans[l]) continue;
+    uint64_t need = slot_need(st, l);
+    uint64_t rounded = gpu_round_up_to_pages(need);
+    for (int e = 0; e < st->experts && loaded_all;) {
+      int nb = 0;
+      for (; e < st->experts && nb < PRELOAD_BATCH; e++) {
+        if (shutdown_requested()) {
+          loaded_all = 0;
+          break;
+        }
+        if (WHERE(l, e) >= 0) continue;
+        if (!st->nfree || (st->sized ? st->bytes + rounded > cap_bytes
+                                     : st->nslots >= st->cap)) {
+          loaded_all = 0;
+          break;
+        }
+        int i = st->free_list[st->nfree - 1];
+        Buf buffer = pool_buffer(st, i, need, 0);
+        if (!buffer.obj) {
+          loaded_all = 0;
+          break;
+        }
+        st->nfree--;
+        Slot *s = &st->slots[i];
+        s->b = buffer;
+        s->written = 0;
+        s->mapped = 0;
+        s->fresh = 0;
+        s->mapped_once = 0;
+        s->prefetched = 0;
+        s->issuer = NULL;
+        s->pinned = 0;
+        s->holds = 0;
+        s->layer = (int16_t)l;
+        s->expert = (int16_t)e;
+        // Preloaded slots are not part of the active token's selection, so
+        // memory pressure may reclaim them immediately if needed.
+        s->used = st->token - 1;
+        st->nslots++;
+        st->bytes += buffer.size;
+        if (st->cache_backbone) memory_touch(&s->memory);
+        place(st, l, e, i);
+        size_t key = (size_t)l * st->experts + e;
+        st->score[i] = expert_priority(st, key);
+        push_front(st, i);
+        start(st, i, 1);
+        batch[nb++] = i;
+      }
+      for (int k = 0; k < nb; k++) {
+        finish(st, batch[k]);
+        map_slot(st, batch[k]);
+      }
+    }
+  }
+  gpu_commit_residency(st->gpu);
+  clear_fresh_slots(st);
+  return loaded_all;
+}
 
 // With slots of the layers' own sizes, the limits are bytes: the counts below
 // say how many slots fit in them, the allocated ones and as many of the

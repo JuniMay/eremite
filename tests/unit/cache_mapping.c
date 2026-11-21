@@ -287,5 +287,43 @@ int main(void) {
             WEXITSTATUS(status) == 0,
         "the slot limit rises to a pass's fewest slots, and passes running "
         "together keep them");
+
+  // Preloading reads and maps all scored experts when capacity holds them all,
+  // and leaves the store streaming when capacity is smaller.
+  static FileSpan pre_spans[2][3][1];
+  static int pre_counts[2] = {1, 1};
+  int pre_fd = open("/dev/zero", O_RDONLY);
+  for (int l = 0; l < 2; l++)
+    for (int e = 0; e < 3; e++)
+      pre_spans[l][e][0] = (FileSpan){.fd = pre_fd, .off = 0, .len = 64};
+  st = expert_store_new(NULL, &(ExpertLayout){.layers = 2,
+                                              .scored_layers = 2,
+                                              .experts = 3,
+                                              .chosen = 1,
+                                              .parts = 1,
+                                              .span = &pre_spans[0][0][0],
+                                              .spans = pre_counts});
+  static Slot pre_slots[6];
+  static double pre_scores[6];
+  static int pre_frees[6];
+  for (int i = 0; i < 6; i++) pre_scores[i] = INFINITY, pre_frees[i] = 5 - i;
+  st->slots = pre_slots, st->score = pre_scores, st->free_list = pre_frees;
+  st->max_slots = st->nfree = 6, st->SLOT_SIZE = 16384;
+  st->cap = 4, st->mcap = 6;
+  st->head = st->tail = st->pass_layer = st->serving = -1;
+  memset(st->where, 0xff, WHERE_BYTES);
+  check(expert_store_preload_if_fits(st) == 0 && st->nslots == 0,
+        "preload refuses when cap cannot hold all scored experts");
+  st->cap = 6;
+  check(expert_store_preload_if_fits(st) == 1 && st->nslots == 6 &&
+            st->nmapped == 6 && !st->any_fresh,
+        "preload reads, maps and commits every scored expert when all fit");
+  int all_present = 1;
+  for (int l = 0; l < 2; l++)
+    for (int e = 0; e < 3; e++) all_present &= WHERE(l, e) >= 0;
+  check(all_present && expert_store_preload_if_fits(st) == 1,
+        "all preloaded experts stay resident and a second preload succeeds");
+  close(pre_fd);
+  for (int i = 0; i < 6; i++) fixture_free(&pre_slots[i].b);
   return failures != 0;
 }

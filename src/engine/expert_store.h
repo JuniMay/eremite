@@ -169,6 +169,13 @@ uint64_t expert_store_pass_minimum_bytes(ExpertStore *st, int rows, int layers);
 // scored ones, or all of them with the stages.
 void expert_store_start(ExpertStore *st, uint64_t budget, int layers);
 
+// Reads all scored layers' missing experts into the store without evicting
+// existing slots when the slot ceiling, GPU residency ceiling and available
+// memory room hold all of them at once. Maps and commits the loaded slots so
+// every layer is reachable through its address table. Returns 1 when every
+// scored expert is resident and committed, or 0 when the store streams.
+int expert_store_preload_if_fits(ExpertStore *st);
+
 // Returns the expert's buffer, mapped for the GPU, or null if the expert has no
 // slot. Sets at[k] to where span k starts. Sets *fresh while the slot is not
 // in the committed residency sets. The command buffer must then be told that
