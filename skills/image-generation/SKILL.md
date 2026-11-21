@@ -39,11 +39,15 @@ read [references/transparency.md](references/transparency.md).
 
 ## What the server controls
 
-- The server picks the size and the quality. A new image comes out at its
-  default size, 2048 by 2048 pixels unless its settings give another, so
-  compose for that frame. An edit comes out at the size of its first image.
-  When the user needs another shape, tell them that the server's default size
-  sets it, and that an edit keeps the shape of its first image.
+- Through the built-in image tool, the server picks the size and the quality.
+  A new image comes out at its default size, 2048 by 2048 pixels unless its
+  settings give another, so compose for that frame. An edit comes out at the
+  size of its first image.
+- When the user asks for an exact size or shape, several variants of one
+  prompt, a JPEG or WebP file, a compression level, a seed, a custom canvas
+  area, a mask for an edit, or a batch of prompts (or when the built-in image
+  tool is unavailable), read [references/script.md](references/script.md) and
+  use `scripts/image_api.py` instead of the tool.
 - Quality changes nothing: the model always takes the same 6 steps.
 - The server makes no animated GIFs. Do not ask the tool for one.
 - The model reads the first 4096 tokens of a prompt and drops the rest. Put
