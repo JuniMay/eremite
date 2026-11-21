@@ -16,9 +16,9 @@
 #include "kernels/library.h"
 #include "model/deepseek/model.h"
 #include "model/model.h"
+#include "platform/image.h"
 #include "platform/system_memory.h"
 #include "platform/threads.h"
-#include "platform/image.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -44,10 +44,11 @@ struct eremite_model {
   // eremite_state_identity's, once known.
   uint8_t identity[32];
   int identified;
-  // A decision model's turn beside decoding calls: when its decisions' latest
-  // turn began, and how long it may run, which is how long the decoding calls
-  // before it took. Decoding calls that have not started wait while it runs.
-  double turn_start, turn_length;
+  // Accumulated active seconds during multi-model GPU contention, rebased so
+  // the lagging active model stays at 0.
+  double fair_time;
+  // Whether this model was contending for the GPU in the previous turn check.
+  int fair_active;
 };
 
 struct eremite_media {
@@ -71,6 +72,12 @@ static Gpu *gpu;
 // The calls posted to streams since the process started. Each stream keeps
 // the number of its call.
 static uint64_t calls_posted;
+// The model that owns the GPU turn while two or more distinct models contend
+// for the GPU, or null when at most one model contends.
+static eremite_model *turn_owner;
+// Wall-clock time when turn_owner's current accounted span began, or 0 outside
+// eremite_run_streams.
+static double turn_started_at;
 // What the engine thread blocks on while no stream's call can go on, made by
 // eremite_init, and whether eremite_wake asked eremite_run_streams to return.
 static ThreadsEvent *wake;
@@ -888,18 +895,22 @@ struct eremite_stream {
   eremite_prefill_info info;
   int32_t next;
   int accepted;
-  // What the stream's prefill waits for in each layer: the decoding calls in
-  // its run that were posted at the wait's first look. The number of the last
-  // call posted then, or 0 between waits.
-  PassWait wait_for_decoding;
-  uint64_t calls_at_first_look;
-  // What the stream's decision waits for in each layer: its turn
-  // (decision_may_go_on), first its GPU work and then decoding calls. The
-  // number of the last command buffer committed at the wait's first look, and
-  // when it was seen finished, or 0 between waits.
+  // Unified cooperative turn wait checked between layers or slices: enforces
+  // same-model decode priority for prefills and balanced measured-time turns
+  // across distinct models.
   PassWait wait_for_turn;
+  // Last posted call number seen at the first look of a same-model prefill
+  // wait, or 0 outside such a wait.
+  uint64_t calls_at_first_look;
+  // Last committed GPU command buffer number seen at the first look of a turn
+  // checkpoint, or 0 outside a checkpoint.
   uint64_t work_at_first_look;
-  double work_finished_at;
+  // Nonzero while waiting for work_at_first_look to finish before accounting
+  // the current turn checkpoint.
+  int in_turn_wait;
+  // Nonzero while yielded waiting for turn_owner to return to this stream's
+  // model.
+  int waiting_for_turn;
   // The run that advances the stream, while one does.
   const StreamRun *run;
 };
@@ -913,96 +924,299 @@ static int has_decoding_call(const eremite_stream *x) {
   return x->call == STREAM_DECODE || x->call == STREAM_VERIFY;
 }
 
-// Whether decoding calls in the stream's run that were posted at its wait's
-// first look have not finished. The first look is the wait's first question.
-static int decoding_calls_remain(eremite_stream *x) {
+// Whether the stream's started call waits for off-GPU background work (such as
+// MP4 or image encoding) rather than GPU or expert-read work.
+static int is_background_waiting(const eremite_stream *x) {
+  return x->call != STREAM_NONE && x->started &&
+         pass_waiting_for(x->pass) == PASS_WAIT_OTHER &&
+         pass_has_notify(x->pass) && !pass_ready(x->pass);
+}
+
+// Whether the stream currently contends for the GPU or expert-read I/O.
+static int is_contending(const eremite_stream *x) {
+  return x->call != STREAM_NONE && !is_background_waiting(x);
+}
+
+// Whether the stream has started work currently in flight on the GPU or
+// waiting on expert reads, rather than paused at a turn or decode yield.
+static int is_in_flight(const eremite_stream *x) {
+  return is_contending(x) && x->started && !x->waiting_for_turn &&
+         !x->calls_at_first_look;
+}
+
+// Whether decoding calls of the same model posted by the wait's first look
+// have not finished yet.
+static int own_decoding_calls_remain(eremite_stream *x) {
   if (!x->run) die("a stream's pass waited outside eremite_run_streams");
   if (!x->calls_at_first_look) x->calls_at_first_look = calls_posted;
   for (int k = 0; k < x->run->count; k++) {
     const eremite_stream *other = x->run->streams[k];
-    if (has_decoding_call(other) &&
+    if (other->m == x->m && has_decoding_call(other) &&
         other->call_number <= x->calls_at_first_look)
       return 1;
   }
   return 0;
 }
 
-// Whether the decoding calls that the stream's prefill waits for have
-// finished. The prefill waits for those in its run that were posted at the
-// wait's first look.
-static int decoding_calls_finished(void *context) {
-  eremite_stream *x = context;
-  if (decoding_calls_remain(x)) return 0;
-  x->calls_at_first_look = 0;
-  return 1;
-}
-
-// Ends the stream's decision's wait in a layer. The next one starts with the
-// decision's GPU work.
-static void end_turn_wait(eremite_stream *x) {
-  x->calls_at_first_look = 0;
-  x->work_at_first_look = 0;
-  x->work_finished_at = 0;
-  x->wait_for_turn.kind = PASS_WAIT_GPU;
-}
-
-// Whether the stream's decision may run its next layer. Without decoding calls
-// in its run posted at the wait's first look, it goes on at once. Beside them,
-// its GPU work committed by then finishes first, so that its turn counts the
-// GPU's time. Its turn goes on while it has run for less time than the
-// decoding calls before the turn took. Then those calls go first, and the next
-// turn may run as long as they took after the decision's GPU work finished.
-// While it waits for them, its wait is for something other than the GPU, so
-// that the engine thread sleeps while they wait for reads.
-static int decision_may_go_on(void *context) {
-  eremite_stream *x = context;
-  eremite_model *m = x->m;
-  if (!x->calls_at_first_look) {
-    x->work_at_first_look = gpu_last_committed(gpu);
-    if (!decoding_calls_remain(x)) return end_turn_wait(x), 1;
-  }
-  if (!x->work_finished_at) {
-    if (x->work_at_first_look && !gpu_has_finished(gpu, x->work_at_first_look))
-      return 0;
-    double at = now();
-    if (at - m->turn_start < m->turn_length) return end_turn_wait(x), 1;
-    m->turn_length = 0;
-    x->work_finished_at = at;
-    x->wait_for_turn.kind = PASS_WAIT_OTHER;
-    pass_set_wait_kind(x->pass, PASS_WAIT_OTHER);
-  }
-  if (decoding_calls_remain(x)) return 0;
-  m->turn_start = now();
-  m->turn_length = m->turn_start - x->work_finished_at;
-  return end_turn_wait(x), 1;
-}
-
-// Waits until the GPU work that the stream's decision committed by its wait's
-// first look has finished. Its pass blocks the engine thread only as the one
-// pass in its run that may go on: in its turn, while the decoding calls that
-// have not started wait.
-static void wait_for_decision_work(void *context) {
-  eremite_stream *x = context;
-  if (x->work_at_first_look)
-    gpu_wait_until_finished(gpu, x->work_at_first_look);
-}
-
-// Whether a decision's turn runs among the streams.
-static int decision_turn_runs(eremite_stream *const *streams, int n) {
-  for (int k = 0; k < n; k++) {
-    const eremite_model *m = streams[k]->m;
-    if (streams[k]->call == STREAM_DECIDE && m->turn_length > 0 &&
-        now() - m->turn_start < m->turn_length)
-      return 1;
-  }
+// Returns whether model m has at least one contending stream in streams.
+static int model_is_contending(const eremite_model *m,
+                               eremite_stream *const *streams, int n) {
+  for (int k = 0; k < n; k++)
+    if (streams[k]->m == m && is_contending(streams[k])) return 1;
   return 0;
 }
 
-// Whether the stream's call waits while a decision's turn runs among the
-// streams: a decoding call that has not started.
-static int waits_for_turn(eremite_stream *x, eremite_stream *const *streams,
-                          int n) {
-  return has_decoding_call(x) && !x->started && decision_turn_runs(streams, n);
+// Returns the earliest call number among contending streams of model m.
+static uint64_t model_earliest_call(const eremite_model *m,
+                                    eremite_stream *const *streams, int n) {
+  uint64_t best = UINT64_MAX;
+  for (int k = 0; k < n; k++)
+    if (streams[k]->m == m && is_contending(streams[k]) &&
+        streams[k]->call_number < best)
+      best = streams[k]->call_number;
+  return best;
+}
+
+// Charges elapsed wall-clock time up to at against the current turn owner.
+static void charge_turn_owner(double at) {
+  if (turn_owner && turn_started_at > 0.0) {
+    double dt = at - turn_started_at;
+    if (dt > 0.0) turn_owner->fair_time += dt;
+    turn_started_at = at;
+  }
+}
+
+// Rebases fair_time across all contending models so the lagging model sits at
+// 0.
+static void rebase_fair_times(eremite_stream *const *streams, int n) {
+  int found = 0;
+  double min_t = 0.0;
+  for (int i = 0; i < nmodels; i++) {
+    if (!model_is_contending(models[i], streams, n)) continue;
+    if (!found || models[i]->fair_time < min_t) {
+      min_t = models[i]->fair_time;
+      found = 1;
+    }
+  }
+  if (!found || min_t <= 0.0) return;
+  for (int i = 0; i < nmodels; i++) {
+    if (!model_is_contending(models[i], streams, n)) continue;
+    models[i]->fair_time -= min_t;
+    if (models[i]->fair_time < 0.0) models[i]->fair_time = 0.0;
+  }
+}
+
+// Picks the contending model with the smallest fair_time (breaking ties by
+// earliest posted call number). When prefer_other is non-null, yields to any
+// other contending model whose fair_time is at most prefer_other's.
+static eremite_model *pick_lowest_fair_model(eremite_stream *const *streams,
+                                             int n,
+                                             eremite_model *prefer_other) {
+  eremite_model *best = NULL;
+  uint64_t best_call = UINT64_MAX;
+  for (int i = 0; i < nmodels; i++) {
+    eremite_model *m = models[i];
+    if (m == prefer_other || !model_is_contending(m, streams, n)) continue;
+    uint64_t call = model_earliest_call(m, streams, n);
+    if (!best || m->fair_time < best->fair_time ||
+        (m->fair_time == best->fair_time && call < best_call)) {
+      best = m;
+      best_call = call;
+    }
+  }
+  if (prefer_other) {
+    if (best && best->fair_time <= prefer_other->fair_time) return best;
+    return prefer_other;
+  }
+  return best;
+}
+
+// Publishes each model's remaining measured turn budget in seconds (0 when
+// running alone, not owning the turn, or before any peer turn is measured).
+static void update_turn_budgets(eremite_stream *const *streams, int n) {
+  double peer_min = 0.0;
+  int has_peer = 0;
+  if (turn_owner) {
+    for (int i = 0; i < nmodels; i++) {
+      eremite_model *m = models[i];
+      if (m == turn_owner || !model_is_contending(m, streams, n)) continue;
+      if (!has_peer || m->fair_time < peer_min) {
+        peer_min = m->fair_time;
+        has_peer = 1;
+      }
+    }
+  }
+  double owner_budget =
+      (turn_owner && has_peer && peer_min > turn_owner->fair_time)
+          ? peer_min - turn_owner->fair_time
+          : 0.0;
+  for (int i = 0; i < nmodels; i++) {
+    if (!models[i]->ops->set_turn_budget) continue;
+    models[i]->ops->set_turn_budget(models[i] == turn_owner ? owner_budget
+                                                            : 0.0);
+  }
+}
+
+// Synchronizes multi-model fairness state, other-passes counts and turn
+// budgets with the current contending streams.
+static void sync_fair_state(eremite_stream *const *streams, int n) {
+  int contending_streams = 0;
+  for (int k = 0; k < n; k++) contending_streams += is_contending(streams[k]);
+  int other = contending_streams > 1 ? contending_streams - 1 : 0;
+  for (int i = 0; i < nmodels; i++)
+    if (models[i]->ops->set_other_passes)
+      models[i]->ops->set_other_passes(other);
+
+  int now_active[8] = {0};
+  int active_models = 0;
+  for (int i = 0; i < nmodels; i++) {
+    now_active[i] = model_is_contending(models[i], streams, n);
+    active_models += now_active[i];
+  }
+
+  if (active_models <= 1) {
+    turn_owner = NULL;
+    turn_started_at = 0.0;
+    for (int i = 0; i < nmodels; i++) {
+      models[i]->fair_time = 0.0;
+      models[i]->fair_active = now_active[i];
+    }
+    update_turn_budgets(streams, n);
+    return;
+  }
+
+  // Rebase already-active models first so newly joining models start at 0,
+  // matching the lagging peer rather than monopolizing or starving.
+  int kept = 0;
+  double kept_min = 0.0;
+  for (int i = 0; i < nmodels; i++) {
+    if (models[i]->fair_active && now_active[i]) {
+      if (!kept || models[i]->fair_time < kept_min) {
+        kept_min = models[i]->fair_time;
+        kept = 1;
+      }
+    }
+  }
+  for (int i = 0; i < nmodels; i++) {
+    if (models[i]->fair_active && now_active[i]) {
+      if (kept && kept_min > 0.0) {
+        models[i]->fair_time -= kept_min;
+        if (models[i]->fair_time < 0.0) models[i]->fair_time = 0.0;
+      }
+    } else if (models[i]->fair_active && !now_active[i]) {
+      models[i]->fair_time = 0.0;
+      if (turn_owner == models[i]) turn_owner = NULL;
+    } else if (!models[i]->fair_active && now_active[i]) {
+      models[i]->fair_time = 0.0;
+    }
+    models[i]->fair_active = now_active[i];
+  }
+  rebase_fair_times(streams, n);
+
+  // Preserve ownership for any model with GPU or expert-read work already in
+  // flight so its remaining GPU execution is charged to it on a clean queue.
+  eremite_model *inflight_model = NULL;
+  int owner_inflight = 0;
+  for (int k = 0; k < n; k++) {
+    if (!is_in_flight(streams[k])) continue;
+    if (streams[k]->m == turn_owner) owner_inflight = 1;
+    if (!inflight_model) inflight_model = streams[k]->m;
+  }
+  if (!owner_inflight) {
+    if (inflight_model)
+      turn_owner = inflight_model;
+    else
+      turn_owner = pick_lowest_fair_model(streams, n, NULL);
+  }
+  if (turn_started_at == 0.0) turn_started_at = now();
+  update_turn_budgets(streams, n);
+}
+
+// Marks the stream's turn wait as PASS_WAIT_OTHER so the engine thread sleeps
+// while another model waits on reads or background work.
+static void set_wait_other(eremite_stream *x) {
+  x->wait_for_turn.kind = PASS_WAIT_OTHER;
+  pass_set_wait_kind(x->pass, PASS_WAIT_OTHER);
+}
+
+// Clears the stream's turn wait state when resuming execution.
+static void end_turn_wait(eremite_stream *x) {
+  x->calls_at_first_look = 0;
+  x->work_at_first_look = 0;
+  x->in_turn_wait = 0;
+  x->waiting_for_turn = 0;
+  x->wait_for_turn.kind = PASS_WAIT_GPU;
+}
+
+// Whether the stream may run its next layer or slice. Enforces same-model
+// decoding priority for prefills and symmetric measured-time turns across
+// distinct contending models, with zero gating when running alone.
+static int stream_may_go_on(void *context) {
+  eremite_stream *x = context;
+  eremite_model *m = x->m;
+  if (!x->run) die("a stream's pass waited outside eremite_run_streams");
+
+  if (x->call == STREAM_PREFILL && own_decoding_calls_remain(x)) {
+    set_wait_other(x);
+    return 0;
+  }
+  x->calls_at_first_look = 0;
+
+  if (!turn_owner) {
+    end_turn_wait(x);
+    return 1;
+  }
+  if (turn_owner != m) {
+    x->waiting_for_turn = 1;
+    x->in_turn_wait = 0;
+    x->work_at_first_look = 0;
+    set_wait_other(x);
+    return 0;
+  }
+  if (x->waiting_for_turn) {
+    update_turn_budgets(x->run->streams, x->run->count);
+    end_turn_wait(x);
+    return 1;
+  }
+
+  if (!x->in_turn_wait) {
+    x->in_turn_wait = 1;
+    x->work_at_first_look = gpu ? gpu_last_committed(gpu) : 0;
+  }
+  if (x->work_at_first_look && !gpu_has_finished(gpu, x->work_at_first_look))
+    return 0;
+
+  double at = now();
+  charge_turn_owner(at);
+  rebase_fair_times(x->run->streams, x->run->count);
+  eremite_model *next =
+      pick_lowest_fair_model(x->run->streams, x->run->count, m);
+  if (next != m) {
+    turn_owner = next;
+    turn_started_at = at;
+    x->waiting_for_turn = 1;
+    x->in_turn_wait = 0;
+    x->work_at_first_look = 0;
+    update_turn_budgets(x->run->streams, x->run->count);
+    set_wait_other(x);
+    return 0;
+  }
+  update_turn_budgets(x->run->streams, x->run->count);
+  end_turn_wait(x);
+  return 1;
+}
+
+// Blocks until the GPU work committed by this stream before its turn
+// checkpoint has finished.
+static void wait_for_turn_work(void *context) {
+  eremite_stream *x = context;
+  if (x->work_at_first_look && gpu)
+    gpu_wait_until_finished(gpu, x->work_at_first_look);
+}
+
+// Whether the stream waits while another model owns the GPU turn.
+static int waits_for_turn(const eremite_stream *x) {
+  return turn_owner && x->m != turn_owner && !is_background_waiting(x);
 }
 
 static void stream_run(eremite_stream *x) {
@@ -1012,7 +1226,7 @@ static void stream_run(eremite_stream *x) {
   case STREAM_PREFILL:
     x->logits = run_prefill(m, x->states[0], x->tokens, x->n, x->from,
                             x->replay, x->capture, &x->captured, &x->info,
-                            x->images, &x->wait_for_decoding);
+                            x->images, &x->wait_for_turn);
     break;
   case STREAM_DECODE:
     x->logits =
@@ -1024,12 +1238,12 @@ static void stream_run(eremite_stream *x) {
         x->logit_rows, x->logit_ids, x->count, x->images, &x->wait_for_turn);
     break;
   case STREAM_IMAGE:
-    run_image_generation(m, &x->image_request, &x->wait_for_decoding,
-                         &x->cancelled, &x->image_result);
+    run_image_generation(m, &x->image_request, &x->wait_for_turn, &x->cancelled,
+                         &x->image_result);
     break;
   case STREAM_VIDEO:
-    run_video_generation(m, &x->video_request, &x->wait_for_decoding,
-                         &x->cancelled, &x->video_result);
+    run_video_generation(m, &x->video_request, &x->wait_for_turn, &x->cancelled,
+                         &x->video_result);
     break;
   case STREAM_VERIFY: {
     int32_t *rows = (int32_t *)x->tokens;
@@ -1070,10 +1284,8 @@ static void stream_body(void *argument) {
 eremite_stream *eremite_stream_new(eremite_model *m) {
   eremite_stream *x = xmalloc(sizeof *x);
   x->m = m;
-  x->wait_for_decoding =
-      (PassWait){decoding_calls_finished, NULL, x, PASS_WAIT_OTHER, NULL};
-  x->wait_for_turn = (PassWait){decision_may_go_on, wait_for_decision_work, x,
-                                PASS_WAIT_GPU, NULL};
+  x->wait_for_turn =
+      (PassWait){stream_may_go_on, wait_for_turn_work, x, PASS_WAIT_GPU, NULL};
   x->pass = m->ops->pass_new(stream_body, x);
   return x;
 }
@@ -1163,12 +1375,12 @@ void eremite_stream_cancel(eremite_stream *x) {
 }
 
 // What the streams with a call wait for while none can go on (THREAD_*): the
-// GPU if any waits for it, else reads if any waits for them, else something
-// else.
+// GPU if any active waiter waits for it, else reads if any waits for them,
+// else something else.
 static int streams_wait_for(eremite_stream *const *streams, int n) {
   int reads = 0;
   for (int k = 0; k < n; k++) {
-    if (streams[k]->call == STREAM_NONE) continue;
+    if (streams[k]->call == STREAM_NONE || waits_for_turn(streams[k])) continue;
     int kind = pass_waiting_for(streams[k]->pass);
     if (kind == PASS_WAIT_GPU) return THREAD_WAIT_GPU;
     reads |= kind == PASS_WAIT_READ;
@@ -1186,37 +1398,42 @@ static void set_stream_run(eremite_stream *const *streams, int n,
 // until it would wait. When none can go on, the thread waits for any of them.
 int eremite_run_streams(eremite_stream *const *streams, int n) {
   static unsigned first;
-  int posted = 0;
-  for (int k = 0; k < n; k++) posted += streams[k]->call != STREAM_NONE;
-  for (int i = 0; i < nmodels; i++)
-    if (models[i]->ops->set_other_passes)
-      models[i]->ops->set_other_passes(posted - 1);
   const StreamRun run = {streams, n};
   set_stream_run(streams, n, &run);
+  sync_fair_state(streams, n);
   Pass *waiting[n];
   int finished = -1;
   for (;;) {
     int ran = 0;
+    eremite_model *owner_before = turn_owner;
     for (int k = 0; k < n && finished < 0; k++) {
       int i = (int)(((unsigned)first + (unsigned)k) % (unsigned)n);
       eremite_stream *x = streams[i];
-      if (waits_for_turn(x, streams, n)) continue;
-      if (pass_ready(x->pass))
-        set_thread_state(THREAD_PASS), pass_resume(x->pass), ran = 1;
+      if (waits_for_turn(x)) continue;
+      if (pass_ready(x->pass)) {
+        set_thread_state(THREAD_PASS);
+        pass_resume(x->pass);
+        ran = 1;
+        if (!x->finished && is_background_waiting(x)) {
+          charge_turn_owner(now());
+          sync_fair_state(streams, n);
+        }
+      }
       if (x->finished) x->finished = 0, first = (unsigned)i + 1, finished = i;
     }
     if (finished >= 0 || atomic_exchange(&woken, 0)) break;
-    if (ran) continue;
+    if (ran || turn_owner != owner_before) continue;
     int count = 0;
     for (int k = 0; k < n; k++)
-      if (streams[k]->call != STREAM_NONE &&
-          !waits_for_turn(streams[k], streams, n))
+      if (streams[k]->call != STREAM_NONE && !waits_for_turn(streams[k]))
         waiting[count++] = streams[k]->pass;
     if (!count) break;
     set_thread_state(streams_wait_for(streams, n));
     if (!pass_wait_for_any(waiting, count, wake))
       die("the streams' calls wait for each other: none can go on");
   }
+  charge_turn_owner(now());
+  turn_started_at = 0.0;
   set_thread_state(THREAD_OUTSIDE);
   set_stream_run(streams, n, NULL);
   return finished;

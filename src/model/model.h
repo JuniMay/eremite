@@ -619,6 +619,10 @@ typedef struct {
   // Sets how many passes besides the running one have GPU work. The engine
   // sets it before it runs passes. Null where a family has no use for it.
   void (*set_other_passes)(int passes);
+  // Sets the remaining measured turn budget in seconds while sharing the GPU
+  // with other models, or 0 when alone or before a peer turn is measured. Null
+  // where a family has no use for it.
+  void (*set_turn_budget)(double seconds);
   // Between two calls of a pass, releases what binds the states the pass used
   // to the model's variables, so that code outside the pass may use those
   // states; or null if nothing is bound.

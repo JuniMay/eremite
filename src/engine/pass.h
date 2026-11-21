@@ -52,6 +52,9 @@ int pass_ready(const Pass *pass);
 // The kind of the pass's wait, PASS_WAIT_OTHER when it waits for nothing.
 int pass_waiting_for(const Pass *pass);
 
+// Whether the pass's wait has a background notify callback.
+int pass_has_notify(const Pass *pass);
+
 // Sets the kind of the pass's wait until the wait ends: a wait's ready function
 // calls it when the wait turns to something else.
 void pass_set_wait_kind(Pass *pass, int kind);
@@ -78,8 +81,12 @@ Pass *pass_current(void);
 // Inside a pass: yields until the wait is over, unless it already is.
 void pass_wait(const PassWait *wait);
 
-// Waits for a group: inside a pass, by yielding.
+// Waits for a read group: inside a pass, by yielding with PASS_WAIT_READ.
 void pass_wait_group(ThreadsGroup *group);
+
+// Waits for an off-GPU background group: inside a pass, by yielding with
+// PASS_WAIT_OTHER so other models may run freely on the GPU meanwhile.
+void pass_wait_background(ThreadsGroup *group);
 
 // When set, runs before a pass yields.
 extern void (*pass_before_yield)(void);

@@ -153,6 +153,10 @@ int pass_waiting_for(const Pass *p) {
   return p->wait.ready ? p->wait.kind : PASS_WAIT_OTHER;
 }
 
+int pass_has_notify(const Pass *p) {
+  return p->wait.ready != NULL && p->wait.notify != NULL;
+}
+
 void pass_set_wait_kind(Pass *p, int kind) { p->wait.kind = kind; }
 
 void pass_block(const Pass *p) {
@@ -215,6 +219,14 @@ static void group_notify(void *group, ThreadsEvent *event) {
 void pass_wait_group(ThreadsGroup *group) {
   if (running)
     pass_wait(&(PassWait){group_ready, group_block, group, PASS_WAIT_READ,
+                          group_notify});
+  else
+    group_block(group);
+}
+
+void pass_wait_background(ThreadsGroup *group) {
+  if (running)
+    pass_wait(&(PassWait){group_ready, group_block, group, PASS_WAIT_OTHER,
                           group_notify});
   else
     group_block(group);
