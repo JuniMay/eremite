@@ -48,7 +48,7 @@ Each entry under `models` holds one model's settings:
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `model` | the checkpoint's folder | required |
-| `id` | the name that requests give in `model` | `deepseek-v4.1-flash`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image`; MiniMax-H3 Video: `minimax-h3-video` |
+| `id` | the name that requests give in `model` | DeepSeek: `deepseek-v4.1-flash`; Inkling-2-Mini: `inkling-2-mini`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image`; MiniMax-H3 Video: `minimax-h3-video` |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
 | `text_encoder` | MiniMax-H3: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3 image and video models |
 | `dit` | MiniMax-H3: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3 image and video models |
@@ -62,7 +62,7 @@ Each entry under `models` holds one model's settings:
 | `variant` | MiniMax-H3 Video: checkpoint task variant, `"fl2va"` or `"ref2va"` | `"fl2va"` |
 | `default_size` | MiniMax-H3-Image: the `WIDTHxHEIGHT` of a text-to-image request whose `size` is `auto` or omitted; it must fit the model as it is | `2048x2048`, the default generation canvas |
 | `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3 image and video: 4096 |
-| `draft` | the most proposals of the model's draft head per pass, 0 to 5; each pass runs the count that has given the most tokens per second | 0 |
+| `draft` | the most proposals of the model's draft head per pass: 0 to 5 for DeepSeek, 0 to 7 for Inkling-2-Mini; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
 | `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; it changes no result, and needs `ced` off | `true` without `ced` |
@@ -79,8 +79,22 @@ to the model that generates text, a decision to the decision model, an image
 request to the image model, and a video request to the video model.
 
 Each request sets its own sampling and thinking effort. A request that sets
-none samples with temperature 1, top_p 1 and every token, and DeepSeek thinks
-at high effort.
+none samples with temperature 1, top_p 1 and every token, and thinks at high
+effort (75 for DeepSeek; 0.9 for Inkling-2-Mini).
+
+Inkling-2-Mini checkpoints (`model_type` `inkling2_loop` or
+`inkling2_loop_text`) serve `POST /v1/chat/completions`, `POST /v1/responses`,
+and `GET /v1/codex/models`. Their entry takes `model`, `id`, `ctx` (up to
+1,048,576), `draft` (0 to 7, using `mtp.safetensors` when present), `lookup`
+(`off` or 1 to 15), `memory`, `max_cached_states` and `idle_unload`, and
+refuses DeepSeek-only and MiniMax-H3 settings. All weights stay resident in
+GPU memory (about 18.5 to 20.3 GiB with its draft head). Thinking effort takes
+`"none"` (0), `"minimal"` (0.1), `"low"` (0.2), `"medium"` (0.7), `"high"`
+(0.9), `"xhigh"` or `"max"` (0.99), or any number in `0.0` to `0.99`. Images
+are accepted as base64 `data:` URLs in `user` and `tool` messages; audio parts
+return HTTP 400. Inkling-2-Mini resumes cached conversations from saved
+snapshots (including its sliding-window KV rings, short-convolution rings and
+draft-head state).
 
 ## Memory
 

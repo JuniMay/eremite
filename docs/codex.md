@@ -46,28 +46,33 @@ Adjust `model` and `base_url` to match the served model's `id` and the server's
 
 ## Responses API and tools
 
-DeepSeek models answer `POST /v1/responses`:
+DeepSeek and Inkling-2-Mini models answer `POST /v1/responses`:
 
 - Send the full conversation in `input`. The server keeps no stored responses,
-  so `previous_response_id` and `conversation` return HTTP 400. Prompt prefix
-  reuse happens automatically through eremite's state cache (`docs/server.md`,
-  Memory).
-- `reasoning.effort` sets the model's thinking effort: `"none"` turns thinking
-  off; `"minimal"` and `"low"` give effort 50; `"medium"`, `"high"` and
-  `"xhigh"` give 75; `"ultra"` and `"max"` give 100; and a number from 1 to 100
-  sets that effort directly. Without an effort, the model thinks at high effort
-  (75). The server returns reasoning as `reasoning_text` rather than summaries.
-- Declared tools of types `function`, `namespace`, `custom`, and `tool_search`
-  stay in the request. The server converts Codex's freeform `apply_patch` tool
-  into a function the model knows and returns its calls as custom tool calls.
-  Unsupported hosted tool types, such as `web_search`, are dropped; use Codex's
-  standalone web tool instead.
+  so `previous_response_id`, `conversation`, and `item_reference` return HTTP
+  400. Prompt prefix reuse happens automatically through eremite's state cache
+  (`docs/server.md`, Memory).
+- `reasoning.effort` sets the model's thinking effort:
+  - DeepSeek: `"none"` turns thinking off; `"minimal"` and `"low"` give effort
+    50; `"medium"`, `"high"` and `"xhigh"` give 75; `"ultra"` and `"max"` give
+    100; and a number from 1 to 100 sets that effort directly. Without an
+    effort, the model thinks at high effort (75).
+  - Inkling-2-Mini: `"none"` gives 0 (thinking off), `"minimal"` gives 0.1,
+    `"low"` gives 0.2, `"medium"` gives 0.7, `"high"` gives 0.9, `"xhigh"` and
+    `"max"` give 0.99, and a number from 0.0 to 0.99 sets that effort directly.
+    Without an effort, the model thinks at high effort (0.9).
+  - Both families return reasoning as `reasoning_text` rather than summaries.
+- Declared tools of types `function`, `namespace`, and `custom` stay in the
+  request (plus `tool_search` on DeepSeek). The server exposes Codex's freeform
+  `apply_patch` custom tool as a function the model knows and returns its calls
+  as `custom_tool_call` items. Unsupported hosted tool types, such as
+  `web_search`, are dropped; use Codex's standalone web tool instead.
 
 ## Model catalog
 
 `GET /v1/codex/models` returns Codex's model catalog (`{"models": [...]}`) for
-the served DeepSeek models. Decision models (d1) and image models
-(MiniMax-H3-Image) are left out.
+the served DeepSeek and Inkling-2-Mini models. Decision models (d1), image
+models (MiniMax-H3-Image) and video models (MiniMax-H3 Video) are left out.
 
 Without catalog metadata, Codex assumes a 272,000-token context window, caps
 `model_context_window` there, and offers no `apply_patch` tool. Each entry in
@@ -75,7 +80,8 @@ eremite's catalog carries:
 
 - `slug` (the model's `id`), `display_name`, and `context_window` /
   `max_context_window` set to the model's served `ctx`.
-- `supported_reasoning_levels` (`none`, `low`, `high`, `max`) and
+- `supported_reasoning_levels` (`none`, `low`, `high`, `max` for DeepSeek;
+  `none`, `minimal`, `low`, `medium`, `high`, `xhigh` for Inkling-2-Mini) and
   `default_reasoning_level` from the model's default effort.
 - `apply_patch_tool_type` set to `"freeform"`, `web_search_tool_type` set to
   `"text"`, `input_modalities` set to `["text", "image"]`, and

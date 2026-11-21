@@ -1,17 +1,20 @@
 #!/bin/sh
 # Downloads the models that eremite serves from Hugging Face: DeepSeek V4.1
-# Flash's checkpoint, the routed experts of GGUF quantizations, LiquidAI's
-# d1-2B decision model, and MiniMax-H3's image and video metadata, tokenizers
-# and Comfy-Org quantized checkpoints. The last shard of each GGUF set holds the
-# Engram tables, which eremite reads from the checkpoint, so the script leaves
-# that shard out. It installs Hugging Face's download command, hf, in a Python
-# environment of its own, and deletes that environment at the end. Running the
-# script again goes on where an interrupted download stopped.
+# Flash's checkpoint, the routed experts of GGUF quantizations, Thinking
+# Machines Lab's Inkling-2-Mini checkpoint, LiquidAI's d1-2B decision model,
+# and MiniMax-H3's image and video metadata, tokenizers and Comfy-Org quantized
+# checkpoints. The last shard of each GGUF set holds the Engram tables, which
+# eremite reads from the checkpoint, so the script leaves that shard out. It
+# installs Hugging Face's download command, hf, in a Python environment of its
+# own, and deletes that environment at the end. Running the script again goes
+# on where an interrupted download stopped.
 #
 # usage: scripts/download-models.sh [--dry-run] FOLDER [QUANT...]
 #   FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017 gets the checkpoint (510 GB).
 #   FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/QUANT gets each QUANT's
 #   experts: UD-IQ2_XXS (165 GB, the default) or UD-IQ1_M (140 GB).
+#   FOLDER/thinkingmachines/Inkling-2-Mini gets Inkling-2-Mini (20.2 GB,
+#   including its MTP draft head).
 #   FOLDER/LiquidAI/d1-2B gets d1-2B (3.9 GB).
 #   FOLDER/MiniMaxAI/MiniMax-H3-Image gets MiniMax-H3-Image's metadata and
 #   tokenizer (23 MB).
@@ -33,6 +36,7 @@ set -eu
 HUB_VERSION=2.4.0
 CHECKPOINT=deepseek-ai/DeepSeek-V4.1-Flash-1017
 EXPERTS=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+INKLING2=thinkingmachines/Inkling-2-Mini
 DECISIONS=LiquidAI/d1-2B
 MINIMAX_H3_IMAGE=MiniMaxAI/MiniMax-H3-Image
 MINIMAX_H3_VIDEO=MiniMaxAI/MiniMax-H3
@@ -90,6 +94,7 @@ for quant in "$@"; do
     --local-dir "$folder/$EXPERTS" $dry_run
   set +f
 done
+"$hf" download "$INKLING2" --local-dir "$folder/$INKLING2" $dry_run
 "$hf" download "$DECISIONS" --local-dir "$folder/$DECISIONS" $dry_run
 # MiniMax-H3 image and video metadata, tokenizers, and Comfy-Org weights.
 set -f

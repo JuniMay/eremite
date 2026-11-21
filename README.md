@@ -20,6 +20,17 @@ of 8,921 tokens. Decoding speed depends on the text, so it is a range.
 `docs/performance/deepseek-v4.1-flash.md` gives the setup and the measured
 runs.
 
+Inkling-2-Mini on the same Apple M5 Max with 128 GiB, all weights resident
+(~18.5 to 20.3 GiB footprint), `lookup` 15, and one request at a time. Prefill
+reads a prompt of 8,784 tokens of source code.
+
+| Mode | Prefill | Decoding |
+|---|---|---|
+| Plain (`draft` 0) | 1,146 token/s | 46.4~61.5 token/s |
+| MTP draft head (`draft` 7) | 1,132 token/s | 48.8~60.9 token/s |
+
+`docs/performance/inkling-2-mini.md` gives the setup and the measured runs.
+
 ## Build
 
 Requirements: macOS 27 with Xcode 27, and `pkgconf`, `yyjson`, `jpeg-turbo`
@@ -50,7 +61,9 @@ against the reference tokenizer's ids.
 DeepSeek V4.1 Flash's checkpoint (510 GB) into
 `FOLDER/deepseek-ai/DeepSeek-V4.1-Flash-1017`, the routed experts of its
 UD-IQ2_XXS GGUF quantization (165 GB) into
-`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, LiquidAI's
+`FOLDER/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS`, Thinking Machines
+Lab's Inkling-2-Mini checkpoint (20.2 GB, including `mtp.safetensors`) into
+`FOLDER/thinkingmachines/Inkling-2-Mini`, LiquidAI's
 d1-2B decision model (3.9 GB) into `FOLDER/LiquidAI/d1-2B`, and
 MiniMax-H3's image and video metadata and tokenizers into
 `FOLDER/MiniMaxAI/MiniMax-H3-Image` and `FOLDER/MiniMaxAI/MiniMax-H3` with
@@ -65,9 +78,11 @@ again from where an interrupted download stopped.
 ## Run
 
 `build/eremite -m CHECKPOINT -p PROMPT` generates a reply with DeepSeek V4.1
-Flash, whose checkpoint is the directory CHECKPOINT. `--experts GGUF` reads
-the routed experts from a GGUF file set instead, and `--memory GB` limits the
-model memory, state memory included. `build/eremite` alone lists the options.
+Flash or Inkling-2-Mini, whose checkpoint is the directory CHECKPOINT. For
+DeepSeek, `--experts GGUF` reads the routed experts from a GGUF file set
+instead. `--draft N` turns on the model's draft head (up to 5 for DeepSeek, up
+to 7 for Inkling-2-Mini), and `--memory GB` limits the model memory, state
+memory included. `build/eremite` alone lists the options.
 
 ## Serve
 
@@ -89,6 +104,10 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
     {
       "model": "/path/to/DeepSeek-V4.1-Flash-1017",
       "experts": "/path/to/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf"
+    },
+    {
+      "model": "/path/to/Inkling-2-Mini",
+      "draft": 7
     },
     {
       "model": "/path/to/d1-2B"
@@ -132,10 +151,12 @@ eremite was inspired by [ds4](https://github.com/antirez/ds4), antirez's
 local inference engine for DeepSeek 4 Flash and Pro. It also builds on:
 
 - [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash,
-  [Liquid AI](https://www.liquid.ai)'s d1 decision models (with Liquid AI's
-  prompt for reranking), and [MiniMax](https://huggingface.co/MiniMaxAI)'s
-  MiniMax-H3-Image and MiniMax-H3 Video with
-  [Comfy-Org](https://huggingface.co/Comfy-Org)'s quantized checkpoints.
+  [Thinking Machines Lab](https://huggingface.co/thinkingmachines)'s
+  Inkling-2-Mini, [Liquid AI](https://www.liquid.ai)'s d1 decision models
+  (with Liquid AI's prompt for reranking), and
+  [MiniMax](https://huggingface.co/MiniMaxAI)'s MiniMax-H3-Image and
+  MiniMax-H3 Video with [Comfy-Org](https://huggingface.co/Comfy-Org)'s
+  quantized checkpoints.
 - The ggml library of [llama.cpp](https://github.com/ggml-org/llama.cpp): the
   GGUF format and the codebooks of its i-quants. Their MIT license is in
   `src/kernels/gguf_grids.metal`.
