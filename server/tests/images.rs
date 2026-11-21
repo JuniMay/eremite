@@ -294,6 +294,7 @@ fn minimax_h3_image_serves_generations_and_edits_over_http() {
         json!({"prompt": "a cat", "size": "512x512", "response_format": "url"}),
         json!({"prompt": "a cat", "size": "512x512", "background": "clear"}),
         json!({"prompt": "a cat", "size": "512x512", "background": "transparent", "output_format": "jpeg"}),
+        json!({"prompt": "a cat", "output_format": "gif", "frame_count": 4}),
     ] {
         let (code, answer) = ask(&server, "POST", "/v1/images/generations", Some(&bad));
         assert_eq!(code, 400, "bad={bad} -> {answer}");

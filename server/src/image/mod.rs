@@ -28,6 +28,10 @@ const LF_HEADER_END: &[u8] = b"\n\n";
 /// The most partial images that OpenAI's image API takes in one request.
 const MAX_PARTIAL_IMAGES: i64 = 3;
 
+/// The GIF options of OpenAI's image API, which this server refuses: it makes
+/// no GIFs.
+const GIF_OPTIONS: [&str; 2] = ["frame_count", "frame_duration_ms"];
+
 /// RFC 4648 standard base64 alphabet.
 const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -130,6 +134,9 @@ fn parse_output_format(value: Option<&str>) -> Result<engine::ImageFormat, chat:
             Ok(engine::ImageFormat::Jpeg)
         }
         Some(raw) if raw.eq_ignore_ascii_case("webp") => Ok(engine::ImageFormat::Webp),
+        Some(raw) if raw.eq_ignore_ascii_case("gif") => Err(chat::Error::new_bad_request(
+            "output_format \"gif\" is not supported: this server makes no GIFs; use \"png\", \"jpeg\" or \"webp\"",
+        )),
         Some(other) => Err(chat::Error::new_bad_request(format!(
             "output_format {other:?} is not supported; use \"png\", \"jpeg\" or \"webp\""
         ))),
@@ -301,6 +308,14 @@ fn read_json_request(
         return Err(chat::Error::new_bad_request(
             "negative_prompt is not supported",
         ));
+    }
+    if let Some(key) = GIF_OPTIONS
+        .into_iter()
+        .find(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(chat::Error::new_bad_request(format!(
+            "{key} is not supported: this server makes no GIFs"
+        )));
     }
 
     Ok(ParsedRequest {
@@ -664,6 +679,15 @@ impl EditForm {
             return Err(chat::Error::new_bad_request(
                 "negative_prompt is not supported",
             ));
+        }
+        if let Some(key) = GIF_OPTIONS.into_iter().find(|key| {
+            fields
+                .get(*key)
+                .is_some_and(|value| !value.trim().is_empty())
+        }) {
+            return Err(chat::Error::new_bad_request(format!(
+                "{key} is not supported: this server makes no GIFs"
+            )));
         }
 
         Ok(ParsedRequest {
@@ -1433,6 +1457,40 @@ mod tests {
             let error = parse(bad.clone()).expect_err("refused");
             assert!(error.message.contains(message), "{bad}: {}", error.message);
         }
+    }
+
+    #[test]
+    fn requests_refuse_gif_output_and_its_options() {
+        let limits = test_limits();
+        for (bad, message) in [
+            (
+                json!({"prompt": "p", "output_format": "gif"}),
+                "output_format \"gif\" is not supported: this server makes no GIFs",
+            ),
+            (
+                json!({"prompt": "p", "frame_count": 9}),
+                "frame_count is not supported: this server makes no GIFs",
+            ),
+            (
+                json!({"prompt": "p", "frame_duration_ms": 200}),
+                "frame_duration_ms is not supported: this server makes no GIFs",
+            ),
+        ] {
+            let body = serde_json::to_vec(&bad).unwrap();
+            let error = parse_generation_request(&body, &limits).expect_err("refused");
+            assert!(error.message.contains(message), "{bad}: {}", error.message);
+        }
+
+        let boundary = "b5";
+        let form = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nabc\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"frame_count\"\r\n\r\n4\r\n\
+             --{boundary}--\r\n"
+        );
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let error = parse_edit_request(Some(&ct), form.as_bytes(), &limits).expect_err("refused");
+        assert!(error.message.contains("makes no GIFs"), "{}", error.message);
     }
 
     #[test]

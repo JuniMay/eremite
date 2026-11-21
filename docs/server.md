@@ -171,7 +171,7 @@ the returned images, `output_format` is their format, and `background` is
   deterministic CPU RNG).
 - `response_format`: omit or `"b64_json"`.
 - `output_format`: `"png"` (default), `"jpeg"` (or `"jpg"`) or `"webp"`.
-  Other formats, such as `"gif"`, get HTTP 400.
+  Other formats get HTTP 400, and so does `"gif"`: the server makes no GIFs.
 - `output_compression`: optional JPEG or WebP quality, 0 to 100 (default
   100, as in OpenAI's API). PNG ignores it.
 - `background`: `"auto"` (default), `"opaque"` or `"transparent"`.
@@ -215,6 +215,8 @@ the returned images, `output_format` is their format, and `background` is
 - `num_inference_steps`: omit or `6` (other values return HTTP 400).
 - `guidance_scale`: omit or `1` (other values return HTTP 400).
 - `negative_prompt`: unsupported; nonempty values return HTTP 400.
+- `frame_count` and `frame_duration_ms`: GIF options, unsupported; any value
+  returns HTTP 400.
 
 Full residence is the primary mode: when enough memory fits, the text encoder
 (13.5 GiB), DiT (19.5 GiB) and VAE decoder (0.8 GiB) stay resident together
