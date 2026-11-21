@@ -149,7 +149,9 @@ $(BUILD)/eremite-server: $(LIB) $(SERVER_INPUTS)
 
 server: $(BUILD)/eremite-server
 
-server-test: $(LIB) $(TIME_LIMIT)
+# The tests that start a server run build/eremite-server, so it is built
+# first.
+server-test: $(LIB) $(TIME_LIMIT) $(BUILD)/eremite-server
 	$(TIME_LIMIT) $(TEST_SECONDS) $(CARGO) test --release --locked --manifest-path server/Cargo.toml --target-dir $(BUILD)/cargo
 
 format:

@@ -7,13 +7,16 @@
 //!
 //! Set EREMITE_MINIMAX_H3_MODEL_DIR, EREMITE_MINIMAX_H3_TEXT_ENCODER,
 //! EREMITE_MINIMAX_H3_DIT, EREMITE_MINIMAX_H3_VAE, and optionally
-//! EREMITE_MINIMAX_H3_REF_IMAGE. Run one model process at a time:
+//! EREMITE_MINIMAX_H3_REF_IMAGE. The test starts build/eremite-server, so
+//! build it first. Run one model process at a time:
 //!
+//!     make server && \
 //!     EREMITE_MINIMAX_H3_MODEL_DIR=... \
 //!     EREMITE_MINIMAX_H3_TEXT_ENCODER=... \
 //!     EREMITE_MINIMAX_H3_DIT=... \
 //!     EREMITE_MINIMAX_H3_VAE=... \
-//!       cargo test --release --manifest-path server/Cargo.toml --test images -- --nocapture
+//!       cargo test --release --manifest-path server/Cargo.toml \
+//!       --target-dir build/cargo --test images -- --nocapture
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
