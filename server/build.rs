@@ -21,7 +21,17 @@ fn main() {
         root.join("build").display()
     );
     println!("cargo:rustc-link-lib=static=eremite");
-    for framework in ["Metal", "Foundation", "IOKit", "ImageIO", "CoreGraphics"] {
+    for framework in [
+        "Metal",
+        "Foundation",
+        "IOKit",
+        "ImageIO",
+        "CoreGraphics",
+        "AVFoundation",
+        "CoreMedia",
+        "CoreVideo",
+        "AudioToolbox",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-lib=objc");

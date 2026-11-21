@@ -44,6 +44,10 @@ LDLIBS += -framework IOKit
 # ImageIO and CoreGraphics, which decode images in formats other than JPEG.
 LDLIBS += -framework ImageIO -framework CoreGraphics
 
+# AVFoundation, CoreMedia, CoreVideo and AudioToolbox, which encode and decode
+# MP4 video and audio clips.
+LDLIBS += -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox
+
 THREADS ?= gcd
 THREADS_FLAG_gcd := -DEREMITE_THREADS_GCD
 THREADS_FLAG_pthread := -DEREMITE_THREADS_PTHREAD
