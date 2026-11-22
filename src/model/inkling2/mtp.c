@@ -34,7 +34,8 @@ static constexpr uint32_t MTP_COMBINE_THREADS = 32;
 static constexpr uint32_t MTP_ELEM_THREADS = 256;
 static constexpr uint32_t MTP_MV_THREADS = 256;
 static constexpr uint32_t MTP_MM_THREADS = 128;
-static constexpr uint32_t MTP_MM_TILE = 64;
+static constexpr uint32_t MTP_MM_TILE_M = 64;
+static constexpr uint32_t MTP_MM_TILE_N = 64;
 static constexpr uint32_t MTP_BF16_ROWS_PER_TG = 32;
 static constexpr uint32_t MTP_BF16_MV_SGS = 8;
 static constexpr uint32_t MTP_BF16_MV_ROWS_PER_SG = 4;
@@ -672,9 +673,9 @@ static void run_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
     gpu_bind_buffer(c, 2, x, 0);
     gpu_bind_buffer(c, 3, y, 0);
     gpu_copy_bytes(c, 4, &p, sizeof p);
-    gpu_run_kernel(c, ((uint32_t)n + MTP_MM_TILE - 1u) / MTP_MM_TILE,
-                   ((uint32_t)m + MTP_MM_TILE - 1u) / MTP_MM_TILE, 1,
-                   MTP_MM_THREADS, 1, 1);
+    uint32_t tiles_n = ((uint32_t)n + MTP_MM_TILE_N - 1u) / MTP_MM_TILE_N;
+    uint32_t tiles_m = ((uint32_t)m + MTP_MM_TILE_M - 1u) / MTP_MM_TILE_M;
+    gpu_run_kernel(c, tiles_n * tiles_m, 1, 1, MTP_MM_THREADS, 1, 1);
   }
 }
 

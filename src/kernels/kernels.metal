@@ -1357,24 +1357,9 @@ kernel void engram_gate(device bfloat *h [[buffer(0)]], device const float *kv [
 
 struct MM { uint m, n, k, round, lda, ldy; };  // lda, ldy: row strides of x and y
 
-#define MM_STORE(expr)                                          \
-  for (uint16_t i = 0; i < c.get_capacity(); i++)               \
-    if (c.is_valid_element(i)) {                                \
-      auto at = c.get_multidimensional_index(i);                \
-      uint col = n0 + at[0], row = m0 + at[1];                  \
-      if (row < p.m && col < p.n) expr;                         \
-    }
-
-#define MM_SETUP                                                                                                       \
-  threadgroup bfloat xs[64 * 64], ws[64 * 64];                                                                         \
-  constexpr auto desc = matmul2d_descriptor(64, 64, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate); \
-  matmul2d<desc, execution_simdgroups<4>> op;                                                                          \
-  tensor<threadgroup bfloat, extents<int32_t, 64, 64>, tensor_inline> tx(xs, extents<int32_t, 64, 64>());              \
-  tensor<threadgroup bfloat, extents<int32_t, 64, 64>, tensor_inline> tw(ws, extents<int32_t, 64, 64>());              \
-  auto c = op.get_destination_cooperative_tensor<decltype(tx), decltype(tw), float>();                                 \
-  for (uint16_t i = 0; i < c.get_capacity(); i++)                                                                      \
-    if (c.is_valid_element(i)) c[i] = 0;                                                                               \
-  uint m0 = tg.y * 64, n0 = tg.x * 64;
+// Tile dimensions and L2 swizzle width for direct-weight BF16 matrix products.
+constant constexpr uint MM_BF16_TILE_M = 64, MM_BF16_TILE_N = 64,
+                        MM_BF16_TILE_K = 64, MM_BF16_SWIZZLE_N = 8;
 
 // 64 rows x 64 columns of x (float) as BF16, eight four-float chunks per
 // thread. As in the experts' kernels, a K step's loads are issued before the
@@ -1384,7 +1369,7 @@ inline X8 x_load(device const float *x, uint m0, uint m, uint lda, uint k0, uint
   X8 c;
   for (uint i = 0; i < 8; i++) {
     uint r = m0 + t / 16 + 8 * i;
-    c.v[i] = r < m ? *(device const float4 *)(x + r * lda + k0 + (t % 16) * 4) : float4(0);
+    c.v[i] = r < m ? *(device const float4 *)(x + (ulong)r * lda + k0 + (t % 16) * 4) : float4(0);
   }
   return c;
 }
@@ -1462,33 +1447,53 @@ kernel void x_bf16(device const float4 *x [[buffer(0)]], device bfloat4 *y [[buf
   y[i.y * (kl.x / 4) + i.x] = bfloat4(x[i.y * (kl.y / 4) + i.x]);
 }
 
-// BF16 weights: four sixteen-byte chunks per thread and K step, stored as
-// they are.
-struct W16 { uint4 q[4]; };
-inline W16 bf16_load(device const ushort *w, uint n0, uint n, uint k, uint k0, uint t) {
-  W16 c;
-  for (uint i = 0; i < 4; i++) {
-    uint r = n0 + t / 8 + 16 * i;
-    c.q[i] = r < n ? *(device const uint4 *)(w + r * k + k0 + (t % 8) * 8) : uint4(0);
-  }
-  return c;
-}
-
-kernel void mm_bf16(device const ushort *w [[buffer(0)]], device const float *x [[buffer(2)]],
+// BF16 matrix product: y[m, n] = x[m, k] @ w[n, k]^T with optional BF16
+// rounding. Stages 64x64 FP32->BF16 input tiles in 8 KiB threadgroup memory
+// and reads BF16 weights directly from device memory into a 64x64 tile.
+// Dispatched as a 1D N-grouped L2-swizzled grid of ceil(n / 64) * ceil(m / 64)
+// threadgroups of 128 threads.
+kernel void mm_bf16(device const bfloat *w [[buffer(0)]], device const float *x [[buffer(2)]],
                     device float *y [[buffer(3)]], constant MM &p [[buffer(4)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  MM_SETUP
+                    uint tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup bfloat xs[MM_BF16_TILE_M * MM_BF16_TILE_K];
+  constexpr auto desc = matmul2d_descriptor(
+      MM_BF16_TILE_M, MM_BF16_TILE_N, MM_BF16_TILE_K, false, true, false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  uint tiles_m = (p.m + MM_BF16_TILE_M - 1u) / MM_BF16_TILE_M;
+  uint tiles_n = (p.n + MM_BF16_TILE_N - 1u) / MM_BF16_TILE_N;
+  uint group_tiles = tiles_m * MM_BF16_SWIZZLE_N;
+  uint g = tg / group_tiles;
+  uint rem = tg - g * group_tiles;
+  uint gn0 = g * MM_BF16_SWIZZLE_N;
+  uint gwidth = min(MM_BF16_SWIZZLE_N, tiles_n - gn0);
+  uint tn = gn0 + (rem % gwidth);
+  uint tm = rem / gwidth;
+  uint m0 = tm * MM_BF16_TILE_M, n0 = tn * MM_BF16_TILE_N;
+
+  tensor<threadgroup bfloat, extents<int32_t, MM_BF16_TILE_K, MM_BF16_TILE_M>, tensor_inline> tx(
+      xs, extents<int32_t, MM_BF16_TILE_K, MM_BF16_TILE_M>());
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tw(
+      (device bfloat *)w, dextents<int32_t, 2>(p.k, p.n));
+  auto c = op.get_destination_cooperative_tensor<decltype(tx), decltype(tw.slice(0, 0)), float>();
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) c[i] = 0;
+
   X8 xc = x_load(x, m0, p.m, p.lda, 0, t);
-  W16 wc = bf16_load(w, n0, p.n, p.k, 0, t);
-  for (uint k0 = 0; k0 < p.k; k0 += 64) {
+  for (uint k0 = 0; k0 < p.k; k0 += MM_BF16_TILE_K) {
     x_store(xs, xc, t);
-    for (uint i = 0; i < 4; i++) *(threadgroup uint4 *)(ws + (t / 8 + 16 * i) * 64 + (t % 8) * 8) = wc.q[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (k0 + 64 < p.k) xc = x_load(x, m0, p.m, p.lda, k0 + 64, t), wc = bf16_load(w, n0, p.n, p.k, k0 + 64, t);
-    op.run(tx, tw, c);
+    if (k0 + MM_BF16_TILE_K < p.k) xc = x_load(x, m0, p.m, p.lda, k0 + MM_BF16_TILE_K, t);
+    auto wb = tw.slice(k0, n0);
+    op.run(tx, wb, c);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  MM_STORE(y[row * p.ldy + col] = p.round ? bf(c[i]) : c[i])
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (row < p.m && col < p.n) y[(ulong)row * p.ldy + col] = p.round ? bf(c[i]) : c[i];
+    }
 }
 
 // Routed experts over many tokens. The (token, expert) pairs are grouped by

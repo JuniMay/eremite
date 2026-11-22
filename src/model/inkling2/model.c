@@ -52,6 +52,8 @@ static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = INK2_HEAD_DIM + 2;
 static constexpr int PREFILL_Q_PAD = 16;
 static constexpr int PREFILL_Q_GROUP = 32;
+static constexpr int MM_TILE_M = 64;
+static constexpr int MM_TILE_N = 64;
 static constexpr int MOE_MM_TILE = 64;
 static constexpr int MOE_MV_MAX_M = 8;
 static constexpr int MOE_MV_ROWS_PER_TG = 32;
@@ -1748,9 +1750,9 @@ static void run_bf16_linear_off(GpuCommandBuffer *c, const Buf *w, const Buf *x,
     gpu_bind_buffer(c, 2, x, x_off);
     gpu_bind_buffer(c, 3, y, 0);
     gpu_copy_bytes(c, 4, &p, sizeof p);
-    gpu_run_kernel(c, ((uint32_t)n + MOE_MM_TILE - 1u) / MOE_MM_TILE,
-                   ((uint32_t)m + MOE_MM_TILE - 1u) / MOE_MM_TILE, 1,
-                   MM_THREADS, 1, 1);
+    uint32_t tiles_n = ((uint32_t)n + MM_TILE_N - 1u) / MM_TILE_N;
+    uint32_t tiles_m = ((uint32_t)m + MM_TILE_M - 1u) / MM_TILE_M;
+    gpu_run_kernel(c, tiles_n * tiles_m, 1, 1, MM_THREADS, 1, 1);
   }
 }
 

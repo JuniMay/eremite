@@ -1124,8 +1124,13 @@ static void linear(GpuCommandBuffer *c, const Lin *w, int m, const Buf *in,
     gpu_bind_buffer(c, 2, fp8 ? &XB : in, fp8 ? 0 : x);
     gpu_bind_buffer(c, 3, out, out_off + row0 * 4);
     gpu_copy_bytes(c, 4, &p, sizeof p);
-    gpu_run_kernel(c, (n + 63) / 64, (m + (fp8 ? 127 : 63)) / (fp8 ? 128 : 64),
-                   1, 128, 1, 1);
+    if (fp8) {
+      gpu_run_kernel(c, (n + 63) / 64, (m + 127) / 128, 1, 128, 1, 1);
+    } else {
+      uint32_t tiles_n = ((uint32_t)n + 63u) / 64u;
+      uint32_t tiles_m = ((uint32_t)m + 63u) / 64u;
+      gpu_run_kernel(c, tiles_n * tiles_m, 1, 1, 128, 1, 1);
+    }
   }
 }
 

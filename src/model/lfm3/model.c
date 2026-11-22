@@ -52,6 +52,8 @@ static constexpr int HEAD_THREADS = LFM3_HEAD_DIM / 2;
 static constexpr int HEAD_GROUPS = LFM3_HEADS + 2 * LFM3_KV_HEADS;
 // The threads of lfm3_attend's threadgroup: its 4 simdgroups.
 static constexpr int ATTEND_THREADS = 128;
+// Tile dimensions and threadgroup size of mm_bf16.
+static constexpr uint32_t MM_TILE_M = 64, MM_TILE_N = 64, MM_THREADS = 128;
 // The rows of the convolution's filter that reach back before a row.
 static constexpr int CONV_BEFORE = LFM3_CONV_WIDTH - 1;
 // The stack of a pass: it holds little more than one row of FP32 values.
@@ -594,8 +596,9 @@ static void multiply(GpuCommandBuffer *c, const Lin *w, int m, const Buf *x,
   gpu_select_kernel(c, K_mm_bf16);
   gpu_bind_buffer(c, 0, &w->w, 0), gpu_bind_buffer(c, 2, x, x_off);
   gpu_bind_buffer(c, 3, y, y_off), gpu_copy_bytes(c, 4, &p, sizeof p);
-  gpu_run_kernel(c, (uint32_t)(w->n + 63) / 64, (uint32_t)(m + 63) / 64, 1, 128,
-                 1, 1);
+  uint32_t tiles_n = ((uint32_t)w->n + MM_TILE_N - 1u) / MM_TILE_N;
+  uint32_t tiles_m = ((uint32_t)m + MM_TILE_M - 1u) / MM_TILE_M;
+  gpu_run_kernel(c, tiles_n * tiles_m, 1, 1, MM_THREADS, 1, 1);
 }
 
 // y = RMSNorm(x) w for m rows of LFM3_DIM values, from bytes x_off and y_off.

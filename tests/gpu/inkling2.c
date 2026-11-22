@@ -25,11 +25,12 @@ static constexpr uint32_t ROW_THREADS = 256, QKVR_THREADS = 128,
                           DECODE_THREADS = 128, COMBINE_THREADS = 32,
                           PREFILL_THREADS = 64, PREFILL_Q_GROUP = 32,
                           Q_PAD = 16, MV_THREADS = 256, MV_ROWS_PER_TG = 32,
-                          MM_THREADS = 128, MM_TILE = 64, PART_FLOATS = 130,
-                          ELEM_THREADS = 256, ROUTE_THREADS = 128,
-                          VEC4_WIDTH = 4, E2M1_MASK = 0xFu, E2M1_SHIFT = 4,
-                          FP8_EXP_BIAS = 127, BF16_ROUND_MASK = 0xFFFF0000u,
-                          BF16_HALF = 0x7FFFu, BF16_SHIFT = 16;
+                          MM_THREADS = 128, MM_TILE = 64, MM_BF16_TILE_N = 64,
+                          PART_FLOATS = 130, ELEM_THREADS = 256,
+                          ROUTE_THREADS = 128, VEC4_WIDTH = 4, E2M1_MASK = 0xFu,
+                          E2M1_SHIFT = 4, FP8_EXP_BIAS = 127,
+                          BF16_ROUND_MASK = 0xFFFF0000u, BF16_HALF = 0x7FFFu,
+                          BF16_SHIFT = 16;
 
 // Numerical constants from config.json and modeling_inkling2.py.
 static constexpr float RMS_EPS = 1e-6f, CLIP_EPS = 1e-6f,
@@ -1425,6 +1426,107 @@ static void test_copy_and_moe_group(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&tiles);
 }
 
+// Parameters passed to mm_bf16 in src/kernels/kernels.metal.
+typedef struct {
+  // Active rows, output columns, inner width, BF16 rounding flag and strides.
+  uint32_t m, n, k, round, lda, ldy;
+} MmBf16Param;
+
+// Tests shared mm_bf16 across multi-tile M/N swizzle boundaries, non-multiple
+// M/N shapes, custom strides, NaN tail sentinels, and both rounding modes.
+static void test_mm_bf16(Gpu *gpu, MemorySlot *slot) {
+  int k_mm = gpu_find_kernel(gpu, "mm_bf16");
+  uint32_t rng = 0x71c3d59bu;
+  // 131 spans 3 M tiles (64); 1037 spans 17 N tiles (64), crossing two
+  // 8-tile L2 swizzle group boundaries; 192 spans 3 K steps (64).
+  uint32_t m = 131, n = 1037, k = 192;
+  uint32_t lda = k + 16, ldy = n + 11;
+  uint32_t m_alloc = m + 13, n_alloc = n + 19;
+
+  Buf w = gpu_alloc(gpu, slot, (size_t)n_alloc * k * sizeof(uint16_t));
+  Buf x = gpu_alloc(gpu, slot, (size_t)m_alloc * lda * sizeof(float));
+  Buf y0 = gpu_alloc(gpu, slot, (size_t)m_alloc * ldy * sizeof(float));
+  Buf y1 = gpu_alloc(gpu, slot, (size_t)m_alloc * ldy * sizeof(float));
+
+  uint16_t *wp = (uint16_t *)w.ptr;
+  float *xp = (float *)x.ptr, *y0p = (float *)y0.ptr, *y1p = (float *)y1.ptr;
+  for (size_t i = 0; i < (size_t)n_alloc * k; i++) wp[i] = 0x7FC0u;
+  for (size_t i = 0; i < (size_t)m_alloc * lda; i++) xp[i] = NAN;
+  for (size_t i = 0; i < (size_t)m_alloc * ldy; i++) {
+    y0p[i] = -7.5f;
+    y1p[i] = -7.5f;
+  }
+  for (uint32_t r = 0; r < n; r++)
+    for (uint32_t c = 0; c < k; c++)
+      wp[(size_t)r * k + c] = f32_to_bf16(rng_f32(&rng) * 0.5f);
+  for (uint32_t r = 0; r < m; r++)
+    for (uint32_t c = 0; c < k; c++)
+      xp[(size_t)r * lda + c] = rng_f32(&rng) * 0.5f;
+
+  MmBf16Param p0 = {m, n, k, 0u, lda, ldy};
+  MmBf16Param p1 = {m, n, k, 1u, lda, ldy};
+  uint32_t tiles_n = (n + MM_BF16_TILE_N - 1u) / MM_BF16_TILE_N;
+  uint32_t tiles_m = (m + MM_TILE - 1u) / MM_TILE;
+
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_mm);
+  gpu_bind_buffer(&cmd, 0, &w, 0);
+  gpu_bind_buffer(&cmd, 2, &x, 0);
+  gpu_bind_buffer(&cmd, 3, &y0, 0);
+  gpu_copy_bytes(&cmd, 4, &p0, sizeof p0);
+  gpu_run_kernel(&cmd, tiles_n * tiles_m, 1, 1, MM_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_mm);
+  gpu_bind_buffer(&cmd, 0, &w, 0);
+  gpu_bind_buffer(&cmd, 2, &x, 0);
+  gpu_bind_buffer(&cmd, 3, &y1, 0);
+  gpu_copy_bytes(&cmd, 4, &p1, sizeof p1);
+  gpu_run_kernel(&cmd, tiles_n * tiles_m, 1, 1, MM_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float err0 = 0.0f, err1 = 0.0f;
+  int pad_ok = 1;
+  for (uint32_t r = 0; r < m; r++) {
+    for (uint32_t c = 0; c < n; c++) {
+      double acc = 0.0;
+      for (uint32_t t = 0; t < k; t++) {
+        float xv = bf_round(xp[(size_t)r * lda + t]);
+        float wv = bf16_to_f32(wp[(size_t)c * k + t]);
+        acc += (double)xv * wv;
+      }
+      float ref0 = (float)acc;
+      float ref1 = bf_round(ref0);
+      float g0 = y0p[(size_t)r * ldy + c];
+      float g1 = y1p[(size_t)r * ldy + c];
+      if (!isfinite(g0) || !isfinite(g1)) pad_ok = 0;
+      err0 = fmaxf(err0, fabsf(g0 - ref0));
+      err1 = fmaxf(err1, fabsf(g1 - ref1));
+    }
+    for (uint32_t c = n; c < ldy; c++) {
+      if (y0p[(size_t)r * ldy + c] != -7.5f ||
+          y1p[(size_t)r * ldy + c] != -7.5f)
+        pad_ok = 0;
+    }
+  }
+  for (uint32_t r = m; r < m_alloc; r++) {
+    for (uint32_t c = 0; c < ldy; c++) {
+      if (y0p[(size_t)r * ldy + c] != -7.5f ||
+          y1p[(size_t)r * ldy + c] != -7.5f)
+        pad_ok = 0;
+    }
+  }
+  check_err("mm_bf16 FP32 output (swizzled odd M/N + NaN tails)", err0,
+            TOL_F32);
+  check_err("mm_bf16 BF16-rounded output", err1, TOL_BF16);
+  check(pad_ok, "mm_bf16 leaves stride padding and out-of-bounds rows intact");
+
+  gpu_free(&w);
+  gpu_free(&x);
+  gpu_free(&y0);
+  gpu_free(&y1);
+}
+
 int main(void) {
   Memory *memory = memory_new();
   MemorySlot *slot = memory_shared(memory);
@@ -1439,6 +1541,7 @@ int main(void) {
   test_attention(gpu, slot);
   test_router_and_moe(gpu, slot);
   test_copy_and_moe_group(gpu, slot);
+  test_mm_bf16(gpu, slot);
 
   gpu_return_freed_memory(gpu);
   return failures != 0;
