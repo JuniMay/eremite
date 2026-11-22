@@ -803,6 +803,19 @@ static void test_background_wait_frees_gpu(void) {
   eremite_stream_free(sl);
 }
 
+// Tests that optional ModelOps callbacks (set_history and replay_start) are
+// safely tolerated when a snapshot-only model family leaves them null.
+static void test_optional_history_and_replay_ops(void) {
+  MockRole roles[1] = {MOCK_ROLE_LLM};
+  reset_world(1, roles);
+  eremite_state *st = (eremite_state *)&fake_gpu_sentinel;
+  int32_t tokens[3] = {10, 20, 30};
+  eremite_set_history(&mock_models[0], st, tokens, 3);
+  int start = eremite_replay_start(&mock_models[0], 135);
+  check(start == 135,
+        "optional set_history and replay_start tolerate null ops callbacks");
+}
+
 int main(void) {
   test_video_heavy_vs_llm_decode();
   test_video_light_vs_llm_heavy();
@@ -811,6 +824,7 @@ int main(void) {
   test_three_models_balanced();
   test_decision_and_intra_model_rules();
   test_background_wait_frees_gpu();
+  test_optional_history_and_replay_ops();
   if (wake) threads_event_free(wake), wake = NULL;
   return failures != 0;
 }

@@ -1481,7 +1481,7 @@ int eremite_replay_rows(const eremite_model *m, int k) {
 
 int eremite_replay_start(const eremite_model *m, int k) {
   require_states(m);
-  return m->ops->replay_start(k);
+  return m->ops->replay_start ? m->ops->replay_start(k) : k;
 }
 
 const float *eremite_decode_rows(eremite_model *m, eremite_state **states,
@@ -1513,7 +1513,7 @@ void eremite_accept(eremite_model *m, eremite_state *s, const int32_t *rows,
 void eremite_set_history(eremite_model *m, eremite_state *s,
                          const int32_t *tokens, int pos) {
   require_states(m);
-  m->ops->set_history(s, tokens, pos);
+  if (m->ops->set_history) m->ops->set_history(s, tokens, pos);
 }
 
 // ---- sampling ----
