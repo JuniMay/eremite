@@ -38,6 +38,8 @@ static const char source[] = {
 #embed "inkling2_mtp.metal"
     , '\n',
 #embed "nemotron_audio.metal"
+    , '\n',
+#embed "nemotron.metal"
 };
 
 const char *kernel_library_source(size_t *length) {

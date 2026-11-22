@@ -3,10 +3,10 @@
 #include "engine/memory.h"
 #include <stdint.h>
 
-// An image in a prompt: its patches, and its feature rows once the model has
-// encoded it. Its span in the prompt holds negative tokens, its keys. The keys
-// come from the file's bytes, so that prefix reuse tells different images
-// apart.
+// A media item in a prompt (image patches or mono audio waveform), and its
+// feature rows once the model has encoded it. Its span in the prompt holds
+// negative tokens, its keys. The keys come from the file's bytes, so that
+// prefix reuse tells different media apart.
 typedef struct {
   // The positions of its span.
   int ntokens;
@@ -14,6 +14,10 @@ typedef struct {
   int vh, vw, th, tw;
   // The patches' pixels in BF16.
   uint16_t *patch;
+  // Decoded mono 16 kHz PCM samples for audio media, or null for images.
+  float *pcm;
+  // Number of samples in pcm.
+  int pcm_samples;
   // The hash of the encoded file's bytes.
   uint64_t hash;
   // The position of its span in the prompt.

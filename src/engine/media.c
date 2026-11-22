@@ -34,6 +34,7 @@ void media_write_keys(const Media *im, int *keys) {
 
 void media_free(Media *im) {
   free(im->patch);
+  free(im->pcm);
   if (im->rows) memory_host_free(im->memory, im->rows);
   *im = (Media){0};
 }
