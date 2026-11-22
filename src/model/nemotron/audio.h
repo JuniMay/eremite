@@ -124,4 +124,21 @@ int nemo_audio_encode(NemoAudioEncoder *enc, const float *pcm, int pcm_samples,
                       const PassWait *wait, float **out_embeds, int *out_tokens,
                       char *error, size_t error_cap);
 
+// Encodes 16 kHz mono PCM into modality embeddings [*out_tokens, 2688] and,
+// when out_asr_bf16 is non-null, also outputs raw pre-fusion ASR encoder
+// states [*out_tokens, 1280] packed as BF16. Returns 1 on success or 0 on
+// failure.
+int nemo_audio_encode_with_asr(NemoAudioEncoder *enc, const float *pcm,
+                               int pcm_samples, const PassWait *wait,
+                               float **out_embeds, uint16_t **out_asr_bf16,
+                               int *out_tokens, char *error, size_t error_cap);
+
+// Runs only the 32-layer ASR encoder branch on 16 kHz mono PCM and outputs
+// BF16-packed ASR encoder states [*out_tokens, 1280] into *out_asr_bf16.
+// Returns 1 on success or 0 on failure.
+int nemo_audio_encode_asr_only(NemoAudioEncoder *enc, const float *pcm,
+                               int pcm_samples, const PassWait *wait,
+                               uint16_t **out_asr_bf16, int *out_tokens,
+                               char *error, size_t error_cap);
+
 #endif

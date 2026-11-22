@@ -1254,10 +1254,24 @@ static void set_audio_err(char *error, size_t cap, const char *msg) {
   if (error && cap > 0) snprintf(error, cap, "%s", msg);
 }
 
-int nemo_audio_encode(NemoAudioEncoder *enc, const float *pcm, int pcm_samples,
-                      const PassWait *wait, float **out_embeds, int *out_tokens,
-                      char *error, size_t error_cap) {
+// Packs count FP32 floats into a heap-allocated BF16 array (ties to even).
+static uint16_t *pack_f32_to_bf16_alloc(const float *src, size_t count) {
+  uint16_t *dst = xmalloc(count * sizeof(uint16_t));
+  for (size_t i = 0; i < count; i++) {
+    float r = round_bf16(src[i]);
+    uint32_t u;
+    memcpy(&u, &r, sizeof u);
+    dst[i] = (uint16_t)(u >> BF16_SHIFT);
+  }
+  return dst;
+}
+
+int nemo_audio_encode_with_asr(NemoAudioEncoder *enc, const float *pcm,
+                               int pcm_samples, const PassWait *wait,
+                               float **out_embeds, uint16_t **out_asr_bf16,
+                               int *out_tokens, char *error, size_t error_cap) {
   if (out_embeds) *out_embeds = NULL;
+  if (out_asr_bf16) *out_asr_bf16 = NULL;
   if (out_tokens) *out_tokens = 0;
   if (!enc || !pcm || pcm_samples < NEMO_AUDIO_HOP_LEN) {
     set_audio_err(error, error_cap, "audio clip is too short to encode");
@@ -1540,11 +1554,151 @@ int nemo_audio_encode(NemoAudioEncoder *enc, const float *pcm, int pcm_samples,
            (size_t)rows * NEMO_AUDIO_OUT_DIM * sizeof(float));
   }
 
+  if (out_asr_bf16) {
+    *out_asr_bf16 = pack_f32_to_bf16_alloc(asr_all, (size_t)total_tokens *
+                                                        NEMO_AUDIO_ASR_DIM);
+  }
   free(asr_all);
   free(probs_all);
   free_scratch(&s);
 
   *out_embeds = embeds;
+  *out_tokens = total_tokens;
+  return 1;
+}
+
+int nemo_audio_encode(NemoAudioEncoder *enc, const float *pcm, int pcm_samples,
+                      const PassWait *wait, float **out_embeds, int *out_tokens,
+                      char *error, size_t error_cap) {
+  return nemo_audio_encode_with_asr(enc, pcm, pcm_samples, wait, out_embeds,
+                                    NULL, out_tokens, error, error_cap);
+}
+
+int nemo_audio_encode_asr_only(NemoAudioEncoder *enc, const float *pcm,
+                               int pcm_samples, const PassWait *wait,
+                               uint16_t **out_asr_bf16, int *out_tokens,
+                               char *error, size_t error_cap) {
+  if (out_asr_bf16) *out_asr_bf16 = NULL;
+  if (out_tokens) *out_tokens = 0;
+  if (!enc || !pcm || pcm_samples < NEMO_AUDIO_HOP_LEN) {
+    set_audio_err(error, error_cap, "audio clip is too short to encode");
+    return 0;
+  }
+  if (!weight_group_load(enc->weights)) {
+    set_audio_err(error, error_cap,
+                  "perception weights do not fit in available memory");
+    return 0;
+  }
+
+  int mel_frames = nemo_audio_mel_frames(pcm_samples);
+  int total_tokens = nemo_audio_token_count(pcm_samples);
+
+  float *mel_raw =
+      xmalloc((size_t)mel_frames * NEMO_AUDIO_N_MELS * sizeof(float));
+  float *mel_asr =
+      xmalloc((size_t)mel_frames * NEMO_AUDIO_N_MELS * sizeof(float));
+  nemo_audio_mel_spectrogram(pcm, pcm_samples, enc->window, enc->fb, mel_raw);
+  nemo_audio_normalize_per_feature(mel_raw, mel_frames, mel_asr);
+  free(mel_raw);
+
+  int use_online = mel_frames > NEMO_AUDIO_ONLINE_MEL_FRAMES;
+  int max_tokens =
+      use_online ? (NEMO_AUDIO_ONLINE_TOKENS + NEMO_AUDIO_CTX_LEFT_TOKENS +
+                    NEMO_AUDIO_CTX_RIGHT_TOKENS)
+                 : total_tokens;
+  int max_seq_stride = align_up(max_tokens, (int)AUD_TILE);
+  int max_fp8_pad = align_up(max_tokens, (int)AUD_FP8_M_TILE);
+
+  AudScratch s = {0};
+  int alloc_ok =
+      try_buf(enc->gpu, enc->work, &s.in,
+              (size_t)max_tokens * NEMO_AUDIO_STACK_DIM * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.h,
+              (size_t)max_tokens * NEMO_AUDIO_ASR_DIM * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.norm,
+              (size_t)max_tokens * NEMO_AUDIO_ASR_DIM * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.qkv,
+              (size_t)max_tokens * 3u * NEMO_AUDIO_ASR_DIM * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.q_hm,
+              (size_t)NEMO_AUDIO_ASR_HEADS * max_seq_stride *
+                  NEMO_AUDIO_ASR_HEAD_DIM * sizeof(uint16_t)) &&
+      try_buf(enc->gpu, enc->work, &s.k_hm,
+              (size_t)NEMO_AUDIO_ASR_HEADS * max_seq_stride *
+                  NEMO_AUDIO_ASR_HEAD_DIM * sizeof(uint16_t)) &&
+      try_buf(enc->gpu, enc->work, &s.v_hm,
+              (size_t)NEMO_AUDIO_ASR_HEADS * max_seq_stride *
+                  NEMO_AUDIO_ASR_HEAD_DIM * sizeof(uint16_t)) &&
+      try_buf(enc->gpu, enc->work, &s.attn_out,
+              (size_t)max_tokens * NEMO_AUDIO_ASR_DIM * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.ffn,
+              (size_t)max_tokens * NEMO_AUDIO_ASR_FFN * sizeof(float)) &&
+      try_buf(enc->gpu, enc->work, &s.x_bf16,
+              (size_t)max_fp8_pad * NEMO_AUDIO_ASR_FFN * sizeof(uint16_t));
+  if (!alloc_ok) {
+    free_scratch(&s);
+    free(mel_asr);
+    set_audio_err(error, error_cap,
+                  "perception workspace does not fit in available memory");
+    return 0;
+  }
+
+  float *asr_all =
+      xmalloc((size_t)total_tokens * NEMO_AUDIO_ASR_DIM * sizeof(float));
+  if (!use_online) {
+    nemo_audio_stack_frames(mel_asr, mel_frames, (float *)s.in.ptr);
+    run_transformer_window(enc, &s, total_tokens, NEMO_AUDIO_ASR_DIM,
+                           NEMO_AUDIO_ASR_HEADS, NEMO_AUDIO_ASR_HEAD_DIM,
+                           NEMO_AUDIO_ASR_HALF_ROT, 1, NEMO_AUDIO_ASR_LAYERS, 0,
+                           &enc->asr_pre_proj, &enc->asr_embed_nw,
+                           &enc->asr_embed_nb, &enc->asr_final_nw,
+                           &enc->asr_final_nb, enc->asr_layers, wait);
+    gpu_sync(enc->gpu);
+    memcpy(asr_all, s.h.ptr,
+           (size_t)total_tokens * NEMO_AUDIO_ASR_DIM * sizeof(float));
+  } else {
+    int chunk_feat = NEMO_AUDIO_ONLINE_MEL_FRAMES;
+    int left_ctx_feat = NEMO_AUDIO_CTX_LEFT_TOKENS * NEMO_AUDIO_SUBSAMPLE;
+    int right_ctx_feat = NEMO_AUDIO_CTX_RIGHT_TOKENS * NEMO_AUDIO_SUBSAMPLE;
+    int num_chunks = (mel_frames + chunk_feat - 1) / chunk_feat;
+    for (int ci = 0; ci < num_chunks; ci++) {
+      int start = ci * chunk_feat;
+      int end = start + chunk_feat;
+      if (end > mel_frames) end = mel_frames;
+      int ctx_start = start - left_ctx_feat;
+      if (ctx_start < 0) ctx_start = 0;
+      int ctx_end = end + right_ctx_feat;
+      if (ctx_end > mel_frames) ctx_end = mel_frames;
+
+      int win_mel = ctx_end - ctx_start;
+      int win_toks =
+          (win_mel + NEMO_AUDIO_SUBSAMPLE - 1) / NEMO_AUDIO_SUBSAMPLE;
+      int left_drop = (start - ctx_start) / NEMO_AUDIO_SUBSAMPLE;
+      int out_pos = (start + NEMO_AUDIO_SUBSAMPLE - 1) / NEMO_AUDIO_SUBSAMPLE;
+      int out_end = (end + NEMO_AUDIO_SUBSAMPLE - 1) / NEMO_AUDIO_SUBSAMPLE;
+      int core_len = out_end - out_pos;
+
+      nemo_audio_stack_frames(mel_asr + (size_t)ctx_start * NEMO_AUDIO_N_MELS,
+                              win_mel, (float *)s.in.ptr);
+      run_transformer_window(enc, &s, win_toks, NEMO_AUDIO_ASR_DIM,
+                             NEMO_AUDIO_ASR_HEADS, NEMO_AUDIO_ASR_HEAD_DIM,
+                             NEMO_AUDIO_ASR_HALF_ROT, 1, NEMO_AUDIO_ASR_LAYERS,
+                             0, &enc->asr_pre_proj, &enc->asr_embed_nw,
+                             &enc->asr_embed_nb, &enc->asr_final_nw,
+                             &enc->asr_final_nb, enc->asr_layers, wait);
+      gpu_sync(enc->gpu);
+      memcpy(asr_all + (size_t)out_pos * NEMO_AUDIO_ASR_DIM,
+             (const float *)s.h.ptr + (size_t)left_drop * NEMO_AUDIO_ASR_DIM,
+             (size_t)core_len * NEMO_AUDIO_ASR_DIM * sizeof(float));
+    }
+  }
+
+  free(mel_asr);
+  free_scratch(&s);
+  uint16_t *packed = pack_f32_to_bf16_alloc(asr_all, (size_t)total_tokens *
+                                                         NEMO_AUDIO_ASR_DIM);
+  free(asr_all);
+
+  *out_asr_bf16 = packed;
   *out_tokens = total_tokens;
   return 1;
 }

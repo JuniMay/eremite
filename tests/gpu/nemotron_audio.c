@@ -93,6 +93,23 @@ typedef struct {
   float eps, threshold, scale;
 } AudFuseParam;
 
+typedef struct {
+  // Input frame count and feature width (multiple of 4).
+  uint32_t frames, dim;
+} CtcInterleaveParam;
+
+typedef struct {
+  // Number of float4 elements and BF16 rounding flag.
+  uint32_t count4, round;
+  // Residual blend scale factor.
+  float scale;
+} CtcResidParam;
+
+typedef struct {
+  // Row count, full vocabulary size and gathered token count.
+  uint32_t rows, vocab, n_gather;
+} CtcLogSoftmaxParam;
+
 // Deterministic PRNG state for reproducible test tensors.
 static uint64_t rng_state = 0x5EED123456789ABCULL;
 
@@ -400,8 +417,10 @@ static void test_qkv_and_attn(Gpu *gpu, MemorySlot *slot, int heads,
                      .seq_stride = (uint32_t)seq_stride,
                      .heads = (uint32_t)heads,
                      .log2_scale = (float)(LOG2_E / sqrt((double)head_dim))};
-  int k_attn = gpu_find_kernel(gpu, head_dim == 128 ? "nemo_aud_flash_attn_128"
-                                                    : "nemo_aud_flash_attn_64");
+  const char *attn_name = head_dim == 128  ? "nemo_aud_flash_attn_128"
+                          : head_dim == 80 ? "nemo_aud_flash_attn_80"
+                                           : "nemo_aud_flash_attn_64";
+  int k_attn = gpu_find_kernel(gpu, attn_name);
 
   GpuCommandBuffer cb = gpu_begin(gpu);
   gpu_select_kernel(&cb, gpu_find_kernel(gpu, "nemo_aud_qkv_prep"));
@@ -689,6 +708,141 @@ static void test_diar_head_and_fuse(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&bx);
 }
 
+// Verifies nemo_ctc_interleave, nemo_ctc_residual_add and
+// nemo_ctc_log_softmax_gather against FP32 CPU references.
+static void test_ctc_kernels(Gpu *gpu, MemorySlot *slot) {
+  static constexpr int FRAMES = 11, DIM = 1280, UP = 2 * FRAMES;
+  static constexpr int VOCAB = 23863, GATHER = 37;
+  static constexpr float RESID_SCALE = 0.1f;
+  static constexpr uint32_t RESID_THREADS = 256;
+
+  Buf beven = gpu_alloc(gpu, slot, (size_t)FRAMES * DIM * sizeof(float));
+  Buf bodd = gpu_alloc(gpu, slot, (size_t)FRAMES * DIM * sizeof(float));
+  Buf bup = gpu_alloc(gpu, slot, (size_t)UP * DIM * sizeof(float));
+  Buf bbridged = gpu_alloc(gpu, slot, (size_t)UP * DIM * sizeof(float));
+  Buf bblend = gpu_alloc(gpu, slot, (size_t)UP * DIM * sizeof(float));
+
+  float *even = (float *)beven.ptr, *odd = (float *)bodd.ptr,
+        *bridged = (float *)bbridged.ptr;
+  for (int i = 0; i < FRAMES * DIM; i++) {
+    even[i] = randf() * 2.0f;
+    odd[i] = randf() * 2.0f;
+  }
+  for (int i = 0; i < UP * DIM; i++) bridged[i] = randf() * 3.0f;
+
+  CtcInterleaveParam ip = {.frames = FRAMES, .dim = DIM};
+  uint32_t count4 = (uint32_t)((UP * DIM) / 4);
+  CtcResidParam rp = {.count4 = count4, .round = 1, .scale = RESID_SCALE};
+
+  GpuCommandBuffer cb = gpu_begin(gpu);
+  gpu_select_kernel(&cb, gpu_find_kernel(gpu, "nemo_ctc_interleave"));
+  gpu_bind_buffer(&cb, 0, &beven, 0);
+  gpu_bind_buffer(&cb, 1, &bodd, 0);
+  gpu_bind_buffer(&cb, 2, &bup, 0);
+  gpu_copy_bytes(&cb, 3, &ip, sizeof ip);
+  gpu_run_kernel(&cb,
+                 (uint32_t)(DIM / 4 + AUD_PACK_THREADS - 1) / AUD_PACK_THREADS,
+                 FRAMES, 1, AUD_PACK_THREADS, 1, 1);
+
+  gpu_select_kernel(&cb, gpu_find_kernel(gpu, "nemo_ctc_residual_add"));
+  gpu_bind_buffer(&cb, 0, &bup, 0);
+  gpu_bind_buffer(&cb, 1, &bbridged, 0);
+  gpu_bind_buffer(&cb, 2, &bblend, 0);
+  gpu_copy_bytes(&cb, 3, &rp, sizeof rp);
+  gpu_run_kernel(&cb, (count4 + RESID_THREADS - 1) / RESID_THREADS, 1, 1,
+                 RESID_THREADS, 1, 1);
+  gpu_commit(&cb);
+  gpu_sync(gpu);
+
+  float *ref_up = xmalloc((size_t)UP * DIM * sizeof(float));
+  float *ref_blend = xmalloc((size_t)UP * DIM * sizeof(float));
+  for (int f = 0; f < FRAMES; f++) {
+    memcpy(ref_up + (size_t)(2 * f) * DIM, even + (size_t)f * DIM,
+           (size_t)DIM * sizeof(float));
+    memcpy(ref_up + (size_t)(2 * f + 1) * DIM, odd + (size_t)f * DIM,
+           (size_t)DIM * sizeof(float));
+  }
+  for (int i = 0; i < UP * DIM; i++)
+    ref_blend[i] = rbf(ref_up[i] + RESID_SCALE * bridged[i]);
+  float up_err = max_diff((const float *)bup.ptr, ref_up, (size_t)UP * DIM);
+  float bl_err =
+      max_diff((const float *)bblend.ptr, ref_blend, (size_t)UP * DIM);
+  checkf(up_err == 0.0f, "nemo_ctc_interleave exact match (max=%.2e)", up_err);
+  checkf(bl_err == 0.0f, "nemo_ctc_residual_add exact match (max=%.2e)",
+         bl_err);
+
+  // Test nemo_ctc_log_softmax_gather with full 23863-class CTC vocabulary,
+  // including ties in maximum logits to verify lowest-index argmax.
+  static constexpr int LROWS = 7;
+  Buf blogits = gpu_alloc(gpu, slot, (size_t)LROWS * VOCAB * sizeof(float));
+  Buf bgids = gpu_alloc(gpu, slot, (size_t)GATHER * sizeof(uint32_t));
+  Buf blogp = gpu_alloc(gpu, slot, (size_t)LROWS * GATHER * sizeof(float));
+  Buf bargmax = gpu_alloc(gpu, slot, (size_t)LROWS * sizeof(uint32_t));
+
+  float *logits = (float *)blogits.ptr;
+  uint32_t *gids = (uint32_t *)bgids.ptr;
+  for (int r = 0; r < LROWS; r++) {
+    for (int v = 0; v < VOCAB; v++) logits[r * VOCAB + v] = randf() * 5.0f;
+    // Plant a known tie on row 3 so lowest-index tie-breaking is exercised.
+    if (r == 3) {
+      logits[r * VOCAB + 1024] = 9.5f;
+      logits[r * VOCAB + 20000] = 9.5f;
+    }
+  }
+  for (int j = 0; j < GATHER - 1; j++) gids[j] = (uint32_t)((j * 617) % VOCAB);
+  gids[GATHER - 1] = VOCAB - 1;
+
+  CtcLogSoftmaxParam lp = {.rows = LROWS, .vocab = VOCAB, .n_gather = GATHER};
+  cb = gpu_begin(gpu);
+  gpu_select_kernel(&cb, gpu_find_kernel(gpu, "nemo_ctc_log_softmax_gather"));
+  gpu_bind_buffer(&cb, 0, &blogits, 0);
+  gpu_bind_buffer(&cb, 1, &bgids, 0);
+  gpu_bind_buffer(&cb, 2, &blogp, 0);
+  gpu_bind_buffer(&cb, 3, &bargmax, 0);
+  gpu_copy_bytes(&cb, 4, &lp, sizeof lp);
+  gpu_run_kernel(&cb, LROWS, 1, 1, AUD_ROW_THREADS, 1, 1);
+  gpu_commit(&cb);
+  gpu_sync(gpu);
+
+  float *ref_lp = xmalloc((size_t)LROWS * GATHER * sizeof(float));
+  int argmax_ok = 1;
+  for (int r = 0; r < LROWS; r++) {
+    const float *row = logits + (size_t)r * VOCAB;
+    float mx = -INFINITY;
+    uint32_t best = 0;
+    for (int v = 0; v < VOCAB; v++) {
+      if (row[v] > mx) {
+        mx = row[v];
+        best = (uint32_t)v;
+      }
+    }
+    if (((const uint32_t *)bargmax.ptr)[r] != best) argmax_ok = 0;
+    double sum = 0.0;
+    for (int v = 0; v < VOCAB; v++) sum += exp((double)row[v] - (double)mx);
+    double lse = (double)mx + log(sum);
+    for (int j = 0; j < GATHER; j++)
+      ref_lp[r * GATHER + j] = (float)((double)row[gids[j]] - lse);
+  }
+  float lp_err =
+      max_diff((const float *)blogp.ptr, ref_lp, (size_t)LROWS * GATHER);
+  checkf(argmax_ok && lp_err < TOL_F32,
+         "nemo_ctc_log_softmax_gather matches CPU (argmax=%d, max=%.2e)",
+         argmax_ok, lp_err);
+
+  free(ref_lp);
+  free(ref_blend);
+  free(ref_up);
+  gpu_free(&bargmax);
+  gpu_free(&blogp);
+  gpu_free(&bgids);
+  gpu_free(&blogits);
+  gpu_free(&bblend);
+  gpu_free(&bbridged);
+  gpu_free(&bup);
+  gpu_free(&bodd);
+  gpu_free(&beven);
+}
+
 int main(void) {
   Memory *mem = memory_new();
   MemoryAccount account;
@@ -705,8 +859,10 @@ int main(void) {
   test_mm_fp8(gpu, &slot);
   test_mm_bf16(gpu, &slot);
   test_qkv_and_attn(gpu, &slot, 10, 128, 32, 1, "ASR 10x128 qk_norm half-RoPE");
+  test_qkv_and_attn(gpu, &slot, 16, 80, 20, 1, "CTC 16x80 qk_norm half-RoPE");
   test_qkv_and_attn(gpu, &slot, 8, 64, 32, 0, "Diar 8x64 full-RoPE");
   test_diar_head_and_fuse(gpu, &slot);
+  test_ctc_kernels(gpu, &slot);
 
   return failures != 0;
 }

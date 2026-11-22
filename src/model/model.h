@@ -303,6 +303,14 @@ typedef struct {
   double image_seconds;
 } ImageResult;
 
+// One word aligned to an audio clip by a model's CTC timestamp head.
+typedef struct {
+  // Byte start (inclusive) and end (exclusive) offsets in the UTF-8 transcript.
+  int byte_start, byte_end;
+  // Aligned start and end times in seconds within [0, duration].
+  double start, end;
+} AudioWord;
+
 // Input and output limits of an image generation model.
 typedef struct {
   // Maximum prompt tokens retained before encoding.
@@ -600,6 +608,18 @@ typedef struct {
   // Returns 0 if the memory does not fit the encoding.
   int (*encode_media)(Media *im);
   void (*set_prefill_media)(const Media *im, int n);
+  // Returns nonzero when checkpoint dir supports word-level audio timestamp
+  // alignment. Null for models without an audio alignment head.
+  int (*can_align_audio)(const char *dir);
+  // Aligns UTF-8 transcript text against encoded audio file bytes. Writes a
+  // heap-allocated array of *out_count words to *out_words and clip duration
+  // in seconds to *out_duration when non-null. Returns 1 on success or 0 with
+  // error populated. Null for models without an audio alignment head.
+  int (*align_audio)(const void *audio_data, size_t audio_len,
+                     const char *transcript, size_t transcript_len,
+                     const PassWait *wait, AudioWord **out_words,
+                     int *out_count, double *out_duration, char *error,
+                     size_t error_cap);
   // Writes the experts that row `row` of the latest decoding pass chose, and
   // where each one was; null for a model without routed experts.
   int (*read_routes)(int row, uint16_t *id, uint8_t *from);

@@ -879,6 +879,29 @@ int eremite_media_encode(eremite_media *x, int from);
 // Closes the inputs, after that prefill.
 void eremite_media_close(eremite_media *x);
 
+// One word aligned to an audio clip by a model's CTC timestamp head.
+typedef struct {
+  // Byte start (inclusive) and end (exclusive) offsets in the UTF-8 transcript.
+  int byte_start, byte_end;
+  // Aligned start and end times in seconds within [0, duration].
+  double start, end;
+} eremite_audio_word;
+
+// Returns nonzero when model m supports word-level audio timestamp alignment.
+int eremite_can_align_audio(const eremite_model *m);
+// Aligns UTF-8 transcript[0..transcript_len - 1] against encoded audio bytes
+// audio_data[0..audio_len - 1]. Writes a heap-allocated array of *out_count
+// words to *out_words (caller frees with eremite_audio_words_free) and audio
+// duration in seconds to *out_duration when non-null. Returns 1 on success or
+// 0 with an error message in error.
+int eremite_align_audio(eremite_model *m, const uint8_t *audio_data,
+                        size_t audio_len, const char *transcript,
+                        size_t transcript_len, eremite_audio_word **out_words,
+                        int *out_count, double *out_duration, char *error,
+                        size_t error_cap);
+// Releases a word array returned by eremite_align_audio.
+void eremite_audio_words_free(eremite_audio_word *words);
+
 // ---- statistics, for the server's status ----
 
 // An expert cache's counts, as ExpertStoreCounts holds them.

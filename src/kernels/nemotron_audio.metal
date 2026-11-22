@@ -92,6 +92,26 @@ struct NemoAudFuseParam {
   float eps, threshold, scale;
 };
 
+// Parameters for interleaving even and odd upsampled frame matrices.
+struct NemoCtcInterleaveParam {
+  // Input encoder frame count and feature width (multiple of 4).
+  uint frames, dim;
+};
+
+// Parameters for scaled residual blending of upsampled and bridged CTC states.
+struct NemoCtcResidParam {
+  // Total float4 elements across all rows and BF16 rounding flag.
+  uint count4, round;
+  // Scalar multiplier on the bridged Transformer output.
+  float scale;
+};
+
+// Parameters for row-wise CTC log-softmax gather and argmax decoding.
+struct NemoCtcLogSoftmaxParam {
+  // Row count, full CTC vocabulary size (including blank) and gathered count.
+  uint rows, vocab, n_gather;
+};
+
 // Exact GELU activation matching PyTorch nn.GELU(approximate='none').
 inline float nemo_aud_gelu(float x) {
   float z = x * NEMO_AUD_INV_SQRT2;
@@ -497,6 +517,10 @@ template [[host_name("nemo_aud_flash_attn_64")]] kernel void
 nemo_aud_flash_attn<64>(device const bfloat *, device const bfloat *,
                         device const bfloat *, device float *,
                         constant NemoAudAttnParam &, uint2, uint, uint);
+template [[host_name("nemo_aud_flash_attn_80")]] kernel void
+nemo_aud_flash_attn<80>(device const bfloat *, device const bfloat *,
+                        device const bfloat *, device float *,
+                        constant NemoAudAttnParam &, uint2, uint, uint);
 template [[host_name("nemo_aud_flash_attn_128")]] kernel void
 nemo_aud_flash_attn<128>(device const bfloat *, device const bfloat *,
                          device const bfloat *, device float *,
@@ -618,5 +642,97 @@ kernel void nemo_aud_fuse(device const float *asr [[buffer(0)]],
     for (uint k = 0; k < p.n_spk; k++)
       inf += dn[k] * diar_kernel[(ulong)k * p.dim + i];
     dst[i] = bf(an + p.scale * bf(inf));
+  }
+}
+
+// Interleaves even [frames, dim] and odd [frames, dim] ConvTranspose1d outputs
+// into [2 * frames, dim]. Grid: x = dim / 4, y = frames.
+kernel void nemo_ctc_interleave(device const float4 *even [[buffer(0)]],
+                                device const float4 *odd [[buffer(1)]],
+                                device float4 *out [[buffer(2)]],
+                                constant NemoCtcInterleaveParam &p [[buffer(3)]],
+                                uint2 i [[thread_position_in_grid]]) {
+  uint cols4 = p.dim / 4u;
+  if (i.x >= cols4 || i.y >= p.frames) return;
+  ulong src = (ulong)i.y * cols4 + i.x;
+  ulong dst_even = (ulong)(2u * i.y) * cols4 + i.x;
+  ulong dst_odd = dst_even + cols4;
+  out[dst_even] = even[src];
+  out[dst_odd] = odd[src];
+}
+
+// Computes out = up + scale * bridged elementwise over float4 vectors, with
+// optional BF16 rounding. Grid: 1D count4 threads.
+kernel void nemo_ctc_residual_add(device const float4 *up [[buffer(0)]],
+                                  device const float4 *bridged [[buffer(1)]],
+                                  device float4 *out [[buffer(2)]],
+                                  constant NemoCtcResidParam &p [[buffer(3)]],
+                                  uint idx [[thread_position_in_grid]]) {
+  if (idx >= p.count4) return;
+  float4 v = up[idx] + p.scale * bridged[idx];
+  if (p.round) {
+    v = float4(bf(v.x), bf(v.y), bf(v.z), bf(v.w));
+  }
+  out[idx] = v;
+}
+
+// Computes exact FP32 row-wise log_softmax over [rows, vocab], gathers
+// log-probabilities for gather_ids[0..n_gather - 1] into out_logp, and writes
+// each row's argmax token index into out_argmax.
+// Grid: rows threadgroups of 256 threads.
+kernel void nemo_ctc_log_softmax_gather(
+    device const float *logits [[buffer(0)]],
+    device const uint *gather_ids [[buffer(1)]],
+    device float *out_logp [[buffer(2)]],
+    device uint *out_argmax [[buffer(3)]],
+    constant NemoCtcLogSoftmaxParam &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint t [[thread_index_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
+  threadgroup float tmp[NEMO_AUD_SIMD];
+  threadgroup uint tmp_id[NEMO_AUD_SIMD];
+  if (row >= p.rows) return;
+  device const float *lr = logits + (ulong)row * p.vocab;
+
+  float best_v = -INFINITY;
+  uint best_id = 0u;
+  for (uint v = t; v < p.vocab; v += nt) {
+    float x = lr[v];
+    if (x > best_v) {
+      best_v = x;
+      best_id = v;
+    }
+  }
+  float sg_max = simd_max(best_v);
+  uint sg_win = simd_min(best_v == sg_max ? best_id : UINT_MAX);
+  uint lane = t % NEMO_AUD_SIMD;
+  uint sg = t / NEMO_AUD_SIMD;
+  uint nsg = (nt + NEMO_AUD_SIMD - 1u) / NEMO_AUD_SIMD;
+  if (lane == 0u) {
+    tmp[sg] = sg_max;
+    tmp_id[sg] = sg_win;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float row_max = -INFINITY;
+  uint argmax = 0u;
+  for (uint s = 0u; s < nsg; s++) {
+    float mv = tmp[s];
+    uint mi = tmp_id[s];
+    if (mv > row_max || (mv == row_max && mi < argmax)) {
+      row_max = mv;
+      argmax = mi;
+    }
+  }
+  if (t == 0u) out_argmax[row] = argmax;
+
+  float sum = 0.0f;
+  for (uint v = t; v < p.vocab; v += nt) sum += exp(lr[v] - row_max);
+  float lse = row_max + log(tg_sum(sum, tmp, t, nt));
+
+  device float *dst = out_logp + (ulong)row * p.n_gather;
+  for (uint j = t; j < p.n_gather; j += nt) {
+    uint id = gather_ids[j];
+    dst[j] = id < p.vocab ? (lr[id] - lse) : -INFINITY;
   }
 }

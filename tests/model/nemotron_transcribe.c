@@ -169,7 +169,6 @@ int main(int argc, char **argv) {
   eremite_media *media =
       eremite_media_open(m, data_arr, len_arr, 1, err, sizeof err);
   checkf(media != NULL, "decoded audio media (err=%s)", err);
-  free(audio_bytes);
 
   const char *prompt =
       "<|im_start|>system\n<|im_end|>\n"
@@ -438,6 +437,34 @@ int main(int argc, char **argv) {
            expect);
   }
 
+  // Verify CTC word-level timestamp alignment through the public engine ABI
+  // (reusing cached pre-fusion ASR states from media encoding).
+  if (eremite_can_align_audio(m)) {
+    eremite_audio_word *words = NULL;
+    int n_words = 0;
+    double clip_dur = 0.0;
+    char align_err[256] = {0};
+    double t_al0 = now();
+    int al_ok =
+        eremite_align_audio(m, audio_bytes, audio_len, text, text_len, &words,
+                            &n_words, &clip_dur, align_err, sizeof align_err);
+    double al_s = now() - t_al0;
+    int mono = 1;
+    for (int i = 0; i < n_words; i++) {
+      if (words[i].byte_start < 0 || words[i].byte_end <= words[i].byte_start ||
+          (size_t)words[i].byte_end > text_len || words[i].start < 0.0 ||
+          words[i].end < words[i].start || words[i].end > clip_dur + 1e-6) {
+        mono = 0;
+      }
+      if (i > 0 && words[i].start < words[i - 1].end - 1e-9) mono = 0;
+    }
+    checkf(al_ok == 1 && n_words > 0 && mono && clip_dur > 0.0,
+           "eremite_align_audio aligned %d words over %.2fs in %.4fs (err=%s)",
+           n_words, clip_dur, al_s, align_err);
+    eremite_audio_words_free(words);
+  }
+
+  free(audio_bytes);
   eremite_media_close(media);
   eremite_state_free(m, st);
   free(raw_toks);

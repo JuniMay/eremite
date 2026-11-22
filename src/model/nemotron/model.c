@@ -13,6 +13,7 @@
 #include "gpu/gpu.h"
 #include "model/model.h"
 #include "model/nemotron/audio.h"
+#include "model/nemotron/ctc.h"
 #include "platform/video.h"
 #include <errno.h>
 #include <math.h>
@@ -440,6 +441,31 @@ static WeightGroup *text_weights;
 static ExpertStore *experts_store;
 static int store_started;
 static NemoAudioEncoder *audio_enc;
+static NemoCtcAligner *ctc_aligner;
+
+// Bounded host LRU cache of recent BF16 ASR encoder states for zero-reencode
+// CTC timestamp alignment immediately after transcription.
+static constexpr int ASR_CACHE_SLOTS = 4;
+static constexpr size_t ASR_CACHE_MAX_BYTES = 128u << 20;
+
+typedef struct {
+  // FNV-1a hash of the uploaded encoded audio bytes.
+  uint64_t hash;
+  // Byte length of the uploaded encoded audio file (0 for an empty slot).
+  size_t source_len;
+  // Decoded 16 kHz mono PCM sample count for exact clip duration.
+  int pcm_samples;
+  // Number of 80 ms ASR encoder frames in asr_bf16.
+  int ntokens;
+  // Heap-allocated BF16 ASR states [ntokens, 1280].
+  uint16_t *asr_bf16;
+  // Monotonic use counter for LRU eviction.
+  uint64_t stamp;
+} AsrCacheEntry;
+
+static AsrCacheEntry asr_cache[ASR_CACHE_SLOTS];
+static uint64_t asr_cache_clock;
+static size_t asr_cache_bytes;
 
 static Buf embed_w, final_norm_w, lm_head_w;
 static LayerDesc layer_desc[NEMO_LAYERS];
@@ -2667,9 +2693,85 @@ static int nemo_prepare_media(const char *dir, Media *im, const void *data,
   return 1;
 }
 
+// Releases one ASR cache slot and updates the total cached byte count.
+static void asr_cache_free_slot(int idx) {
+  if (!asr_cache[idx].asr_bf16) return;
+  size_t bytes =
+      (size_t)asr_cache[idx].ntokens * NEMO_AUDIO_ASR_DIM * sizeof(uint16_t);
+  free(asr_cache[idx].asr_bf16);
+  asr_cache[idx] = (AsrCacheEntry){0};
+  asr_cache_bytes = asr_cache_bytes >= bytes ? asr_cache_bytes - bytes : 0;
+}
+
+// Releases all cached BF16 ASR states.
+static void asr_cache_clear(void) {
+  for (int i = 0; i < ASR_CACHE_SLOTS; i++) asr_cache_free_slot(i);
+}
+
+// Looks up cached BF16 ASR states by encoded audio hash and source length.
+static AsrCacheEntry *asr_cache_find(uint64_t hash, size_t source_len) {
+  for (int i = 0; i < ASR_CACHE_SLOTS; i++) {
+    if (asr_cache[i].asr_bf16 && asr_cache[i].hash == hash &&
+        (source_len == 0 || asr_cache[i].source_len == 0 ||
+         asr_cache[i].source_len == source_len)) {
+      asr_cache[i].stamp = ++asr_cache_clock;
+      return &asr_cache[i];
+    }
+  }
+  return NULL;
+}
+
+// Inserts heap-owned asr_bf16 [ntokens, 1280] into the bounded LRU cache,
+// evicting older entries as needed. Takes ownership of asr_bf16 (or frees it
+// if larger than ASR_CACHE_MAX_BYTES).
+static void asr_cache_put(uint64_t hash, size_t source_len, int pcm_samples,
+                          int ntokens, uint16_t *asr_bf16) {
+  if (!asr_bf16 || ntokens <= 0) {
+    free(asr_bf16);
+    return;
+  }
+  size_t bytes = (size_t)ntokens * NEMO_AUDIO_ASR_DIM * sizeof(uint16_t);
+  if (bytes > ASR_CACHE_MAX_BYTES) {
+    free(asr_bf16);
+    return;
+  }
+  for (int i = 0; i < ASR_CACHE_SLOTS; i++) {
+    if (asr_cache[i].asr_bf16 && asr_cache[i].hash == hash) {
+      asr_cache_free_slot(i);
+    }
+  }
+  while (asr_cache_bytes + bytes > ASR_CACHE_MAX_BYTES) {
+    int victim = -1;
+    for (int i = 0; i < ASR_CACHE_SLOTS; i++) {
+      if (!asr_cache[i].asr_bf16) continue;
+      if (victim < 0 || asr_cache[i].stamp < asr_cache[victim].stamp)
+        victim = i;
+    }
+    if (victim < 0) break;
+    asr_cache_free_slot(victim);
+  }
+  int slot = -1;
+  for (int i = 0; i < ASR_CACHE_SLOTS; i++) {
+    if (!asr_cache[i].asr_bf16) {
+      slot = i;
+      break;
+    }
+    if (slot < 0 || asr_cache[i].stamp < asr_cache[slot].stamp) slot = i;
+  }
+  if (asr_cache[slot].asr_bf16) asr_cache_free_slot(slot);
+  asr_cache[slot] = (AsrCacheEntry){.hash = hash,
+                                    .source_len = source_len,
+                                    .pcm_samples = pcm_samples,
+                                    .ntokens = ntokens,
+                                    .asr_bf16 = asr_bf16,
+                                    .stamp = ++asr_cache_clock};
+  asr_cache_bytes += bytes;
+}
+
 // Runs the Parallel Expert Perception audio encoder on `im->pcm` and stores
-// `im->ntokens` BF16 feature rows of width 2688 in `im->rows`. Returns 1 on
-// success or 0 when memory does not fit or perception is unavailable.
+// `im->ntokens` BF16 feature rows of width 2688 in `im->rows`. Also caches
+// pre-fusion BF16 ASR states when the CTC timestamp artifact is present.
+// Returns 1 on success or 0 when memory does not fit or perception is absent.
 static int nemo_encode_media(Media *im) {
   if (!has_audio || !im || !im->pcm || im->pcm_samples <= 0) return 0;
   if (!audio_enc) {
@@ -2678,28 +2780,152 @@ static int nemo_encode_media(Media *im) {
   }
   nemo_audio_pin(audio_enc, 1);
   float *emb = NULL;
+  uint16_t *asr_bf16 = NULL;
   int ntokens = 0;
+  int capture_asr = nemo_ctc_available(model_dir);
   char err[256] = {0};
-  int ok = nemo_audio_encode(audio_enc, im->pcm, im->pcm_samples, NULL, &emb,
-                             &ntokens, err, sizeof err);
+  int ok = nemo_audio_encode_with_asr(audio_enc, im->pcm, im->pcm_samples, NULL,
+                                      &emb, capture_asr ? &asr_bf16 : NULL,
+                                      &ntokens, err, sizeof err);
   nemo_audio_pin(audio_enc, 0);
   if (!ok || !emb || ntokens != im->ntokens) {
+    free(asr_bf16);
     free(emb);
     return 0;
   }
   size_t count = (size_t)ntokens * NEMO_DIM;
   uint16_t *rows = memory_host_alloc(work_slot, count * sizeof(uint16_t));
   if (!rows) {
+    free(asr_bf16);
     free(emb);
     return 0;
   }
   for (size_t i = 0; i < count; i++) rows[i] = f32_to_bf16(emb[i]);
   free(emb);
+  if (asr_bf16) asr_cache_put(im->hash, 0, im->pcm_samples, ntokens, asr_bf16);
   free(im->pcm);
   im->pcm = NULL;
   im->pcm_samples = 0;
   im->rows = rows;
   im->memory = work_slot;
+  return 1;
+}
+
+// Returns nonzero when checkpoint dir contains model-ctc-bf16.safetensors.
+static int nemo_can_align_audio(const char *dir) {
+  return nemo_ctc_available(dir);
+}
+
+// Aligns UTF-8 transcript[0..transcript_len - 1] against encoded audio bytes
+// using cached or freshly computed ASR encoder states and the CTC timestamp
+// head. Writes heap-allocated AudioWord array to *out_words.
+static int nemo_align_audio(const void *audio_data, size_t audio_len,
+                            const char *transcript, size_t transcript_len,
+                            const PassWait *wait, AudioWord **out_words,
+                            int *out_count, double *out_duration, char *error,
+                            size_t error_cap) {
+  if (out_words) *out_words = NULL;
+  if (out_count) *out_count = 0;
+  if (out_duration) *out_duration = 0.0;
+  if (!has_audio || !nemo_ctc_available(model_dir)) {
+    if (error && error_cap > 0)
+      snprintf(error, error_cap,
+               "checkpoint does not include model-ctc-bf16.safetensors");
+    return 0;
+  }
+  if (!audio_data || audio_len == 0) {
+    if (error && error_cap > 0) snprintf(error, error_cap, "empty audio input");
+    return 0;
+  }
+
+  uint64_t hash = fnv1a_bytes(audio_data, audio_len);
+  const uint16_t *asr_ptr = NULL;
+  uint16_t *owned_asr = NULL;
+  int ntokens = 0;
+  int pcm_samples = 0;
+
+  AsrCacheEntry *hit = asr_cache_find(hash, audio_len);
+  if (hit) {
+    asr_ptr = hit->asr_bf16;
+    ntokens = hit->ntokens;
+    pcm_samples = hit->pcm_samples;
+  } else {
+    const char *dec_err = NULL;
+    float *pcm =
+        audio_decode_pcm_mono(audio_data, audio_len, NEMO_AUDIO_SAMPLE_RATE,
+                              AUDIO_MAX_DECODE_SECONDS, &pcm_samples, &dec_err);
+    if (!pcm) {
+      if (error && error_cap > 0)
+        snprintf(error, error_cap, "%s",
+                 dec_err ? dec_err : "failed to decode audio");
+      return 0;
+    }
+    if (!audio_enc) {
+      audio_enc =
+          nemo_audio_open(gpu, work_slot->account, work_slot, model_dir);
+      if (!audio_enc) {
+        free(pcm);
+        if (error && error_cap > 0)
+          snprintf(error, error_cap, "failed to open perception audio encoder");
+        return 0;
+      }
+    }
+    nemo_audio_pin(audio_enc, 1);
+    int enc_ok =
+        nemo_audio_encode_asr_only(audio_enc, pcm, pcm_samples, wait,
+                                   &owned_asr, &ntokens, error, error_cap);
+    nemo_audio_pin(audio_enc, 0);
+    free(pcm);
+    if (!enc_ok || !owned_asr || ntokens <= 0) {
+      free(owned_asr);
+      return 0;
+    }
+    asr_ptr = owned_asr;
+  }
+
+  if (!ctc_aligner) {
+    ctc_aligner = nemo_ctc_open(gpu, work_slot->account, work_slot, model_dir);
+    if (!ctc_aligner) {
+      free(owned_asr);
+      if (error && error_cap > 0)
+        snprintf(error, error_cap, "failed to open model-ctc-bf16.safetensors");
+      return 0;
+    }
+  }
+
+  double duration = (double)pcm_samples / (double)NEMO_AUDIO_SAMPLE_RATE;
+  NemoCtcWord *ctc_words = NULL;
+  int count = 0;
+  nemo_ctc_pin(ctc_aligner, 1);
+  int ok = nemo_ctc_align(ctc_aligner, asr_ptr, ntokens, duration, transcript,
+                          transcript_len, wait, &ctc_words, &count, error,
+                          error_cap);
+  nemo_ctc_pin(ctc_aligner, 0);
+
+  if (owned_asr)
+    asr_cache_put(hash, audio_len, pcm_samples, ntokens, owned_asr);
+  if (!ok) {
+    free(ctc_words);
+    return 0;
+  }
+
+  AudioWord *words = NULL;
+  if (count > 0) {
+    words = xmalloc((size_t)count * sizeof *words);
+    for (int i = 0; i < count; i++) {
+      words[i] = (AudioWord){.byte_start = ctc_words[i].byte_start,
+                             .byte_end = ctc_words[i].byte_end,
+                             .start = ctc_words[i].start,
+                             .end = ctc_words[i].end};
+    }
+  }
+  free(ctc_words);
+  if (out_words)
+    *out_words = words;
+  else
+    free(words);
+  if (out_count) *out_count = count;
+  if (out_duration) *out_duration = duration;
   return 1;
 }
 
@@ -2878,6 +3104,9 @@ static void nemo_read_counters(ModelCounters *c) {
           (text_weights ? weight_group_resident_bytes(text_weights) : 0) +
           (audio_enc && nemo_audio_is_loaded(audio_enc)
                ? nemo_audio_weight_bytes(audio_enc)
+               : 0) +
+          (ctc_aligner && nemo_ctc_is_loaded(ctc_aligner)
+               ? nemo_ctc_weight_bytes(ctc_aligner)
                : 0),
       .required_bytes = required_bytes,
       .decode = decode_stats,
@@ -3347,6 +3576,8 @@ static void nemo_accept(ModelState *ms, const int *rows, int n, int pos) {
 
 // Resizes the expert cache while idle and returns remaining slot count.
 static int nemo_run_idle_work(void) {
+  if (text_weights && weight_group_resident_bytes(text_weights) == 0)
+    asr_cache_clear();
   if (!experts_store) return 0;
   expert_store_resize_when_idle(experts_store);
   return expert_store_slot_count(experts_store);
@@ -3460,6 +3691,8 @@ const ModelOps nemotron_ops = {.family = "Nemotron-H",
                                .prepare_media = nemo_prepare_media,
                                .encode_media = nemo_encode_media,
                                .set_prefill_media = nemo_set_prefill_media,
+                               .can_align_audio = nemo_can_align_audio,
+                               .align_audio = nemo_align_audio,
                                .render_chat_turn = nemo_render_chat_turn,
                                .pass_new = nemo_pass_new,
                                .pass_begin = nemo_pass_begin,

@@ -1635,6 +1635,56 @@ void eremite_media_close(eremite_media *x) {
   free(x->items), free(x);
 }
 
+int eremite_can_align_audio(const eremite_model *m) {
+  if (!m || !m->ops->can_align_audio || !m->ops->align_audio) return 0;
+  return m->ops->can_align_audio(m->dir);
+}
+
+int eremite_align_audio(eremite_model *m, const uint8_t *audio_data,
+                        size_t audio_len, const char *transcript,
+                        size_t transcript_len, eremite_audio_word **out_words,
+                        int *out_count, double *out_duration, char *error,
+                        size_t error_cap) {
+  if (out_words) *out_words = NULL;
+  if (out_count) *out_count = 0;
+  if (out_duration) *out_duration = 0.0;
+  if (!m || !m->ops->align_audio ||
+      (m->ops->can_align_audio && !m->ops->can_align_audio(m->dir))) {
+    if (error && error_cap > 0)
+      snprintf(error, error_cap,
+               "this model does not support word-level audio timestamps");
+    return 0;
+  }
+  AudioWord *raw = NULL;
+  int count = 0;
+  double duration = 0.0;
+  if (!m->ops->align_audio(audio_data, audio_len, transcript, transcript_len,
+                           NULL, &raw, &count, &duration, error, error_cap)) {
+    free(raw);
+    return 0;
+  }
+  eremite_audio_word *words = NULL;
+  if (count > 0) {
+    words = xmalloc((size_t)count * sizeof *words);
+    for (int i = 0; i < count; i++) {
+      words[i] = (eremite_audio_word){.byte_start = raw[i].byte_start,
+                                      .byte_end = raw[i].byte_end,
+                                      .start = raw[i].start,
+                                      .end = raw[i].end};
+    }
+  }
+  free(raw);
+  if (out_words)
+    *out_words = words;
+  else
+    free(words);
+  if (out_count) *out_count = count;
+  if (out_duration) *out_duration = duration;
+  return 1;
+}
+
+void eremite_audio_words_free(eremite_audio_word *words) { free(words); }
+
 // ---- statistics ----
 
 static eremite_cache_counts counts(const ExpertStoreCounts *c) {
