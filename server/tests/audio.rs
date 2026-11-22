@@ -409,4 +409,30 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
             "expected SSD streaming with partial expert cache, got cache={cache} counters={counters}"
         );
     }
+
+    // 3. MTP speculative decoding + SSD streaming (6 GiB cap, draft: 7):
+    // verify model-mtp-fp8.safetensors loads, status reports drafts=7 with
+    // partial expert cache, and transcript matches baseline verbatim.
+    {
+        let server = start_audio_server(&model_dir, json!({"memory": 6, "draft": 7}));
+        let (ct, body) = build_multipart(&[("file", Some("speech.wav"), &speech_wav)]);
+        let (code, _, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        let json_resp: Value = serde_json::from_slice(&resp_body).expect("JSON");
+        assert_eq!(json_resp["text"].as_str().unwrap(), expected_text);
+
+        let (code, status) = ask(&server, "GET", "/v1/models/nemotron-3.5-transcribe", None);
+        assert_eq!(code, 200);
+        assert_eq!(status["status"]["drafts"], 7);
+        let cache = &status["status"]["expert_cache"];
+        let counters = &status["status"]["engine_counters"];
+        let slots = cache["slots"].as_u64().unwrap();
+        let total_experts = counters["routed_layers"].as_u64().unwrap()
+            * counters["experts_per_layer"].as_u64().unwrap();
+        let misses = cache["misses"].as_u64().unwrap();
+        assert!(
+            slots < total_experts && misses > 0,
+            "expected SSD streaming with MTP active, got cache={cache} counters={counters}"
+        );
+    }
 }

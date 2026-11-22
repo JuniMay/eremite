@@ -35,6 +35,7 @@ static constexpr uint32_t BF16_SHIFT = 16;
 static constexpr uint32_t BF16_HALF = 0x7FFFu;
 static constexpr uint32_t BF16_MASK = 0xFFFF0000u;
 static constexpr uint32_t ACT_NONE = 0, ACT_RELU2 = 1;
+static constexpr uint32_t KV_SKIP_POS = 0xFFFFFFFFu;
 static constexpr uint32_t ROW_THREADS = 256, FP8_MV_THREADS = 256,
                           NV_MV_THREADS = 128, MM_THREADS = 128,
                           CONV_THREADS = 256, SSM_THREADS = 128,
@@ -58,8 +59,8 @@ typedef struct {
 } NormParam;
 
 typedef struct {
-  // Active rows, output width, inner width, residual and BF16 round flags.
-  uint32_t m, n, k, has_res, round;
+  // Active rows, output width, inner width, activation, residual and round.
+  uint32_t m, n, k, act, has_res, round;
   // Per-tensor weight scale multiplied by 256.
   float scale;
 } Fp8LinParam;
@@ -126,6 +127,32 @@ typedef struct {
   // Active rows, hidden width and top-k count.
   uint32_t rows, dim, topk;
 } MoeCombineParam;
+
+typedef struct {
+  // Active rows, hidden width and flag selecting h0 for row 0.
+  uint32_t rows, dim, use_h0;
+  // RMSNorm epsilon.
+  float eps;
+} MtpEhParam;
+
+typedef struct {
+  // Device addresses of one FP8 routed expert's up and down projections.
+  uint64_t w_up, w_down;
+  // Per-tensor up and down weight scales multiplied by 256.
+  float s_up, s_down;
+} Fp8ExpertRef;
+
+typedef struct {
+  // Winning logit value for one stage-1 unembed threadgroup.
+  float val;
+  // First vocabulary index achieving val.
+  int32_t idx;
+} ArgmaxPair;
+
+typedef struct {
+  // Vocabulary size and hidden width.
+  uint32_t vocab, k;
+} UnembedParam;
 
 // Deterministic xorshift64* PRNG state and helpers.
 static uint64_t rng_state = 0x243F6A8885A308D3ull;
@@ -318,20 +345,21 @@ static void test_fp8_linear(Gpu *g, MemorySlot *work) {
 
   for (size_t mi = 0; mi < sizeof MS / sizeof *MS; mi++) {
     int m = MS[mi];
-    int has_res = (mi & 1u) ? 1 : 0;
+    uint32_t act = (mi % 3u == 1u) ? ACT_RELU2 : ACT_NONE;
+    uint32_t has_res = (mi & 1u) ? 1u : 0u;
     for (int r = 0; r < m; r++) {
       for (int o = 0; o < N; o++) {
         double acc = 0.0;
         for (int k = 0; k < K; k++)
           acc += (double)xp[r * K + k] * (double)e4m3_to_f32(wp[o * K + k]);
         float v = round_bf((float)(acc * W_SCALE));
+        if (act == ACT_RELU2) v = round_bf(relu2f(v));
         if (has_res) v = round_bf(v + rp[r * N + o]);
         ref[r * N + o] = v;
       }
     }
 
-    Fp8LinParam p = {(uint32_t)m,       N,  K,
-                     (uint32_t)has_res, 1u, W_SCALE * FP8_UNDO};
+    Fp8LinParam p = {(uint32_t)m, N, K, act, has_res, 1u, W_SCALE * FP8_UNDO};
     GpuCommandBuffer cmd = gpu_begin(g);
     if (m <= (int)MOE_MV_MAX_M) {
       gpu_select_kernel(&cmd, k_mv);
@@ -363,10 +391,10 @@ static void test_fp8_linear(Gpu *g, MemorySlot *work) {
     gpu_commit(&cmd);
     gpu_sync(g);
 
-    float diff = max_abs_diff((const float *)y.ptr, ref, (size_t)m * N);
-    checkf(diff <= TOL_BF16,
-           "nemo_fp8_%s m=%d res=%d (off=8) matches CPU (max=%.2e)",
-           m <= (int)MOE_MV_MAX_M ? "mv" : "mm", m, has_res, diff);
+    float diff = max_rel_diff((const float *)y.ptr, ref, (size_t)m * N);
+    checkf(diff <= TOL_REL_BF16,
+           "nemo_fp8_%s m=%d act=%u res=%u (off=8) matches CPU (rel=%.2e)",
+           m <= (int)MOE_MV_MAX_M ? "mv" : "mm", m, act, has_res, diff);
   }
   free(ref);
   gpu_free(&w), gpu_free(&x), gpu_free(&res), gpu_free(&y), gpu_free(&x_pack);
@@ -1217,6 +1245,314 @@ static void test_moe_pipeline(Gpu *g, MemorySlot *work) {
       gpu_free(&h_bf16), gpu_free(&y_pair);
 }
 
+// Tests MTP-specific kernels: nemo_kv_store (single-state and batched with
+// skip), nemo_mtp_eh_cat (both use_h0 modes), nemo_moe_fp8_up_mv +
+// nemo_moe_fp8_down_mv + combine_add (8-byte offset weights), and fused
+// nemo_unembed_argmax_part + nemo_unembed_argmax_final (with tie-breaking).
+static void test_mtp_kernels(Gpu *g, MemorySlot *work) {
+  // 1. nemo_kv_store: single-state write at pos0=3 (rows=2) + batched write
+  // with row 1 skipped via KV_SKIP_POS.
+  static constexpr int KV_CAP = 16, KV_ROWS = 2, KV_POS0 = 3;
+  Buf k_raw = make_buf(g, work, (size_t)KV_ROWS * NEMO_KV_DIM * sizeof(float));
+  Buf v_raw = make_buf(g, work, (size_t)KV_ROWS * NEMO_KV_DIM * sizeof(float));
+  Buf k0 = make_buf(g, work, (size_t)KV_CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+  Buf k1 = make_buf(g, work, (size_t)KV_CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+  Buf v0 = make_buf(g, work, (size_t)KV_CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+  Buf v1 = make_buf(g, work, (size_t)KV_CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+  Buf kt = make_buf(g, work, (size_t)KV_ROWS * sizeof(KvTarget));
+  memset(k0.ptr, 0, k0.size), memset(k1.ptr, 0, k1.size);
+  memset(v0.ptr, 0, v0.size), memset(v1.ptr, 0, v1.size);
+  for (int i = 0; i < KV_ROWS * NEMO_KV_DIM; i++) {
+    ((float *)k_raw.ptr)[i] = round_bf(randf());
+    ((float *)v_raw.ptr)[i] = round_bf(randf());
+  }
+  QkvParam qp_single = {KV_ROWS, KV_ROWS, KV_POS0, 0u};
+  GpuCommandBuffer cmd = gpu_begin(g);
+  int k_kv_store = gpu_find_kernel(g, "nemo_kv_store");
+  gpu_select_kernel(&cmd, k_kv_store);
+  gpu_bind_buffer(&cmd, 0, &k_raw, 0);
+  gpu_bind_buffer(&cmd, 1, &v_raw, 0);
+  gpu_bind_buffer(&cmd, 2, &k0, 0);
+  gpu_bind_buffer(&cmd, 3, &k1, 0);
+  gpu_bind_buffer(&cmd, 4, &v0, 0);
+  gpu_bind_buffer(&cmd, 5, &v1, 0);
+  gpu_bind_buffer(&cmd, 6, &kt, 0);
+  gpu_copy_bytes(&cmd, 7, &qp_single, sizeof qp_single);
+  gpu_run_kernel(&cmd, 2u * NEMO_KV_HEADS, KV_ROWS, 1, QKV_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(g);
+
+  int kv_ok = 1;
+  for (int r = 0; r < KV_ROWS; r++) {
+    int p = KV_POS0 + r;
+    for (int d = 0; d < NEMO_HEAD_DIM; d++) {
+      if (bf16_to_f32(((const uint16_t *)k0.ptr)[p * NEMO_HEAD_DIM + d]) !=
+              ((const float *)k_raw.ptr)[r * NEMO_KV_DIM + d] ||
+          bf16_to_f32(((const uint16_t *)k1.ptr)[p * NEMO_HEAD_DIM + d]) !=
+              ((const float *)k_raw.ptr)[r * NEMO_KV_DIM + NEMO_HEAD_DIM + d] ||
+          bf16_to_f32(((const uint16_t *)v0.ptr)[p * NEMO_HEAD_DIM + d]) !=
+              ((const float *)v_raw.ptr)[r * NEMO_KV_DIM + d] ||
+          bf16_to_f32(((const uint16_t *)v1.ptr)[p * NEMO_HEAD_DIM + d]) !=
+              ((const float *)v_raw.ptr)[r * NEMO_KV_DIM + NEMO_HEAD_DIM + d])
+        kv_ok = 0;
+    }
+  }
+  ((KvTarget *)kt.ptr)[0] = (KvTarget){k0.address + k0.off,
+                                       k1.address + k1.off,
+                                       v0.address + v0.off,
+                                       v1.address + v1.off,
+                                       9u,
+                                       0u};
+  ((KvTarget *)kt.ptr)[1] =
+      (KvTarget){k0.address + k0.off, k1.address + k1.off, v0.address + v0.off,
+                 v1.address + v1.off, KV_SKIP_POS,         0u};
+  QkvParam qp_batch = {KV_ROWS, KV_ROWS, 0u, 1u};
+  cmd = gpu_begin(g);
+  gpu_select_kernel(&cmd, k_kv_store);
+  gpu_bind_buffer(&cmd, 0, &k_raw, 0);
+  gpu_bind_buffer(&cmd, 1, &v_raw, 0);
+  gpu_bind_buffer(&cmd, 2, &k0, 0);
+  gpu_bind_buffer(&cmd, 3, &k1, 0);
+  gpu_bind_buffer(&cmd, 4, &v0, 0);
+  gpu_bind_buffer(&cmd, 5, &v1, 0);
+  gpu_bind_buffer(&cmd, 6, &kt, 0);
+  gpu_copy_bytes(&cmd, 7, &qp_batch, sizeof qp_batch);
+  gpu_run_kernel(&cmd, 2u * NEMO_KV_HEADS, KV_ROWS, 1, QKV_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(g);
+  for (int d = 0; d < NEMO_HEAD_DIM; d++) {
+    if (bf16_to_f32(((const uint16_t *)k0.ptr)[9 * NEMO_HEAD_DIM + d]) !=
+            ((const float *)k_raw.ptr)[d] ||
+        bf16_to_f32(((const uint16_t *)v1.ptr)[9 * NEMO_HEAD_DIM + d]) !=
+            ((const float *)v_raw.ptr)[NEMO_HEAD_DIM + d])
+      kv_ok = 0;
+  }
+  checkf(kv_ok, "nemo_kv_store single-state and batched+skip match CPU");
+  gpu_free(&k_raw), gpu_free(&v_raw), gpu_free(&k0), gpu_free(&k1),
+      gpu_free(&v0), gpu_free(&v1), gpu_free(&kt);
+
+  // 2. nemo_mtp_eh_cat for use_h0 = 0 and use_h0 = 1.
+  static constexpr int EH_ROWS = 4, EH_DIM = 256;
+  Buf emb = make_buf(g, work, (size_t)EH_ROWS * EH_DIM * sizeof(float));
+  Buf h0 = make_buf(g, work, (size_t)EH_DIM * sizeof(float));
+  Buf hseq = make_buf(g, work, (size_t)EH_ROWS * EH_DIM * sizeof(float));
+  Buf ew = make_buf(g, work, (size_t)EH_DIM * sizeof(float));
+  Buf hw = make_buf(g, work, (size_t)EH_DIM * sizeof(float));
+  Buf eh_out = make_buf(g, work, (size_t)EH_ROWS * 2 * EH_DIM * sizeof(float));
+  for (int i = 0; i < EH_ROWS * EH_DIM; i++) {
+    ((float *)emb.ptr)[i] = randf();
+    ((float *)hseq.ptr)[i] = randf();
+  }
+  for (int i = 0; i < EH_DIM; i++) {
+    ((float *)h0.ptr)[i] = randf();
+    ((float *)ew.ptr)[i] = 0.25f + 0.1f * randf();
+    ((float *)hw.ptr)[i] = 1.8f + 0.3f * randf();
+  }
+  float eh_ref[EH_ROWS * 2 * EH_DIM];
+  int k_eh = gpu_find_kernel(g, "nemo_mtp_eh_cat");
+  for (uint32_t use_h0 = 0; use_h0 <= 1u; use_h0++) {
+    MtpEhParam ep = {EH_ROWS, EH_DIM, use_h0, RMS_EPS};
+    cmd = gpu_begin(g);
+    gpu_select_kernel(&cmd, k_eh);
+    gpu_bind_buffer(&cmd, 0, &emb, 0);
+    gpu_bind_buffer(&cmd, 1, &h0, 0);
+    gpu_bind_buffer(&cmd, 2, &hseq, 0);
+    gpu_bind_buffer(&cmd, 3, &ew, 0);
+    gpu_bind_buffer(&cmd, 4, &hw, 0);
+    gpu_bind_buffer(&cmd, 5, &eh_out, 0);
+    gpu_copy_bytes(&cmd, 6, &ep, sizeof ep);
+    gpu_run_kernel(&cmd, EH_ROWS, 1, 1, ROW_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(g);
+    for (int r = 0; r < EH_ROWS; r++) {
+      const float *er = (const float *)emb.ptr + r * EH_DIM;
+      const float *hr = (use_h0 && r == 0) ? (const float *)h0.ptr
+                                           : (const float *)hseq.ptr +
+                                                 (use_h0 ? r - 1 : r) * EH_DIM;
+      double sqe = 0.0, sqh = 0.0;
+      for (int d = 0; d < EH_DIM; d++) {
+        sqe += (double)er[d] * er[d];
+        sqh += (double)hr[d] * hr[d];
+      }
+      float inve = 1.0f / sqrtf((float)(sqe / EH_DIM) + RMS_EPS);
+      float invh = 1.0f / sqrtf((float)(sqh / EH_DIM) + RMS_EPS);
+      for (int d = 0; d < EH_DIM; d++) {
+        eh_ref[r * 2 * EH_DIM + d] =
+            round_bf(((const float *)ew.ptr)[d] * (er[d] * inve));
+        eh_ref[r * 2 * EH_DIM + EH_DIM + d] =
+            round_bf(((const float *)hw.ptr)[d] * (hr[d] * invh));
+      }
+    }
+    float diff =
+        max_abs_diff((const float *)eh_out.ptr, eh_ref, EH_ROWS * 2 * EH_DIM);
+    checkf(diff <= TOL_BF16, "nemo_mtp_eh_cat use_h0=%u matches CPU (max=%.2e)",
+           use_h0, diff);
+  }
+  gpu_free(&emb), gpu_free(&h0), gpu_free(&hseq), gpu_free(&ew), gpu_free(&hw),
+      gpu_free(&eh_out);
+
+  // 3. nemo_moe_fp8_up_mv + nemo_moe_fp8_down_mv + nemo_moe_combine_add on
+  // 2 rows (creating both count==1 and count==2 tiles) with 8-byte offsets.
+  static constexpr int FDIM = 128, FINTER = 128, FEXPS = 16, FTOPK = 6,
+                       FROWS = 2, FNPAIRS = FROWS * FTOPK;
+  size_t fu_bytes = (size_t)FINTER * FDIM;
+  size_t fd_bytes = (size_t)FDIM * FINTER;
+  size_t fone = OFF8 + fu_bytes + fd_bytes;
+  Buf fpool = make_buf(g, work, (size_t)FEXPS * fone);
+  Buf ftab = make_buf(g, work, (size_t)FEXPS * sizeof(Fp8ExpertRef));
+  Buf fx = make_buf(g, work, (size_t)FROWS * FDIM * sizeof(float));
+  Buf fsh = make_buf(g, work, (size_t)FROWS * FDIM * sizeof(float));
+  Buf fcur = make_buf(g, work, (size_t)FROWS * FDIM * sizeof(float));
+  Buf fptok = make_buf(g, work, (size_t)FNPAIRS * sizeof(int32_t));
+  Buf fpw = make_buf(g, work, (size_t)FNPAIRS * sizeof(float));
+  Buf ftp = make_buf(g, work, (size_t)FNPAIRS * sizeof(int32_t));
+  Buf ftiles =
+      make_buf(g, work, (size_t)(FNPAIRS + FEXPS) * sizeof(NemoMoeTile));
+  Buf fh = make_buf(g, work, (size_t)FNPAIRS * FINTER * sizeof(uint16_t));
+  Buf fyp = make_buf(g, work, (size_t)FNPAIRS * FDIM * sizeof(float));
+
+  Fp8ExpertRef *fer = (Fp8ExpertRef *)ftab.ptr;
+  float fsu_raw[FEXPS], fsd_raw[FEXPS];
+  for (int e = 0; e < FEXPS; e++) {
+    size_t base_off = (size_t)e * fone + OFF8;
+    uint8_t *bp = fpool.ptr + base_off;
+    uint64_t ga = fpool.address + fpool.off + base_off;
+    for (size_t i = 0; i < fu_bytes + fd_bytes; i++) bp[i] = rand_e4m3(0);
+    fsu_raw[e] = 0.002f + 0.001f * fabsf(randf());
+    fsd_raw[e] = 0.002f + 0.001f * fabsf(randf());
+    fer[e] = (Fp8ExpertRef){ga, ga + fu_bytes, fsu_raw[e] * FP8_UNDO,
+                            fsd_raw[e] * FP8_UNDO};
+  }
+  float fcur0[FROWS * FDIM];
+  for (int i = 0; i < FROWS * FDIM; i++) {
+    ((float *)fx.ptr)[i] = round_bf(randf() * 0.25f);
+    ((float *)fsh.ptr)[i] = round_bf(randf() * 0.2f);
+    fcur0[i] = ((float *)fcur.ptr)[i] = round_bf(randf() * 0.3f);
+  }
+  uint32_t frids[FNPAIRS] = {0, 1, 2, 3, 4, 5, 0, 1, 6, 7, 8, 9};
+  float frw[FNPAIRS];
+  for (int i = 0; i < FNPAIRS; i++) frw[i] = 0.3f + 0.2f * fabsf(randf());
+  int fntiles = nemotron_group_expert_tiles(
+      frids, frw, FROWS, MOE_MM_TILE, (int *)fptok.ptr, (float *)fpw.ptr,
+      (int *)ftp.ptr, (NemoMoeTile *)ftiles.ptr);
+
+  MoeParam fmp_up = {FINTER, FDIM, FNPAIRS, (uint32_t)fntiles};
+  MoeParam fmp_dn = {FDIM, FINTER, FNPAIRS, (uint32_t)fntiles};
+  MoeCombineParam fmcp = {FROWS, FDIM, FTOPK};
+  cmd = gpu_begin(g);
+  gpu_select_kernel(&cmd, gpu_find_kernel(g, "nemo_moe_fp8_up_mv"));
+  gpu_bind_buffer(&cmd, 0, &ftab, 0);
+  gpu_bind_buffer(&cmd, 1, &fx, 0);
+  gpu_bind_buffer(&cmd, 2, &fptok, 0);
+  gpu_bind_buffer(&cmd, 3, &ftiles, 0);
+  gpu_bind_buffer(&cmd, 4, &fh, 0);
+  gpu_copy_bytes(&cmd, 5, &fmp_up, sizeof fmp_up);
+  gpu_run_kernel(&cmd, (FINTER + 31u) / 32u, (uint32_t)fntiles, 1,
+                 MOE_MV_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, gpu_find_kernel(g, "nemo_moe_fp8_down_mv"));
+  gpu_bind_buffer(&cmd, 0, &ftab, 0);
+  gpu_bind_buffer(&cmd, 1, &fh, 0);
+  gpu_bind_buffer(&cmd, 2, &fpw, 0);
+  gpu_bind_buffer(&cmd, 3, &ftiles, 0);
+  gpu_bind_buffer(&cmd, 4, &fyp, 0);
+  gpu_copy_bytes(&cmd, 5, &fmp_dn, sizeof fmp_dn);
+  gpu_run_kernel(&cmd, (FDIM + 31u) / 32u, (uint32_t)fntiles, 1, MOE_MV_THREADS,
+                 1, 1);
+
+  gpu_select_kernel(&cmd, gpu_find_kernel(g, "nemo_moe_combine_add"));
+  gpu_bind_buffer(&cmd, 0, &fyp, 0);
+  gpu_bind_buffer(&cmd, 1, &ftp, 0);
+  gpu_bind_buffer(&cmd, 2, &fsh, 0);
+  gpu_bind_buffer(&cmd, 3, &fcur, 0);
+  gpu_copy_bytes(&cmd, 4, &fmcp, sizeof fmcp);
+  gpu_run_kernel(&cmd, (FDIM + MOE_COMBINE_THREADS - 1u) / MOE_COMBINE_THREADS,
+                 FROWS, 1, MOE_COMBINE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(g);
+
+  float fref[FROWS * FDIM];
+  for (int r = 0; r < FROWS; r++) {
+    float routed[FDIM] = {0};
+    for (int k = 0; k < FTOPK; k++) {
+      uint32_t e = frids[r * FTOPK + k];
+      float rw_val = frw[r * FTOPK + k];
+      const uint8_t *bp = fpool.ptr + (size_t)e * fone + OFF8;
+      const uint8_t *wu = bp, *wd = bp + fu_bytes;
+      float hv[FINTER];
+      for (int o = 0; o < FINTER; o++) {
+        double acc = 0.0;
+        for (int c = 0; c < FDIM; c++)
+          acc += (double)((const float *)fx.ptr)[r * FDIM + c] *
+                 (double)e4m3_to_f32(wu[o * FDIM + c]);
+        hv[o] = round_bf(relu2f(round_bf((float)(acc * fsu_raw[e]))));
+      }
+      for (int o = 0; o < FDIM; o++) {
+        double acc = 0.0;
+        for (int c = 0; c < FINTER; c++)
+          acc += (double)hv[c] * (double)e4m3_to_f32(wd[o * FINTER + c]);
+        routed[o] += round_bf((float)(acc * fsd_raw[e])) * rw_val;
+      }
+    }
+    for (int d = 0; d < FDIM; d++) {
+      float moe = round_bf(round_bf(routed[d]) +
+                           ((const float *)fsh.ptr)[r * FDIM + d]);
+      fref[r * FDIM + d] = round_bf(fcur0[r * FDIM + d] + moe);
+    }
+  }
+  float fdiff = max_rel_diff((const float *)fcur.ptr, fref, FROWS * FDIM);
+  checkf(fdiff <= TOL_REL_BF16,
+         "nemo_moe_fp8_up_mv + down_mv (off=8) + combine_add matches CPU "
+         "(rel=%.2e)",
+         fdiff);
+  gpu_free(&fpool), gpu_free(&ftab), gpu_free(&fx), gpu_free(&fsh),
+      gpu_free(&fcur), gpu_free(&fptok), gpu_free(&fpw), gpu_free(&ftp),
+      gpu_free(&ftiles), gpu_free(&fh), gpu_free(&fyp);
+
+  // 4. nemo_unembed_argmax_part + nemo_unembed_argmax_final (non-multiple-of-32
+  // vocab and exact tie-breaking to lowest index).
+  static constexpr int UVOCAB = 1005, UK = 256;
+  static constexpr int TIE_LOW = 317, TIE_HIGH = 829;
+  uint32_t unparts = (UVOCAB + 31u) / 32u;
+  Buf uw = make_buf(g, work, (size_t)UVOCAB * UK * sizeof(uint16_t));
+  Buf ux = make_buf(g, work, (size_t)UK * sizeof(float));
+  Buf uparts = make_buf(g, work, (size_t)unparts * sizeof(ArgmaxPair));
+  Buf utok = make_buf(g, work, sizeof(int32_t));
+  uint16_t *uwp = (uint16_t *)uw.ptr;
+  for (int i = 0; i < UVOCAB * UK; i++) uwp[i] = f32_to_bf16(randf() * 0.25f);
+  float *uxp = (float *)ux.ptr;
+  for (int i = 0; i < UK; i++) uxp[i] = round_bf(0.2f + 0.1f * fabsf(randf()));
+  // Make rows TIE_LOW and TIE_HIGH identical large positive rows so both tie
+  // for maximum and lowest index TIE_LOW must win.
+  for (int i = 0; i < UK; i++) {
+    uint16_t big = f32_to_bf16(2.0f);
+    uwp[TIE_LOW * UK + i] = big;
+    uwp[TIE_HIGH * UK + i] = big;
+  }
+  UnembedParam up = {UVOCAB, UK};
+  cmd = gpu_begin(g);
+  gpu_select_kernel(&cmd, gpu_find_kernel(g, "nemo_unembed_argmax_part"));
+  gpu_bind_buffer(&cmd, 0, &uw, 0);
+  gpu_bind_buffer(&cmd, 1, &ux, 0);
+  gpu_bind_buffer(&cmd, 2, &uparts, 0);
+  gpu_copy_bytes(&cmd, 3, &up, sizeof up);
+  gpu_run_kernel(&cmd, unparts, 1, 1, FP8_MV_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, gpu_find_kernel(g, "nemo_unembed_argmax_final"));
+  gpu_bind_buffer(&cmd, 0, &uparts, 0);
+  gpu_bind_buffer(&cmd, 1, &utok, 0);
+  gpu_copy_bytes(&cmd, 2, &unparts, sizeof unparts);
+  gpu_run_kernel(&cmd, 1, 1, 1, ROW_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(g);
+
+  int32_t got_tok = ((const int32_t *)utok.ptr)[0];
+  checkf(got_tok == TIE_LOW,
+         "nemo_unembed_argmax selects first-maximum winner (got=%d expect=%d)",
+         got_tok, TIE_LOW);
+  gpu_free(&uw), gpu_free(&ux), gpu_free(&uparts), gpu_free(&utok);
+}
+
 int main(void) {
   Memory *mem = memory_new();
   MemoryAccount account;
@@ -1236,5 +1572,6 @@ int main(void) {
   test_mamba2(g, &work);
   test_nope_attention(g, &work);
   test_moe_pipeline(g, &work);
+  test_mtp_kernels(g, &work);
   return failures != 0;
 }

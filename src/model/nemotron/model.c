@@ -90,6 +90,10 @@ static constexpr uint32_t BF16_MV_SPLIT_MIN_K = 2048;
 static constexpr uint32_t BF16_MV_SPLIT_FACTOR = 4;
 static constexpr uint32_t ACT_NONE = 0;
 static constexpr uint32_t ACT_RELU2 = 1;
+static constexpr uint32_t KV_SKIP_POS = 0xFFFFFFFFu;
+static constexpr uint32_t UNEMBED_ROWS_PER_TG = 32;
+static constexpr uint32_t UNEMBED_PARTS =
+    ((uint32_t)NEMO_VOCAB + UNEMBED_ROWS_PER_TG - 1u) / UNEMBED_ROWS_PER_TG;
 
 // Expert store layout, packing ratio, prefetch threshold and route inspection
 // source codes matching src/eremite.h.
@@ -116,6 +120,9 @@ static constexpr size_t SSM_LAYER_BYTES = (size_t)NEMO_MAMBA_HEADS *
 static constexpr size_t SSM_TOTAL_BYTES =
     (size_t)NEMO_MAMBA_LAYERS * SSM_LAYER_BYTES;
 static constexpr size_t SNAP_ROLLING_BYTES = CONV_TOTAL_BYTES + SSM_TOTAL_BYTES;
+static constexpr size_t LAST_HIDDEN_BYTES = (size_t)NEMO_DIM * sizeof(float);
+static constexpr size_t SNAP_MTP_ROLLING_BYTES =
+    SNAP_ROLLING_BYTES + LAST_HIDDEN_BYTES;
 static constexpr size_t LOGITS_BYTES = (size_t)NEMO_VOCAB * sizeof(float);
 
 // Layer block type in the 52-layer Nemotron-H hybrid schedule.
@@ -156,8 +163,8 @@ typedef struct {
 } NormParam;
 
 typedef struct {
-  // Active rows, output width, inner width, residual flag and BF16 round flag.
-  uint32_t m, n, k, has_res, round;
+  // Active rows, output width, inner width, activation, residual and round.
+  uint32_t m, n, k, act, has_res, round;
   // Per-tensor weight scale multiplied by 256.
   float scale;
 } Fp8LinParam;
@@ -220,6 +227,35 @@ typedef struct {
   uint32_t rows, dim, topk;
 } MoeCombineParam;
 
+typedef struct {
+  // Active rows, hidden width and flag selecting h0 for row 0.
+  uint32_t rows, dim, use_h0;
+  // RMSNorm epsilon.
+  float eps;
+} MtpEhParam;
+
+// Per-expert FP8 GPU addresses and scales matching NemoFp8ExpertRef.
+typedef struct {
+  // Raw F8_E4M3 up_proj and down_proj device addresses.
+  uint64_t w_up, w_down;
+  // Per-tensor up_proj and down_proj weight scales multiplied by 256.
+  float s_up, s_down;
+} Fp8ExpertRef;
+
+// Winning logit and token index for one stage-1 unembed argmax threadgroup.
+typedef struct {
+  // Maximum logit found by this threadgroup.
+  float val;
+  // First vocabulary index achieving val.
+  int32_t idx;
+} ArgmaxPair;
+
+// Parameters for fused BF16 unembed + first-maximum argmax.
+typedef struct {
+  // Vocabulary size and hidden width.
+  uint32_t vocab, k;
+} UnembedParam;
+
 // Per-expert GPU device addresses matching NemoExpertRef in nemotron.metal.
 typedef struct {
   // Packed up_proj weights, up_proj scales, down_proj weights and scales.
@@ -272,6 +308,26 @@ typedef struct {
   Buf factor_up, factor_down;
 } MoeLayer;
 
+// Weights for the repeated *E Multi-Token Prediction draft module loaded from
+// model-mtp-fp8.safetensors when opt.draft > 0.
+typedef struct {
+  // Embedding and hidden-state RMSNorm weights [2688] in FP32.
+  Buf enorm_w, hnorm_w;
+  // Concatenated embedding + hidden projection [2688, 5376] in FP8.
+  Fp8Lin eh_proj;
+  // Layer 0 (NoPE GQA 32/2 attention) pre-norm [2688] FP32 and FP8 QKV/O.
+  Buf attn_norm_w;
+  Fp8Lin q, k, v, o;
+  // Layer 1 (MoE) pre-norm [2688], final norm [2688], BF16 router [128, 2688]
+  // and FP32 correction bias [128].
+  Buf moe_norm_w, final_norm_w, router_w, router_bias;
+  // Layer 1 FP8 shared expert up [3712, 2688] and down [2688, 3712].
+  Fp8Lin shared_up, shared_down;
+  // Layer 1 FP8 routed expert weights [128] and per-tensor scales (* 256).
+  Buf exp_up[NEMO_EXPERTS], exp_down[NEMO_EXPERTS];
+  float exp_s_up[NEMO_EXPERTS], exp_s_down[NEMO_EXPERTS];
+} MtpModel;
+
 // One layer of the 52-layer hybrid backbone.
 typedef struct {
   // Block type (Mamba, Attention or MoE).
@@ -306,10 +362,15 @@ typedef struct {
   // Growing BF16 K and V buffers for the 6 attention layers and 2 KV heads.
   Buf k[NEMO_ATTN_LAYERS][NEMO_KV_HEADS];
   Buf v[NEMO_ATTN_LAYERS][NEMO_KV_HEADS];
+  // Growing BF16 K and V buffers for MTP layer 0 (allocated when drafting).
+  Buf mtp_k[NEMO_KV_HEADS];
+  Buf mtp_v[NEMO_KV_HEADS];
   // Rolling FP32 Mamba-2 conv1d history [23, 3, 6144].
   Buf conv_state;
   // Rolling FP32 Mamba-2 SSM state [23, 64, 64, 128].
   Buf ssm_state;
+  // Final post-norm backbone hidden state [2688] at pos - 1 (when drafting).
+  Buf last_hidden;
 } NemoState;
 
 // Snapshot of rolling Mamba-2 state at one position, plus optional logits.
@@ -342,9 +403,15 @@ typedef struct {
   Buf x_bf16, h_bf16, y_pair;
   // Per-state target arrays for batched multi-state Mamba and KV decode.
   Buf mamba_tgt, kv_tgt;
-  // Pre-verify Mamba-2 state backups and per-layer FP32 zxbcdt inputs for
-  // exact partial-acceptance rewind.
-  Buf verify_conv, verify_ssm, verify_zxbcdt;
+  // Pre-verify Mamba-2 state backups, per-layer FP32 zxbcdt inputs for exact
+  // partial-acceptance rewind, and post-norm backbone hidden states for MTP.
+  Buf verify_conv, verify_ssm, verify_zxbcdt, verify_hidden;
+  // MTP scratch buffers (allocated when active_drafts > 0): saved input
+  // embeddings [rows, 2688], post-norm hidden states [rows, 2688],
+  // concatenated [enorm, hnorm] [rows, 5376], batched previous hidden states
+  // [8, 2688], batched MTP KV targets [8], draft token IDs [9], and stage-1
+  // unembed argmax reductions [4096].
+  Buf mtp_emb, mtp_h, mtp_eh, mtp_h_prev, mtp_kv_tgt, mtp_tok, mtp_argmax;
   // Allocated verify_zxbcdt row capacity, active verify row count and start
   // position.
   int verify_cap, verify_count, verify_pos;
@@ -363,10 +430,12 @@ static int state_slot_ready;
 static char model_dir[PATH_CAP];
 static Options opt;
 static int has_audio;
+static int active_drafts;
 static int eos_tokens[MAX_EOS_TOKENS];
 static int n_eos_tokens;
 
 static TensorIndex *checkpoint;
+static TensorIndex *mtp_checkpoint;
 static WeightGroup *text_weights;
 static ExpertStore *experts_store;
 static int store_started;
@@ -377,6 +446,8 @@ static LayerDesc layer_desc[NEMO_LAYERS];
 static MambaLayer mamba_layers[NEMO_MAMBA_LAYERS];
 static AttnLayer attn_layers[NEMO_ATTN_LAYERS];
 static MoeLayer moe_layers[NEMO_MOE_LAYERS];
+static MtpModel mtp;
+static Buf mtp_exp_table;
 static FileSpan expert_spans[NEMO_MOE_LAYERS][NEMO_EXPERTS][EXPERT_PARTS];
 static int expert_span_counts[NEMO_MOE_LAYERS];
 static Buf layer_table[NEMO_MOE_LAYERS];
@@ -389,10 +460,13 @@ static int K_fp8_mv, K_fp8_mm;
 static int K_nvfp4_mv, K_nvfp4_mm;
 static int K_mamba_conv_prefill, K_mamba_conv_save, K_mamba_conv_decode;
 static int K_mamba_ssm_prefill, K_mamba_ssm_decode, K_mamba_norm_gated;
-static int K_qkv_store, K_attend_prefill, K_attend_part, K_attend_combine;
+static int K_qkv_store, K_kv_store, K_attend_prefill, K_attend_part,
+    K_attend_combine;
 static int K_route_topk, K_moe_group, K_moe_gather_bf16;
 static int K_moe_up_mv, K_moe_dn_mv, K_moe_up_mm, K_moe_dn_mm,
     K_moe_combine_add;
+static int K_mtp_eh_cat, K_moe_fp8_up_mv, K_moe_fp8_dn_mv;
+static int K_unembed_argmax_part, K_unembed_argmax_final;
 
 // Runtime counters and latest decode route history.
 static uint64_t decode_rows_count, prefill_rows_count;
@@ -894,6 +968,133 @@ static void register_weights(void) {
   }
 }
 
+// Registers the optional repeated *E Multi-Token Prediction weights from
+// dir/model-mtp-fp8.safetensors into text_weights when opt.draft > 0.
+static void register_mtp_weights(const char *dir) {
+  active_drafts = 0;
+  if (opt.draft <= 0) return;
+  char path[PATH_CAP];
+  snprintf(path, sizeof path, "%s/model-mtp-fp8.safetensors", dir);
+  if (access(path, R_OK) != 0) return;
+  if (opt.draft > NEMO_MTP_MAX_DRAFTS)
+    die("nemotron: requested %d drafts exceeds MTP limit %d", opt.draft,
+        NEMO_MTP_MAX_DRAFTS);
+
+  mtp_checkpoint = tensor_index_open_file(path);
+  weight_group_add_vector(
+      text_weights, &mtp.enorm_w,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.enorm.weight"), 0.0f,
+      0);
+  weight_group_add_vector(
+      text_weights, &mtp.hnorm_w,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.hnorm.weight"), 0.0f,
+      0);
+  add_fp8_lin(
+      &mtp.eh_proj,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.eh_proj.weight"),
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.eh_proj.weight_scale"),
+      NEMO_DIM, NEMO_EH_DIM);
+  weight_group_add_vector(
+      text_weights, &mtp.attn_norm_w,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.norm.weight"), 0.0f,
+      0);
+  add_fp8_lin(
+      &mtp.q,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.mixer.q_proj.weight"),
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.0.mixer.q_proj.weight_scale"),
+      NEMO_Q_DIM, NEMO_DIM);
+  add_fp8_lin(
+      &mtp.k,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.mixer.k_proj.weight"),
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.0.mixer.k_proj.weight_scale"),
+      NEMO_KV_DIM, NEMO_DIM);
+  add_fp8_lin(
+      &mtp.v,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.mixer.v_proj.weight"),
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.0.mixer.v_proj.weight_scale"),
+      NEMO_KV_DIM, NEMO_DIM);
+  add_fp8_lin(
+      &mtp.o,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.0.mixer.o_proj.weight"),
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.0.mixer.o_proj.weight_scale"),
+      NEMO_DIM, NEMO_Q_DIM);
+
+  weight_group_add_vector(
+      text_weights, &mtp.moe_norm_w,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.1.norm.weight"), 0.0f,
+      0);
+  weight_group_add_vector(
+      text_weights, &mtp.final_norm_w,
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.1.final_layernorm.weight"),
+      0.0f, 0);
+  add_raw(
+      &mtp.router_w,
+      tensor_index_get(mtp_checkpoint, "llm.mtp.layers.1.mixer.gate.weight"));
+  weight_group_add_vector(
+      text_weights, &mtp.router_bias,
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.1.mixer.gate.e_score_correction_bias"),
+      0.0f, 0);
+  add_fp8_lin(
+      &mtp.shared_up,
+      tensor_index_get(mtp_checkpoint,
+                       "llm.mtp.layers.1.mixer.shared_experts.up_proj.weight"),
+      tensor_index_get(
+          mtp_checkpoint,
+          "llm.mtp.layers.1.mixer.shared_experts.up_proj.weight_scale"),
+      NEMO_SHARED_INTER, NEMO_DIM);
+  add_fp8_lin(
+      &mtp.shared_down,
+      tensor_index_get(
+          mtp_checkpoint,
+          "llm.mtp.layers.1.mixer.shared_experts.down_proj.weight"),
+      tensor_index_get(
+          mtp_checkpoint,
+          "llm.mtp.layers.1.mixer.shared_experts.down_proj.weight_scale"),
+      NEMO_DIM, NEMO_SHARED_INTER);
+
+  for (int e = 0; e < NEMO_EXPERTS; e++) {
+    Tensor uw = tensor_index_get(
+        mtp_checkpoint, "llm.mtp.layers.1.mixer.experts.%d.up_proj.weight", e);
+    Tensor us = tensor_index_get(
+        mtp_checkpoint,
+        "llm.mtp.layers.1.mixer.experts.%d.up_proj.weight_scale", e);
+    Tensor dw = tensor_index_get(
+        mtp_checkpoint, "llm.mtp.layers.1.mixer.experts.%d.down_proj.weight",
+        e);
+    Tensor ds = tensor_index_get(
+        mtp_checkpoint,
+        "llm.mtp.layers.1.mixer.experts.%d.down_proj.weight_scale", e);
+    if (uw.dtype != '8' || uw.ndim != 2 || uw.shape[0] != NEMO_MOE_INTER ||
+        uw.shape[1] != NEMO_DIM)
+      die("nemotron: unexpected MTP expert %d up_proj shape", e);
+    if (dw.dtype != '8' || dw.ndim != 2 || dw.shape[0] != NEMO_DIM ||
+        dw.shape[1] != NEMO_MOE_INTER)
+      die("nemotron: unexpected MTP expert %d down_proj shape", e);
+    mtp.exp_s_up[e] = read_scalar_f32(us) * FP8_UNDO;
+    mtp.exp_s_down[e] = read_scalar_f32(ds) * FP8_UNDO;
+    add_raw(&mtp.exp_up[e], uw);
+    add_raw(&mtp.exp_down[e], dw);
+  }
+  active_drafts = opt.draft;
+}
+
+// Rebuilds mtp_exp_table with current resident GPU addresses for all 128 FP8
+// MTP routed experts after text_weights loads or reloads.
+static void refresh_mtp_expert_table(void) {
+  Fp8ExpertRef *ref = (Fp8ExpertRef *)mtp_exp_table.ptr;
+  for (int e = 0; e < NEMO_EXPERTS; e++) {
+    ref[e] = (Fp8ExpertRef){mtp.exp_up[e].address + mtp.exp_up[e].off,
+                            mtp.exp_down[e].address + mtp.exp_down[e].off,
+                            mtp.exp_s_up[e], mtp.exp_s_down[e]};
+  }
+}
+
 // ---- Workspace management ----
 
 // Returns the GPU workspace byte footprint needed for `rows` active tokens.
@@ -903,6 +1104,7 @@ static uint64_t estimate_work_bytes(int rows) {
                 : (rows <= NEMO_MAX_VERIFY ? NEMO_MAX_VERIFY : rows);
   int q_stride = align_up(cap, PREFILL_Q_PAD);
   int padded_m2 = align_up(cap, MM_TILE_M2);
+  int x_pack_cols = active_drafts > 0 ? NEMO_EH_DIM : NEMO_MAMBA_INNER;
   int npairs = cap * NEMO_TOPK;
   int max_tiles = npairs + NEMO_EXPERTS;
   int part_rows = cap < NEMO_MAX_BATCH_ROWS ? cap : NEMO_MAX_BATCH_ROWS;
@@ -911,7 +1113,7 @@ static uint64_t estimate_work_bytes(int rows) {
   uint64_t bytes = 0;
   bytes += gpu_round_up_to_pages((size_t)cap * sizeof(int32_t));
   bytes += 2 * gpu_round_up_to_pages((size_t)cap * NEMO_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)padded_m2 * NEMO_MAMBA_INNER *
+  bytes += gpu_round_up_to_pages((size_t)padded_m2 * (size_t)x_pack_cols *
                                  sizeof(uint16_t));
   bytes +=
       gpu_round_up_to_pages((size_t)cap * NEMO_MAMBA_IN_DIM * sizeof(float));
@@ -945,18 +1147,31 @@ static uint64_t estimate_work_bytes(int rows) {
                                  NEMO_MAX_BATCH_ROWS * sizeof(MambaTarget));
   bytes += gpu_round_up_to_pages((size_t)NEMO_ATTN_LAYERS *
                                  NEMO_MAX_BATCH_ROWS * sizeof(KvTarget));
+  if (active_drafts > 0) {
+    bytes += 2 * gpu_round_up_to_pages((size_t)cap * NEMO_DIM * sizeof(float));
+    bytes += gpu_round_up_to_pages((size_t)cap * NEMO_EH_DIM * sizeof(float));
+    bytes += gpu_round_up_to_pages((size_t)NEMO_MAX_BATCH_ROWS * NEMO_DIM *
+                                   sizeof(float));
+    bytes +=
+        gpu_round_up_to_pages((size_t)NEMO_MAX_BATCH_ROWS * sizeof(KvTarget));
+    bytes += gpu_round_up_to_pages((size_t)(NEMO_MTP_MAX_DRAFTS + 1) *
+                                   sizeof(int32_t));
+    bytes += gpu_round_up_to_pages((size_t)UNEMBED_PARTS * sizeof(ArgmaxPair));
+  }
   bytes += gpu_round_up_to_pages(LOGITS_BYTES);
   return bytes;
 }
 
 // Returns the extra workspace bytes needed by multi-token verify() rollback
-// buffers and multi-row logits.
+// buffers, MTP verify hidden states, and multi-row logits.
 static uint64_t estimate_verify_bytes(int rows) {
   int vcap = rows > NEMO_MAX_VERIFY ? rows : NEMO_MAX_VERIFY;
   uint64_t bytes = gpu_round_up_to_pages(CONV_TOTAL_BYTES);
   bytes += gpu_round_up_to_pages(SSM_TOTAL_BYTES);
   bytes += gpu_round_up_to_pages((size_t)NEMO_MAMBA_LAYERS * (size_t)vcap *
                                  NEMO_MAMBA_IN_DIM * sizeof(float));
+  if (active_drafts > 0)
+    bytes += gpu_round_up_to_pages((size_t)vcap * NEMO_DIM * sizeof(float));
   if (rows > 1)
     bytes += gpu_round_up_to_pages((size_t)(rows - 1) * LOGITS_BYTES);
   return bytes;
@@ -965,17 +1180,21 @@ static uint64_t estimate_verify_bytes(int rows) {
 // Returns the bytes currently allocated in pass-local resizable workspace
 // buffers (excluding work.logits).
 static uint64_t work_resizable_bytes(void) {
-  const Buf *list[] = {&work.ids,        &work.cur,          &work.normed,
-                       &work.x_pack,     &work.mamba_zxbcdt, &work.mamba_xbc,
-                       &work.mamba_y,    &work.mamba_normed, &work.q_raw,
-                       &work.k_raw,      &work.v_raw,        &work.q_hm,
-                       &work.attn_part,  &work.attn_out,     &work.shared_h,
-                       &work.shared_out, &work.route_logits, &work.route_ids,
-                       &work.route_w,    &work.ptok,         &work.pw,
-                       &work.tp,         &work.tiles,        &work.expert_table,
-                       &work.x_bf16,     &work.h_bf16,       &work.y_pair,
-                       &work.mamba_tgt,  &work.kv_tgt,       &work.verify_conv,
-                       &work.verify_ssm, &work.verify_zxbcdt};
+  const Buf *list[] = {
+      &work.ids,        &work.cur,           &work.normed,
+      &work.x_pack,     &work.mamba_zxbcdt,  &work.mamba_xbc,
+      &work.mamba_y,    &work.mamba_normed,  &work.q_raw,
+      &work.k_raw,      &work.v_raw,         &work.q_hm,
+      &work.attn_part,  &work.attn_out,      &work.shared_h,
+      &work.shared_out, &work.route_logits,  &work.route_ids,
+      &work.route_w,    &work.ptok,          &work.pw,
+      &work.tp,         &work.tiles,         &work.expert_table,
+      &work.x_bf16,     &work.h_bf16,        &work.y_pair,
+      &work.mamba_tgt,  &work.kv_tgt,        &work.verify_conv,
+      &work.verify_ssm, &work.verify_zxbcdt, &work.verify_hidden,
+      &work.mtp_emb,    &work.mtp_h,         &work.mtp_eh,
+      &work.mtp_h_prev, &work.mtp_kv_tgt,    &work.mtp_tok,
+      &work.mtp_argmax};
   uint64_t bytes = 0;
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     bytes += list[i]->allocated;
@@ -984,16 +1203,20 @@ static uint64_t work_resizable_bytes(void) {
 
 // Marks all buffers in w to be freed once prior GPU commands complete.
 static void free_work(NemoWork *w) {
-  Buf *list[] = {
-      &w->ids,          &w->cur,         &w->normed,     &w->x_pack,
-      &w->mamba_zxbcdt, &w->mamba_xbc,   &w->mamba_y,    &w->mamba_normed,
-      &w->q_raw,        &w->k_raw,       &w->v_raw,      &w->q_hm,
-      &w->attn_part,    &w->attn_out,    &w->shared_h,   &w->shared_out,
-      &w->route_logits, &w->route_ids,   &w->route_w,    &w->ptok,
-      &w->pw,           &w->tp,          &w->tiles,      &w->expert_table,
-      &w->x_bf16,       &w->h_bf16,      &w->y_pair,     &w->mamba_tgt,
-      &w->kv_tgt,       &w->verify_conv, &w->verify_ssm, &w->verify_zxbcdt,
-      &w->logits};
+  Buf *list[] = {&w->ids,        &w->cur,           &w->normed,
+                 &w->x_pack,     &w->mamba_zxbcdt,  &w->mamba_xbc,
+                 &w->mamba_y,    &w->mamba_normed,  &w->q_raw,
+                 &w->k_raw,      &w->v_raw,         &w->q_hm,
+                 &w->attn_part,  &w->attn_out,      &w->shared_h,
+                 &w->shared_out, &w->route_logits,  &w->route_ids,
+                 &w->route_w,    &w->ptok,          &w->pw,
+                 &w->tp,         &w->tiles,         &w->expert_table,
+                 &w->x_bf16,     &w->h_bf16,        &w->y_pair,
+                 &w->mamba_tgt,  &w->kv_tgt,        &w->verify_conv,
+                 &w->verify_ssm, &w->verify_zxbcdt, &w->verify_hidden,
+                 &w->mtp_emb,    &w->mtp_h,         &w->mtp_eh,
+                 &w->mtp_h_prev, &w->mtp_kv_tgt,    &w->mtp_tok,
+                 &w->mtp_argmax, &w->logits};
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     if (list[i]->obj) gpu_mark_to_free(list[i]);
   *w = (NemoWork){0};
@@ -1014,6 +1237,7 @@ static void ensure_work(int rows, int logits_rows) {
     work.cap_rows = new_cap;
     work.q_stride = align_up(new_cap, PREFILL_Q_PAD);
     int padded_m2 = align_up(new_cap, MM_TILE_M2);
+    int x_pack_cols = active_drafts > 0 ? NEMO_EH_DIM : NEMO_MAMBA_INNER;
     int npairs = new_cap * NEMO_TOPK;
     int max_tiles = npairs + NEMO_EXPERTS;
     int part_rows =
@@ -1025,7 +1249,7 @@ static void ensure_work(int rows, int logits_rows) {
     work.cur = work_alloc((size_t)new_cap * NEMO_DIM * sizeof(float));
     work.normed = work_alloc((size_t)new_cap * NEMO_DIM * sizeof(float));
     work.x_pack =
-        work_alloc((size_t)padded_m2 * NEMO_MAMBA_INNER * sizeof(uint16_t));
+        work_alloc((size_t)padded_m2 * (size_t)x_pack_cols * sizeof(uint16_t));
     work.mamba_zxbcdt =
         work_alloc((size_t)new_cap * NEMO_MAMBA_IN_DIM * sizeof(float));
     work.mamba_xbc =
@@ -1064,6 +1288,18 @@ static void ensure_work(int rows, int logits_rows) {
                                 NEMO_MAX_BATCH_ROWS * sizeof(MambaTarget));
     work.kv_tgt = work_alloc((size_t)NEMO_ATTN_LAYERS * NEMO_MAX_BATCH_ROWS *
                              sizeof(KvTarget));
+    if (active_drafts > 0) {
+      work.mtp_emb = work_alloc((size_t)new_cap * NEMO_DIM * sizeof(float));
+      work.mtp_h = work_alloc((size_t)new_cap * NEMO_DIM * sizeof(float));
+      work.mtp_eh = work_alloc((size_t)new_cap * NEMO_EH_DIM * sizeof(float));
+      work.mtp_h_prev =
+          work_alloc((size_t)NEMO_MAX_BATCH_ROWS * NEMO_DIM * sizeof(float));
+      work.mtp_kv_tgt =
+          work_alloc((size_t)NEMO_MAX_BATCH_ROWS * sizeof(KvTarget));
+      work.mtp_tok =
+          work_alloc((size_t)(NEMO_MTP_MAX_DRAFTS + 1) * sizeof(int32_t));
+      work.mtp_argmax = work_alloc((size_t)UNEMBED_PARTS * sizeof(ArgmaxPair));
+    }
     work.logits = old_logits;
     work.logits_rows = old_lr;
   }
@@ -1074,16 +1310,19 @@ static void ensure_work(int rows, int logits_rows) {
   }
 }
 
-// Allocates Mamba-2 pre-verify backup and zxbcdt rollback buffers for up to
-// `rows` verified tokens.
+// Allocates Mamba-2 pre-verify backup, zxbcdt rollback, and MTP hidden-state
+// buffers for up to `rows` verified tokens.
 static void ensure_verify_work(int rows) {
   int need = rows > NEMO_MAX_VERIFY ? rows : NEMO_MAX_VERIFY;
   if (!work.verify_conv.obj) work.verify_conv = work_alloc(CONV_TOTAL_BYTES);
   if (!work.verify_ssm.obj) work.verify_ssm = work_alloc(SSM_TOTAL_BYTES);
   if (need > work.verify_cap) {
     if (work.verify_zxbcdt.obj) gpu_mark_to_free(&work.verify_zxbcdt);
+    if (work.verify_hidden.obj) gpu_mark_to_free(&work.verify_hidden);
     work.verify_zxbcdt = work_alloc((size_t)NEMO_MAMBA_LAYERS * (size_t)need *
                                     NEMO_MAMBA_IN_DIM * sizeof(float));
+    if (active_drafts > 0)
+      work.verify_hidden = work_alloc((size_t)need * NEMO_DIM * sizeof(float));
     work.verify_cap = need;
   }
 }
@@ -1292,26 +1531,29 @@ static int grown_cap(int positions) {
   return cap;
 }
 
-// Resizes the 24 growing KV buffers of s to `new_cap` rows, preserving the
-// first `keep` rows and zero-initializing the newly added tail. Returns 1 on
-// success or 0 on memory refusal.
+// Returns the byte size of one snapshot's rolling payload.
+static size_t snap_rolling_bytes(void) {
+  return active_drafts > 0 ? SNAP_MTP_ROLLING_BYTES : SNAP_ROLLING_BYTES;
+}
+
+// Resizes the growing backbone (and optional MTP) KV buffers of s to `new_cap`
+// rows, preserving the first `keep` rows and zero-initializing the newly added
+// tail. Returns 1 on success or 0 on memory refusal.
 static int state_resize_kv(NemoState *s, int new_cap, int keep) {
   size_t new_bytes = (size_t)new_cap * KV_HEAD_ROW_BYTES;
   size_t copy_bytes = (size_t)keep * KV_HEAD_ROW_BYTES;
   Buf nk[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
   Buf nv[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
-  for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
-    for (int h = 0; h < NEMO_KV_HEADS; h++) {
+  Buf mk[NEMO_KV_HEADS] = {0};
+  Buf mv[NEMO_KV_HEADS] = {0};
+  int ok = 1;
+  for (int a = 0; a < NEMO_ATTN_LAYERS && ok; a++) {
+    for (int h = 0; h < NEMO_KV_HEADS && ok; h++) {
       nk[a][h] = state_try_alloc(new_bytes);
       nv[a][h] = nk[a][h].obj ? state_try_alloc(new_bytes) : (Buf){0};
       if (!nv[a][h].obj) {
-        for (int pa = 0; pa <= a; pa++) {
-          for (int ph = 0; ph < NEMO_KV_HEADS; ph++) {
-            if (nk[pa][ph].obj) gpu_free(&nk[pa][ph]);
-            if (nv[pa][ph].obj) gpu_free(&nv[pa][ph]);
-          }
-        }
-        return 0;
+        ok = 0;
+        break;
       }
       if (copy_bytes && s->k[a][h].obj) {
         memcpy(nk[a][h].ptr, s->k[a][h].ptr, copy_bytes);
@@ -1323,12 +1565,51 @@ static int state_resize_kv(NemoState *s, int new_cap, int keep) {
       }
     }
   }
+  if (ok && active_drafts > 0) {
+    for (int h = 0; h < NEMO_KV_HEADS && ok; h++) {
+      mk[h] = state_try_alloc(new_bytes);
+      mv[h] = mk[h].obj ? state_try_alloc(new_bytes) : (Buf){0};
+      if (!mv[h].obj) {
+        ok = 0;
+        break;
+      }
+      if (copy_bytes && s->mtp_k[h].obj) {
+        memcpy(mk[h].ptr, s->mtp_k[h].ptr, copy_bytes);
+        memcpy(mv[h].ptr, s->mtp_v[h].ptr, copy_bytes);
+      }
+      if (new_bytes > copy_bytes) {
+        memset((uint8_t *)mk[h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
+        memset((uint8_t *)mv[h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
+      }
+    }
+  }
+  if (!ok) {
+    for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
+      for (int h = 0; h < NEMO_KV_HEADS; h++) {
+        if (nk[a][h].obj) gpu_free(&nk[a][h]);
+        if (nv[a][h].obj) gpu_free(&nv[a][h]);
+      }
+    }
+    for (int h = 0; h < NEMO_KV_HEADS; h++) {
+      if (mk[h].obj) gpu_free(&mk[h]);
+      if (mv[h].obj) gpu_free(&mv[h]);
+    }
+    return 0;
+  }
   for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
     for (int h = 0; h < NEMO_KV_HEADS; h++) {
       if (s->k[a][h].obj) gpu_mark_to_free(&s->k[a][h]);
       if (s->v[a][h].obj) gpu_mark_to_free(&s->v[a][h]);
       s->k[a][h] = nk[a][h];
       s->v[a][h] = nv[a][h];
+    }
+  }
+  if (active_drafts > 0) {
+    for (int h = 0; h < NEMO_KV_HEADS; h++) {
+      if (s->mtp_k[h].obj) gpu_mark_to_free(&s->mtp_k[h]);
+      if (s->mtp_v[h].obj) gpu_mark_to_free(&s->mtp_v[h]);
+      s->mtp_k[h] = mk[h];
+      s->mtp_v[h] = mv[h];
     }
   }
   s->cap = new_cap;
@@ -1352,14 +1633,20 @@ static ModelState *nemo_state_new(void) {
   s->conv_state = state_try_alloc(CONV_TOTAL_BYTES);
   s->ssm_state =
       s->conv_state.obj ? state_try_alloc(SSM_TOTAL_BYTES) : (Buf){0};
-  if (!s->ssm_state.obj || !state_resize_kv(s, init_cap, 0)) {
+  if (s->ssm_state.obj && active_drafts > 0)
+    s->last_hidden = state_try_alloc(LAST_HIDDEN_BYTES);
+  int rolling_ok =
+      s->ssm_state.obj && (active_drafts == 0 || s->last_hidden.obj);
+  if (!rolling_ok || !state_resize_kv(s, init_cap, 0)) {
     if (s->conv_state.obj) gpu_free(&s->conv_state);
     if (s->ssm_state.obj) gpu_free(&s->ssm_state);
+    if (s->last_hidden.obj) gpu_free(&s->last_hidden);
     free(s);
     return NULL;
   }
   memset(s->conv_state.ptr, 0, CONV_TOTAL_BYTES);
   memset(s->ssm_state.ptr, 0, SSM_TOTAL_BYTES);
+  if (s->last_hidden.obj) memset(s->last_hidden.ptr, 0, LAST_HIDDEN_BYTES);
   return (ModelState *)s;
 }
 
@@ -1373,8 +1660,13 @@ static void nemo_state_free(ModelState *ms) {
       if (s->v[a][h].obj) gpu_mark_to_free(&s->v[a][h]);
     }
   }
+  for (int h = 0; h < NEMO_KV_HEADS; h++) {
+    if (s->mtp_k[h].obj) gpu_mark_to_free(&s->mtp_k[h]);
+    if (s->mtp_v[h].obj) gpu_mark_to_free(&s->mtp_v[h]);
+  }
   if (s->conv_state.obj) gpu_mark_to_free(&s->conv_state);
   if (s->ssm_state.obj) gpu_mark_to_free(&s->ssm_state);
+  if (s->last_hidden.obj) gpu_mark_to_free(&s->last_hidden);
   free(s);
 }
 
@@ -1385,13 +1677,16 @@ static size_t nemo_state_bytes(const ModelState *ms, int positions) {
   int cap = s ? s->cap : grown_cap(positions > 0 ? positions : 1);
   if (positions > cap) cap = grown_cap(positions);
   size_t kv_one = gpu_round_up_to_pages((size_t)cap * KV_HEAD_ROW_BYTES);
-  return (size_t)(NEMO_ATTN_LAYERS * NEMO_KV_HEADS * 2) * kv_one +
-         gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
-         gpu_round_up_to_pages(SSM_TOTAL_BYTES);
+  int kv_layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
+  size_t bytes = (size_t)(kv_layers * NEMO_KV_HEADS * 2) * kv_one +
+                 gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
+                 gpu_round_up_to_pages(SSM_TOTAL_BYTES);
+  if (active_drafts > 0) bytes += gpu_round_up_to_pages(LAST_HIDDEN_BYTES);
+  return bytes;
 }
 
-// Writes the 24 growing KV regions of s. When fill is nonzero, resizes s to
-// hold `positions` tokens first.
+// Writes the growing KV regions of s (24 backbone + 4 lag-1 MTP when drafting).
+// When fill is nonzero, resizes s to hold `positions` tokens first.
 static int nemo_write_state_regions(ModelState *ms, int positions, int fill,
                                     StateRegion *out) {
   NemoState *s = (NemoState *)ms;
@@ -1412,6 +1707,14 @@ static int nemo_write_state_regions(ModelState *ms, int positions, int fill,
           (StateRegion){s->v[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0};
     }
   }
+  if (active_drafts > 0) {
+    for (int h = 0; h < NEMO_KV_HEADS; h++) {
+      out[n++] =
+          (StateRegion){s->mtp_k[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1};
+      out[n++] =
+          (StateRegion){s->mtp_v[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1};
+    }
+  }
   return n;
 }
 
@@ -1425,18 +1728,20 @@ static void nemo_state_copy(ModelState *dst_ms, const ModelState *src_ms,
   regions_copy(to, from, n, positions);
 }
 
-// Captures the rolling Mamba-2 conv and SSM states of s at `pos`, plus
-// optional logits.
+// Captures the rolling Mamba-2 conv/SSM states (and optional MTP last_hidden)
+// of s at `pos`, plus optional logits.
 static ModelSnapshot *nemo_snapshot_take(ModelState *ms, int pos,
                                          const float *lg) {
   NemoState *s = (NemoState *)ms;
   model_sync();
+  size_t rbytes = snap_rolling_bytes();
   NemoSnapshot *x = xmalloc(sizeof *x);
-  *x = (NemoSnapshot){
-      .pos = pos,
-      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+  *x = (NemoSnapshot){.pos = pos,
+                      .rows = memory_host_alloc_required(&state_slot, rbytes)};
   memcpy(x->rows, s->conv_state.ptr, CONV_TOTAL_BYTES);
   memcpy(x->rows + CONV_TOTAL_BYTES, s->ssm_state.ptr, SSM_TOTAL_BYTES);
+  if (active_drafts > 0)
+    memcpy(x->rows + SNAP_ROLLING_BYTES, s->last_hidden.ptr, LAST_HIDDEN_BYTES);
   if (lg) {
     x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
     memcpy(x->logits, lg, LOGITS_BYTES);
@@ -1444,13 +1749,16 @@ static ModelSnapshot *nemo_snapshot_take(ModelState *ms, int pos,
   return (ModelSnapshot *)x;
 }
 
-// Restores rolling Mamba-2 conv and SSM states from x into s.
+// Restores rolling Mamba-2 conv/SSM states (and optional MTP last_hidden) from
+// x into s.
 static void nemo_snapshot_restore(ModelState *ms, const ModelSnapshot *mx) {
   NemoState *s = (NemoState *)ms;
   const NemoSnapshot *x = (const NemoSnapshot *)mx;
   model_sync();
   memcpy(s->conv_state.ptr, x->rows, CONV_TOTAL_BYTES);
   memcpy(s->ssm_state.ptr, x->rows + CONV_TOTAL_BYTES, SSM_TOTAL_BYTES);
+  if (active_drafts > 0)
+    memcpy(s->last_hidden.ptr, x->rows + SNAP_ROLLING_BYTES, LAST_HIDDEN_BYTES);
   s->pos = x->pos;
 }
 
@@ -1465,7 +1773,7 @@ static void nemo_snapshot_free(ModelSnapshot *mx) {
 
 // Returns the byte footprint of one snapshot.
 static size_t nemo_snapshot_bytes(int with_logits) {
-  return SNAP_ROLLING_BYTES + (with_logits ? LOGITS_BYTES : 0);
+  return snap_rolling_bytes() + (with_logits ? LOGITS_BYTES : 0);
 }
 
 // Returns the saved logits of snapshot x, or null if none were saved.
@@ -1485,7 +1793,7 @@ static int nemo_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
   int n = 0;
   if (x) {
     meta[0] = x->pos;
-    out[n++] = (SnapshotPart){x->rows, SNAP_ROLLING_BYTES};
+    out[n++] = (SnapshotPart){x->rows, snap_rolling_bytes()};
     if (x->logits) out[n++] = (SnapshotPart){x->logits, LOGITS_BYTES};
     return n;
   }
@@ -1493,6 +1801,8 @@ static int nemo_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
   meta[0] = pos;
   out[n++] = (SnapshotPart){s->conv_state.ptr, CONV_TOTAL_BYTES};
   out[n++] = (SnapshotPart){s->ssm_state.ptr, SSM_TOTAL_BYTES};
+  if (active_drafts > 0)
+    out[n++] = (SnapshotPart){s->last_hidden.ptr, LAST_HIDDEN_BYTES};
   return n;
 }
 
@@ -1503,7 +1813,7 @@ static ModelSnapshot *nemo_snapshot_new_empty(const int32_t *meta, int nmeta,
   NemoSnapshot *x = xmalloc(sizeof *x);
   *x = (NemoSnapshot){
       .pos = meta[0],
-      .rows = memory_host_alloc_required(&state_slot, SNAP_ROLLING_BYTES)};
+      .rows = memory_host_alloc_required(&state_slot, snap_rolling_bytes())};
   if (with_logits)
     x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
   return (ModelSnapshot *)x;
@@ -1591,14 +1901,14 @@ static void run_pack_bf16(GpuCommandBuffer *c, const Buf *x, int rows,
                  PACK_THREADS, 1, 1);
 }
 
-// Dispatches one per-tensor FP8 linear projection y = x @ w^T * scale (+ res).
-// When prepacked is nonzero and m > MOE_MV_MAX_M, uses work.x_pack directly.
+// Dispatches one per-tensor FP8 linear projection y = act(x @ w^T * scale)
+// (+ res). When prepacked is nonzero and m > MOE_MV_MAX_M, uses work.x_pack.
 static void run_fp8_linear(GpuCommandBuffer *c, const Fp8Lin *lin, const Buf *x,
                            const Buf *res, const Buf *y, size_t y_off, int m,
-                           int prepacked) {
-  Fp8LinParam p = {
-      (uint32_t)m, (uint32_t)lin->n, (uint32_t)lin->k, res ? 1u : 0u,
-      1u,          lin->scale};
+                           uint32_t act, int prepacked) {
+  Fp8LinParam p = {(uint32_t)m, (uint32_t)lin->n, (uint32_t)lin->k,
+                   act,         res ? 1u : 0u,    1u,
+                   lin->scale};
   const Buf *res_buf = res ? res : x;
   if (m <= MOE_MV_MAX_M) {
     gpu_select_kernel(c, K_fp8_mv);
@@ -1760,10 +2070,12 @@ static const uint16_t *find_media_row(int pos) {
       pos);
 }
 
-// Unpacks encoded BF16 audio feature rows into work.cur for any negative
-// placeholder tokens in [pos0, pos0 + rows).
+// Unpacks encoded BF16 audio feature rows into work.cur (and work.mtp_emb when
+// MTP drafting is active) for any negative placeholder tokens in
+// [pos0, pos0 + rows).
 static void inject_media_rows(const int *tokens, int pos0, int rows) {
   float *cur = (float *)work.cur.ptr;
+  float *mtp_emb = active_drafts > 0 ? (float *)work.mtp_emb.ptr : NULL;
   for (int r = 0; r < rows; r++) {
     if (tokens[r] >= 0) continue;
     const uint16_t *src = find_media_row(pos0 + r);
@@ -1772,6 +2084,7 @@ static void inject_media_rows(const int *tokens, int pos0, int rows) {
       uint32_t bits = (uint32_t)src[d] << BF16_SHIFT;
       memcpy(&dst[d], &bits, sizeof(float));
     }
+    if (mtp_emb) memcpy(mtp_emb + (size_t)r * NEMO_DIM, dst, LAST_HIDDEN_BYTES);
   }
 }
 
@@ -1787,7 +2100,8 @@ static void run_mamba_layer(GpuCommandBuffer *cmd, int m_idx, int rows,
   size_t zoff = capture_verify ? (size_t)m_idx * (size_t)rows *
                                      NEMO_MAMBA_IN_DIM * sizeof(float)
                                : 0;
-  run_fp8_linear(cmd, &ml->in_proj, &work.normed, NULL, zbuf, zoff, rows, 0);
+  run_fp8_linear(cmd, &ml->in_proj, &work.normed, NULL, zbuf, zoff, rows,
+                 ACT_NONE, 0);
 
   MambaParam mp = {(uint32_t)rows, RMS_EPS};
   uint32_t conv_gx =
@@ -1858,7 +2172,7 @@ static void run_mamba_layer(GpuCommandBuffer *cmd, int m_idx, int rows,
                  ROW_THREADS, 1, 1);
 
   run_fp8_linear(cmd, &ml->out_proj, &work.mamba_normed, &work.cur, &work.cur,
-                 0, rows, 0);
+                 0, rows, ACT_NONE, 0);
 }
 
 // Runs one NoPE GQA 32/2 attention layer (a_idx in 0..5) and adds its output
@@ -2086,11 +2400,58 @@ static void run_moe_layer(GpuCommandBuffer *cmd, int m_idx, int rows,
   }
 }
 
+// Updates MTP layer-0 K and V caches for `rows` (emb, prev_h) pairs without
+// running MTP attention Q/O or MTP layer-1 MoE.
+static void encode_mtp_kv_sync(GpuCommandBuffer *cmd, const Buf *emb,
+                               size_t emb_off, const Buf *h0, const Buf *h_seq,
+                               int use_h0, int rows, int kv_pos0,
+                               const NemoState *s, int batched) {
+  MtpEhParam ehp = {(uint32_t)rows, (uint32_t)NEMO_DIM, (uint32_t)use_h0,
+                    RMS_EPS};
+  gpu_select_kernel(cmd, K_mtp_eh_cat);
+  gpu_bind_buffer(cmd, 0, emb, emb_off);
+  gpu_bind_buffer(cmd, 1, h0, 0);
+  gpu_bind_buffer(cmd, 2, h_seq, 0);
+  gpu_bind_buffer(cmd, 3, &mtp.enorm_w, 0);
+  gpu_bind_buffer(cmd, 4, &mtp.hnorm_w, 0);
+  gpu_bind_buffer(cmd, 5, &work.mtp_eh, 0);
+  gpu_copy_bytes(cmd, 6, &ehp, sizeof ehp);
+  gpu_run_kernel(cmd, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+
+  run_fp8_linear(cmd, &mtp.eh_proj, &work.mtp_eh, NULL, &work.shared_out, 0,
+                 rows, ACT_NONE, 0);
+  run_rmsnorm(cmd, &work.shared_out, 0, &mtp.attn_norm_w, &work.normed, rows);
+
+  int prepacked = 0;
+  if (rows > MOE_MV_MAX_M) {
+    run_pack_bf16(cmd, &work.normed, rows, NEMO_DIM);
+    prepacked = 1;
+  }
+  run_fp8_linear(cmd, &mtp.k, &work.normed, NULL, &work.k_raw, 0, rows,
+                 ACT_NONE, prepacked);
+  run_fp8_linear(cmd, &mtp.v, &work.normed, NULL, &work.v_raw, 0, rows,
+                 ACT_NONE, prepacked);
+
+  QkvParam qp = {(uint32_t)rows, (uint32_t)rows, (uint32_t)kv_pos0,
+                 (uint32_t)batched};
+  gpu_select_kernel(cmd, K_kv_store);
+  gpu_bind_buffer(cmd, 0, &work.k_raw, 0);
+  gpu_bind_buffer(cmd, 1, &work.v_raw, 0);
+  gpu_bind_buffer(cmd, 2, &s->mtp_k[0], 0);
+  gpu_bind_buffer(cmd, 3, &s->mtp_k[1], 0);
+  gpu_bind_buffer(cmd, 4, &s->mtp_v[0], 0);
+  gpu_bind_buffer(cmd, 5, &s->mtp_v[1], 0);
+  gpu_bind_buffer(cmd, 6, &work.mtp_kv_tgt, 0);
+  gpu_copy_bytes(cmd, 7, &qp, sizeof qp);
+  gpu_run_kernel(cmd, (uint32_t)(2 * NEMO_KV_HEADS), (uint32_t)rows, 1,
+                 QKV_THREADS, 1, 1);
+}
+
 // Runs the complete 52-layer Nemotron-H forward pass over `rows` tokens.
 // Computes logits for all rows (logits_mode == 2), last row only (1), or skips
 // lm_head (0). When capture_verify is nonzero, captures Mamba-2 in_proj outputs
-// into work.verify_zxbcdt for exact partial-acceptance rollback. Returns 1 on
-// completion, or 0 if shutdown stopped a prefill.
+// into work.verify_zxbcdt and post-norm hidden states into work.verify_hidden.
+// Returns 1 on completion, or 0 if shutdown stopped a prefill.
 static int run_forward(NemoState *const *states, const int *tokens,
                        const int *pos, int rows, int batched, int is_prefill,
                        int logits_mode, int capture_verify,
@@ -2130,6 +2491,20 @@ static int run_forward(NemoState *const *states, const int *tokens,
                        0u};
       }
     }
+    if (active_drafts > 0) {
+      KvTarget *mkt = (KvTarget *)work.mtp_kv_tgt.ptr;
+      for (int r = 0; r < rows; r++) {
+        const NemoState *sr = states[r];
+        memcpy((float *)work.mtp_h_prev.ptr + (size_t)r * NEMO_DIM,
+               sr->last_hidden.ptr, LAST_HIDDEN_BYTES);
+        mkt[r] = (KvTarget){sr->mtp_k[0].address + sr->mtp_k[0].off,
+                            sr->mtp_k[1].address + sr->mtp_k[1].off,
+                            sr->mtp_v[0].address + sr->mtp_v[0].off,
+                            sr->mtp_v[1].address + sr->mtp_v[1].off,
+                            pos[r] > 0 ? (uint32_t)(pos[r] - 1) : KV_SKIP_POS,
+                            0u};
+      }
+    }
   } else {
     state_ensure_cap(states[0], pos0 + rows);
     max_pos = pos0 + rows - 1;
@@ -2153,6 +2528,15 @@ static int run_forward(NemoState *const *states, const int *tokens,
   gpu_copy_bytes(&cmd, 3, &ep, sizeof ep);
   gpu_run_kernel(&cmd, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
 
+  if (active_drafts > 0 && !capture_verify) {
+    gpu_select_kernel(&cmd, K_embed);
+    gpu_bind_buffer(&cmd, 0, &embed_w, 0);
+    gpu_bind_buffer(&cmd, 1, &work.ids, 0);
+    gpu_bind_buffer(&cmd, 2, &work.mtp_emb, 0);
+    gpu_copy_bytes(&cmd, 3, &ep, sizeof ep);
+    gpu_run_kernel(&cmd, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+  }
+
   for (int l = 0; l < NEMO_LAYERS; l++) {
     if (is_prefill) {
       prefill_layer_now = l + 1;
@@ -2174,16 +2558,42 @@ static int run_forward(NemoState *const *states, const int *tokens,
     }
   }
 
-  if (!stopped && logits_mode > 0) {
-    if (logits_mode == 1) {
-      size_t last_off = (size_t)(rows - 1) * NEMO_DIM * sizeof(float);
-      run_rmsnorm(&cmd, &work.cur, last_off, &final_norm_w, &work.normed, 1);
-      run_bf16_linear(&cmd, &lm_head_w, &work.normed, 0, &work.logits, 1,
-                      NEMO_VOCAB, NEMO_DIM, 0);
-    } else {
-      run_rmsnorm(&cmd, &work.cur, 0, &final_norm_w, &work.normed, rows);
-      run_bf16_linear(&cmd, &lm_head_w, &work.normed, 0, &work.logits, rows,
-                      NEMO_VOCAB, NEMO_DIM, 0);
+  if (!stopped) {
+    if (active_drafts > 0) {
+      const Buf *h_dst = capture_verify ? &work.verify_hidden : &work.mtp_h;
+      run_rmsnorm(&cmd, &work.cur, 0, &final_norm_w, h_dst, rows);
+      if (logits_mode == 1) {
+        size_t last_off = (size_t)(rows - 1) * NEMO_DIM * sizeof(float);
+        run_bf16_linear(&cmd, &lm_head_w, h_dst, last_off, &work.logits, 1,
+                        NEMO_VOCAB, NEMO_DIM, 0);
+      } else if (logits_mode == 2) {
+        run_bf16_linear(&cmd, &lm_head_w, h_dst, 0, &work.logits, rows,
+                        NEMO_VOCAB, NEMO_DIM, 0);
+      }
+      if (!capture_verify) {
+        if (batched) {
+          encode_mtp_kv_sync(&cmd, &work.mtp_emb, 0, &work.mtp_h_prev,
+                             &work.mtp_h_prev, 0, rows, 0, states[0], 1);
+        } else if (pos0 == 0 && rows >= 2) {
+          encode_mtp_kv_sync(&cmd, &work.mtp_emb, LAST_HIDDEN_BYTES,
+                             &work.mtp_h, &work.mtp_h, 0, rows - 1, 0,
+                             states[0], 0);
+        } else if (pos0 > 0) {
+          encode_mtp_kv_sync(&cmd, &work.mtp_emb, 0, &states[0]->last_hidden,
+                             &work.mtp_h, 1, rows, pos0 - 1, states[0], 0);
+        }
+      }
+    } else if (logits_mode > 0) {
+      if (logits_mode == 1) {
+        size_t last_off = (size_t)(rows - 1) * NEMO_DIM * sizeof(float);
+        run_rmsnorm(&cmd, &work.cur, last_off, &final_norm_w, &work.normed, 1);
+        run_bf16_linear(&cmd, &lm_head_w, &work.normed, 0, &work.logits, 1,
+                        NEMO_VOCAB, NEMO_DIM, 0);
+      } else {
+        run_rmsnorm(&cmd, &work.cur, 0, &final_norm_w, &work.normed, rows);
+        run_bf16_linear(&cmd, &lm_head_w, &work.normed, 0, &work.logits, rows,
+                        NEMO_VOCAB, NEMO_DIM, 0);
+      }
     }
   }
 
@@ -2195,9 +2605,21 @@ static int run_forward(NemoState *const *states, const int *tokens,
 
   if (!stopped) {
     if (batched) {
-      for (int r = 0; r < rows; r++) states[r]->pos = pos[r] + 1;
+      for (int r = 0; r < rows; r++) {
+        states[r]->pos = pos[r] + 1;
+        if (active_drafts > 0 && !capture_verify) {
+          memcpy(states[r]->last_hidden.ptr,
+                 (const float *)work.mtp_h.ptr + (size_t)r * NEMO_DIM,
+                 LAST_HIDDEN_BYTES);
+        }
+      }
     } else {
       states[0]->pos = pos0 + rows;
+      if (active_drafts > 0 && !capture_verify) {
+        memcpy(states[0]->last_hidden.ptr,
+               (const float *)work.mtp_h.ptr + (size_t)(rows - 1) * NEMO_DIM,
+               LAST_HIDDEN_BYTES);
+      }
     }
   }
   return !stopped;
@@ -2327,6 +2749,7 @@ static int nemo_load(Gpu *g, MemorySlot *work_mem, const char *dir,
     K(K_mamba_ssm_decode, "nemo_mamba_ssm_decode");
     K(K_mamba_norm_gated, "nemo_mamba_norm_gated");
     K(K_qkv_store, "nemo_qkv_store");
+    K(K_kv_store, "nemo_kv_store");
     K(K_attend_prefill, "nemo_attend_prefill");
     K(K_attend_part, "nemo_attend_part");
     K(K_attend_combine, "nemo_attend_combine");
@@ -2338,12 +2761,18 @@ static int nemo_load(Gpu *g, MemorySlot *work_mem, const char *dir,
     K(K_moe_up_mm, "nemo_moe_nvfp4_up_mm");
     K(K_moe_dn_mm, "nemo_moe_nvfp4_down_mm");
     K(K_moe_combine_add, "nemo_moe_combine_add");
+    K(K_mtp_eh_cat, "nemo_mtp_eh_cat");
+    K(K_moe_fp8_up_mv, "nemo_moe_fp8_up_mv");
+    K(K_moe_fp8_dn_mv, "nemo_moe_fp8_down_mv");
+    K(K_unembed_argmax_part, "nemo_unembed_argmax_part");
+    K(K_unembed_argmax_final, "nemo_unembed_argmax_final");
 #undef K
 
     checkpoint = tensor_index_open(dir);
     text_weights =
         weight_group_new(gpu, work_mem->account, "Nemotron-H weights");
     register_weights();
+    register_mtp_weights(dir);
 
     ExpertLayout layout = {.layers = NEMO_MOE_LAYERS,
                            .scored_layers = NEMO_MOE_LAYERS,
@@ -2383,9 +2812,12 @@ static int nemo_load(Gpu *g, MemorySlot *work_mem, const char *dir,
       layer_table[m] = work_alloc((size_t)NEMO_EXPERTS * sizeof(ExpertRef));
       layer_table_gen[m] = UINT64_MAX;
     }
+    if (active_drafts > 0)
+      mtp_exp_table = work_alloc((size_t)NEMO_EXPERTS * sizeof(Fp8ExpertRef));
     expert_store_start(experts_store, 0, NEMO_MOE_LAYERS);
     store_started = 1;
   }
+  if (active_drafts > 0) refresh_mtp_expert_table();
   expert_store_preload_if_fits(experts_store);
   if (shutdown_requested()) {
     memory_pin(slot, 0);
@@ -2472,8 +2904,8 @@ static int nemo_max_rows(void) { return NEMO_MAX_BATCH_ROWS; }
 // Returns the maximum verify rows (committed token + up to 15 proposals).
 static int nemo_max_verify(void) { return NEMO_MAX_VERIFY; }
 
-// Returns active drafts per pass (0 while speculative drafting is disabled).
-static int nemo_drafts_per_pass(void) { return 0; }
+// Returns active MTP drafts per pass (0..8).
+static int nemo_drafts_per_pass(void) { return active_drafts; }
 
 // Returns safe rewind margin (0 for Mamba-2 SSM states).
 static int nemo_rewind_margin(void) { return 0; }
@@ -2504,6 +2936,7 @@ static const float *nemo_prefill(ModelState *ms, const int *tokens, int n,
   if (from == 0) {
     memset(s->conv_state.ptr, 0, CONV_TOTAL_BYTES);
     memset(s->ssm_state.ptr, 0, SSM_TOTAL_BYTES);
+    if (active_drafts > 0) memset(s->last_hidden.ptr, 0, LAST_HIDDEN_BYTES);
     s->pos = 0;
   } else if (s->pos != from) {
     die("nemotron: prefill from %d does not match Mamba state position %d",
@@ -2584,6 +3017,204 @@ static const float *nemo_decode_rows(ModelState *const *states,
   return (const float *)work.logits.ptr;
 }
 
+// Runs up to 8 repeated *E Multi-Token Prediction steps on GPU in a single
+// command buffer, predicting `n` greedy draft tokens after `token` at `pos`.
+// Returns null so target verification preserves exact serial sampling.
+static const double *nemo_propose_drafts(ModelState *ms, int token, int pos,
+                                         int *drafts, int n, Sampler *sampler) {
+  (void)sampler;
+  if (!active_drafts) die("nemotron: MTP draft head is not active");
+  if (n < 1 || n > active_drafts)
+    die("nemotron: MTP propose requires 1 to %d drafts (got %d)", active_drafts,
+        n);
+  if (pos < 1) die("nemotron: MTP propose requires pos >= 1 (got %d)", pos);
+  if (token < 0 || token >= NEMO_VOCAB)
+    die("nemotron: MTP propose got invalid token %d", token);
+
+  NemoState *s = (NemoState *)ms;
+  if (s->pos != pos)
+    die("nemotron: MTP propose pos %d does not match state pos %d", pos,
+        s->pos);
+  if (!prepare_rows(1, 0, 0))
+    die("nemotron: out of memory preparing MTP draft pass");
+  ensure_work(1, 0);
+  state_ensure_cap(s, pos + n);
+
+  ((int32_t *)work.mtp_tok.ptr)[0] = token;
+
+  NormParam ep = {(uint32_t)NEMO_DIM, 0u, RMS_EPS};
+  MtpEhParam ehp = {1u, (uint32_t)NEMO_DIM, 0u, RMS_EPS};
+  RouteParam rp = {1u, (uint32_t)NEMO_EXPERTS, (uint32_t)NEMO_TOPK,
+                   ROUTE_SCALE};
+  uint32_t m_topk[2] = {1u, (uint32_t)NEMO_TOPK};
+  MoeParam mp_up = {(uint32_t)NEMO_MOE_INTER, (uint32_t)NEMO_DIM,
+                    (uint32_t)NEMO_TOPK, (uint32_t)NEMO_TOPK};
+  MoeParam mp_dn = {(uint32_t)NEMO_DIM, (uint32_t)NEMO_MOE_INTER,
+                    (uint32_t)NEMO_TOPK, (uint32_t)NEMO_TOPK};
+  MoeCombineParam mcp = {1u, (uint32_t)NEMO_DIM, (uint32_t)NEMO_TOPK};
+  UnembedParam up = {(uint32_t)NEMO_VOCAB, (uint32_t)NEMO_DIM};
+  uint32_t nparts_u = UNEMBED_PARTS;
+  uint32_t gx_up =
+      ((uint32_t)NEMO_MOE_INTER + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG;
+  uint32_t gx_dn =
+      ((uint32_t)NEMO_DIM + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG;
+
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  for (int d = 0; d < n; d++) {
+    int kv_pos = pos - 1 + d;
+
+    gpu_select_kernel(&cmd, K_embed);
+    gpu_bind_buffer(&cmd, 0, &embed_w, 0);
+    gpu_bind_buffer(&cmd, 1, &work.mtp_tok, (size_t)d * sizeof(int32_t));
+    gpu_bind_buffer(&cmd, 2, &work.mtp_emb, 0);
+    gpu_copy_bytes(&cmd, 3, &ep, sizeof ep);
+    gpu_run_kernel(&cmd, 1, 1, 1, ROW_THREADS, 1, 1);
+
+    const Buf *prev_h = (d == 0) ? &s->last_hidden : &work.mtp_h;
+    gpu_select_kernel(&cmd, K_mtp_eh_cat);
+    gpu_bind_buffer(&cmd, 0, &work.mtp_emb, 0);
+    gpu_bind_buffer(&cmd, 1, prev_h, 0);
+    gpu_bind_buffer(&cmd, 2, prev_h, 0);
+    gpu_bind_buffer(&cmd, 3, &mtp.enorm_w, 0);
+    gpu_bind_buffer(&cmd, 4, &mtp.hnorm_w, 0);
+    gpu_bind_buffer(&cmd, 5, &work.mtp_eh, 0);
+    gpu_copy_bytes(&cmd, 6, &ehp, sizeof ehp);
+    gpu_run_kernel(&cmd, 1, 1, 1, ROW_THREADS, 1, 1);
+
+    run_fp8_linear(&cmd, &mtp.eh_proj, &work.mtp_eh, NULL, &work.cur, 0, 1,
+                   ACT_NONE, 0);
+
+    // Layer 0: NoPE GQA 32/2 attention over MTP KV positions 0..kv_pos.
+    run_rmsnorm(&cmd, &work.cur, 0, &mtp.attn_norm_w, &work.normed, 1);
+    run_fp8_linear(&cmd, &mtp.q, &work.normed, NULL, &work.q_raw, 0, 1,
+                   ACT_NONE, 0);
+    run_fp8_linear(&cmd, &mtp.k, &work.normed, NULL, &work.k_raw, 0, 1,
+                   ACT_NONE, 0);
+    run_fp8_linear(&cmd, &mtp.v, &work.normed, NULL, &work.v_raw, 0, 1,
+                   ACT_NONE, 0);
+
+    QkvParam qp = {1u, 1u, (uint32_t)kv_pos, 0u};
+    gpu_select_kernel(&cmd, K_qkv_store);
+    gpu_bind_buffer(&cmd, 0, &work.q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &work.k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &work.v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &work.q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &s->mtp_k[0], 0);
+    gpu_bind_buffer(&cmd, 5, &s->mtp_k[1], 0);
+    gpu_bind_buffer(&cmd, 6, &s->mtp_v[0], 0);
+    gpu_bind_buffer(&cmd, 7, &s->mtp_v[1], 0);
+    gpu_bind_buffer(&cmd, 8, &work.mtp_kv_tgt, 0);
+    gpu_copy_bytes(&cmd, 9, &qp, sizeof qp);
+    gpu_run_kernel(&cmd, QKV_SLOTS, 1, 1, QKV_THREADS, 1, 1);
+
+    int total_k = kv_pos + 1;
+    int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
+    if (nparts < 1) nparts = 1;
+    if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
+    AttnDecodeParam adp = {
+        1u, 1u, (uint32_t)kv_pos, (uint32_t)nparts, MAX_DECODE_PARTS, 0u};
+    gpu_select_kernel(&cmd, K_attend_part);
+    gpu_bind_buffer(&cmd, 0, &work.q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &s->mtp_k[0], 0);
+    gpu_bind_buffer(&cmd, 2, &s->mtp_k[1], 0);
+    gpu_bind_buffer(&cmd, 3, &s->mtp_v[0], 0);
+    gpu_bind_buffer(&cmd, 4, &s->mtp_v[1], 0);
+    gpu_bind_buffer(&cmd, 5, &work.mtp_kv_tgt, 0);
+    gpu_bind_buffer(&cmd, 6, &work.attn_part, 0);
+    gpu_copy_bytes(&cmd, 7, &adp, sizeof adp);
+    gpu_run_kernel(&cmd, (uint32_t)NEMO_KV_HEADS, (uint32_t)nparts, 1,
+                   DECODE_PART_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_attend_combine);
+    gpu_bind_buffer(&cmd, 0, &work.attn_part, 0);
+    gpu_bind_buffer(&cmd, 1, &work.attn_out, 0);
+    gpu_copy_bytes(&cmd, 2, &adp, sizeof adp);
+    gpu_run_kernel(&cmd, (uint32_t)NEMO_HEADS, 1, 1, DECODE_COMBINE_THREADS, 1,
+                   1);
+
+    run_fp8_linear(&cmd, &mtp.o, &work.attn_out, &work.cur, &work.cur, 0, 1,
+                   ACT_NONE, 0);
+
+    // Layer 1: FP8 shared + top-6 routed MoE + final_layernorm.
+    run_rmsnorm(&cmd, &work.cur, 0, &mtp.moe_norm_w, &work.normed, 1);
+    run_fp8_linear(&cmd, &mtp.shared_up, &work.normed, NULL, &work.shared_h, 0,
+                   1, ACT_RELU2, 0);
+    run_fp8_linear(&cmd, &mtp.shared_down, &work.shared_h, NULL,
+                   &work.shared_out, 0, 1, ACT_NONE, 0);
+
+    run_bf16_linear(&cmd, &mtp.router_w, &work.normed, 0, &work.route_logits, 1,
+                    NEMO_EXPERTS, NEMO_DIM, 0);
+    gpu_select_kernel(&cmd, K_route_topk);
+    gpu_bind_buffer(&cmd, 0, &work.route_logits, 0);
+    gpu_bind_buffer(&cmd, 1, &mtp.router_bias, 0);
+    gpu_bind_buffer(&cmd, 2, &work.route_ids, 0);
+    gpu_bind_buffer(&cmd, 3, &work.route_w, 0);
+    gpu_copy_bytes(&cmd, 4, &rp, sizeof rp);
+    gpu_run_kernel(&cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_moe_group);
+    gpu_bind_buffer(&cmd, 0, &work.route_ids, 0);
+    gpu_bind_buffer(&cmd, 1, &work.route_w, 0);
+    gpu_bind_buffer(&cmd, 2, &work.ptok, 0);
+    gpu_bind_buffer(&cmd, 3, &work.pw, 0);
+    gpu_bind_buffer(&cmd, 4, &work.tp, 0);
+    gpu_bind_buffer(&cmd, 5, &work.tiles, 0);
+    gpu_copy_bytes(&cmd, 6, m_topk, sizeof m_topk);
+    gpu_run_kernel(&cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_moe_fp8_up_mv);
+    gpu_bind_buffer(&cmd, 0, &mtp_exp_table, 0);
+    gpu_bind_buffer(&cmd, 1, &work.normed, 0);
+    gpu_bind_buffer(&cmd, 2, &work.ptok, 0);
+    gpu_bind_buffer(&cmd, 3, &work.tiles, 0);
+    gpu_bind_buffer(&cmd, 4, &work.h_bf16, 0);
+    gpu_copy_bytes(&cmd, 5, &mp_up, sizeof mp_up);
+    gpu_run_kernel(&cmd, gx_up, (uint32_t)NEMO_TOPK, 1, MOE_MV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_moe_fp8_dn_mv);
+    gpu_bind_buffer(&cmd, 0, &mtp_exp_table, 0);
+    gpu_bind_buffer(&cmd, 1, &work.h_bf16, 0);
+    gpu_bind_buffer(&cmd, 2, &work.pw, 0);
+    gpu_bind_buffer(&cmd, 3, &work.tiles, 0);
+    gpu_bind_buffer(&cmd, 4, &work.y_pair, 0);
+    gpu_copy_bytes(&cmd, 5, &mp_dn, sizeof mp_dn);
+    gpu_run_kernel(&cmd, gx_dn, (uint32_t)NEMO_TOPK, 1, MOE_MV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_moe_combine_add);
+    gpu_bind_buffer(&cmd, 0, &work.y_pair, 0);
+    gpu_bind_buffer(&cmd, 1, &work.tp, 0);
+    gpu_bind_buffer(&cmd, 2, &work.shared_out, 0);
+    gpu_bind_buffer(&cmd, 3, &work.cur, 0);
+    gpu_copy_bytes(&cmd, 4, &mcp, sizeof mcp);
+    gpu_run_kernel(&cmd,
+                   ((uint32_t)NEMO_DIM + MOE_COMBINE_THREADS - 1u) /
+                       MOE_COMBINE_THREADS,
+                   1, 1, MOE_COMBINE_THREADS, 1, 1);
+
+    run_rmsnorm(&cmd, &work.cur, 0, &mtp.final_norm_w, &work.mtp_h, 1);
+
+    // Fused unembed + argmax into work.mtp_tok[d + 1].
+    gpu_select_kernel(&cmd, K_unembed_argmax_part);
+    gpu_bind_buffer(&cmd, 0, &lm_head_w, 0);
+    gpu_bind_buffer(&cmd, 1, &work.mtp_h, 0);
+    gpu_bind_buffer(&cmd, 2, &work.mtp_argmax, 0);
+    gpu_copy_bytes(&cmd, 3, &up, sizeof up);
+    gpu_run_kernel(&cmd, nparts_u, 1, 1, FP8_MV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, K_unembed_argmax_final);
+    gpu_bind_buffer(&cmd, 0, &work.mtp_argmax, 0);
+    gpu_bind_buffer(&cmd, 1, &work.mtp_tok, (size_t)(d + 1) * sizeof(int32_t));
+    gpu_copy_bytes(&cmd, 2, &nparts_u, sizeof nparts_u);
+    gpu_run_kernel(&cmd, 1, 1, 1, ROW_THREADS, 1, 1);
+  }
+
+  model_commit(&cmd);
+  model_sync();
+  memcpy(drafts, (const int32_t *)work.mtp_tok.ptr + 1,
+         (size_t)n * sizeof(int32_t));
+  return NULL;
+}
+
 // Verifies `count` sequential tokens (1 committed token + up to 15 drafts) on
 // state `ms` starting at `pos`, returning `count` rows of logits and saving
 // pre-verify Mamba-2 state and zxbcdt projections for exact partial accept.
@@ -2620,65 +3251,95 @@ static const float *nemo_verify(ModelState *ms, const int *rows, int count,
 }
 
 // Commits the first `n` verified tokens (1 <= n <= count) on state `ms`.
-// Full acceptance needs no rollback; partial acceptance restores pre-verify
-// Mamba-2 conv/SSM state and replays only the 23 lightweight conv1d + SSM scan
-// updates over the saved FP32 zxbcdt prefix without rerunning any projections.
+// Partial acceptance restores pre-verify Mamba-2 conv/SSM state and replays
+// only the 23 lightweight conv1d + SSM scan updates over the saved FP32 zxbcdt
+// prefix. When MTP drafting is active, refreshes MTP layer-0 K/V for the
+// committed prefix from exact backbone hidden states and updates last_hidden.
 static void nemo_accept(ModelState *ms, const int *rows, int n, int pos) {
-  (void)rows;
   NemoState *s = (NemoState *)ms;
   if (s != work.verify_state || pos != work.verify_pos || n < 1 ||
       n > work.verify_count)
     die("nemotron: invalid accept (n=%d, verify_count=%d, pos=%d, "
         "verify_pos=%d)",
         n, work.verify_count, pos, work.verify_pos);
-  if (n < work.verify_count) {
+  int need_rewind = (n < work.verify_count);
+  if (need_rewind || active_drafts > 0) {
     model_sync();
-    memcpy(s->conv_state.ptr, work.verify_conv.ptr, CONV_TOTAL_BYTES);
-    memcpy(s->ssm_state.ptr, work.verify_ssm.ptr, SSM_TOTAL_BYTES);
-
-    MambaParam mp = {(uint32_t)n, RMS_EPS};
-    uint32_t conv_gx =
-        ((uint32_t)NEMO_MAMBA_CONV_DIM + CONV_THREADS - 1u) / CONV_THREADS;
-    uint32_t ssm_gx = (uint32_t)NEMO_MAMBA_HEAD_DIM / SSM_P_PER_TG;
+    if (need_rewind) {
+      memcpy(s->conv_state.ptr, work.verify_conv.ptr, CONV_TOTAL_BYTES);
+      memcpy(s->ssm_state.ptr, work.verify_ssm.ptr, SSM_TOTAL_BYTES);
+    }
+    if (active_drafts > 0)
+      memcpy(work.ids.ptr, rows, (size_t)n * sizeof(int32_t));
 
     GpuCommandBuffer cmd = gpu_begin(gpu);
-    for (int m = 0; m < NEMO_MAMBA_LAYERS; m++) {
-      const MambaLayer *ml = &mamba_layers[m];
-      size_t zoff = (size_t)m * (size_t)work.verify_count * NEMO_MAMBA_IN_DIM *
-                    sizeof(float);
-      size_t conv_off = (size_t)m * CONV_LAYER_BYTES;
-      size_t ssm_off = (size_t)m * SSM_LAYER_BYTES;
+    if (need_rewind) {
+      MambaParam mp = {(uint32_t)n, RMS_EPS};
+      uint32_t conv_gx =
+          ((uint32_t)NEMO_MAMBA_CONV_DIM + CONV_THREADS - 1u) / CONV_THREADS;
+      uint32_t ssm_gx = (uint32_t)NEMO_MAMBA_HEAD_DIM / SSM_P_PER_TG;
 
-      gpu_select_kernel(&cmd, K_mamba_conv_prefill);
-      gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
-      gpu_bind_buffer(&cmd, 1, &s->conv_state, conv_off);
-      gpu_bind_buffer(&cmd, 2, &ml->conv_w, 0);
-      gpu_bind_buffer(&cmd, 3, &ml->conv_b, 0);
-      gpu_bind_buffer(&cmd, 4, &work.mamba_xbc, 0);
-      gpu_copy_bytes(&cmd, 5, &mp, sizeof mp);
-      gpu_run_kernel(&cmd, conv_gx, (uint32_t)n, 1, CONV_THREADS, 1, 1);
+      for (int m = 0; m < NEMO_MAMBA_LAYERS; m++) {
+        const MambaLayer *ml = &mamba_layers[m];
+        size_t zoff = (size_t)m * (size_t)work.verify_count *
+                      NEMO_MAMBA_IN_DIM * sizeof(float);
+        size_t conv_off = (size_t)m * CONV_LAYER_BYTES;
+        size_t ssm_off = (size_t)m * SSM_LAYER_BYTES;
 
-      gpu_select_kernel(&cmd, K_mamba_conv_save);
-      gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
-      gpu_bind_buffer(&cmd, 1, &s->conv_state, conv_off);
-      gpu_copy_bytes(&cmd, 2, &mp, sizeof mp);
-      gpu_run_kernel(&cmd, conv_gx, 1, 1, CONV_THREADS, 1, 1);
+        gpu_select_kernel(&cmd, K_mamba_conv_prefill);
+        gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
+        gpu_bind_buffer(&cmd, 1, &s->conv_state, conv_off);
+        gpu_bind_buffer(&cmd, 2, &ml->conv_w, 0);
+        gpu_bind_buffer(&cmd, 3, &ml->conv_b, 0);
+        gpu_bind_buffer(&cmd, 4, &work.mamba_xbc, 0);
+        gpu_copy_bytes(&cmd, 5, &mp, sizeof mp);
+        gpu_run_kernel(&cmd, conv_gx, (uint32_t)n, 1, CONV_THREADS, 1, 1);
 
-      gpu_select_kernel(&cmd, K_mamba_ssm_prefill);
-      gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
-      gpu_bind_buffer(&cmd, 1, &work.mamba_xbc, 0);
-      gpu_bind_buffer(&cmd, 2, &s->ssm_state, ssm_off);
-      gpu_bind_buffer(&cmd, 3, &ml->a_exp, 0);
-      gpu_bind_buffer(&cmd, 4, &ml->d_skip, 0);
-      gpu_bind_buffer(&cmd, 5, &ml->dt_bias, 0);
-      gpu_bind_buffer(&cmd, 6, &work.mamba_y, 0);
-      gpu_copy_bytes(&cmd, 7, &mp, sizeof mp);
-      gpu_run_kernel(&cmd, ssm_gx, (uint32_t)NEMO_MAMBA_HEADS, 1, SSM_THREADS,
-                     1, 1);
+        gpu_select_kernel(&cmd, K_mamba_conv_save);
+        gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
+        gpu_bind_buffer(&cmd, 1, &s->conv_state, conv_off);
+        gpu_copy_bytes(&cmd, 2, &mp, sizeof mp);
+        gpu_run_kernel(&cmd, conv_gx, 1, 1, CONV_THREADS, 1, 1);
+
+        gpu_select_kernel(&cmd, K_mamba_ssm_prefill);
+        gpu_bind_buffer(&cmd, 0, &work.verify_zxbcdt, zoff);
+        gpu_bind_buffer(&cmd, 1, &work.mamba_xbc, 0);
+        gpu_bind_buffer(&cmd, 2, &s->ssm_state, ssm_off);
+        gpu_bind_buffer(&cmd, 3, &ml->a_exp, 0);
+        gpu_bind_buffer(&cmd, 4, &ml->d_skip, 0);
+        gpu_bind_buffer(&cmd, 5, &ml->dt_bias, 0);
+        gpu_bind_buffer(&cmd, 6, &work.mamba_y, 0);
+        gpu_copy_bytes(&cmd, 7, &mp, sizeof mp);
+        gpu_run_kernel(&cmd, ssm_gx, (uint32_t)NEMO_MAMBA_HEADS, 1, SSM_THREADS,
+                       1, 1);
+      }
+    }
+    if (active_drafts > 0) {
+      NormParam ep = {(uint32_t)NEMO_DIM, 0u, RMS_EPS};
+      gpu_select_kernel(&cmd, K_embed);
+      gpu_bind_buffer(&cmd, 0, &embed_w, 0);
+      gpu_bind_buffer(&cmd, 1, &work.ids, 0);
+      gpu_bind_buffer(&cmd, 2, &work.mtp_emb, 0);
+      gpu_copy_bytes(&cmd, 3, &ep, sizeof ep);
+      gpu_run_kernel(&cmd, (uint32_t)n, 1, 1, ROW_THREADS, 1, 1);
+
+      if (pos > 0) {
+        encode_mtp_kv_sync(&cmd, &work.mtp_emb, 0, &s->last_hidden,
+                           &work.verify_hidden, 1, n, pos - 1, s, 0);
+      } else if (n >= 2) {
+        encode_mtp_kv_sync(&cmd, &work.mtp_emb, LAST_HIDDEN_BYTES,
+                           &work.verify_hidden, &work.verify_hidden, 0, n - 1,
+                           0, s, 0);
+      }
     }
     model_commit(&cmd);
     model_sync();
-    s->pos = pos + n;
+    if (need_rewind) s->pos = pos + n;
+    if (active_drafts > 0) {
+      memcpy(s->last_hidden.ptr,
+             (const float *)work.verify_hidden.ptr + (size_t)(n - 1) * NEMO_DIM,
+             LAST_HIDDEN_BYTES);
+    }
   }
   work.verify_state = NULL;
   work.verify_count = 0;
@@ -2762,7 +3423,7 @@ static const char *const nemo_model_types[] = {"nemo_speechlm", "nemotron_h",
 const ModelOps nemotron_ops = {.family = "Nemotron-H",
                                .model_types = nemo_model_types,
                                .media_token = "<|audio|>",
-                               .max_drafts = 0,
+                               .max_drafts = NEMO_MTP_MAX_DRAFTS,
                                .load = nemo_load,
                                .dense_weight_slot = nemo_dense_weight_slot,
                                .set_request_running = nemo_set_request_running,
@@ -2792,6 +3453,7 @@ const ModelOps nemotron_ops = {.family = "Nemotron-H",
                                .prefill = nemo_prefill,
                                .replay_rows = nemo_replay_rows,
                                .decode_rows = nemo_decode_rows,
+                               .propose_drafts = nemo_propose_drafts,
                                .verify = nemo_verify,
                                .accept = nemo_accept,
                                .run_idle_work = nemo_run_idle_work,

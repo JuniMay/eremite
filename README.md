@@ -129,7 +129,8 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
     },
     {
       "model": "/path/to/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4",
-      "memory": 5
+      "memory": 6,
+      "draft": 7
     }
   ]
 }

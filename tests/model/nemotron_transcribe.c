@@ -35,12 +35,13 @@ static void checkf(int ok, const char *fmt, ...) {
 // 3. Verifies snapshot capture, state copy and snapshot restore reproduce
 //    identical next-token logits.
 //
-// usage: model-nemotron_transcribe CHECKPOINT AUDIO_FILE
-//        [--memory-gb N] [--expect SUBSTRING]
+// usage: model-nemotron_transcribe CHECKPOINT [AUDIO_FILE] [--say TEXT]
+//        [--memory-gb N] [--draft N] [--expect SUBSTRING]
 
 static constexpr int MAX_PROMPT_TOKENS = 65536;
 static constexpr int MAX_GEN_TOKENS = 256;
 static constexpr int MODEL_CTX = 8192;
+static constexpr int MAX_VERIFY_ROWS = 16;
 static constexpr size_t TRANSCRIPT_CAP = 16384;
 static constexpr float SNAP_LOGIT_TOL = 1e-4f;
 
@@ -103,7 +104,7 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
             "usage: %s CHECKPOINT [AUDIO_FILE] [--say TEXT] "
-            "[--memory-gb N] [--expect SUBSTRING]\n",
+            "[--memory-gb N] [--draft N] [--expect SUBSTRING]\n",
             argv[0]);
     return 2;
   }
@@ -111,10 +112,13 @@ int main(int argc, char **argv) {
   const char *audio_path = NULL;
   const char *say_text = NULL;
   double memory_gb = 0.0;
+  int draft = 0;
   const char *expect = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--memory-gb") && i + 1 < argc) {
       memory_gb = atof(argv[++i]);
+    } else if (!strcmp(argv[i], "--draft") && i + 1 < argc) {
+      draft = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--expect") && i + 1 < argc) {
       expect = argv[++i];
     } else if (!strcmp(argv[i], "--say") && i + 1 < argc) {
@@ -135,14 +139,20 @@ int main(int argc, char **argv) {
   checkf(eremite_init(&proc) == 0, "initialized eremite (memory_gb=%.1f)",
          memory_gb);
 
-  eremite_config cfg = {.abi = EREMITE_ABI, .model = dir, .ctx = MODEL_CTX};
+  eremite_config cfg = {.abi = EREMITE_ABI,
+                        .model = dir,
+                        .ctx = MODEL_CTX,
+                        .deepseek = {.draft = draft}};
   eremite_model *m = eremite_open(&cfg);
-  checkf(m != NULL, "opened Nemotron-3.5-Transcribe model");
+  checkf(m != NULL, "opened Nemotron-3.5-Transcribe model (draft=%d)", draft);
 
   double t_load0 = now();
   checkf(eremite_load(m) == 1, "loaded model weights (%.2fs)", now() - t_load0);
   checkf(eremite_vocab_size(m) == 131072, "vocab_size is 131072 (got %d)",
          eremite_vocab_size(m));
+  checkf(eremite_drafts_per_pass(m) == draft,
+         "drafts_per_pass matches requested draft=%d (got %d)", draft,
+         eremite_drafts_per_pass(m));
   checkf(eremite_replay_rows(m, 10) == -1,
          "replay_rows reports snapshot-only resume (-1)");
 
@@ -318,6 +328,91 @@ int main(int argc, char **argv) {
            "full accept(7/7) leaves Mamba-2+KV state exact (tok=%d vs %d)",
            after_full ? argmax_token(after_full, vocab) : -1, expect12);
     eremite_state_free(m, sv);
+  }
+
+  // When MTP drafting is enabled (--draft N), decode the full transcript using
+  // speculative propose_drafts + verify + sample_verify_drafts + accept from
+  // the restored prompt-end snapshot, asserting exact token-by-token match
+  // against greedy single-token decoding and reporting acceptance rate + speed.
+  if (draft > 0 && gen_count > 0) {
+    eremite_state *sm = eremite_state_new(m);
+    checkf(sm != NULL, "allocated state for MTP speculative decode");
+    eremite_state_copy(m, sm, st, exp_n);
+    eremite_snapshot_restore(m, sm, prompt_end_snap);
+
+    eremite_sampler *greedy = eremite_sampler_new(0.0, 1.0, 0, 0, 0);
+    int32_t spec_toks[MAX_GEN_TOKENS];
+    int spec_count = 0;
+    int32_t tok = first_tok;
+    int pos = exp_n;
+    int total_proposed = 0, total_accepted = 0, passes = 0;
+    int exact_match = 1;
+    double t_prop = 0.0, t_ver = 0.0, t_acc = 0.0;
+    double t_spec0 = now();
+    while (spec_count < MAX_GEN_TOKENS && !eremite_is_stop_token(m, tok)) {
+      int32_t vrows[MAX_VERIFY_ROWS];
+      vrows[0] = tok;
+      int nd = draft;
+      if (spec_count + 1 + nd > MAX_GEN_TOKENS)
+        nd = MAX_GEN_TOKENS - spec_count - 1;
+      if (nd <= 0) {
+        spec_toks[spec_count++] = tok;
+        break;
+      }
+      double ts0 = now();
+      const double *q =
+          eremite_propose_drafts(m, sm, tok, pos, vrows + 1, nd, greedy);
+      double ts1 = now();
+      const float *vl = eremite_verify(m, sm, vrows, nd + 1, pos);
+      double ts2 = now();
+      if (!vl) break;
+      int accepted = 0;
+      int32_t next = eremite_sample_verify_drafts(m, vl, vrows + 1, nd, q,
+                                                  greedy, &accepted);
+      eremite_accept(m, sm, vrows, accepted + 1, pos);
+      double ts3 = now();
+      t_prop += ts1 - ts0;
+      t_ver += ts2 - ts1;
+      t_acc += ts3 - ts2;
+      total_proposed += nd;
+      total_accepted += accepted;
+      passes++;
+      for (int k = 0; k <= accepted && spec_count < MAX_GEN_TOKENS; k++)
+        spec_toks[spec_count++] = vrows[k];
+      pos += accepted + 1;
+      tok = next;
+    }
+    double spec_s = now() - t_spec0;
+    if (spec_count != gen_count || tok != cur_tok) {
+      exact_match = 0;
+    } else {
+      for (int i = 0; i < gen_count; i++) {
+        if (spec_toks[i] != gen_toks[i]) {
+          exact_match = 0;
+          break;
+        }
+      }
+    }
+    double accept_pct =
+        total_proposed > 0 ? 100.0 * total_accepted / total_proposed : 0.0;
+    double tok_per_pass = passes > 0 ? (double)spec_count / passes : 0.0;
+    double spec_tps = spec_s > 0.0 ? (double)spec_count / spec_s : 0.0;
+    double base_tps = dec_s > 0.0 ? (double)gen_count / dec_s : 0.0;
+    printf("MTP (draft=%d): %d tokens in %.3fs (%.1f tok/s vs %.1f tok/s "
+           "baseline = %.2fx), %d/%d drafts accepted (%.1f%%, %.2f tok/pass) "
+           "[propose=%.3fs verify=%.3fs accept=%.3fs]\n",
+           draft, spec_count, spec_s, spec_tps, base_tps,
+           base_tps > 0.0 ? spec_tps / base_tps : 0.0, total_accepted,
+           total_proposed, accept_pct, tok_per_pass, t_prop, t_ver, t_acc);
+    checkf(exact_match,
+           "MTP speculative decode (draft=%d) matches baseline token-for-token "
+           "(%d vs %d tokens, stop=%d vs %d)",
+           draft, spec_count, gen_count, tok, cur_tok);
+    checkf(total_accepted > 0,
+           "MTP draft head achieved non-zero draft acceptance (%d/%d = %.1f%%)",
+           total_accepted, total_proposed, accept_pct);
+    eremite_sampler_free(greedy);
+    eremite_state_free(m, sm);
   }
   eremite_snapshot_free(m, prompt_end_snap);
 

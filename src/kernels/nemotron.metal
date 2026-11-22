@@ -10,7 +10,8 @@
 //   non-gated relu2 shared expert + 128 NVFP4 routed experts (ExpertStore).
 
 // Architecture geometry constants (llm_backbone/config.json).
-constant constexpr uint NEMO_DIM = 2688, NEMO_HEADS = 32, NEMO_KV_HEADS = 2,
+constant constexpr uint NEMO_DIM = 2688, NEMO_EH_DIM = 2u * NEMO_DIM,
+                        NEMO_HEADS = 32, NEMO_KV_HEADS = 2,
                         NEMO_GQA = NEMO_HEADS / NEMO_KV_HEADS,
                         NEMO_HEAD_DIM = 128,
                         NEMO_Q_DIM = NEMO_HEADS * NEMO_HEAD_DIM,
@@ -34,9 +35,14 @@ constant constexpr uint NEMO_SIMD = 32, NEMO_TILE = 64, NEMO_M_TILE2 = 128,
                         NEMO_MOE_MV_SGS = 8, NEMO_SWIZZLE_N = 8,
                         NEMO_STAGE_HALF_K = 32, NEMO_STAGE_VEC4S = 8,
                         NEMO_SSM_SGS = 4, NEMO_DECODE_PART_FLOATS = NEMO_HEAD_DIM + 2u,
-                        NEMO_ROUTE_SGS = NEMO_EXPERTS / NEMO_SIMD;
+                        NEMO_ROUTE_SGS = NEMO_EXPERTS / NEMO_SIMD,
+                        NEMO_UNEMBED_SGS = 8, NEMO_UNEMBED_ROWS_PER_SG = 4,
+                        NEMO_UNEMBED_BF16_PER_U4 = 8,
+                        NEMO_ARGMAX_THREADS = 256,
+                        NEMO_ARGMAX_SGS = NEMO_ARGMAX_THREADS / NEMO_SIMD,
+                        NEMO_KV_SKIP_POS = 0xFFFFFFFFu;
 
-// Activation modes for dense NVFP4 linear kernels.
+// Activation modes for dense linear kernels.
 constant constexpr uint NEMO_ACT_NONE = 0, NEMO_ACT_RELU2 = 1;
 
 // Numerical constants for routing, softplus stability and attention scaling.
@@ -57,8 +63,8 @@ struct NemoNormParam {
 struct NemoFp8LinParam {
   // Active rows, output width and inner width.
   uint m, n, k;
-  // Nonzero to add residual buffer, nonzero to round output to BF16.
-  uint has_res, round;
+  // Activation mode (NEMO_ACT_*), residual-add flag and BF16 rounding flag.
+  uint act, has_res, round;
   // Per-tensor weight_scale multiplied by 256 to cancel fp8x4's 2^-8.
   float scale;
 };
@@ -159,6 +165,38 @@ struct NemoMoeCombineParam {
   uint rows, dim, topk;
 };
 
+// Parameters for MTP embedding + hidden-state RMSNorm concatenation.
+struct NemoMtpEhParam {
+  // Active rows, hidden width (2688) and flag selecting h0 for row 0.
+  uint rows, dim, use_h0;
+  // RMSNorm epsilon (1e-5).
+  float eps;
+};
+
+// Device pointers and per-tensor scales for one FP8 routed expert in MTP.
+struct NemoFp8ExpertRef {
+  // Raw F8_E4M3 up_proj [1856, 2688] and down_proj [2688, 1856] weights.
+  device const uchar *w_up;
+  device const uchar *w_down;
+  // Per-tensor up_proj and down_proj weight scales multiplied by 256.
+  float s_up;
+  float s_down;
+};
+
+// Winning logit and token index for one stage-1 unembed argmax threadgroup.
+struct NemoArgmaxPair {
+  // Maximum logit value found by this threadgroup.
+  float val;
+  // First vocabulary index achieving val.
+  int idx;
+};
+
+// Parameters for fused BF16 unembed + first-maximum argmax.
+struct NemoUnembedParam {
+  // Vocabulary size (131072) and hidden width (2688).
+  uint vocab, k;
+};
+
 // Numerically stable SiLU activation.
 inline float nemo_silu(float x) { return x * sigm(x); }
 
@@ -239,6 +277,10 @@ kernel void nemo_fp8_mv(device const uchar *w [[buffer(0)]],
                p.scale;                                                        \
     if (lane < NEMO_MV_ROWS && row + lane < p.n) {                             \
       float v = p.round ? bf(s[lane]) : s[lane];                               \
+      if (p.act == NEMO_ACT_RELU2) {                                           \
+        v = nemo_relu2(v);                                                     \
+        if (p.round) v = bf(v);                                                \
+      }                                                                        \
       ulong out_i = (ulong)(m_idx) * p.n + row + lane;                         \
       if (p.has_res) v = p.round ? bf(v + res[out_i]) : (v + res[out_i]);      \
       y[out_i] = v;                                                            \
@@ -443,6 +485,10 @@ kernel void nemo_fp8_mm(device const uchar *w [[buffer(0)]],
       if (r0 < p.m) {
         float v = c0[i] * p.scale;
         if (p.round) v = bf(v);
+        if (p.act == NEMO_ACT_RELU2) {
+          v = nemo_relu2(v);
+          if (p.round) v = bf(v);
+        }
         ulong idx = (ulong)r0 * p.n + col;
         if (p.has_res) v = p.round ? bf(v + res[idx]) : (v + res[idx]);
         y[idx] = v;
@@ -452,6 +498,10 @@ kernel void nemo_fp8_mm(device const uchar *w [[buffer(0)]],
         if (r1 < p.m) {
           float v = c1[i] * p.scale;
           if (p.round) v = bf(v);
+          if (p.act == NEMO_ACT_RELU2) {
+            v = nemo_relu2(v);
+            if (p.round) v = bf(v);
+          }
           ulong idx = (ulong)r1 * p.n + col;
           if (p.has_res) v = p.round ? bf(v + res[idx]) : (v + res[idx]);
           y[idx] = v;
@@ -1694,4 +1744,281 @@ kernel void nemo_moe_combine_add(device const float *y_pair [[buffer(0)]],
   ulong idx = (ulong)row * p.dim + col;
   float moe = bf(bf(sum) + shared_out[idx]);
   cur[idx] = bf(cur[idx] + moe);
+}
+
+// ---- Multi-Token Prediction (MTP) draft kernels ----
+
+// Stores BF16 K and V rows [rows, 256] into separate per-KV-head cache buffers
+// without touching Q. In batched mode, skips rows whose target position equals
+// NEMO_KV_SKIP_POS. Grid: x = 4 (2 K + 2 V), y = rows; TG = 128 threads.
+kernel void nemo_kv_store(device const float *k_raw [[buffer(0)]],
+                          device const float *v_raw [[buffer(1)]],
+                          device bfloat *k0 [[buffer(2)]],
+                          device bfloat *k1 [[buffer(3)]],
+                          device bfloat *v0 [[buffer(4)]],
+                          device bfloat *v1 [[buffer(5)]],
+                          device const NemoKvTarget *targets [[buffer(6)]],
+                          constant NemoQkvParam &p [[buffer(7)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint d [[thread_index_in_threadgroup]]) {
+  uint slot = tg.x, row = tg.y;
+  if (slot >= 2u * NEMO_KV_HEADS || row >= p.rows) return;
+  uint is_v = slot >= NEMO_KV_HEADS ? 1u : 0u;
+  uint kvh = slot & 1u;
+  float val = is_v ? v_raw[(ulong)row * NEMO_KV_DIM + kvh * NEMO_HEAD_DIM + d]
+                   : k_raw[(ulong)row * NEMO_KV_DIM + kvh * NEMO_HEAD_DIM + d];
+  device bfloat *dst_buf;
+  uint pos;
+  if (p.batched) {
+    NemoKvTarget kt = targets[row];
+    if (kt.pos == NEMO_KV_SKIP_POS) return;
+    pos = kt.pos;
+    dst_buf = is_v ? (kvh ? kt.v1 : kt.v0) : (kvh ? kt.k1 : kt.k0);
+  } else {
+    pos = p.pos0 + row;
+    dst_buf = is_v ? (kvh ? v1 : v0) : (kvh ? k1 : k0);
+  }
+  dst_buf[(ulong)pos * NEMO_HEAD_DIM + d] = bfloat(val);
+}
+
+// Applies enorm to token embeddings and hnorm to preceding hidden states, then
+// concatenates [enorm(emb), hnorm(h)] into eh_out [rows, 2 * dim] (BF16).
+// When use_h0 is nonzero, row 0 reads h0 and rows r >= 1 read h_seq[r - 1].
+// Grid: rows threadgroups of 256 threads.
+kernel void nemo_mtp_eh_cat(device const float *emb [[buffer(0)]],
+                            device const float *h0 [[buffer(1)]],
+                            device const float *h_seq [[buffer(2)]],
+                            device const float *enorm_w [[buffer(3)]],
+                            device const float *hnorm_w [[buffer(4)]],
+                            device float *eh_out [[buffer(5)]],
+                            constant NemoMtpEhParam &p [[buffer(6)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint t [[thread_index_in_threadgroup]],
+                            uint nt [[threads_per_threadgroup]]) {
+  threadgroup float tmp[NEMO_SIMD];
+  if (row >= p.rows) return;
+  device const float *er = emb + (ulong)row * p.dim;
+  device const float *hr =
+      (p.use_h0 && row == 0u)
+          ? h0
+          : h_seq + (ulong)(p.use_h0 ? row - 1u : row) * p.dim;
+  device float *dst = eh_out + (ulong)row * (2u * p.dim);
+
+  float sq_e = 0.0f, sq_h = 0.0f;
+  for (uint i = t; i < p.dim; i += nt) {
+    sq_e += er[i] * er[i];
+    sq_h += hr[i] * hr[i];
+  }
+  float inv_e = rsqrt(tg_sum(sq_e, tmp, t, nt) / float(p.dim) + p.eps);
+  float inv_h = rsqrt(tg_sum(sq_h, tmp, t, nt) / float(p.dim) + p.eps);
+  for (uint i = t; i < p.dim; i += nt) {
+    dst[i] = bf(enorm_w[i] * (er[i] * inv_e));
+    dst[p.dim + i] = bf(hnorm_w[i] * (hr[i] * inv_h));
+  }
+}
+
+// Multi-vec per-tensor FP8 routed expert up_proj + relu2 for MTP tiles
+// (count <= 8). Uses 8-byte-aligned uint2 weight loads.
+// Grid: x = ceil(n / 32), y = ntiles; threadgroup = 256 threads (8 sgs).
+kernel void nemo_moe_fp8_up_mv(device const NemoFp8ExpertRef *experts [[buffer(0)]],
+                               device const float *x [[buffer(1)]],
+                               device const int *ptok [[buffer(2)]],
+                               device const NemoMoeTile *tiles [[buffer(3)]],
+                               device bfloat *h_out [[buffer(4)]],
+                               constant NemoMoeParam &p [[buffer(5)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  NemoMoeTile tl = tiles[tg.y];
+  if (tl.count == 0u || tl.count > NEMO_MV_MAX_M) return;
+  uint row = (tg.x * NEMO_MOE_MV_SGS + sg) * NEMO_MV_ROWS;
+  if (row >= p.n) return;
+
+  uint chunks = p.k / 8u;
+  NemoFp8ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w_up + (ulong)row * p.k;
+
+  for (uint j = 0u; j < tl.count; j++) {
+    float4 acc = float4(0.0f);
+    device const float4 *xr =
+        (device const float4 *)(x + (ulong)uint(ptok[tl.start + j]) * p.k);
+    for (uint c = lane; c < chunks; c += NEMO_SIMD) {
+      float4 x0 = xr[2u * c], x1 = xr[2u * c + 1u];
+#pragma unroll
+      for (uint r = 0u; r < NEMO_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * p.k))[c];
+        float4 prod = fp8x4(q.x) * x0 + fp8x4(q.y) * x1;
+        acc[r] += prod.x + prod.y + prod.z + prod.w;
+      }
+    }
+    float4 s = float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z),
+                      simd_sum(acc.w)) *
+               er.s_up;
+    if (lane < NEMO_MV_ROWS && row + lane < p.n) {
+      float v = bf(s[lane]);
+      h_out[(ulong)(tl.start + j) * p.n + row + lane] = bfloat(nemo_relu2(v));
+    }
+  }
+}
+
+// Multi-vec per-tensor FP8 routed expert down_proj for MTP tiles (count <= 8),
+// reading BF16 intermediate activations and scaling outputs by routing weight pw.
+// Grid: x = ceil(n / 32), y = ntiles; threadgroup = 256 threads (8 sgs).
+kernel void nemo_moe_fp8_down_mv(device const NemoFp8ExpertRef *experts [[buffer(0)]],
+                                 device const bfloat *h [[buffer(1)]],
+                                 device const float *pw [[buffer(2)]],
+                                 device const NemoMoeTile *tiles [[buffer(3)]],
+                                 device float *y_out [[buffer(4)]],
+                                 constant NemoMoeParam &p [[buffer(5)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  NemoMoeTile tl = tiles[tg.y];
+  if (tl.count == 0u || tl.count > NEMO_MV_MAX_M) return;
+  uint row = (tg.x * NEMO_MOE_MV_SGS + sg) * NEMO_MV_ROWS;
+  if (row >= p.n) return;
+
+  uint chunks = p.k / 8u;
+  NemoFp8ExpertRef er = experts[tl.expert];
+  device const uchar *we = er.w_down + (ulong)row * p.k;
+
+  for (uint j = 0u; j < tl.count; j++) {
+    float4 acc = float4(0.0f);
+    device const bfloat4 *hr =
+        (device const bfloat4 *)(h + (ulong)(tl.start + j) * p.k);
+    for (uint c = lane; c < chunks; c += NEMO_SIMD) {
+      float4 x0 = float4(hr[2u * c]), x1 = float4(hr[2u * c + 1u]);
+#pragma unroll
+      for (uint r = 0u; r < NEMO_MV_ROWS; r++) {
+        uint2 q = ((device const uint2 *)(we + (ulong)r * p.k))[c];
+        float4 prod = fp8x4(q.x) * x0 + fp8x4(q.y) * x1;
+        acc[r] += prod.x + prod.y + prod.z + prod.w;
+      }
+    }
+    float4 s = float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z),
+                      simd_sum(acc.w)) *
+               er.s_down;
+    float rw = pw[tl.start + j];
+    if (lane < NEMO_MV_ROWS && row + lane < p.n)
+      y_out[(ulong)(tl.start + j) * p.n + row + lane] = bf(s[lane]) * rw;
+  }
+}
+
+// Fused BF16 unembed + threadgroup first-maximum argmax (stage 1) for MTP
+// draft sampling without writing 131072 FP32 logits to DRAM.
+// Grid: ceil(vocab / 32) threadgroups of 256 threads (8 sgs, 4 rows/sg).
+kernel void nemo_unembed_argmax_part(device const ushort *w [[buffer(0)]],
+                                     device const float *x [[buffer(1)]],
+                                     device NemoArgmaxPair *part_max [[buffer(2)]],
+                                     constant NemoUnembedParam &p [[buffer(3)]],
+                                     uint tg [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  uint row = (tg * NEMO_UNEMBED_SGS + sg) * NEMO_UNEMBED_ROWS_PER_SG;
+  uint chunks = p.k / NEMO_UNEMBED_BF16_PER_U4;
+  float4 acc = float4(0.0f);
+  if (row < p.vocab) {
+    uint valid_rows = min(NEMO_UNEMBED_ROWS_PER_SG, p.vocab - row);
+    device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.k);
+    device const float4 *xr = (device const float4 *)x;
+    if (valid_rows == NEMO_UNEMBED_ROWS_PER_SG) {
+      for (uint c = lane; c < chunks; c += NEMO_SIMD) {
+        float4 x0 = xr[2u * c], x1 = xr[2u * c + 1u];
+#pragma unroll
+        for (uint r = 0u; r < NEMO_UNEMBED_ROWS_PER_SG; r++) {
+          uint4 q = wr[r * chunks + c];
+          float4 d = bf16x4(q.xy) * x0 + bf16x4(q.zw) * x1;
+          acc[r] += d.x + d.y + d.z + d.w;
+        }
+      }
+    } else {
+      for (uint c = lane; c < chunks; c += NEMO_SIMD) {
+        float4 x0 = xr[2u * c], x1 = xr[2u * c + 1u];
+        for (uint r = 0u; r < valid_rows; r++) {
+          uint4 q = wr[r * chunks + c];
+          float4 d = bf16x4(q.xy) * x0 + bf16x4(q.zw) * x1;
+          acc[r] += d.x + d.y + d.z + d.w;
+        }
+      }
+    }
+  }
+  acc = float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z),
+               simd_sum(acc.w));
+
+  threadgroup float sm_v[NEMO_UNEMBED_SGS];
+  threadgroup int sm_i[NEMO_UNEMBED_SGS];
+  if (lane == 0u) {
+    float bv = -INFINITY;
+    int bi = int(p.vocab);
+    for (uint r = 0u; r < NEMO_UNEMBED_ROWS_PER_SG; r++) {
+      uint id = row + r;
+      if (id < p.vocab) {
+        float v = acc[r];
+        if (v > bv || (v == bv && int(id) < bi)) {
+          bv = v;
+          bi = int(id);
+        }
+      }
+    }
+    sm_v[sg] = bv;
+    sm_i[sg] = bi;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float bv = sm_v[0];
+    int bi = sm_i[0];
+    for (uint s = 1u; s < NEMO_UNEMBED_SGS; s++) {
+      if (sm_v[s] > bv || (sm_v[s] == bv && sm_i[s] < bi)) {
+        bv = sm_v[s];
+        bi = sm_i[s];
+      }
+    }
+    part_max[tg] = NemoArgmaxPair{bv, bi};
+  }
+}
+
+// Reduces stage-1 threadgroup argmax pairs to one winning token index (stage 2).
+// Grid: 1 threadgroup of 256 threads.
+kernel void nemo_unembed_argmax_final(device const NemoArgmaxPair *part_max [[buffer(0)]],
+                                      device int *out_tok [[buffer(1)]],
+                                      constant uint &nparts [[buffer(2)]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint sg [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (uint i = tid; i < nparts; i += NEMO_ARGMAX_THREADS) {
+    NemoArgmaxPair cur = part_max[i];
+    if (cur.val > bv || (cur.val == bv && cur.idx < bi)) {
+      bv = cur.val;
+      bi = cur.idx;
+    }
+  }
+  for (uint off = NEMO_SIMD / 2u; off > 0u; off >>= 1u) {
+    float ov = simd_shuffle_xor(bv, off);
+    int oi = simd_shuffle_xor(bi, off);
+    if (ov > bv || (ov == bv && oi < bi)) {
+      bv = ov;
+      bi = oi;
+    }
+  }
+  threadgroup float sm_v[NEMO_ARGMAX_SGS];
+  threadgroup int sm_i[NEMO_ARGMAX_SGS];
+  if (lane == 0u) {
+    sm_v[sg] = bv;
+    sm_i[sg] = bi;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float fbv = sm_v[0];
+    int fbi = sm_i[0];
+    for (uint s = 1u; s < NEMO_ARGMAX_SGS; s++) {
+      if (sm_v[s] > fbv || (sm_v[s] == fbv && sm_i[s] < fbi)) {
+        fbv = sm_v[s];
+        fbi = sm_i[s];
+      }
+    }
+    out_tok[0] = fbi;
+  }
 }

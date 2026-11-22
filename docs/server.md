@@ -62,7 +62,7 @@ Each entry under `models` holds one model's settings:
 | `variant` | MiniMax-H3 Video: checkpoint task variant, `"fl2va"` or `"ref2va"` | `"fl2va"` |
 | `default_size` | MiniMax-H3-Image: the `WIDTHxHEIGHT` of a text-to-image request whose `size` is `auto` or omitted; it must fit the model as it is | `2048x2048`, the default generation canvas |
 | `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3 image and video: 4096; Nemotron-3.5-Transcribe: 65536 |
-| `draft` | the most proposals of the model's draft head per pass: 0 to 5 for DeepSeek, 0 to 7 for Inkling-2-Mini; each pass runs the count that has given the most tokens per second | 0 |
+| `draft` | the most proposals of the model's draft head per pass: 0 to 5 for DeepSeek, 0 to 7 for Inkling-2-Mini, 0 to 8 for Nemotron-3.5-Transcribe; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
 | `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; it changes no result, and needs `ced` off | `true` without `ced` |
@@ -351,10 +351,12 @@ prefill and denoising/VAE/MP4 work in dedicated video counters.
 
 NVIDIA Nemotron-3.5-Transcribe (`model_type` `nemo_speechlm`) transcribes
 speech and translates speech into English. Its `model` folder holds
-`config.json`, `tokenizer.json`, `model.safetensors.index.json` and its
-safetensors weight shards. Its entry takes `model`, `id`, `ctx` (default
-65,536, fitting up to 1-hour recordings plus transcripts), `memory`,
-`max_cached_states` and `idle_unload`, and refuses DeepSeek-only and
+`config.json`, `tokenizer.json`, `model.safetensors.index.json`, its
+safetensors weight shards, `perception.safetensors`, and optionally
+`model-mtp-fp8.safetensors` for speculative drafting. Its entry takes `model`,
+`id`, `ctx` (default 65,536, fitting up to 1-hour recordings plus transcripts),
+`draft` (0 to 8, default 0), `lookup` (`off` or 1 to 15, default `off`),
+`memory`, `max_cached_states` and `idle_unload`, and refuses DeepSeek-only and
 MiniMax-H3 settings.
 
 An audio transcription model serves OpenAI's Audio API (`multipart/form-data`,
@@ -393,6 +395,12 @@ Nemotron-3.5-Transcribe keeps its dense hybrid Mamba-2 and attention backbone
 resident in GPU memory (~3.3 GiB) and loads its 815 MiB Parallel Expert
 Perception audio encoder on demand. Its 2,944 NVFP4 routed experts across 23
 MoE layers live in the shared SSD-backed expert cache (~15.7 GiB when all
-experts stay resident). Setting `memory` (for example `5` GiB) streams routed
-experts from SSD into a bounded cache so transcription runs alongside a large
-language model such as DeepSeek without holding all experts in RAM.
+experts stay resident). Setting `draft` to `1` through `8` loads the checkpoint's
+repeated `*E` FP8 Multi-Token Prediction head (`model-mtp-fp8.safetensors`,
+~1.25 GiB) and accelerates decoding without changing outputs; `draft: 7` gives
+the fastest measured decode speed in both full-resident and SSD-streaming modes
+because verification stays within the 8-row multi-vector kernels. Setting
+`memory` (for example `5` GiB without `draft`, or `6` GiB with `draft: 7`)
+streams routed experts from SSD into a bounded cache so transcription runs
+alongside a large language model such as DeepSeek without holding all experts
+in RAM.

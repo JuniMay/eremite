@@ -18,6 +18,7 @@ static constexpr int NEMO_MAMBA_LAYERS = 23;
 static constexpr int NEMO_ATTN_LAYERS = 6;
 static constexpr int NEMO_MOE_LAYERS = 23;
 static constexpr int NEMO_DIM = 2688;
+static constexpr int NEMO_EH_DIM = 2 * NEMO_DIM;
 static constexpr int NEMO_VOCAB = 131072;
 static constexpr int NEMO_HEADS = 32;
 static constexpr int NEMO_KV_HEADS = 2;
@@ -42,6 +43,7 @@ static constexpr int NEMO_SHARED_INTER = 3712;
 static constexpr int NEMO_NVFP4_BLOCK = 16;
 static constexpr int NEMO_MAX_BATCH_ROWS = 8;
 static constexpr int NEMO_MAX_VERIFY = 16;
+static constexpr int NEMO_MTP_MAX_DRAFTS = 8;
 
 // One grouped-expert work tile matching NemoMoeTile in nemotron.metal.
 typedef struct {

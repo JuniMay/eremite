@@ -1496,9 +1496,16 @@ impl Model {
                 weight_files.push(path.clone());
             }
         }
-        let extra_weight_file = if architecture == Architecture::Inkling2 && o.draft > 0 {
-            let mtp = std::path::Path::new(&o.model).join("mtp.safetensors");
-            mtp.exists().then(|| mtp.to_string_lossy().into_owned())
+        let extra_weight_file = if o.draft > 0 {
+            let file = match architecture {
+                Architecture::Inkling2 => Some("mtp.safetensors"),
+                Architecture::NemotronTranscribe => Some("model-mtp-fp8.safetensors"),
+                _ => None,
+            };
+            file.and_then(|name| {
+                let path = std::path::Path::new(&o.model).join(name);
+                path.exists().then(|| path.to_string_lossy().into_owned())
+            })
         } else {
             None
         };
