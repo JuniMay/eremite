@@ -96,8 +96,8 @@ typedef struct {
 // Returns nonzero when process shutdown was requested or hooks request cancel.
 int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks);
 
-// Returns nonzero when hooks indicate other active passes or external GPU work
-// shares the GPU and heavy kernels should drain and slice to the turn budget.
+// Returns nonzero when hooks indicate other active passes share the GPU and
+// heavy kernels should drain and slice to the turn budget.
 int minimax_h3_hooks_contended(const MinimaxH3RunHooks *hooks);
 
 // Returns the remaining measured turn budget in seconds from hooks, or 0.

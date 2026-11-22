@@ -2,7 +2,6 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
@@ -65,41 +64,11 @@ void threads_event_signal(ThreadsEvent *event) {
   pthread_mutex_unlock(&event->lock);
 }
 
-// Nanoseconds in one second for timed condition waits.
-static constexpr long NS_PER_SECOND = 1000000000L;
-
 void threads_event_wait(ThreadsEvent *event) {
   pthread_mutex_lock(&event->lock);
   while (!event->signaled) pthread_cond_wait(&event->changed, &event->lock);
   event->signaled = 0;
   pthread_mutex_unlock(&event->lock);
-}
-
-int threads_event_wait_for(ThreadsEvent *event, double seconds) {
-  if (seconds <= 0.0) return threads_event_take(event);
-  pthread_mutex_lock(&event->lock);
-  if (!event->signaled) {
-    time_t sec = (time_t)seconds;
-    long nsec = (long)((seconds - (double)sec) * (double)NS_PER_SECOND);
-    if (nsec < 0) nsec = 0;
-    if (nsec >= NS_PER_SECOND) sec++, nsec -= NS_PER_SECOND;
-#ifdef __APPLE__
-    struct timespec rel = {.tv_sec = sec, .tv_nsec = nsec};
-    pthread_cond_timedwait_relative_np(&event->changed, &event->lock, &rel);
-#else
-    struct timespec abs;
-    clock_gettime(CLOCK_REALTIME, &abs);
-    abs.tv_sec += sec;
-    abs.tv_nsec += nsec;
-    if (abs.tv_nsec >= NS_PER_SECOND)
-      abs.tv_sec++, abs.tv_nsec -= NS_PER_SECOND;
-    pthread_cond_timedwait(&event->changed, &event->lock, &abs);
-#endif
-  }
-  int signaled = event->signaled;
-  event->signaled = 0;
-  pthread_mutex_unlock(&event->lock);
-  return signaled;
 }
 
 int threads_event_take(ThreadsEvent *event) {

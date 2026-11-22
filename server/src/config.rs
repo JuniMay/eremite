@@ -28,18 +28,6 @@ const MAX_COUNT: f64 = 65536.0;
 /// The most seconds that a time setting takes. The reason for this value is
 /// unknown.
 const MAX_SECONDS: f64 = 1e6;
-/// The largest fraction of GPU wall time that the engine yields to active
-/// desktop or external GPU work.
-const MAX_SYSTEM_GPU_SHARE: f64 = 0.5;
-/// The default fraction of GPU wall time yielded while user input or another
-/// GPU process is active.
-const DEFAULT_SYSTEM_GPU_SHARE: f64 = 0.15;
-/// The shortest allowed lookback window in seconds for detecting recent user
-/// input or external GPU submissions.
-const MIN_SYSTEM_GPU_WINDOW_S: f64 = 0.1;
-/// The default lookback window in seconds for detecting recent user input or
-/// external GPU submissions.
-const DEFAULT_SYSTEM_GPU_WINDOW_S: f64 = 2.0;
 /// The most context-copy proposals of one pass: a verify pass takes its token
 /// and up to 15 more rows. A model's lookup gives up to this many unless its
 /// entry says otherwise.
@@ -573,12 +561,6 @@ pub struct Budgets {
     /// A wait for the GPU that lasts this many seconds ends the server. Only a
     /// failed command buffer or a stopped GPU takes that long.
     pub gpu_timeout_s: f64,
-    /// Fraction of GPU wall time (0 to 0.5) yielded while user input or another
-    /// GPU process is active; 0 disables yielding.
-    pub system_gpu_share: f64,
-    /// Lookback window in seconds for detecting recent user input or external
-    /// GPU work.
-    pub system_gpu_window_s: f64,
     /// The seconds between a decoding request's progress lines in the log; 0:
     /// none.
     pub progress_log_s: f64,
@@ -605,8 +587,6 @@ impl Default for Budgets {
             memory_gb: 0.0,
             reserve_gb: 10.0,
             gpu_timeout_s: 60.0,
-            system_gpu_share: DEFAULT_SYSTEM_GPU_SHARE,
-            system_gpu_window_s: DEFAULT_SYSTEM_GPU_WINDOW_S,
             progress_log_s: 10.0,
             idle_unload_s: 600.0,
             state_disk_gb: 32.0,
@@ -647,22 +627,6 @@ impl Budgets {
             }
             "gpu_timeout" if number > 0.0 => self.gpu_timeout_s = number,
             "gpu_timeout" => return Err("gpu_timeout takes a positive number of seconds".into()),
-            "system_gpu_share" if (0.0..=MAX_SYSTEM_GPU_SHARE).contains(&number) => {
-                self.system_gpu_share = number
-            }
-            "system_gpu_share" => {
-                return Err(format!(
-                    "system_gpu_share takes 0 (off) to {MAX_SYSTEM_GPU_SHARE}"
-                ));
-            }
-            "system_gpu_window" if (MIN_SYSTEM_GPU_WINDOW_S..=MAX_SECONDS).contains(&number) => {
-                self.system_gpu_window_s = number
-            }
-            "system_gpu_window" => {
-                return Err(format!(
-                    "system_gpu_window takes {MIN_SYSTEM_GPU_WINDOW_S} to {MAX_SECONDS} seconds"
-                ));
-            }
             "progress_log" if (0.0..=MAX_SECONDS).contains(&number) => self.progress_log_s = number,
             "progress_log" => {
                 return Err(format!(
@@ -712,8 +676,6 @@ impl Budgets {
             memory_gb: self.memory_gb,
             reserve_gb: self.reserve_gb,
             gpu_timeout_seconds: self.gpu_timeout_s,
-            system_gpu_share: self.system_gpu_share,
-            system_gpu_window_seconds: self.system_gpu_window_s,
         }
     }
 }
@@ -760,8 +722,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
             "memory",
             "reserve",
             "gpu_timeout",
-            "system_gpu_share",
-            "system_gpu_window",
             "progress_log",
             "state_disk",
             "state_disk_tokens",
@@ -799,8 +759,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
         "memory",
         "reserve",
         "gpu_timeout",
-        "system_gpu_share",
-        "system_gpu_window",
         "progress_log",
         "state_disk",
         "state_disk_tokens",
@@ -908,20 +866,12 @@ mod tests {
     fn a_budget_takes_values_in_its_range_only() {
         let mut budgets = Budgets::default();
         assert_eq!(
-            (
-                budgets.memory_gb,
-                budgets.reserve_gb,
-                budgets.gpu_timeout_s,
-                budgets.system_gpu_share,
-                budgets.system_gpu_window_s,
-            ),
-            (0.0, 10.0, 60.0, 0.15, 2.0)
+            (budgets.memory_gb, budgets.reserve_gb, budgets.gpu_timeout_s),
+            (0.0, 10.0, 60.0)
         );
         budgets.set("memory", &json!(64)).unwrap();
         budgets.set("reserve", &json!(12)).unwrap();
         budgets.set("gpu_timeout", &json!(120)).unwrap();
-        budgets.set("system_gpu_share", &json!(0.25)).unwrap();
-        budgets.set("system_gpu_window", &json!(5.0)).unwrap();
         budgets.set("max_waiting_requests", &json!(4)).unwrap();
         assert_eq!(budgets.max_waiting_requests, 4);
         let settings = budgets.process_settings();
@@ -929,24 +879,9 @@ mod tests {
             (
                 settings.memory_gb,
                 settings.reserve_gb,
-                settings.gpu_timeout_seconds,
-                settings.system_gpu_share,
-                settings.system_gpu_window_seconds,
+                settings.gpu_timeout_seconds
             ),
-            (64.0, 12.0, 120.0, 0.25, 5.0)
-        );
-        let parsed = parse(&json!({
-            "system_gpu_share": 0.2,
-            "system_gpu_window": 3.5,
-            "models": [{"model": "/m"}]
-        }))
-        .unwrap();
-        assert_eq!(
-            (
-                parsed.budgets.system_gpu_share,
-                parsed.budgets.system_gpu_window_s
-            ),
-            (0.2, 3.5)
+            (64.0, 12.0, 120.0)
         );
         for (name, value) in [
             ("memory", json!(-1)),
@@ -954,10 +889,6 @@ mod tests {
             ("reserve", json!(1)),
             ("gpu_timeout", json!(0)),
             ("gpu_timeout", json!("long")),
-            ("system_gpu_share", json!(-0.1)),
-            ("system_gpu_share", json!(0.6)),
-            ("system_gpu_window", json!(0.05)),
-            ("system_gpu_window", json!(0)),
             ("max_waiting_requests", json!(0)),
             ("max_waiting_requests", json!(1.5)),
             ("cache", json!(8)),

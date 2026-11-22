@@ -17,7 +17,6 @@
 #include "model/deepseek/model.h"
 #include "model/model.h"
 #include "platform/image.h"
-#include "platform/system_gpu.h"
 #include "platform/system_memory.h"
 #include "platform/threads.h"
 #include <math.h>
@@ -60,14 +59,6 @@ struct eremite_media {
 
 // The bytes in one GiB.
 static constexpr double GiB = 1024.0 * 1024 * 1024;
-// Maximum share of wall-clock time yielded to active system display or
-// external GPU work.
-static constexpr double SYSTEM_GPU_SHARE_MAX = 0.5;
-// Default activity lookback window in seconds when system_gpu_window_seconds
-// is 0.
-static constexpr double SYSTEM_GPU_DEFAULT_WINDOW = 2.0;
-// Number of full IOKit accelerator polls per lookback window.
-static constexpr double SYSTEM_GPU_POLL_DIVISOR = 4.0;
 
 static eremite_process proc;
 static int initialized;
@@ -87,22 +78,6 @@ static eremite_model *turn_owner;
 // Wall-clock time when turn_owner's current accounted span began, or 0 outside
 // eremite_run_streams.
 static double turn_started_at;
-// Whether user input or another GPU process was recently active and the engine
-// should yield system_gpu_share of wall-clock time.
-static int system_gpu_busy;
-// Measured main display refresh period in seconds, or 0 when unavailable or
-// when the display is asleep.
-static double system_frame_seconds;
-// Wall-clock time of the latest full IOKit and CoreGraphics activity poll.
-static double system_gpu_full_poll_at;
-// Wall-clock time of the latest fast user-input idle poll.
-static double system_gpu_fast_poll_at;
-// Active GPU seconds accumulated since the latest system-GPU yield pause.
-static double system_gpu_work_s;
-// Wall-clock time when the current active GPU span began, or 0 while idle.
-static double system_work_started_at;
-// Wall-clock time when the previous eremite_run_streams call ended, or 0.
-static double system_last_run_ended_at;
 // What the engine thread blocks on while no stream's call can go on, made by
 // eremite_init, and whether eremite_wake asked eremite_run_streams to return.
 static ThreadsEvent *wake;
@@ -173,12 +148,9 @@ int eremite_init(const eremite_process *p) {
                              p->keep_recently_used_weights_seconds,
                              p->free_pages_only_after_swapout_seconds,
                              p->expert_cache_growth_margin_gb,
-                             p->gpu_memory_limit_margin_gb,
-                             p->system_gpu_share,
-                             p->system_gpu_window_seconds};
+                             p->gpu_memory_limit_margin_gb};
   for (size_t i = 0; i < sizeof settings / sizeof *settings; i++)
     if (!isfinite(settings[i]) || settings[i] < 0) return -1;
-  if (p->system_gpu_share > SYSTEM_GPU_SHARE_MAX) return -1;
   memory = memory_new();
   expert_store_set_memory(
       memory,
@@ -1059,169 +1031,30 @@ static eremite_model *pick_lowest_fair_model(eremite_stream *const *streams,
   return best;
 }
 
-// Returns the active system-GPU activity lookback window in seconds.
-static double system_gpu_window(void) {
-  return proc.system_gpu_window_seconds > 0.0 ? proc.system_gpu_window_seconds
-                                              : SYSTEM_GPU_DEFAULT_WINDOW;
-}
-
-// Returns the active display frame period in seconds while yielding to active
-// desktop or external GPU work, or 0 otherwise.
-static double system_frame_budget(void) {
-  return system_gpu_busy && system_frame_seconds > 0.0 ? system_frame_seconds
-                                                       : 0.0;
-}
-
-// Credits idle_dt seconds of GPU inactivity against accumulated active work at
-// the configured system-GPU yield ratio.
-static void credit_system_gpu_idle(double idle_dt) {
-  if (idle_dt <= 0.0 || proc.system_gpu_share <= 0.0 ||
-      system_gpu_work_s <= 0.0)
-    return;
-  double paid =
-      idle_dt * ((1.0 - proc.system_gpu_share) / proc.system_gpu_share);
-  system_gpu_work_s =
-      paid >= system_gpu_work_s ? 0.0 : system_gpu_work_s - paid;
-}
-
-// Charges elapsed active GPU seconds up to at into system_gpu_work_s.
-static void charge_system_gpu_work(double at) {
-  if (proc.system_gpu_share <= 0.0) return;
-  if (system_work_started_at > 0.0) {
-    double dt = at - system_work_started_at;
-    if (dt > 0.0 && system_gpu_busy) system_gpu_work_s += dt;
-  }
-  system_work_started_at = at;
-}
-
-// Refreshes system_gpu_busy and system_frame_seconds from macOS sensors,
-// rate-limiting full IOKit accelerator scans to the lookback window while
-// checking fast user-input idle at display-frame cadence when unthrottled.
-// Returns nonzero when system_gpu_busy or system_frame_seconds changed.
-static int refresh_system_gpu(double at) {
-  int prev_busy = system_gpu_busy;
-  double prev_frame = system_frame_seconds;
-  if (proc.system_gpu_share <= 0.0) {
-    system_gpu_busy = 0;
-    system_frame_seconds = 0.0;
-    system_gpu_work_s = 0.0;
-    system_work_started_at = 0.0;
-    return prev_busy != 0 || prev_frame != 0.0;
-  }
-  double window = system_gpu_window();
-  double poll_interval = window / SYSTEM_GPU_POLL_DIVISOR;
-  int need_full = system_gpu_full_poll_at == 0.0 ||
-                  (at - system_gpu_full_poll_at) >= poll_interval;
-  if (need_full) {
-    SystemGpuActivity act = system_gpu_read_activity();
-    system_gpu_full_poll_at = at;
-    system_gpu_fast_poll_at = at;
-    system_frame_seconds = act.display_frame_seconds;
-    int input_active = !act.display_asleep && act.input_idle_seconds < window;
-    int external_active = act.external_gpu_idle_seconds < window;
-    system_gpu_busy = input_active || external_active;
-  } else if (!system_gpu_busy && system_frame_seconds > 0.0 &&
-             (system_gpu_fast_poll_at == 0.0 ||
-              (at - system_gpu_fast_poll_at) >= system_frame_seconds)) {
-    int asleep = 0;
-    double input_idle = system_gpu_input_idle_seconds(&asleep);
-    system_gpu_fast_poll_at = at;
-    if (!asleep && input_idle < window) system_gpu_busy = 1;
-  }
-  if (system_gpu_busy != prev_busy) {
-    system_gpu_work_s = 0.0;
-    system_work_started_at = at;
-  }
-  return system_gpu_busy != prev_busy || system_frame_seconds != prev_frame;
-}
-
-// Returns whether accumulated active GPU work has reached one display frame
-// quantum and should yield to active desktop or external GPU work.
-static int needs_system_gpu_yield(double at) {
-  if (!system_gpu_busy || proc.system_gpu_share <= 0.0) return 0;
-  double pending = system_gpu_work_s;
-  if (system_work_started_at > 0.0 && at > system_work_started_at)
-    pending += at - system_work_started_at;
-  return pending > 0.0 && pending >= system_frame_seconds;
-}
-
 // Publishes each model's remaining measured turn budget in seconds (0 when
-// uncontended, not owning the turn, or before any peer turn is measured).
+// running alone, not owning the turn, or before any peer turn is measured).
 static void update_turn_budgets(eremite_stream *const *streams, int n) {
-  double frame_budget = system_frame_budget();
-  if (!turn_owner) {
-    for (int i = 0; i < nmodels; i++) {
-      if (!models[i]->ops->set_turn_budget) continue;
-      double budget =
-          frame_budget > 0.0 && model_is_contending(models[i], streams, n)
-              ? frame_budget
-              : 0.0;
-      models[i]->ops->set_turn_budget(budget);
-    }
-    return;
-  }
   double peer_min = 0.0;
   int has_peer = 0;
-  for (int i = 0; i < nmodels; i++) {
-    eremite_model *m = models[i];
-    if (m == turn_owner || !model_is_contending(m, streams, n)) continue;
-    if (!has_peer || m->fair_time < peer_min) {
-      peer_min = m->fair_time;
-      has_peer = 1;
+  if (turn_owner) {
+    for (int i = 0; i < nmodels; i++) {
+      eremite_model *m = models[i];
+      if (m == turn_owner || !model_is_contending(m, streams, n)) continue;
+      if (!has_peer || m->fair_time < peer_min) {
+        peer_min = m->fair_time;
+        has_peer = 1;
+      }
     }
   }
-  double owner_budget = (has_peer && peer_min > turn_owner->fair_time)
-                            ? peer_min - turn_owner->fair_time
-                            : 0.0;
-  if (frame_budget > 0.0 &&
-      (owner_budget <= 0.0 || frame_budget < owner_budget))
-    owner_budget = frame_budget;
+  double owner_budget =
+      (turn_owner && has_peer && peer_min > turn_owner->fair_time)
+          ? peer_min - turn_owner->fair_time
+          : 0.0;
   for (int i = 0; i < nmodels; i++) {
     if (!models[i]->ops->set_turn_budget) continue;
     models[i]->ops->set_turn_budget(models[i] == turn_owner ? owner_budget
                                                             : 0.0);
   }
-}
-
-// Sleeps off-GPU for the pause matching accumulated active work at
-// proc.system_gpu_share, returning the post-pause timestamp and advancing
-// turn_started_at so the sleep is never charged to any model.
-static double maybe_yield_system_gpu(double at, eremite_stream *const *streams,
-                                     int n) {
-  if (proc.system_gpu_share <= 0.0) return at;
-  charge_system_gpu_work(at);
-  if (refresh_system_gpu(at)) update_turn_budgets(streams, n);
-  if (!system_gpu_busy || system_gpu_work_s <= 0.0 ||
-      system_gpu_work_s < system_frame_seconds)
-    return at;
-  if (gpu) {
-    uint64_t last = gpu_last_committed(gpu);
-    if (last && !gpu_has_finished(gpu, last)) {
-      set_thread_state(THREAD_WAIT_GPU);
-      gpu_wait_until_finished(gpu, last);
-      at = now();
-      charge_turn_owner(at);
-      charge_system_gpu_work(at);
-    }
-  }
-  if (atomic_load(&woken)) return at;
-  if (threads_event_take(wake) && atomic_load(&woken)) return at;
-  if (atomic_load(&woken)) return at;
-  double share = proc.system_gpu_share;
-  double pause_s = system_gpu_work_s * (share / (1.0 - share));
-  if (pause_s <= 0.0) return at;
-  set_thread_state(THREAD_WAIT_OTHER);
-  double before = now();
-  int early = threads_event_wait_for(wake, pause_s);
-  double after = now();
-  if (!early)
-    system_gpu_work_s = 0.0;
-  else
-    credit_system_gpu_idle(after - before);
-  system_work_started_at = after;
-  if (turn_owner && turn_started_at > 0.0) turn_started_at = after;
-  if (refresh_system_gpu(after)) update_turn_budgets(streams, n);
-  return after;
 }
 
 // Synchronizes multi-model fairness state, other-passes counts and turn
@@ -1330,29 +1163,6 @@ static int stream_may_go_on(void *context) {
   x->calls_at_first_look = 0;
 
   if (!turn_owner) {
-    if (proc.system_gpu_share > 0.0) {
-      double at = now();
-      if (x->in_turn_wait) {
-        if (x->work_at_first_look &&
-            !gpu_has_finished(gpu, x->work_at_first_look))
-          return 0;
-        maybe_yield_system_gpu(now(), x->run->streams, x->run->count);
-        end_turn_wait(x);
-        return 1;
-      }
-      if (refresh_system_gpu(at))
-        update_turn_budgets(x->run->streams, x->run->count);
-      if (needs_system_gpu_yield(at)) {
-        uint64_t last = gpu ? gpu_last_committed(gpu) : 0;
-        if (last && !gpu_has_finished(gpu, last)) {
-          x->in_turn_wait = 1;
-          x->work_at_first_look = last;
-          x->wait_for_turn.kind = PASS_WAIT_GPU;
-          return 0;
-        }
-        maybe_yield_system_gpu(at, x->run->streams, x->run->count);
-      }
-    }
     end_turn_wait(x);
     return 1;
   }
@@ -1387,12 +1197,10 @@ static int stream_may_go_on(void *context) {
     x->waiting_for_turn = 1;
     x->in_turn_wait = 0;
     x->work_at_first_look = 0;
-    maybe_yield_system_gpu(at, x->run->streams, x->run->count);
     update_turn_budgets(x->run->streams, x->run->count);
     set_wait_other(x);
     return 0;
   }
-  maybe_yield_system_gpu(at, x->run->streams, x->run->count);
   update_turn_budgets(x->run->streams, x->run->count);
   end_turn_wait(x);
   return 1;
@@ -1592,13 +1400,6 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
   static unsigned first;
   const StreamRun run = {streams, n};
   set_stream_run(streams, n, &run);
-  if (proc.system_gpu_share > 0.0) {
-    double entry_at = now();
-    if (system_last_run_ended_at > 0.0)
-      credit_system_gpu_idle(entry_at - system_last_run_ended_at);
-    refresh_system_gpu(entry_at);
-    system_work_started_at = entry_at;
-  }
   sync_fair_state(streams, n);
   Pass *waiting[n];
   int finished = -1;
@@ -1627,33 +1428,11 @@ int eremite_run_streams(eremite_stream *const *streams, int n) {
       if (streams[k]->call != STREAM_NONE && !waits_for_turn(streams[k]))
         waiting[count++] = streams[k]->pass;
     if (!count) break;
-    int wait_state = streams_wait_for(streams, n);
-    set_thread_state(wait_state);
-    int gpu_idle_wait =
-        proc.system_gpu_share > 0.0 && wait_state != THREAD_WAIT_GPU &&
-        (!gpu || gpu_has_finished(gpu, gpu_last_committed(gpu)));
-    double idle_before = 0.0;
-    if (gpu_idle_wait) {
-      idle_before = now();
-      charge_system_gpu_work(idle_before);
-      system_work_started_at = 0.0;
-    }
+    set_thread_state(streams_wait_for(streams, n));
     if (!pass_wait_for_any(waiting, count, wake))
       die("the streams' calls wait for each other: none can go on");
-    if (gpu_idle_wait) {
-      double idle_after = now();
-      credit_system_gpu_idle(idle_after - idle_before);
-      system_work_started_at = idle_after;
-    }
   }
-  double exit_at = now();
-  charge_turn_owner(exit_at);
-  if (finished >= 0 && proc.system_gpu_share > 0.0)
-    exit_at = maybe_yield_system_gpu(exit_at, streams, n);
-  else if (proc.system_gpu_share > 0.0)
-    charge_system_gpu_work(exit_at);
-  system_work_started_at = 0.0;
-  system_last_run_ended_at = exit_at;
+  charge_turn_owner(now());
   turn_started_at = 0.0;
   set_thread_state(THREAD_OUTSIDE);
   set_stream_run(streams, n, NULL);

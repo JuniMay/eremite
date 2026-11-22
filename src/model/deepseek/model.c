@@ -51,8 +51,6 @@ static GpuEvent *event;
 static uint64_t last_committed;
 // Passes with GPU work besides the running one, which the engine sets.
 static int other_passes;
-// Current GPU turn budget in seconds, or 0 when running uncontended.
-static double turn_budget;
 // The seconds that the last wait for a layer's expert reads took, per read.
 static double read_wait_per_read;
 
@@ -132,11 +130,10 @@ static void model_wait_signal(uint64_t value) {
     signal_block(&wait);
 }
 
-// Keeps the GPU's clock up for about seconds, unless other passes or active
-// system display or external GPU work already share the GPU.
+// Keeps the GPU's clock up for about seconds, unless other passes have GPU
+// work, which keeps the clock up already.
 static void keep_clock(double seconds) {
-  if (other_passes <= 0 && turn_budget <= 0.0)
-    gpu_keep_clock_up(clock_keeper, seconds);
+  if (other_passes <= 0) gpu_keep_clock_up(clock_keeper, seconds);
 }
 
 // Before a pass yields: ends the program if a command buffer begun in the
@@ -4470,9 +4467,6 @@ static void ds_set_other_passes(int passes) {
   if (experts_store) expert_store_set_other_passes(experts_store, passes);
 }
 
-// Records the engine's current GPU turn budget in seconds, or 0 uncontended.
-static void ds_set_turn_budget(double seconds) { turn_budget = seconds; }
-
 static const char *const ds_types[] = {"deepseek_v41", 0};
 
 static int ds_prepare_image(const char *dir, Media *im, const void *data,
@@ -4530,5 +4524,4 @@ const ModelOps deepseek_ops = {.family = "DeepSeek V4.1",
                                .pass_begin = deepseek_pass_begin,
                                .pass_end = deepseek_pass_end,
                                .pass_release = deepseek_pass_release,
-                               .set_other_passes = ds_set_other_passes,
-                               .set_turn_budget = ds_set_turn_budget};
+                               .set_other_passes = ds_set_other_passes};

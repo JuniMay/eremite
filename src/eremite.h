@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 14
+#define EREMITE_ABI 13
 
 // ---- the process ----
 
@@ -64,14 +64,6 @@ typedef struct {
   // GiB kept unused below the GPU's memory limit, for slots that the GPU
   // driver still counts after they leave its list (default 3).
   double gpu_memory_limit_margin_gb;
-  // Fraction of GPU time yielded to macOS UI and other GPU-using apps while
-  // interactive input or external GPU activity is detected (0: off, at most
-  // 0.5).
-  double system_gpu_share;
-  // Seconds after the last user input or external GPU submission before the
-  // engine treats the system GPU as free and uses full capacity (0: default
-  // 2).
-  double system_gpu_window_seconds;
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
   // log's lock: it must return quickly and must not call eremite_log.

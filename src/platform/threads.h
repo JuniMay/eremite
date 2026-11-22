@@ -58,9 +58,6 @@ void threads_event_free(ThreadsEvent *event);
 void threads_event_signal(ThreadsEvent *event);
 // Blocks until the event is signaled, then takes the signal.
 void threads_event_wait(ThreadsEvent *event);
-// Blocks until the event is signaled or seconds elapse, then takes any signal.
-// Returns 1 if signaled, or 0 if seconds elapsed first.
-int threads_event_wait_for(ThreadsEvent *event, double seconds);
 // Takes the event's signal if there is one, without blocking. Returns whether
 // there was one.
 int threads_event_take(ThreadsEvent *event);

@@ -187,8 +187,7 @@ int minimax_h3_should_stop(const MinimaxH3RunHooks *hooks) {
 }
 
 int minimax_h3_hooks_contended(const MinimaxH3RunHooks *hooks) {
-  return hooks && ((hooks->other_passes && *hooks->other_passes > 0) ||
-                   (hooks->turn_budget && *hooks->turn_budget > 0.0));
+  return hooks && hooks->other_passes && *hooks->other_passes > 0;
 }
 
 double minimax_h3_hooks_turn_budget(const MinimaxH3RunHooks *hooks) {
