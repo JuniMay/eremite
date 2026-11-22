@@ -48,6 +48,12 @@ struct MinimaxH3DitNormMod {
   float eps;
 };
 
+// Parameters for fused RMSNorm + AdaLN modulation + ConvRot INT8 quantization.
+struct MinimaxH3DitNormModConvRot {
+  uint m, dim, mod_stride, shift_off, scale_off;
+  float eps;
+};
+
 // Parameters for fused AdaLN gated residual addition.
 struct MinimaxH3DitGateAdd {
   uint rows, dim, mod_stride, gate_off;
@@ -246,6 +252,122 @@ kernel void minimax_h3_dit_norm_mod(device const float *x [[buffer(0)]],
   for (uint c = t; c < p.dim; c += nt) {
     float normed = w[c] * (xr[c] * inv);
     yr[c] = normed * (1.0f + scale[c]) + shift[c];
+  }
+}
+
+// Fused RMSNorm + AdaLN modulation + ConvRot block-256 Hadamard + per-row INT8
+// quantization (zeroing padded rows past m). Reads x once into registers when
+// dim <= nsg * 2048. One 256-thread group per output row up to padded_m.
+kernel void minimax_h3_dit_norm_mod_convrot(
+    device const float *x [[buffer(0)]],
+    device const float *w [[buffer(1)]],
+    device const float *mod [[buffer(2)]],
+    device const uint *mod_rows [[buffer(3)]],
+    device int8_t *xq [[buffer(4)]],
+    device float *xscale [[buffer(5)]],
+    constant MinimaxH3DitNormModConvRot &p [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint t [[thread_index_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]]) {
+  device int8_t *dst = xq + (ulong)row * p.dim;
+  if (row >= p.m) {
+    for (uint c = t; c < p.dim; c += nt) dst[c] = 0;
+    return;
+  }
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
+  uint lane = t & MINIMAX_H3_SIMD_MASK;
+  uint sg = t >> MINIMAX_H3_SIMD_SHIFT;
+  uint nsg = nt >> MINIMAX_H3_SIMD_SHIFT;
+  uint ngroups = p.dim >> MINIMAX_H3_CONVROT_GROUP_SHIFT;
+  device const float *xr = x + (ulong)row * p.dim;
+  uint mr = mod_rows[row];
+  device const float *shift = mod + (ulong)mr * p.mod_stride + p.shift_off;
+  device const float *mscale = mod + (ulong)mr * p.mod_stride + p.scale_off;
+
+  if (ngroups <= nsg * MINIMAX_H3_CONVROT_MAX_REG_GROUPS) {
+    float reg[MINIMAX_H3_CONVROT_MAX_REG_GROUPS][MINIMAX_H3_CONVROT_PER_LANE];
+    float ss = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device const float *gp = xr + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float v = gp[lane + j * MINIMAX_H3_SIMD_WIDTH];
+          reg[idx][j] = v;
+          ss += v * v;
+        }
+      }
+    }
+    float inv_rms = rsqrt(tg_sum(ss, tmp, t, nt) / float(p.dim) + p.eps);
+    float amax = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        uint base = g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+          float normed = w[c] * (reg[idx][j] * inv_rms);
+          reg[idx][j] = normed * (1.0f + mscale[c]) + shift[c];
+        }
+        minimax_h3_hadamard256(reg[idx], lane);
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+          amax = max(amax, fabs(reg[idx][j]));
+      }
+    }
+    float row_max = tg_max(amax, tmp, t, nt);
+    float qscale =
+        max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+    if (t == 0) xscale[row] = qscale;
+    float inv_q = 1.0f / qscale;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device int8_t *dp = dst + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float q = clamp(rint(reg[idx][j] * inv_q), MINIMAX_H3_INT8_MIN,
+                          MINIMAX_H3_INT8_MAX);
+          dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+        }
+      }
+    }
+    return;
+  }
+
+  float ss = 0.0f;
+  for (uint c = t; c < p.dim; c += nt) ss += xr[c] * xr[c];
+  float inv_rms = rsqrt(tg_sum(ss, tmp, t, nt) / float(p.dim) + p.eps);
+  float amax = 0.0f;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      float normed = w[c] * (xr[c] * inv_rms);
+      v[j] = normed * (1.0f + mscale[c]) + shift[c];
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+      amax = max(amax, fabs(v[j]));
+  }
+  float row_max = tg_max(amax, tmp, t, nt);
+  float qscale = max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+  if (t == 0) xscale[row] = qscale;
+  float inv_q = 1.0f / qscale;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    device int8_t *dp = dst + base;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      float normed = w[c] * (xr[c] * inv_rms);
+      v[j] = normed * (1.0f + mscale[c]) + shift[c];
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      float q = clamp(rint(v[j] * inv_q), MINIMAX_H3_INT8_MIN,
+                      MINIMAX_H3_INT8_MAX);
+      dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+    }
   }
 }
 

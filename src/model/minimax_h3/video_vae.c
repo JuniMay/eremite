@@ -55,20 +55,20 @@ static const float IMAGENET_STD[MINIMAX_H3_RGB_CHANNELS] = {0.229f, 0.224f,
 
 // Metal dispatch tile and threadgroup dimensions matching
 // src/kernels/minimax_h3_{quant,vae,video_vae}.metal.
-static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
-                          CONVROT_THREADS = 256, NORM_THREADS = 256,
-                          EMBED_THREADS = 256, HEADS_THREADS = 32,
-                          ATTN_GROUP_ROWS = 64, ATTN_THREADS = 128,
-                          ELEM_THREADS = 32, ADD_THREADS = 256, IM2COL_TX = 32,
-                          IM2COL_TY = 8;
+static constexpr uint32_t TILE_M = 64, TILE_M_I8 = 128, TILE_N = 64,
+                          MM_THREADS = 128, CONVROT_THREADS = 256,
+                          NORM_THREADS = 256, EMBED_THREADS = 256,
+                          HEADS_THREADS = 32, ATTN_GROUP_ROWS = 64,
+                          ATTN_THREADS = 128, ELEM_THREADS = 32,
+                          ADD_THREADS = 256, IM2COL_TX = 32, IM2COL_TY = 8;
 
-// Parameters passed to minimax_h3_rmsnorm.
+// Parameters passed to minimax_h3_rmsnorm_convrot.
 typedef struct {
-  // Row width in floats.
-  uint32_t n;
+  // Active row count and row width in floats.
+  uint32_t m, k;
   // Normalization epsilon.
   float eps;
-} RmsNormParam;
+} RmsNormConvRotParam;
 
 // Parameters passed to minimax_h3_layernorm.
 typedef struct {
@@ -108,11 +108,11 @@ typedef struct {
   uint32_t rows, dim;
 } AddScaledParam;
 
-// Parameters passed to minimax_h3_swiglu_chunked.
+// Parameters passed to minimax_h3_swiglu_convrot.
 typedef struct {
-  // Row count and half-width inner dimension.
-  uint32_t rows, inner;
-} SwigluChunkedParam;
+  // Active row count and half-width inner dimension.
+  uint32_t m, k;
+} SwigluConvRotParam;
 
 // Parameters passed to minimax_h3_vvae_embed.
 typedef struct {
@@ -263,9 +263,9 @@ struct MinimaxH3VideoVae {
   Buf enc_norm_out_w, enc_norm_out_b;
 
   // Cached Metal kernel indices.
-  int k_rmsnorm, k_layernorm, k_convrot, k_mm_i8, k_x_f16, k_mm_f16,
-      k_add_scaled, k_swiglu, k_embed, k_heads, k_attend, k_gn3d, k_im2col3d,
-      k_add;
+  int k_rmsnorm_convrot, k_layernorm, k_convrot, k_mm_i8, k_x_f16, k_mm_f16,
+      k_add_scaled, k_swiglu_convrot, k_embed, k_heads, k_attend, k_gn3d,
+      k_im2col3d, k_add;
 };
 
 // Returns ceil(a / b) for positive integers.
@@ -544,14 +544,14 @@ MinimaxH3VideoVae *minimax_h3_video_vae_open(Gpu *gpu, MemoryAccount *account,
   minimax_h3_read_tensor_bytes(lm, vae->latents_mean);
   minimax_h3_read_tensor_bytes(ls, vae->latents_std);
 
-  vae->k_rmsnorm = gpu_find_kernel(gpu, "minimax_h3_rmsnorm");
+  vae->k_rmsnorm_convrot = gpu_find_kernel(gpu, "minimax_h3_rmsnorm_convrot");
   vae->k_layernorm = gpu_find_kernel(gpu, "minimax_h3_layernorm");
   vae->k_convrot = gpu_find_kernel(gpu, "minimax_h3_convrot_quant_i8");
   vae->k_mm_i8 = gpu_find_kernel(gpu, "minimax_h3_mm_int8");
   vae->k_x_f16 = gpu_find_kernel(gpu, "minimax_h3_x_f16");
   vae->k_mm_f16 = gpu_find_kernel(gpu, "minimax_h3_mm_f16");
   vae->k_add_scaled = gpu_find_kernel(gpu, "minimax_h3_add_scaled");
-  vae->k_swiglu = gpu_find_kernel(gpu, "minimax_h3_swiglu_chunked");
+  vae->k_swiglu_convrot = gpu_find_kernel(gpu, "minimax_h3_swiglu_convrot");
   vae->k_embed = gpu_find_kernel(gpu, "minimax_h3_vvae_embed");
   vae->k_heads = gpu_find_kernel(gpu, "minimax_h3_vvae_heads");
   vae->k_attend = gpu_find_kernel(gpu, "minimax_h3_vvae_attend");
@@ -699,13 +699,14 @@ uint64_t minimax_h3_video_vae_decode_workspace_bytes(void) {
                          (uint64_t)VVAE_TILE_CELLS * (uint64_t)VVAE_TILE_CELLS;
   uint64_t max_seq = max_patches + (uint64_t)VVAE_SUFFIX_TOKENS;
   uint64_t max_padded = ceil_div((uint32_t)max_seq, TILE_M) * TILE_M;
+  uint64_t max_padded_i8 = ceil_div((uint32_t)max_seq, TILE_M_I8) * TILE_M_I8;
   uint64_t bytes = 0;
   bytes += gpu_round_up_to_pages((uint64_t)MINIMAX_H3_VAE_LATENT_CHANNELS *
                                  max_patches * sizeof(float));
   bytes +=
       2u * gpu_round_up_to_pages(max_seq * (uint64_t)VVAE_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages(max_padded * (uint64_t)VVAE_FFN_INNER);
-  bytes += gpu_round_up_to_pages(max_padded * sizeof(float));
+  bytes += gpu_round_up_to_pages(max_padded_i8 * (uint64_t)VVAE_FFN_INNER);
+  bytes += gpu_round_up_to_pages(max_padded_i8 * sizeof(float));
   bytes +=
       gpu_round_up_to_pages(max_seq * (uint64_t)VVAE_W1_WIDTH * sizeof(float));
   bytes +=
@@ -740,6 +741,8 @@ static int alloc_decode_ws(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
   size_t max_patches = (size_t)max_t * (size_t)max_h * (size_t)max_w;
   size_t max_seq = max_patches + (size_t)VVAE_SUFFIX_TOKENS;
   size_t max_padded = (size_t)ceil_div((uint32_t)max_seq, TILE_M) * TILE_M;
+  size_t max_padded_i8 =
+      (size_t)ceil_div((uint32_t)max_seq, TILE_M_I8) * TILE_M_I8;
   size_t head_bytes = (size_t)VVAE_HEADS * max_padded * (size_t)VVAE_HEAD_DIM *
                       sizeof(uint16_t);
   MemorySlot *s = &vae->workspace_slot;
@@ -750,9 +753,10 @@ static int alloc_decode_ws(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
                                  max_seq * (size_t)VVAE_DIM * sizeof(float));
   ws->norm = gpu_try_alloc_required(vae->gpu, s,
                                     max_seq * (size_t)VVAE_DIM * sizeof(float));
-  ws->xq =
-      gpu_try_alloc_required(vae->gpu, s, max_padded * (size_t)VVAE_FFN_INNER);
-  ws->x_scale = gpu_try_alloc_required(vae->gpu, s, max_padded * sizeof(float));
+  ws->xq = gpu_try_alloc_required(vae->gpu, s,
+                                  max_padded_i8 * (size_t)VVAE_FFN_INNER);
+  ws->x_scale =
+      gpu_try_alloc_required(vae->gpu, s, max_padded_i8 * sizeof(float));
   ws->wide = gpu_try_alloc_required(
       vae->gpu, s, max_seq * (size_t)VVAE_W1_WIDTH * sizeof(float));
   ws->mid = gpu_try_alloc_required(
@@ -771,19 +775,10 @@ static int alloc_decode_ws(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
   return 1;
 }
 
-// Encodes ConvRot INT8 quantization + INT8 matmul with bias into cmd.
-static void enc_i8_lin(const MinimaxH3VideoVae *vae, GpuCommandBuffer *cmd,
-                       const VvaeInt8Lin *lin, const Buf *x, const Buf *xq,
-                       const Buf *xs, const Buf *y, uint32_t rows,
-                       uint32_t padded) {
-  ConvRotParam cp = {rows, (uint32_t)lin->k, (uint32_t)lin->k};
-  gpu_select_kernel(cmd, vae->k_convrot);
-  gpu_bind_buffer(cmd, 0, x, 0);
-  gpu_bind_buffer(cmd, 1, xq, 0);
-  gpu_bind_buffer(cmd, 2, xs, 0);
-  gpu_copy_bytes(cmd, 3, &cp, sizeof cp);
-  gpu_run_kernel(cmd, padded, 1, 1, CONVROT_THREADS, 1, 1);
-
+// Encodes native INT8 matmul with bias on already-rotated xq and xs into cmd.
+static void enc_mm_i8(const MinimaxH3VideoVae *vae, GpuCommandBuffer *cmd,
+                      const VvaeInt8Lin *lin, const Buf *xq, const Buf *xs,
+                      const Buf *y, uint32_t rows, uint32_t padded_i8) {
   Int8MMParam mp = {rows, (uint32_t)lin->n, (uint32_t)lin->k, (uint32_t)lin->n,
                     1u};
   gpu_select_kernel(cmd, vae->k_mm_i8);
@@ -794,8 +789,24 @@ static void enc_i8_lin(const MinimaxH3VideoVae *vae, GpuCommandBuffer *cmd,
   gpu_bind_buffer(cmd, 4, &lin->bias, 0);
   gpu_bind_buffer(cmd, 5, y, 0);
   gpu_copy_bytes(cmd, 6, &mp, sizeof mp);
-  gpu_run_kernel(cmd, ceil_div((uint32_t)lin->n, TILE_N), padded / TILE_M, 1,
-                 MM_THREADS, 1, 1);
+  gpu_run_kernel(cmd,
+                 ceil_div((uint32_t)lin->n, TILE_N) * (padded_i8 / TILE_M_I8),
+                 1, 1, MM_THREADS, 1, 1);
+}
+
+// Encodes ConvRot INT8 quantization + INT8 matmul with bias into cmd.
+static void enc_i8_lin(const MinimaxH3VideoVae *vae, GpuCommandBuffer *cmd,
+                       const VvaeInt8Lin *lin, const Buf *x, const Buf *xq,
+                       const Buf *xs, const Buf *y, uint32_t rows,
+                       uint32_t padded_i8) {
+  ConvRotParam cp = {rows, (uint32_t)lin->k, (uint32_t)lin->k};
+  gpu_select_kernel(cmd, vae->k_convrot);
+  gpu_bind_buffer(cmd, 0, x, 0);
+  gpu_bind_buffer(cmd, 1, xq, 0);
+  gpu_bind_buffer(cmd, 2, xs, 0);
+  gpu_copy_bytes(cmd, 3, &cp, sizeof cp);
+  gpu_run_kernel(cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
+  enc_mm_i8(vae, cmd, lin, xq, xs, y, rows, padded_i8);
 }
 
 // Decodes one denormalized latent tile [24, t_lat, h_lat, w_lat] in ws->z_tile
@@ -807,6 +818,7 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
   uint32_t patches = (uint32_t)(t_lat * h_lat * w_lat);
   uint32_t rows = patches + (uint32_t)VVAE_SUFFIX_TOKENS;
   uint32_t padded = ceil_div(rows, TILE_M) * TILE_M;
+  uint32_t padded_i8 = ceil_div(rows, TILE_M_I8) * TILE_M_I8;
 
   VvaeEmbedParam ep = {(uint32_t)t_lat, (uint32_t)h_lat, (uint32_t)w_lat};
   GpuCommandBuffer cmd = gpu_begin(vae->gpu);
@@ -824,28 +836,29 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
   gpu_commit(&cmd);
   minimax_h3_gpu_wait_hooks(vae->gpu, cb, hooks);
 
-  RmsNormParam rnp = {VVAE_DIM, VVAE_NORM_EPS};
+  RmsNormConvRotParam rnp = {rows, VVAE_DIM, VVAE_NORM_EPS};
   VvaeHeadsParam hp = {
       rows,         padded, (uint32_t)t_lat, (uint32_t)h_lat, (uint32_t)w_lat,
       VVAE_NORM_EPS};
   VvaeAttendParam ap = {rows, padded};
   AddScaledParam asp = {rows, VVAE_DIM};
-  SwigluChunkedParam swp = {rows, VVAE_FFN_INNER};
+  SwigluConvRotParam swp = {rows, VVAE_FFN_INNER};
 
   for (int li = 0; li < VVAE_LAYERS; li++) {
     if (minimax_h3_should_stop(hooks)) return 0;
     const VvaeBlock *b = &vae->blocks[li];
     cmd = gpu_begin(vae->gpu);
 
-    gpu_select_kernel(&cmd, vae->k_rmsnorm);
+    gpu_select_kernel(&cmd, vae->k_rmsnorm_convrot);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &b->norm1, 0);
-    gpu_bind_buffer(&cmd, 2, &ws->norm, 0);
-    gpu_copy_bytes(&cmd, 3, &rnp, sizeof rnp);
-    gpu_run_kernel(&cmd, rows, 1, 1, NORM_THREADS, 1, 1);
+    gpu_bind_buffer(&cmd, 2, &ws->xq, 0);
+    gpu_bind_buffer(&cmd, 3, &ws->x_scale, 0);
+    gpu_copy_bytes(&cmd, 4, &rnp, sizeof rnp);
+    gpu_run_kernel(&cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
 
-    enc_i8_lin(vae, &cmd, &b->to_qkv, &ws->norm, &ws->xq, &ws->x_scale,
-               &ws->wide, rows, padded);
+    enc_mm_i8(vae, &cmd, &b->to_qkv, &ws->xq, &ws->x_scale, &ws->wide, rows,
+              padded_i8);
 
     gpu_select_kernel(&cmd, vae->k_heads);
     gpu_bind_buffer(&cmd, 0, &ws->wide, 0);
@@ -867,7 +880,7 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
                    ATTN_THREADS, 1, 1);
 
     enc_i8_lin(vae, &cmd, &b->to_out, &ws->mid, &ws->xq, &ws->x_scale,
-               &ws->norm, rows, padded);
+               &ws->norm, rows, padded_i8);
 
     gpu_select_kernel(&cmd, vae->k_add_scaled);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
@@ -877,25 +890,26 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
     gpu_run_kernel(&cmd, ceil_div(VVAE_DIM, ELEM_THREADS), rows, 1,
                    ELEM_THREADS, 1, 1);
 
-    gpu_select_kernel(&cmd, vae->k_rmsnorm);
+    gpu_select_kernel(&cmd, vae->k_rmsnorm_convrot);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);
     gpu_bind_buffer(&cmd, 1, &b->norm2, 0);
-    gpu_bind_buffer(&cmd, 2, &ws->norm, 0);
-    gpu_copy_bytes(&cmd, 3, &rnp, sizeof rnp);
-    gpu_run_kernel(&cmd, rows, 1, 1, NORM_THREADS, 1, 1);
+    gpu_bind_buffer(&cmd, 2, &ws->xq, 0);
+    gpu_bind_buffer(&cmd, 3, &ws->x_scale, 0);
+    gpu_copy_bytes(&cmd, 4, &rnp, sizeof rnp);
+    gpu_run_kernel(&cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
 
-    enc_i8_lin(vae, &cmd, &b->ff_w1, &ws->norm, &ws->xq, &ws->x_scale,
-               &ws->wide, rows, padded);
+    enc_mm_i8(vae, &cmd, &b->ff_w1, &ws->xq, &ws->x_scale, &ws->wide, rows,
+              padded_i8);
 
-    gpu_select_kernel(&cmd, vae->k_swiglu);
+    gpu_select_kernel(&cmd, vae->k_swiglu_convrot);
     gpu_bind_buffer(&cmd, 0, &ws->wide, 0);
-    gpu_bind_buffer(&cmd, 1, &ws->mid, 0);
-    gpu_copy_bytes(&cmd, 2, &swp, sizeof swp);
-    gpu_run_kernel(&cmd, ceil_div(VVAE_FFN_INNER, ELEM_THREADS), rows, 1,
-                   ELEM_THREADS, 1, 1);
+    gpu_bind_buffer(&cmd, 1, &ws->xq, 0);
+    gpu_bind_buffer(&cmd, 2, &ws->x_scale, 0);
+    gpu_copy_bytes(&cmd, 3, &swp, sizeof swp);
+    gpu_run_kernel(&cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
 
-    enc_i8_lin(vae, &cmd, &b->ff_w2, &ws->mid, &ws->xq, &ws->x_scale, &ws->norm,
-               rows, padded);
+    enc_mm_i8(vae, &cmd, &b->ff_w2, &ws->xq, &ws->x_scale, &ws->norm, rows,
+              padded_i8);
 
     gpu_select_kernel(&cmd, vae->k_add_scaled);
     gpu_bind_buffer(&cmd, 0, &ws->h, 0);

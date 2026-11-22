@@ -60,6 +60,34 @@ typedef struct {
   uint32_t m, k, lda;
 } ConvRotParam;
 
+// Parameters passed to minimax_h3_swiglu_convrot.
+typedef struct {
+  // Active rows and half-width inner dimension.
+  uint32_t m, k;
+} SwigluConvRotParam;
+
+// Parameters passed to minimax_h3_swiglu_chunked.
+typedef struct {
+  // Row count and half-width inner dimension.
+  uint32_t rows, inner;
+} SwigluChunkedParam;
+
+// Parameters passed to minimax_h3_rmsnorm.
+typedef struct {
+  // Row width in floats.
+  uint32_t n;
+  // Normalization epsilon.
+  float eps;
+} RmsNormParam;
+
+// Parameters passed to minimax_h3_rmsnorm_convrot.
+typedef struct {
+  // Active rows and row width in floats.
+  uint32_t m, k;
+  // Normalization epsilon.
+  float eps;
+} RmsNormConvRotParam;
+
 // Parameters passed to minimax_h3_mm_int8.
 typedef struct {
   // Rows, output columns, inner columns, output row stride and bias flag.
@@ -450,9 +478,10 @@ static void test_convrot_int8(Gpu *gpu, MemorySlot *slot) {
       gpu_bind_buffer(&cmd, 4, &bias_buf, 0);
       gpu_bind_buffer(&cmd, 5, &y_buf, 0);
       gpu_copy_bytes(&cmd, 6, &mp, sizeof mp);
-      gpu_run_kernel(&cmd, (uint32_t)((n + TILE_N - 1) / TILE_N),
-                     (uint32_t)((m + TILE_N - 1) / TILE_N), 1, MM_THREADS, 1,
-                     1);
+      gpu_run_kernel(&cmd,
+                     (uint32_t)((n + TILE_N - 1) / TILE_N) *
+                         (uint32_t)((m + TILE_M - 1) / TILE_M),
+                     1, 1, MM_THREADS, 1, 1);
       gpu_commit(&cmd);
       gpu_sync(gpu);
 
@@ -545,6 +574,132 @@ static void test_embed_int8(Gpu *gpu, MemorySlot *slot) {
         "INT8 row-scaled embedding lookup matches CPU and keeps negative IDs");
 }
 
+// Tests single-pass and 2-pass-fallback fused ConvRot kernels
+// (minimax_h3_swiglu_convrot and minimax_h3_rmsnorm_convrot) against unfused
+// reference kernel chains.
+static void test_fused_convrot(Gpu *gpu, MemorySlot *slot) {
+  int k_rot = gpu_find_kernel(gpu, "minimax_h3_convrot_quant_i8");
+  int k_sw = gpu_find_kernel(gpu, "minimax_h3_swiglu_chunked");
+  int k_sw_rot = gpu_find_kernel(gpu, "minimax_h3_swiglu_convrot");
+  int k_rms = gpu_find_kernel(gpu, "minimax_h3_rmsnorm");
+  int k_rms_rot = gpu_find_kernel(gpu, "minimax_h3_rmsnorm_convrot");
+
+  // Cover both register-cached single-pass (512 <= 16384) and 2-pass fallback
+  // (16640 > 16384).
+  static const uint32_t ks[] = {512u, 16640u};
+  uint32_t m = 5u;
+  uint32_t padded_m =
+      (m + (uint32_t)TILE_M - 1u) / (uint32_t)TILE_M * (uint32_t)TILE_M;
+  uint32_t rng = 0x51525354u;
+  int sw_ok = 1, rms_ok = 1;
+
+  for (size_t ki = 0; ki < sizeof ks / sizeof ks[0]; ki++) {
+    uint32_t k = ks[ki];
+    Buf in2 = gpu_alloc(gpu, slot, (size_t)m * (size_t)(2u * k) * 4u);
+    Buf mid = gpu_alloc(gpu, slot, (size_t)m * (size_t)k * 4u);
+    Buf w = gpu_alloc(gpu, slot, (size_t)k * 4u);
+    Buf xq_ref = gpu_alloc(gpu, slot, (size_t)padded_m * (size_t)k);
+    Buf xs_ref = gpu_alloc(gpu, slot, (size_t)m * 4u);
+    Buf xq_got = gpu_alloc(gpu, slot, (size_t)padded_m * (size_t)k);
+    Buf xs_got = gpu_alloc(gpu, slot, (size_t)m * 4u);
+
+    float *in2p = (float *)in2.ptr, *wp = (float *)w.ptr;
+    for (size_t i = 0; i < (size_t)m * (size_t)(2u * k); i++)
+      in2p[i] = rng_float(&rng) * 2.0f;
+    for (uint32_t c = 0; c < k; c++) wp[c] = 0.5f + rng_float(&rng);
+    memset(xq_ref.ptr, 0x5a, xq_ref.size);
+    memset(xq_got.ptr, 0x5a, xq_got.size);
+
+    SwigluChunkedParam swp = {m, k};
+    ConvRotParam rp = {m, k, k};
+    SwigluConvRotParam swrp = {m, k};
+    GpuCommandBuffer cmd = gpu_begin(gpu);
+    gpu_select_kernel(&cmd, k_sw);
+    gpu_bind_buffer(&cmd, 0, &in2, 0);
+    gpu_bind_buffer(&cmd, 1, &mid, 0);
+    gpu_copy_bytes(&cmd, 2, &swp, sizeof swp);
+    gpu_run_kernel(&cmd, (k + 31u) / 32u, m, 1, 32u, 1, 1);
+
+    gpu_select_kernel(&cmd, k_rot);
+    gpu_bind_buffer(&cmd, 0, &mid, 0);
+    gpu_bind_buffer(&cmd, 1, &xq_ref, 0);
+    gpu_bind_buffer(&cmd, 2, &xs_ref, 0);
+    gpu_copy_bytes(&cmd, 3, &rp, sizeof rp);
+    gpu_run_kernel(&cmd, padded_m, 1, 1, (uint32_t)CONVROT_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_sw_rot);
+    gpu_bind_buffer(&cmd, 0, &in2, 0);
+    gpu_bind_buffer(&cmd, 1, &xq_got, 0);
+    gpu_bind_buffer(&cmd, 2, &xs_got, 0);
+    gpu_copy_bytes(&cmd, 3, &swrp, sizeof swrp);
+    gpu_run_kernel(&cmd, padded_m, 1, 1, (uint32_t)CONVROT_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+
+    if (memcmp(xq_ref.ptr, xq_got.ptr, (size_t)padded_m * (size_t)k) != 0 ||
+        memcmp(xs_ref.ptr, xs_got.ptr, (size_t)m * 4u) != 0)
+      sw_ok = 0;
+
+    // Now test minimax_h3_rmsnorm_convrot against minimax_h3_rmsnorm + convrot.
+    memset(xq_ref.ptr, 0x5a, xq_ref.size);
+    memset(xq_got.ptr, 0x5a, xq_got.size);
+    float eps = 1e-5f;
+    RmsNormParam rnp = {k, eps};
+    RmsNormConvRotParam rnrp = {m, k, eps};
+    cmd = gpu_begin(gpu);
+    gpu_select_kernel(&cmd, k_rms);
+    gpu_bind_buffer(&cmd, 0, &in2, 0);
+    gpu_bind_buffer(&cmd, 1, &w, 0);
+    gpu_bind_buffer(&cmd, 2, &mid, 0);
+    gpu_copy_bytes(&cmd, 3, &rnp, sizeof rnp);
+    gpu_run_kernel(&cmd, m, 1, 1, (uint32_t)CONVROT_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_rot);
+    gpu_bind_buffer(&cmd, 0, &mid, 0);
+    gpu_bind_buffer(&cmd, 1, &xq_ref, 0);
+    gpu_bind_buffer(&cmd, 2, &xs_ref, 0);
+    gpu_copy_bytes(&cmd, 3, &rp, sizeof rp);
+    gpu_run_kernel(&cmd, padded_m, 1, 1, (uint32_t)CONVROT_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_rms_rot);
+    gpu_bind_buffer(&cmd, 0, &in2, 0);
+    gpu_bind_buffer(&cmd, 1, &w, 0);
+    gpu_bind_buffer(&cmd, 2, &xq_got, 0);
+    gpu_bind_buffer(&cmd, 3, &xs_got, 0);
+    gpu_copy_bytes(&cmd, 4, &rnrp, sizeof rnrp);
+    gpu_run_kernel(&cmd, padded_m, 1, 1, (uint32_t)CONVROT_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+
+    const int8_t *qr = (const int8_t *)xq_ref.ptr;
+    const int8_t *qg = (const int8_t *)xq_got.ptr;
+    const float *sr = (const float *)xs_ref.ptr;
+    const float *sg = (const float *)xs_got.ptr;
+    for (uint32_t r = 0; r < m; r++) {
+      if (fabsf(sr[r] - sg[r]) > fmaxf(1e-7f, sr[r] * 1e-5f)) rms_ok = 0;
+      for (uint32_t c = 0; c < k; c++)
+        if (abs((int)qr[(size_t)r * k + c] - (int)qg[(size_t)r * k + c]) > 1)
+          rms_ok = 0;
+    }
+    for (uint32_t r = m; r < padded_m; r++)
+      for (uint32_t c = 0; c < k; c++)
+        if (qg[(size_t)r * k + c] != 0) rms_ok = 0;
+
+    gpu_free(&xs_got);
+    gpu_free(&xq_got);
+    gpu_free(&xs_ref);
+    gpu_free(&xq_ref);
+    gpu_free(&w);
+    gpu_free(&mid);
+    gpu_free(&in2);
+  }
+  check(sw_ok, "minimax_h3_swiglu_convrot matches unfused SwiGLU + ConvRot "
+               "bit-for-bit across 1-pass and 2-pass widths");
+  check(rms_ok,
+        "minimax_h3_rmsnorm_convrot matches unfused RMSNorm + ConvRot across "
+        "1-pass and 2-pass widths");
+}
+
 // Benchmarks one DiT-sized INT8-ConvRot linear (1024 x 5376 x 5376) and one
 // Qwen3-VL-sized NVFP4 linear (256 x 5120 x 5120).
 static void bench_realistic_shapes(Gpu *gpu, MemorySlot *slot) {
@@ -588,7 +743,7 @@ static void bench_realistic_shapes(Gpu *gpu, MemorySlot *slot) {
     gpu_bind_buffer(&cmd, 4, &bias, 0);
     gpu_bind_buffer(&cmd, 5, &y, 0);
     gpu_copy_bytes(&cmd, 6, &mp, sizeof mp);
-    gpu_run_kernel(&cmd, (uint32_t)(n / TILE_N), (uint32_t)(m / TILE_N), 1,
+    gpu_run_kernel(&cmd, (uint32_t)(n / TILE_N) * (uint32_t)(m / TILE_M), 1, 1,
                    MM_THREADS, 1, 1);
     gpu_commit(&cmd);
     gpu_sync(gpu);
@@ -618,6 +773,7 @@ int main(void) {
   test_scale_unswizzle(gpu, &account);
   test_nvfp4_linear(gpu, slot);
   test_convrot_int8(gpu, slot);
+  test_fused_convrot(gpu, slot);
   test_embed_int8(gpu, slot);
   bench_realistic_shapes(gpu, slot);
 

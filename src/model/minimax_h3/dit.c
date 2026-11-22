@@ -104,11 +104,12 @@ static constexpr uint32_t OFF_SHIFT_MSA = 0 * DIT_DIM,
 
 // Threadgroup and tile sizes matching minimax_h3_quant.metal and
 // minimax_h3_dit.metal.
-static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
-                          F32MM_TILE_M = 64, F32MM_TILE_N = 32,
-                          F32MM_THREADS = 128, CONVROT_THREADS = 256,
-                          NORM_THREADS = 256, HEADS_THREADS = 64,
-                          ELEM_THREADS = 256, GRID2D_THREADS = 32;
+static constexpr uint32_t TILE_M = 64, TILE_M_I8 = 128, TILE_N = 64,
+                          MM_THREADS = 128, F32MM_TILE_M = 64,
+                          F32MM_TILE_N = 32, F32MM_THREADS = 128,
+                          CONVROT_THREADS = 256, NORM_THREADS = 256,
+                          HEADS_THREADS = 64, ELEM_THREADS = 256,
+                          GRID2D_THREADS = 32;
 
 // Parameters passed to minimax_h3_x_bf16.
 typedef struct {
@@ -154,6 +155,12 @@ typedef struct {
   uint32_t rows, inner;
 } SwigluChunkedParam;
 
+// Parameters passed to minimax_h3_swiglu_convrot.
+typedef struct {
+  // Active rows and half-width inner dimension.
+  uint32_t m, k;
+} SwigluConvRotParam;
+
 // Parameters passed to minimax_h3_dit_adaln.
 typedef struct {
   // Number of distinct timesteps, output width per timestep and F16 bias flag.
@@ -167,6 +174,14 @@ typedef struct {
   // RMSNorm epsilon.
   float eps;
 } DitNormModParam;
+
+// Parameters passed to minimax_h3_dit_norm_mod_convrot.
+typedef struct {
+  // Active rows, row width, modulation stride, shift offset and scale offset.
+  uint32_t m, dim, mod_stride, shift_off, scale_off;
+  // RMSNorm epsilon.
+  float eps;
+} DitNormModConvRotParam;
 
 // Parameters passed to minimax_h3_dit_gate_add.
 typedef struct {
@@ -330,7 +345,8 @@ struct MinimaxH3Dit {
   Buf audio_out_w, audio_out_b;
   // Compiled Metal kernel indices for linear, norm, AdaLN and attention ops.
   int k_x_bf16, k_mm_bf16, k_mm_f32, k_convrot, k_mm_int8, k_rmsnorm, k_add,
-      k_swiglu_chunked, k_adaln, k_norm_mod, k_gate_add, k_heads, k_attend;
+      k_swiglu_chunked, k_swiglu_convrot, k_adaln, k_norm_mod,
+      k_norm_mod_convrot, k_gate_add, k_heads, k_attend;
 };
 
 // Reads PDD step count and sigma schedule from checkpoint metadata and
@@ -446,8 +462,11 @@ MinimaxH3Dit *minimax_h3_dit_open(Gpu *gpu, MemoryAccount *account,
   dit->k_rmsnorm = gpu_find_kernel(gpu, "minimax_h3_rmsnorm");
   dit->k_add = gpu_find_kernel(gpu, "minimax_h3_add");
   dit->k_swiglu_chunked = gpu_find_kernel(gpu, "minimax_h3_swiglu_chunked");
+  dit->k_swiglu_convrot = gpu_find_kernel(gpu, "minimax_h3_swiglu_convrot");
   dit->k_adaln = gpu_find_kernel(gpu, "minimax_h3_dit_adaln");
   dit->k_norm_mod = gpu_find_kernel(gpu, "minimax_h3_dit_norm_mod");
+  dit->k_norm_mod_convrot =
+      gpu_find_kernel(gpu, "minimax_h3_dit_norm_mod_convrot");
   dit->k_gate_add = gpu_find_kernel(gpu, "minimax_h3_dit_gate_add");
   dit->k_heads = gpu_find_kernel(gpu, "minimax_h3_dit_heads");
   dit->k_attend = gpu_find_kernel(gpu, "minimax_h3_dit_attend");
@@ -830,6 +849,8 @@ static uint64_t dit_workspace_bytes_impl(int text_len, int total_vis,
   int seq_len = text_len + total_vis + total_audio;
   uint64_t padded_seq =
       ((uint64_t)seq_len + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
+  uint64_t padded_seq_i8 = ((uint64_t)seq_len + (uint64_t)TILE_M_I8 - 1) /
+                           (uint64_t)TILE_M_I8 * TILE_M_I8;
   uint64_t padded_text =
       ((uint64_t)text_len + (uint64_t)TILE_M - 1) / (uint64_t)TILE_M * TILE_M;
   uint64_t xb_rows = lora ? padded_seq : padded_text;
@@ -837,7 +858,7 @@ static uint64_t dit_workspace_bytes_impl(int text_len, int total_vis,
   bytes += (uint64_t)text_len * (uint64_t)DIT_DIM * sizeof(float);
   bytes += 2u * (uint64_t)seq_len * (uint64_t)DIT_DIM * sizeof(float);
   bytes += xb_rows * (uint64_t)DIT_FFN_DIM * sizeof(uint16_t);
-  bytes += padded_seq * (uint64_t)DIT_FFN_DIM;
+  bytes += padded_seq_i8 * (uint64_t)DIT_FFN_DIM;
   bytes += (uint64_t)seq_len * sizeof(float);
   bytes += minimax_h3_lora_workspace_bytes(lora, seq_len);
   bytes += (uint64_t)MINIMAX_H3_QKV_PARTS * (uint64_t)DIT_HEADS * padded_seq *
@@ -887,6 +908,8 @@ static int alloc_dit_workspace(MinimaxH3Dit *dit, int text_len, int total_vis,
   memset(ws, 0, sizeof *ws);
   int seq_len = text_len + total_vis + total_audio;
   uint32_t padded_seq = ((uint32_t)seq_len + TILE_M - 1) / TILE_M * TILE_M;
+  uint32_t padded_seq_i8 =
+      ((uint32_t)seq_len + TILE_M_I8 - 1) / TILE_M_I8 * TILE_M_I8;
   uint32_t padded_text = ((uint32_t)text_len + TILE_M - 1) / TILE_M * TILE_M;
   uint32_t xb_rows = lora ? padded_seq : padded_text;
   uint64_t lora_mid_bytes = minimax_h3_lora_workspace_bytes(lora, seq_len);
@@ -900,8 +923,8 @@ static int alloc_dit_workspace(MinimaxH3Dit *dit, int text_len, int total_vis,
                                     (size_t)seq_len * DIT_DIM * sizeof(float));
   ws->xb = gpu_try_alloc_required(
       dit->gpu, slot, (size_t)xb_rows * DIT_FFN_DIM * sizeof(uint16_t));
-  ws->xq =
-      gpu_try_alloc_required(dit->gpu, slot, (size_t)padded_seq * DIT_FFN_DIM);
+  ws->xq = gpu_try_alloc_required(dit->gpu, slot,
+                                  (size_t)padded_seq_i8 * DIT_FFN_DIM);
   ws->xscale =
       gpu_try_alloc_required(dit->gpu, slot, (size_t)seq_len * sizeof(float));
   if (lora_mid_bytes > 0)
@@ -997,22 +1020,12 @@ static void run_bf16_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
                  1, MM_THREADS, 1, 1);
 }
 
-// Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul
-// for rows starting at byte offsets x_off in x and y_off in y.
-static void run_convrot_linear_at(const MinimaxH3Dit *dit,
-                                  GpuCommandBuffer *cmd, const Buf *x,
-                                  size_t x_off, const Buf *xq,
-                                  const Buf *xscale, const Int8Lin *lin,
-                                  const Buf *y, size_t y_off, int rows) {
-  uint32_t padded = ((uint32_t)rows + TILE_M - 1) / TILE_M * TILE_M;
-  ConvRotParam rp = {(uint32_t)rows, (uint32_t)lin->k, (uint32_t)lin->k};
-  gpu_select_kernel(cmd, dit->k_convrot);
-  gpu_bind_buffer(cmd, 0, x, x_off);
-  gpu_bind_buffer(cmd, 1, xq, 0);
-  gpu_bind_buffer(cmd, 2, xscale, 0);
-  gpu_copy_bytes(cmd, 3, &rp, sizeof rp);
-  gpu_run_kernel(cmd, padded, 1, 1, CONVROT_THREADS, 1, 1);
-
+// Encodes native INT8 matmul on already-rotated xq and xscale into y at y_off.
+static void run_mm_int8_at(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
+                           const Buf *xq, const Buf *xscale, const Int8Lin *lin,
+                           const Buf *y, size_t y_off, int rows) {
+  uint32_t tiles_m = ((uint32_t)rows + TILE_M_I8 - 1) / TILE_M_I8;
+  uint32_t tiles_n = ((uint32_t)lin->n + TILE_N - 1) / TILE_N;
   Int8MMParam mp = {(uint32_t)rows, (uint32_t)lin->n, (uint32_t)lin->k,
                     (uint32_t)lin->n, 0};
   gpu_select_kernel(cmd, dit->k_mm_int8);
@@ -1023,8 +1036,25 @@ static void run_convrot_linear_at(const MinimaxH3Dit *dit,
   gpu_bind_buffer(cmd, 4, &dit->rope_inv_freq, 0);
   gpu_bind_buffer(cmd, 5, y, y_off);
   gpu_copy_bytes(cmd, 6, &mp, sizeof mp);
-  gpu_run_kernel(cmd, ((uint32_t)lin->n + TILE_N - 1) / TILE_N, padded / TILE_M,
-                 1, MM_THREADS, 1, 1);
+  gpu_run_kernel(cmd, tiles_n * tiles_m, 1, 1, MM_THREADS, 1, 1);
+}
+
+// Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul
+// for rows starting at byte offsets x_off in x and y_off in y.
+static void run_convrot_linear_at(const MinimaxH3Dit *dit,
+                                  GpuCommandBuffer *cmd, const Buf *x,
+                                  size_t x_off, const Buf *xq,
+                                  const Buf *xscale, const Int8Lin *lin,
+                                  const Buf *y, size_t y_off, int rows) {
+  uint32_t padded = ((uint32_t)rows + TILE_M_I8 - 1) / TILE_M_I8 * TILE_M_I8;
+  ConvRotParam rp = {(uint32_t)rows, (uint32_t)lin->k, (uint32_t)lin->k};
+  gpu_select_kernel(cmd, dit->k_convrot);
+  gpu_bind_buffer(cmd, 0, x, x_off);
+  gpu_bind_buffer(cmd, 1, xq, 0);
+  gpu_bind_buffer(cmd, 2, xscale, 0);
+  gpu_copy_bytes(cmd, 3, &rp, sizeof rp);
+  gpu_run_kernel(cmd, padded, 1, 1, CONVROT_THREADS, 1, 1);
+  run_mm_int8_at(dit, cmd, xq, xscale, lin, y, y_off, rows);
 }
 
 // Encodes ConvRot Hadamard + per-row INT8 quantization + native INT8 matmul
@@ -1192,8 +1222,8 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
   RmsNormParam np = {(uint32_t)DIT_DIM, DIT_NORM_EPS};
   SwigluChunkedParam swp = {(uint32_t)text_len, (uint32_t)DIT_FFN_DIM};
   DitHeadsParam hp = {(uint32_t)text_len, padded, 0, DIT_NORM_EPS};
-  uint32_t refiner_tiles = padded / TILE_M;
-  DitAttendParam ap = {(uint32_t)text_len, padded, 0u, refiner_tiles};
+  uint32_t q_tiles = padded / TILE_M;
+  DitAttendParam ap = {(uint32_t)text_len, padded, 0u, q_tiles};
 
   GpuCommandBuffer cmd = gpu_begin(dit->gpu);
   run_bf16_linear(dit, &cmd, text_hidden, &ws->xb, &dit->condition_proj,
@@ -1235,8 +1265,7 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
     gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, refiner_tiles * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS,
-                   1, 1);
+    gpu_run_kernel(&cmd, q_tiles * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS, 1, 1);
 
     run_bf16_linear(dit, &cmd, &ws->attn_out, &ws->xb, &r->out_proj, &ws->norm,
                     text_len);
@@ -1300,16 +1329,25 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
 }
 
 // Encodes one complete INT8-ConvRot DiT block (with optional BF16 LoRA) into
-// cmd as a single command buffer.
+// cmd as a single command buffer. Uses fused norm+modulation+ConvRot and
+// SwiGLU+ConvRot when no runtime LoRA targets this block.
 static void encode_dit_block_full(const MinimaxH3Dit *dit,
                                   GpuCommandBuffer *cmd, const DitWorkspace *ws,
                                   const DitBlock *b, const MinimaxH3Lora *lora,
                                   const MinimaxH3LoraBlock *lb, int seq_len,
                                   uint32_t padded_seq, uint32_t num_t) {
+  uint32_t padded_i8 =
+      ((uint32_t)seq_len + TILE_M_I8 - 1) / TILE_M_I8 * TILE_M_I8;
   DitNormModParam msa_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
                                 OFF_SHIFT_MSA, OFF_SCALE_MSA, DIT_NORM_EPS};
   DitNormModParam mlp_norm_p = {(uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
                                 OFF_SHIFT_MLP, OFF_SCALE_MLP, DIT_NORM_EPS};
+  DitNormModConvRotParam msa_rot_p = {
+      (uint32_t)seq_len, (uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
+      OFF_SHIFT_MSA,     OFF_SCALE_MSA,     DIT_NORM_EPS};
+  DitNormModConvRotParam mlp_rot_p = {
+      (uint32_t)seq_len, (uint32_t)DIT_DIM, (uint32_t)DIT_ADALN_STRIDE,
+      OFF_SHIFT_MLP,     OFF_SCALE_MLP,     DIT_NORM_EPS};
   DitGateAddParam msa_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
                                 (uint32_t)DIT_ADALN_STRIDE, OFF_GATE_MSA};
   DitGateAddParam mlp_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
@@ -1318,6 +1356,7 @@ static void encode_dit_block_full(const MinimaxH3Dit *dit,
   uint32_t q_tiles = padded_seq / TILE_M;
   DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq, 0u, q_tiles};
   SwigluChunkedParam swiglu_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
+  SwigluConvRotParam swiglu_rot_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
   DitAdalnParam block_adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT,
                                  b->adaln_bias_f16};
 
@@ -1331,20 +1370,33 @@ static void encode_dit_block_full(const MinimaxH3Dit *dit,
                  ((uint32_t)DIT_ADALN_OUT + ELEM_THREADS - 1) / ELEM_THREADS,
                  num_t, 1, ELEM_THREADS, 1, 1);
 
-  gpu_select_kernel(cmd, dit->k_norm_mod);
-  gpu_bind_buffer(cmd, 0, &ws->h, 0);
-  gpu_bind_buffer(cmd, 1, &b->norm1, 0);
-  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
-  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
-  gpu_bind_buffer(cmd, 4, &ws->norm, 0);
-  gpu_copy_bytes(cmd, 5, &msa_norm_p, sizeof msa_norm_p);
-  gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+  if (!lb) {
+    gpu_select_kernel(cmd, dit->k_norm_mod_convrot);
+    gpu_bind_buffer(cmd, 0, &ws->h, 0);
+    gpu_bind_buffer(cmd, 1, &b->norm1, 0);
+    gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+    gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+    gpu_bind_buffer(cmd, 4, &ws->xq, 0);
+    gpu_bind_buffer(cmd, 5, &ws->xscale, 0);
+    gpu_copy_bytes(cmd, 6, &msa_rot_p, sizeof msa_rot_p);
+    gpu_run_kernel(cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
+    run_mm_int8_at(dit, cmd, &ws->xq, &ws->xscale, &b->qkv_proj, &ws->qkv, 0,
+                   seq_len);
+  } else {
+    gpu_select_kernel(cmd, dit->k_norm_mod);
+    gpu_bind_buffer(cmd, 0, &ws->h, 0);
+    gpu_bind_buffer(cmd, 1, &b->norm1, 0);
+    gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+    gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+    gpu_bind_buffer(cmd, 4, &ws->norm, 0);
+    gpu_copy_bytes(cmd, 5, &msa_norm_p, sizeof msa_norm_p);
+    gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
 
-  run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->qkv_proj,
-                     &ws->qkv, seq_len);
-  if (lb)
+    run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->qkv_proj,
+                       &ws->qkv, seq_len);
     minimax_h3_lora_apply(lora, cmd, &lb->qkv_proj, &ws->norm, &ws->xb,
                           &ws->lora_mid, &ws->qkv, seq_len, 0);
+  }
 
   gpu_select_kernel(cmd, dit->k_heads);
   gpu_bind_buffer(cmd, 0, &ws->qkv, 0);
@@ -1382,33 +1434,54 @@ static void encode_dit_block_full(const MinimaxH3Dit *dit,
   gpu_run_kernel(cmd, ((uint32_t)DIT_DIM + GRID2D_THREADS - 1) / GRID2D_THREADS,
                  (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
 
-  gpu_select_kernel(cmd, dit->k_norm_mod);
-  gpu_bind_buffer(cmd, 0, &ws->h, 0);
-  gpu_bind_buffer(cmd, 1, &b->norm2, 0);
-  gpu_bind_buffer(cmd, 2, &ws->mod, 0);
-  gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
-  gpu_bind_buffer(cmd, 4, &ws->norm, 0);
-  gpu_copy_bytes(cmd, 5, &mlp_norm_p, sizeof mlp_norm_p);
-  gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+  if (!lb) {
+    gpu_select_kernel(cmd, dit->k_norm_mod_convrot);
+    gpu_bind_buffer(cmd, 0, &ws->h, 0);
+    gpu_bind_buffer(cmd, 1, &b->norm2, 0);
+    gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+    gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+    gpu_bind_buffer(cmd, 4, &ws->xq, 0);
+    gpu_bind_buffer(cmd, 5, &ws->xscale, 0);
+    gpu_copy_bytes(cmd, 6, &mlp_rot_p, sizeof mlp_rot_p);
+    gpu_run_kernel(cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
+    run_mm_int8_at(dit, cmd, &ws->xq, &ws->xscale, &b->fc1, &ws->fc1_out, 0,
+                   seq_len);
 
-  run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->fc1,
-                     &ws->fc1_out, seq_len);
-  if (lb)
+    gpu_select_kernel(cmd, dit->k_swiglu_convrot);
+    gpu_bind_buffer(cmd, 0, &ws->fc1_out, 0);
+    gpu_bind_buffer(cmd, 1, &ws->xq, 0);
+    gpu_bind_buffer(cmd, 2, &ws->xscale, 0);
+    gpu_copy_bytes(cmd, 3, &swiglu_rot_p, sizeof swiglu_rot_p);
+    gpu_run_kernel(cmd, padded_i8, 1, 1, CONVROT_THREADS, 1, 1);
+    run_mm_int8_at(dit, cmd, &ws->xq, &ws->xscale, &b->fc2, &ws->norm, 0,
+                   seq_len);
+  } else {
+    gpu_select_kernel(cmd, dit->k_norm_mod);
+    gpu_bind_buffer(cmd, 0, &ws->h, 0);
+    gpu_bind_buffer(cmd, 1, &b->norm2, 0);
+    gpu_bind_buffer(cmd, 2, &ws->mod, 0);
+    gpu_bind_buffer(cmd, 3, &ws->mod_rows, 0);
+    gpu_bind_buffer(cmd, 4, &ws->norm, 0);
+    gpu_copy_bytes(cmd, 5, &mlp_norm_p, sizeof mlp_norm_p);
+    gpu_run_kernel(cmd, (uint32_t)seq_len, 1, 1, NORM_THREADS, 1, 1);
+
+    run_convrot_linear(dit, cmd, &ws->norm, &ws->xq, &ws->xscale, &b->fc1,
+                       &ws->fc1_out, seq_len);
     minimax_h3_lora_apply(lora, cmd, &lb->fc1, &ws->norm, &ws->xb,
                           &ws->lora_mid, &ws->fc1_out, seq_len, 0);
 
-  gpu_select_kernel(cmd, dit->k_swiglu_chunked);
-  gpu_bind_buffer(cmd, 0, &ws->fc1_out, 0);
-  gpu_bind_buffer(cmd, 1, &ws->fc1_mid, 0);
-  gpu_copy_bytes(cmd, 2, &swiglu_p, sizeof swiglu_p);
-  gpu_run_kernel(cmd, (uint32_t)DIT_FFN_DIM / GRID2D_THREADS, (uint32_t)seq_len,
-                 1, GRID2D_THREADS, 1, 1);
+    gpu_select_kernel(cmd, dit->k_swiglu_chunked);
+    gpu_bind_buffer(cmd, 0, &ws->fc1_out, 0);
+    gpu_bind_buffer(cmd, 1, &ws->fc1_mid, 0);
+    gpu_copy_bytes(cmd, 2, &swiglu_p, sizeof swiglu_p);
+    gpu_run_kernel(cmd, (uint32_t)DIT_FFN_DIM / GRID2D_THREADS,
+                   (uint32_t)seq_len, 1, GRID2D_THREADS, 1, 1);
 
-  run_convrot_linear(dit, cmd, &ws->fc1_mid, &ws->xq, &ws->xscale, &b->fc2,
-                     &ws->norm, seq_len);
-  if (lb)
+    run_convrot_linear(dit, cmd, &ws->fc1_mid, &ws->xq, &ws->xscale, &b->fc2,
+                       &ws->norm, seq_len);
     minimax_h3_lora_apply(lora, cmd, &lb->fc2, &ws->fc1_mid, &ws->xb,
                           &ws->lora_mid, &ws->norm, seq_len, 0);
+  }
 
   gpu_select_kernel(cmd, dit->k_gate_add);
   gpu_bind_buffer(cmd, 0, &ws->h, 0);

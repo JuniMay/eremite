@@ -18,9 +18,10 @@ static constexpr int DIT_HEADS = 56, DIT_HEAD_DIM = 128,
                      DIT_ROPE_FREQS = 16, DIT_ADALN_RANK = 8;
 
 // Tile padding, threadgroup sizes and tolerances.
-static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
-                          F32MM_TILE_M = 64, F32MM_TILE_N = 32,
-                          F32MM_THREADS = 128, NORM_THREADS = 256,
+static constexpr uint32_t TILE_M = 64, TILE_M_I8 = 128, TILE_N = 64,
+                          MM_THREADS = 128, F32MM_TILE_M = 64,
+                          F32MM_TILE_N = 32, F32MM_THREADS = 128,
+                          CONVROT_THREADS = 256, NORM_THREADS = 256,
                           HEADS_THREADS = 64, ELEM_THREADS = 256,
                           GRID2D_THREADS = 32;
 static constexpr float NORM_EPS = 1e-5f, FP32_TOL = 1e-4f, BF16_TOL = 5e-2f;
@@ -57,6 +58,20 @@ typedef struct {
   float eps;
 } DitNormModParam;
 
+// Parameters passed to minimax_h3_dit_norm_mod_convrot.
+typedef struct {
+  // Active rows, row width, modulation stride, shift offset and scale offset.
+  uint32_t m, dim, mod_stride, shift_off, scale_off;
+  // RMSNorm epsilon.
+  float eps;
+} DitNormModConvRotParam;
+
+// Parameters passed to minimax_h3_convrot_quant_i8.
+typedef struct {
+  // Active rows, inner width and input row stride.
+  uint32_t m, k, lda;
+} ConvRotParam;
+
 // Parameters passed to minimax_h3_dit_gate_add.
 typedef struct {
   // Rows, row width, modulation stride and gate offset.
@@ -73,8 +88,7 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_attend.
 typedef struct {
-  // Active sequence length, padded head stride, query tile offset and tile
-  // count per head in this dispatch.
+  // Active sequence length, padded head stride, starting tile and slice tiles.
   uint32_t rows, padded, tile_offset, slice_tiles;
 } DitAttendParam;
 
@@ -397,6 +411,106 @@ static void test_norm_mod_and_gate_add(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&x);
 }
 
+// Tests fused minimax_h3_dit_norm_mod_convrot against unfused
+// minimax_h3_dit_norm_mod + minimax_h3_convrot_quant_i8 across 1-pass and
+// 2-pass widths.
+static void test_norm_mod_convrot(Gpu *gpu, MemorySlot *slot) {
+  int k_nm = gpu_find_kernel(gpu, "minimax_h3_dit_norm_mod");
+  int k_rot = gpu_find_kernel(gpu, "minimax_h3_convrot_quant_i8");
+  int k_fused = gpu_find_kernel(gpu, "minimax_h3_dit_norm_mod_convrot");
+  static const uint32_t dims[] = {512u, 16640u};
+  uint32_t rows = 7u, num_mod_rows = 3u;
+  uint32_t padded = (rows + TILE_M_I8 - 1u) / TILE_M_I8 * TILE_M_I8;
+  uint32_t rng = 0x42427788u;
+  int ok = 1;
+
+  for (size_t di = 0; di < sizeof dims / sizeof dims[0]; di++) {
+    uint32_t dim = dims[di], mod_stride = 6u * dim;
+    uint32_t shift_off = 3u * dim, scale_off = 4u * dim;
+    Buf x = gpu_alloc(gpu, slot, (size_t)rows * dim * sizeof(float));
+    Buf w = gpu_alloc(gpu, slot, (size_t)dim * sizeof(float));
+    Buf mod =
+        gpu_alloc(gpu, slot, (size_t)num_mod_rows * mod_stride * sizeof(float));
+    Buf mod_rows = gpu_alloc(gpu, slot, (size_t)rows * sizeof(uint32_t));
+    Buf y = gpu_alloc(gpu, slot, (size_t)rows * dim * sizeof(float));
+    Buf xq_ref = gpu_alloc(gpu, slot, (size_t)padded * dim);
+    Buf xs_ref = gpu_alloc(gpu, slot, (size_t)rows * sizeof(float));
+    Buf xq_got = gpu_alloc(gpu, slot, (size_t)padded * dim);
+    Buf xs_got = gpu_alloc(gpu, slot, (size_t)rows * sizeof(float));
+
+    float *xp = (float *)x.ptr, *wp = (float *)w.ptr, *mp = (float *)mod.ptr;
+    uint32_t *mrp = (uint32_t *)mod_rows.ptr;
+    for (size_t i = 0; i < (size_t)rows * dim; i++) xp[i] = rng_float(&rng);
+    for (uint32_t i = 0; i < dim; i++) wp[i] = 0.5f + rng_float(&rng);
+    for (size_t i = 0; i < (size_t)num_mod_rows * mod_stride; i++)
+      mp[i] = 0.4f * rng_float(&rng);
+    for (uint32_t r = 0; r < rows; r++) mrp[r] = r % num_mod_rows;
+    memset(xq_ref.ptr, 0x5a, xq_ref.size);
+    memset(xq_got.ptr, 0x5a, xq_got.size);
+
+    DitNormModParam nmp = {dim, mod_stride, shift_off, scale_off, NORM_EPS};
+    ConvRotParam rp = {rows, dim, dim};
+    DitNormModConvRotParam fp = {rows,      dim,       mod_stride,
+                                 shift_off, scale_off, NORM_EPS};
+    GpuCommandBuffer cmd = gpu_begin(gpu);
+    gpu_select_kernel(&cmd, k_nm);
+    gpu_bind_buffer(&cmd, 0, &x, 0);
+    gpu_bind_buffer(&cmd, 1, &w, 0);
+    gpu_bind_buffer(&cmd, 2, &mod, 0);
+    gpu_bind_buffer(&cmd, 3, &mod_rows, 0);
+    gpu_bind_buffer(&cmd, 4, &y, 0);
+    gpu_copy_bytes(&cmd, 5, &nmp, sizeof nmp);
+    gpu_run_kernel(&cmd, rows, 1, 1, NORM_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_rot);
+    gpu_bind_buffer(&cmd, 0, &y, 0);
+    gpu_bind_buffer(&cmd, 1, &xq_ref, 0);
+    gpu_bind_buffer(&cmd, 2, &xs_ref, 0);
+    gpu_copy_bytes(&cmd, 3, &rp, sizeof rp);
+    gpu_run_kernel(&cmd, padded, 1, 1, CONVROT_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_fused);
+    gpu_bind_buffer(&cmd, 0, &x, 0);
+    gpu_bind_buffer(&cmd, 1, &w, 0);
+    gpu_bind_buffer(&cmd, 2, &mod, 0);
+    gpu_bind_buffer(&cmd, 3, &mod_rows, 0);
+    gpu_bind_buffer(&cmd, 4, &xq_got, 0);
+    gpu_bind_buffer(&cmd, 5, &xs_got, 0);
+    gpu_copy_bytes(&cmd, 6, &fp, sizeof fp);
+    gpu_run_kernel(&cmd, padded, 1, 1, CONVROT_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+
+    const int8_t *qr = (const int8_t *)xq_ref.ptr;
+    const int8_t *qg = (const int8_t *)xq_got.ptr;
+    const float *sr = (const float *)xs_ref.ptr;
+    const float *sg = (const float *)xs_got.ptr;
+    for (uint32_t r = 0; r < rows; r++) {
+      if (fabsf(sr[r] - sg[r]) > fmaxf(1e-7f, sr[r] * 1e-5f)) ok = 0;
+      for (uint32_t c = 0; c < dim; c++)
+        if (abs((int)qr[(size_t)r * dim + c] - (int)qg[(size_t)r * dim + c]) >
+            1)
+          ok = 0;
+    }
+    for (uint32_t r = rows; r < padded; r++)
+      for (uint32_t c = 0; c < dim; c++)
+        if (qg[(size_t)r * dim + c] != 0) ok = 0;
+
+    gpu_free(&xs_got);
+    gpu_free(&xq_got);
+    gpu_free(&xs_ref);
+    gpu_free(&xq_ref);
+    gpu_free(&y);
+    gpu_free(&mod_rows);
+    gpu_free(&mod);
+    gpu_free(&w);
+    gpu_free(&x);
+  }
+  check(ok,
+        "minimax_h3_dit_norm_mod_convrot matches unfused norm_mod + ConvRot "
+        "across 1-pass and 2-pass widths");
+}
+
 // Tests minimax_h3_dit_heads for both TokenRefiner (no RoPE) and DiT (partial
 // 3D split-half RoPE on first 96 of 128 head dims).
 static void test_heads(Gpu *gpu, MemorySlot *slot) {
@@ -653,6 +767,7 @@ int main(void) {
   test_mm_f32(gpu, slot);
   test_adaln(gpu, slot);
   test_norm_mod_and_gate_add(gpu, slot);
+  test_norm_mod_convrot(gpu, slot);
   test_heads(gpu, slot);
   test_attend(gpu, slot);
   return failures != 0;

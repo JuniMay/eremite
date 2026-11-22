@@ -26,6 +26,19 @@ struct MinimaxH3ConvRot {
   uint m, k, lda;
 };
 
+// Parameters for fused chunked SwiGLU + ConvRot block-256 Hadamard + INT8
+// quantization: input rows have 2 * k floats (gate, up); output has k int8s.
+struct MinimaxH3SwigluConvRot {
+  uint m, k;
+};
+
+// Parameters for fused RMSNorm + ConvRot block-256 Hadamard + INT8
+// quantization over m rows of width k.
+struct MinimaxH3RmsNormConvRot {
+  uint m, k;
+  float eps;
+};
+
 // Parameters for INT8 matrix multiplication with per-row and per-column FP32
 // scales and optional FP32 bias.
 struct MinimaxH3Int8MM {
@@ -51,11 +64,13 @@ constant constexpr uint MINIMAX_H3_SIMD_WIDTH = 32,
 // Simdgroups participating in one cooperative matrix multiply tile.
 constant constexpr uint MINIMAX_H3_MM_SGROUPS = 4;
 
-// Matrix tile dimensions: 128-row NVFP4 tile made of two 64-row subtiles, 64 columns wide.
+// Matrix tile dimensions: 128-row NVFP4/INT8 tile (two 64-row NVFP4 subtiles),
+// 64 columns wide, and 8 N-tiles per L2-coherent 1D swizzle group.
 constant constexpr uint MINIMAX_H3_TILE_M = 128,
                         MINIMAX_H3_SUBTILE_M = 64,
                         MINIMAX_H3_TILE_N = 64,
-                        MINIMAX_H3_TILE_K = 64;
+                        MINIMAX_H3_TILE_K = 64,
+                        MINIMAX_H3_MM_SWIZZLE_N = 8;
 
 // NVFP4 weight packing: two 4-bit codes per byte, 16 weights per FP8 E4M3 scale,
 // and 32 weights (two blocks) loaded per thread in a 128-thread tile loader.
@@ -63,11 +78,14 @@ constant constexpr uint MINIMAX_H3_NVFP4_PER_BYTE = 2,
                         MINIMAX_H3_NVFP4_BLOCK = 16,
                         MINIMAX_H3_NVFP4_CHUNK = 32;
 
-// ConvRot regular Hadamard group of 256 values: 8 values per lane across 32 lanes.
+// ConvRot regular Hadamard group of 256 values: 8 values per lane across 32
+// lanes, and up to 8 groups cached per simdgroup in registers for single-pass
+// quantization (8 simdgroups x 8 groups x 256 = 16384 columns).
 constant constexpr uint MINIMAX_H3_CONVROT_GROUP = 256,
                         MINIMAX_H3_CONVROT_GROUP_SHIFT = 8,
                         MINIMAX_H3_CONVROT_PER_LANE =
-                            MINIMAX_H3_CONVROT_GROUP / MINIMAX_H3_SIMD_WIDTH;
+                            MINIMAX_H3_CONVROT_GROUP / MINIMAX_H3_SIMD_WIDTH,
+                        MINIMAX_H3_CONVROT_MAX_REG_GROUPS = 8;
 
 // Number of spatial-temporal position axes (time, height, width) in 3D RoPE and MRoPE.
 constant constexpr uint MINIMAX_H3_POS_AXES = 3;
@@ -280,9 +298,10 @@ inline void minimax_h3_hadamard256(thread float v[MINIMAX_H3_CONVROT_PER_LANE],
 }
 
 // Rotates each activation row in blocks of 256 by H_4^{\otimes 4} / 16 and
-// quantizes per row to INT8 (zeroing padded rows past m). Dispatched with one
-// threadgroup of 256 threads per output row up to padded_m. k must be a
-// multiple of 256.
+// quantizes per row to INT8 (zeroing padded rows past m). Uses a single-pass
+// register cache when k <= nsg * 2048 and falls back to two passes otherwise.
+// Dispatched with one threadgroup of 256 threads per output row up to padded_m.
+// k must be a multiple of 256.
 kernel void minimax_h3_convrot_quant_i8(device const float *x [[buffer(0)]],
                                         device int8_t *xq [[buffer(1)]],
                                         device float *xscale [[buffer(2)]],
@@ -290,7 +309,7 @@ kernel void minimax_h3_convrot_quant_i8(device const float *x [[buffer(0)]],
                                         uint row [[threadgroup_position_in_grid]],
                                         uint t [[thread_index_in_threadgroup]],
                                         uint nt [[threads_per_threadgroup]]) {
-  device int8_t *dst = xq + row * p.k;
+  device int8_t *dst = xq + (ulong)row * p.k;
   if (row >= p.m) {
     for (uint c = t; c < p.k; c += nt) dst[c] = 0;
     return;
@@ -300,9 +319,42 @@ kernel void minimax_h3_convrot_quant_i8(device const float *x [[buffer(0)]],
   uint sg = t >> MINIMAX_H3_SIMD_SHIFT;
   uint nsg = nt >> MINIMAX_H3_SIMD_SHIFT;
   uint ngroups = p.k >> MINIMAX_H3_CONVROT_GROUP_SHIFT;
-  device const float *src = x + row * p.lda;
+  device const float *src = x + (ulong)row * p.lda;
 
-  // Pass 1: rotate blocks in registers to find the row's peak magnitude.
+  if (ngroups <= nsg * MINIMAX_H3_CONVROT_MAX_REG_GROUPS) {
+    float reg[MINIMAX_H3_CONVROT_MAX_REG_GROUPS][MINIMAX_H3_CONVROT_PER_LANE];
+    float amax = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device const float *gp = src + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+          reg[idx][j] = gp[lane + j * MINIMAX_H3_SIMD_WIDTH];
+        minimax_h3_hadamard256(reg[idx], lane);
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+          amax = max(amax, fabs(reg[idx][j]));
+      }
+    }
+    float row_max = tg_max(amax, tmp, t, nt);
+    float scale =
+        max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+    if (t == 0) xscale[row] = scale;
+    float inv_scale = 1.0f / scale;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device int8_t *dp = dst + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float q = clamp(rint(reg[idx][j] * inv_scale), MINIMAX_H3_INT8_MIN,
+                          MINIMAX_H3_INT8_MAX);
+          dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+        }
+      }
+    }
+    return;
+  }
+
+  // Two-pass fallback for rows wider than the register cache.
   float amax = 0.0f;
   for (uint g = sg; g < ngroups; g += nsg) {
     device const float *gp = src + g * MINIMAX_H3_CONVROT_GROUP;
@@ -318,7 +370,6 @@ kernel void minimax_h3_convrot_quant_i8(device const float *x [[buffer(0)]],
   if (t == 0) xscale[row] = scale;
   float inv_scale = 1.0f / scale;
 
-  // Pass 2: re-read the L1-cached row, rotate and write INT8 codes.
   for (uint g = sg; g < ngroups; g += nsg) {
     device const float *gp = src + g * MINIMAX_H3_CONVROT_GROUP;
     device int8_t *dp = dst + g * MINIMAX_H3_CONVROT_GROUP;
@@ -334,10 +385,212 @@ kernel void minimax_h3_convrot_quant_i8(device const float *x [[buffer(0)]],
   }
 }
 
+// Fused chunked SwiGLU + ConvRot block-256 Hadamard + per-row INT8
+// quantization (zeroing padded rows past m). Reads [m, 2 * k] (gate, up) once
+// and writes [padded_m, k] int8 codes without materializing an FP32 middle
+// tensor. Dispatched with one 256-thread group per row up to padded_m.
+kernel void minimax_h3_swiglu_convrot(device const float *in [[buffer(0)]],
+                                      device int8_t *xq [[buffer(1)]],
+                                      device float *xscale [[buffer(2)]],
+                                      constant MinimaxH3SwigluConvRot &p [[buffer(3)]],
+                                      uint row [[threadgroup_position_in_grid]],
+                                      uint t [[thread_index_in_threadgroup]],
+                                      uint nt [[threads_per_threadgroup]]) {
+  device int8_t *dst = xq + (ulong)row * p.k;
+  if (row >= p.m) {
+    for (uint c = t; c < p.k; c += nt) dst[c] = 0;
+    return;
+  }
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
+  uint lane = t & MINIMAX_H3_SIMD_MASK;
+  uint sg = t >> MINIMAX_H3_SIMD_SHIFT;
+  uint nsg = nt >> MINIMAX_H3_SIMD_SHIFT;
+  uint ngroups = p.k >> MINIMAX_H3_CONVROT_GROUP_SHIFT;
+  device const float *src = in + (ulong)row * (2u * p.k);
+
+  if (ngroups <= nsg * MINIMAX_H3_CONVROT_MAX_REG_GROUPS) {
+    float reg[MINIMAX_H3_CONVROT_MAX_REG_GROUPS][MINIMAX_H3_CONVROT_PER_LANE];
+    float amax = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        uint base = g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+          float gv = src[c], uv = src[p.k + c];
+          reg[idx][j] = gv / (1.0f + exp(-gv)) * uv;
+        }
+        minimax_h3_hadamard256(reg[idx], lane);
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+          amax = max(amax, fabs(reg[idx][j]));
+      }
+    }
+    float row_max = tg_max(amax, tmp, t, nt);
+    float scale =
+        max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+    if (t == 0) xscale[row] = scale;
+    float inv_scale = 1.0f / scale;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device int8_t *dp = dst + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float q = clamp(rint(reg[idx][j] * inv_scale), MINIMAX_H3_INT8_MIN,
+                          MINIMAX_H3_INT8_MAX);
+          dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+        }
+      }
+    }
+    return;
+  }
+
+  float amax = 0.0f;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      float gv = src[c], uv = src[p.k + c];
+      v[j] = gv / (1.0f + exp(-gv)) * uv;
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+      amax = max(amax, fabs(v[j]));
+  }
+  float row_max = tg_max(amax, tmp, t, nt);
+  float scale = max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+  if (t == 0) xscale[row] = scale;
+  float inv_scale = 1.0f / scale;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    device int8_t *dp = dst + base;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      float gv = src[c], uv = src[p.k + c];
+      v[j] = gv / (1.0f + exp(-gv)) * uv;
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      float q = clamp(rint(v[j] * inv_scale), MINIMAX_H3_INT8_MIN,
+                      MINIMAX_H3_INT8_MAX);
+      dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+    }
+  }
+}
+
+// Fused RMSNorm + ConvRot block-256 Hadamard + per-row INT8 quantization
+// (zeroing padded rows past m). Reads x once into registers when
+// k <= nsg * 2048. Dispatched with one 256-thread group per row up to padded_m.
+kernel void minimax_h3_rmsnorm_convrot(device const float *x [[buffer(0)]],
+                                       device const float *w [[buffer(1)]],
+                                       device int8_t *xq [[buffer(2)]],
+                                       device float *xscale [[buffer(3)]],
+                                       constant MinimaxH3RmsNormConvRot &p [[buffer(4)]],
+                                       uint row [[threadgroup_position_in_grid]],
+                                       uint t [[thread_index_in_threadgroup]],
+                                       uint nt [[threads_per_threadgroup]]) {
+  device int8_t *dst = xq + (ulong)row * p.k;
+  if (row >= p.m) {
+    for (uint c = t; c < p.k; c += nt) dst[c] = 0;
+    return;
+  }
+  threadgroup float tmp[MINIMAX_H3_TG_MAX_SGROUPS];
+  uint lane = t & MINIMAX_H3_SIMD_MASK;
+  uint sg = t >> MINIMAX_H3_SIMD_SHIFT;
+  uint nsg = nt >> MINIMAX_H3_SIMD_SHIFT;
+  uint ngroups = p.k >> MINIMAX_H3_CONVROT_GROUP_SHIFT;
+  device const float *xr = x + (ulong)row * p.k;
+
+  if (ngroups <= nsg * MINIMAX_H3_CONVROT_MAX_REG_GROUPS) {
+    float reg[MINIMAX_H3_CONVROT_MAX_REG_GROUPS][MINIMAX_H3_CONVROT_PER_LANE];
+    float ss = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device const float *gp = xr + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float v = gp[lane + j * MINIMAX_H3_SIMD_WIDTH];
+          reg[idx][j] = v;
+          ss += v * v;
+        }
+      }
+    }
+    float inv_rms = rsqrt(tg_sum(ss, tmp, t, nt) / float(p.k) + p.eps);
+    float amax = 0.0f;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        uint base = g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+          reg[idx][j] = w[c] * (reg[idx][j] * inv_rms);
+        }
+        minimax_h3_hadamard256(reg[idx], lane);
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+          amax = max(amax, fabs(reg[idx][j]));
+      }
+    }
+    float row_max = tg_max(amax, tmp, t, nt);
+    float scale =
+        max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+    if (t == 0) xscale[row] = scale;
+    float inv_scale = 1.0f / scale;
+    for (uint idx = 0; idx < MINIMAX_H3_CONVROT_MAX_REG_GROUPS; idx++) {
+      uint g = sg + idx * nsg;
+      if (g < ngroups) {
+        device int8_t *dp = dst + g * MINIMAX_H3_CONVROT_GROUP;
+        for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+          float q = clamp(rint(reg[idx][j] * inv_scale), MINIMAX_H3_INT8_MIN,
+                          MINIMAX_H3_INT8_MAX);
+          dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+        }
+      }
+    }
+    return;
+  }
+
+  float ss = 0.0f;
+  for (uint c = t; c < p.k; c += nt) ss += xr[c] * xr[c];
+  float inv_rms = rsqrt(tg_sum(ss, tmp, t, nt) / float(p.k) + p.eps);
+  float amax = 0.0f;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      v[j] = w[c] * (xr[c] * inv_rms);
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++)
+      amax = max(amax, fabs(v[j]));
+  }
+  float row_max = tg_max(amax, tmp, t, nt);
+  float scale = max(row_max / MINIMAX_H3_INT8_MAX, MINIMAX_H3_INT8_SCALE_MIN);
+  if (t == 0) xscale[row] = scale;
+  float inv_scale = 1.0f / scale;
+  for (uint g = sg; g < ngroups; g += nsg) {
+    uint base = g * MINIMAX_H3_CONVROT_GROUP;
+    device int8_t *dp = dst + base;
+    float v[MINIMAX_H3_CONVROT_PER_LANE];
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      uint c = base + lane + j * MINIMAX_H3_SIMD_WIDTH;
+      v[j] = w[c] * (xr[c] * inv_rms);
+    }
+    minimax_h3_hadamard256(v, lane);
+    for (uint j = 0; j < MINIMAX_H3_CONVROT_PER_LANE; j++) {
+      float q = clamp(rint(v[j] * inv_scale), MINIMAX_H3_INT8_MIN,
+                      MINIMAX_H3_INT8_MAX);
+      dp[lane + j * MINIMAX_H3_SIMD_WIDTH] = int8_t(int(q));
+    }
+  }
+}
+
 // Native INT8 matrix product with per-row activation scale, per-column weight
 // scale, and optional FP32 bias: y[r, c] = acc[r, c] * xs[r] * ws[c] + bias[c].
-// Activations xq must have rows padded to a multiple of 64; k and n must be
-// multiples of 64. Each threadgroup of 128 threads computes a 64x64 tile.
+// Activations xq must have rows padded to a multiple of 128; k and n must be
+// multiples of 64. Dispatched as a 1D N-grouped L2-swizzled grid of
+// tiles_n * tiles_m threadgroups (128 threads each) computing 128x64 tiles.
 kernel void minimax_h3_mm_int8(device const int8_t *w [[buffer(0)]],
                                device const float *ws [[buffer(1)]],
                                device const int8_t *xq [[buffer(2)]],
@@ -345,32 +598,53 @@ kernel void minimax_h3_mm_int8(device const int8_t *w [[buffer(0)]],
                                device const float *bias [[buffer(4)]],
                                device float *y [[buffer(5)]],
                                constant MinimaxH3Int8MM &p [[buffer(6)]],
-                               uint2 tg [[threadgroup_position_in_grid]]) {
+                               uint tg [[threadgroup_position_in_grid]],
+                               uint t [[thread_index_in_threadgroup]]) {
+  constexpr uint BM = MINIMAX_H3_TILE_M, BN = MINIMAX_H3_TILE_N;
   constexpr auto desc =
-      matmul2d_descriptor(MINIMAX_H3_SUBTILE_M, MINIMAX_H3_TILE_N,
-                          static_cast<int>(dynamic_extent), false, true, false,
-                          matmul2d_descriptor::mode::multiply);
+      matmul2d_descriptor(BM, BN, static_cast<int>(dynamic_extent), false, true,
+                          false, matmul2d_descriptor::mode::multiply);
   matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
-  uint padded_m = (p.m + MINIMAX_H3_SUBTILE_M - 1u) / MINIMAX_H3_SUBTILE_M *
-                  MINIMAX_H3_SUBTILE_M;
+  uint padded_m = (p.m + BM - 1u) / BM * BM;
+  uint tiles_m = padded_m / BM;
+  uint tiles_n = (p.n + BN - 1u) / BN;
+  uint group_tiles = tiles_m * MINIMAX_H3_MM_SWIZZLE_N;
+  uint g = tg / group_tiles;
+  uint rem = tg - g * group_tiles;
+  uint gn0 = g * MINIMAX_H3_MM_SWIZZLE_N;
+  uint gwidth = min(MINIMAX_H3_MM_SWIZZLE_N, tiles_n - gn0);
+  uint tn = gn0 + (rem % gwidth);
+  uint tm = rem / gwidth;
+  uint m0 = tm * BM, n0 = tn * BN;
+
+  // Stage per-row activation scales, per-column weight scales and optional
+  // bias in threadgroup memory before the matrix multiply.
+  threadgroup float xst[BM], wst[BN], bst[BN];
+  xst[t] = (m0 + t < p.m) ? xs[m0 + t] : 0.0f;
+  if (t < BN) {
+    uint col = n0 + t;
+    wst[t] = col < p.n ? ws[col] : 0.0f;
+    bst[t] = (p.has_bias && col < p.n) ? bias[col] : 0.0f;
+  }
+
   tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tx(
       (device int8_t *)xq, dextents<int32_t, 2>(p.k, padded_m));
   tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tw(
       (device int8_t *)w, dextents<int32_t, 2>(p.k, p.n));
-  uint m0 = tg.y * MINIMAX_H3_SUBTILE_M, n0 = tg.x * MINIMAX_H3_TILE_N;
   auto a = tx.slice(0, m0);
   auto b = tw.slice(0, n0);
   auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
                                                  int>();
   op.run(a, b, c);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint16_t i = 0; i < c.get_capacity(); i++)
     if (c.is_valid_element(i)) {
       auto at = c.get_multidimensional_index(i);
-      uint col = n0 + at[0], row = m0 + at[1];
-      if (col < p.n && row < p.m) {
-        float bval = p.has_bias ? bias[col] : 0.0f;
-        y[row * p.ldy + col] = float(c[i]) * (xs[row] * ws[col]) + bval;
-      }
+      uint lc = at[0], lr = at[1];
+      uint col = n0 + lc, row = m0 + lr;
+      if (col < p.n && row < p.m)
+        y[(ulong)row * p.ldy + col] =
+            float(c[i]) * (xst[lr] * wst[lc]) + bst[lc];
     }
 }
 
