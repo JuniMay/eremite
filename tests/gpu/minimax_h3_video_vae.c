@@ -88,7 +88,7 @@ static uint32_t reflect_coord(int c, uint32_t limit) {
 // Tests 3D video VAE tile embedding (post_quant_conv + x_embedder + suffixes).
 static void test_vvae_embed(Gpu *gpu, MemorySlot *slot) {
   int k_emb = gpu_find_kernel(gpu, "minimax_h3_vvae_embed");
-  const uint32_t tl = 3, hl = 4, wl = 5;
+  const uint32_t tl = 3, hl = 6, wl = 7;
   const uint32_t patches = tl * hl * wl, rows = patches + SUFFIX;
   uint32_t rng = 0x11112222u;
 
@@ -167,7 +167,7 @@ static void test_vvae_embed(Gpu *gpu, MemorySlot *slot) {
 static void test_vvae_heads_and_attend(Gpu *gpu, MemorySlot *slot) {
   int k_heads = gpu_find_kernel(gpu, "minimax_h3_vvae_heads");
   int k_attend = gpu_find_kernel(gpu, "minimax_h3_vvae_attend");
-  const uint32_t tl = 3, hl = 4, wl = 5;
+  const uint32_t tl = 3, hl = 6, wl = 7;
   const uint32_t patches = tl * hl * wl, rows = patches + SUFFIX;
   const uint32_t padded = ceil_div(rows, TILE_M) * TILE_M;
   uint32_t rng = 0x22223333u;
@@ -204,8 +204,8 @@ static void test_vvae_heads_and_attend(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &bv, 0);
   gpu_bind_buffer(&cmd, 3, &bo, 0);
   gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-  gpu_run_kernel(&cmd, ceil_div(rows, ATTN_GROUP_ROWS), HEADS, 1, ATTN_THREADS,
-                 1, 1);
+  gpu_run_kernel(&cmd, ceil_div(rows, ATTN_GROUP_ROWS) * HEADS, 1, 1,
+                 ATTN_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 

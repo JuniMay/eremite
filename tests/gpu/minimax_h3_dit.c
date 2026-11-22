@@ -72,8 +72,9 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_attend.
 typedef struct {
-  // Active sequence length, padded head stride and query tile offset.
-  uint32_t rows, padded, tile_offset;
+  // Active sequence length, padded head stride, query tile offset and tile
+  // count per head in this dispatch.
+  uint32_t rows, padded, tile_offset, slice_tiles;
 } DitAttendParam;
 
 // Deterministic PRNG for synthetic test inputs.
@@ -502,12 +503,13 @@ static void test_heads(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&qkv);
 }
 
-// Tests minimax_h3_dit_attend bidirectional 56-head FlashAttention across the
-// 64-key tile boundary.
+// Tests minimax_h3_dit_attend bidirectional 56-head FlashAttention across
+// interior, boundary and tail 64-key tiles plus multi-tile slicing.
 static void test_attend(Gpu *gpu, MemorySlot *slot) {
   int k_attend = gpu_find_kernel(gpu, "minimax_h3_dit_attend");
-  int rows = 73;
+  int rows = 137;
   uint32_t padded = ((uint32_t)rows + TILE_M - 1) / TILE_M * TILE_M;
+  uint32_t total_tiles = padded / TILE_M;
   uint32_t rng = 0x99887766u;
 
   size_t head_elems = (size_t)DIT_HEADS * padded * DIT_HEAD_DIM;
@@ -534,7 +536,7 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
     }
   }
 
-  DitAttendParam p = {(uint32_t)rows, padded, 0u};
+  DitAttendParam p = {(uint32_t)rows, padded, 0u, total_tiles};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_attend);
   gpu_bind_buffer(&cmd, 0, &qh, 0);
@@ -542,34 +544,39 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &vh, 0);
   gpu_bind_buffer(&cmd, 3, &out, 0);
   gpu_copy_bytes(&cmd, 4, &p, sizeof p);
-  gpu_run_kernel(&cmd, padded / TILE_M, (uint32_t)DIT_HEADS, 1, MM_THREADS, 1,
+  gpu_run_kernel(&cmd, total_tiles * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS, 1,
                  1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
-  // Verify sliced tile_offset dispatches match the single-dispatch output
+  // Verify 1-tile and 2-tile sliced dispatches match the full dispatch
   // bit-for-bit across tile boundaries.
   Buf out_sliced =
       gpu_alloc(gpu, slot, (size_t)rows * (size_t)DIT_INNER * sizeof(float));
-  memset(out_sliced.ptr, 0, (size_t)rows * (size_t)DIT_INNER * sizeof(float));
-  uint32_t total_tiles = padded / TILE_M;
-  for (uint32_t t = 0; t < total_tiles; t++) {
-    DitAttendParam sp = {(uint32_t)rows, padded, t};
-    GpuCommandBuffer scmd = gpu_begin(gpu);
-    gpu_select_kernel(&scmd, k_attend);
-    gpu_bind_buffer(&scmd, 0, &qh, 0);
-    gpu_bind_buffer(&scmd, 1, &kh, 0);
-    gpu_bind_buffer(&scmd, 2, &vh, 0);
-    gpu_bind_buffer(&scmd, 3, &out_sliced, 0);
-    gpu_copy_bytes(&scmd, 4, &sp, sizeof sp);
-    gpu_run_kernel(&scmd, 1u, (uint32_t)DIT_HEADS, 1, MM_THREADS, 1, 1);
-    gpu_commit(&scmd);
-    gpu_sync(gpu);
+  for (uint32_t step = 1; step <= 2; step++) {
+    memset(out_sliced.ptr, 0, (size_t)rows * (size_t)DIT_INNER * sizeof(float));
+    for (uint32_t t = 0; t < total_tiles; t += step) {
+      uint32_t st = t + step <= total_tiles ? step : total_tiles - t;
+      DitAttendParam sp = {(uint32_t)rows, padded, t, st};
+      GpuCommandBuffer scmd = gpu_begin(gpu);
+      gpu_select_kernel(&scmd, k_attend);
+      gpu_bind_buffer(&scmd, 0, &qh, 0);
+      gpu_bind_buffer(&scmd, 1, &kh, 0);
+      gpu_bind_buffer(&scmd, 2, &vh, 0);
+      gpu_bind_buffer(&scmd, 3, &out_sliced, 0);
+      gpu_copy_bytes(&scmd, 4, &sp, sizeof sp);
+      gpu_run_kernel(&scmd, st * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS, 1, 1);
+      gpu_commit(&scmd);
+      gpu_sync(gpu);
+    }
+    check(memcmp(out.ptr, out_sliced.ptr,
+                 (size_t)rows * (size_t)DIT_INNER * sizeof(float)) == 0,
+          step == 1
+              ? "minimax_h3_dit_attend 1-tile slicing matches full dispatch "
+                "bit-for-bit"
+              : "minimax_h3_dit_attend 2-tile slicing matches full dispatch "
+                "bit-for-bit");
   }
-  check(memcmp(out.ptr, out_sliced.ptr,
-               (size_t)rows * (size_t)DIT_INNER * sizeof(float)) == 0,
-        "minimax_h3_dit_attend sliced tile_offset matches full dispatch "
-        "bit-for-bit");
   gpu_free(&out_sliced);
 
   const float *op = (const float *)out.ptr;
@@ -580,7 +587,7 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
   for (size_t hi = 0; hi < sizeof check_heads / sizeof check_heads[0]; hi++) {
     int h = check_heads[hi];
     for (int q = 0; q < rows; q++) {
-      float scores[73];
+      float scores[137];
       float mx = -INFINITY;
       size_t qbase = ((size_t)h * padded + (size_t)q) * DIT_HEAD_DIM;
       for (int k = 0; k < rows; k++) {

@@ -824,8 +824,8 @@ static void decode_one_tile(MinimaxH3ImageVae *vae, const VaeWorkspace *ws,
     gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, padded / TILE_M, (uint32_t)VAE_HEADS, 1, MM_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, (padded / TILE_M) * (uint32_t)VAE_HEADS, 1, 1,
+                   MM_THREADS, 1, 1);
 
     run_f16_linear(vae, &cmd, &ws->attn_out, &ws->xh, &b->to_out, &ws->norm,
                    seq);

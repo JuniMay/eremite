@@ -369,9 +369,9 @@ static void test_norms_and_embed(Gpu *gpu, MemorySlot *slot) {
 static void test_vae_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   int k_heads = gpu_find_kernel(gpu, "minimax_h3_vae_heads");
   int k_attend = gpu_find_kernel(gpu, "minimax_h3_vae_attend");
-  // 8x9 = 72 patches + 5 suffix tokens = 77 rows (crosses 64-key tile
-  // boundary).
-  int h_lat = 8, w_lat = 9, patches = h_lat * w_lat, seq = patches + SUFFIX;
+  // 10x13 = 130 patches + 5 suffix tokens = 135 rows (interior, boundary and
+  // tail 64-key tiles).
+  int h_lat = 10, w_lat = 13, patches = h_lat * w_lat, seq = patches + SUFFIX;
   uint32_t padded = ((uint32_t)seq + TILE_M - 1) / TILE_M * TILE_M;
   uint32_t rng = 0x99aabbccu;
 
@@ -406,7 +406,8 @@ static void test_vae_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &vh, 0);
   gpu_bind_buffer(&cmd, 3, &out, 0);
   gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-  gpu_run_kernel(&cmd, padded / TILE_M, (uint32_t)HEADS, 1, MM_THREADS, 1, 1);
+  gpu_run_kernel(&cmd, (padded / TILE_M) * (uint32_t)HEADS, 1, 1, MM_THREADS, 1,
+                 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -415,7 +416,7 @@ static void test_vae_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   const _Float16 *kh16 = (const _Float16 *)kh.ptr;
   const _Float16 *vh16 = (const _Float16 *)vh.ptr;
   int rope_ok = 1;
-  static const int check_rows[] = {0, 13, 71, 72, 76};
+  static const int check_rows[] = {0, 13, 63, 71, 127, 130, 134};
   for (size_t ri = 0; ri < sizeof check_rows / sizeof check_rows[0]; ri++) {
     int r = check_rows[ri];
     for (int h = 0; h < HEADS; h += 5) {
@@ -458,7 +459,7 @@ static void test_vae_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
 
   int attn_ok = 1;
   float scale = 1.0f / sqrtf((float)HEAD_DIM);
-  float scores[128];
+  float scores[256];
   const float *outf = (const float *)out.ptr;
   for (int h = 0; h < HEADS; h += 5) {
     for (size_t ri = 0; ri < sizeof check_rows / sizeof check_rows[0]; ri++) {

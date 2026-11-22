@@ -183,8 +183,9 @@ typedef struct {
 
 // Parameters passed to minimax_h3_dit_attend.
 typedef struct {
-  // Active sequence length, padded head stride and query tile offset.
-  uint32_t rows, padded, tile_offset;
+  // Active sequence length, padded head stride, query tile offset and tile
+  // count per head in this dispatch.
+  uint32_t rows, padded, tile_offset, slice_tiles;
 } DitAttendParam;
 
 // Measured GPU seconds per 64-row tile for each heavy DiT block stage during
@@ -1148,7 +1149,8 @@ static int run_dit_attend_sliced(const MinimaxH3Dit *dit,
             ? pick_slice_tiles(rem_tiles, minimax_h3_hooks_turn_budget(hooks),
                                *sec_per_tile)
             : rem_tiles;
-    DitAttendParam ap = {(uint32_t)seq_len, padded_seq, (uint32_t)tile_off};
+    DitAttendParam ap = {(uint32_t)seq_len, padded_seq, (uint32_t)tile_off,
+                         (uint32_t)slice_tiles};
     GpuCommandBuffer cmd = gpu_begin(dit->gpu);
     gpu_select_kernel(&cmd, dit->k_attend);
     gpu_bind_buffer(&cmd, 0, &ws->qh, 0);
@@ -1156,7 +1158,7 @@ static int run_dit_attend_sliced(const MinimaxH3Dit *dit,
     gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, (uint32_t)slice_tiles, (uint32_t)DIT_HEADS, 1,
+    gpu_run_kernel(&cmd, (uint32_t)slice_tiles * (uint32_t)DIT_HEADS, 1, 1,
                    MM_THREADS, 1, 1);
     double t0 = now();
     gpu_commit(&cmd);
@@ -1179,7 +1181,8 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
   RmsNormParam np = {(uint32_t)DIT_DIM, DIT_NORM_EPS};
   SwigluChunkedParam swp = {(uint32_t)text_len, (uint32_t)DIT_FFN_DIM};
   DitHeadsParam hp = {(uint32_t)text_len, padded, 0, DIT_NORM_EPS};
-  DitAttendParam ap = {(uint32_t)text_len, padded, 0u};
+  uint32_t refiner_tiles = padded / TILE_M;
+  DitAttendParam ap = {(uint32_t)text_len, padded, 0u, refiner_tiles};
 
   GpuCommandBuffer cmd = gpu_begin(dit->gpu);
   run_bf16_linear(dit, &cmd, text_hidden, &ws->xb, &dit->condition_proj,
@@ -1221,8 +1224,8 @@ static void run_token_refiner(MinimaxH3Dit *dit, const Buf *text_hidden,
     gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws->attn_out, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, padded / TILE_M, (uint32_t)DIT_HEADS, 1, MM_THREADS, 1,
-                   1);
+    gpu_run_kernel(&cmd, refiner_tiles * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS,
+                   1, 1);
 
     run_bf16_linear(dit, &cmd, &ws->attn_out, &ws->xb, &r->out_proj, &ws->norm,
                     text_len);
@@ -1301,7 +1304,8 @@ static void encode_dit_block_full(const MinimaxH3Dit *dit,
   DitGateAddParam mlp_gate_p = {(uint32_t)seq_len, (uint32_t)DIT_DIM,
                                 (uint32_t)DIT_ADALN_STRIDE, OFF_GATE_MLP};
   DitHeadsParam heads_p = {(uint32_t)seq_len, padded_seq, 1u, DIT_NORM_EPS};
-  DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq, 0u};
+  uint32_t q_tiles = padded_seq / TILE_M;
+  DitAttendParam attend_p = {(uint32_t)seq_len, padded_seq, 0u, q_tiles};
   SwigluChunkedParam swiglu_p = {(uint32_t)seq_len, (uint32_t)DIT_FFN_DIM};
   DitAdalnParam block_adaln_p = {num_t, (uint32_t)DIT_ADALN_OUT,
                                  b->adaln_bias_f16};
@@ -1350,8 +1354,7 @@ static void encode_dit_block_full(const MinimaxH3Dit *dit,
   gpu_bind_buffer(cmd, 2, &ws->vh, 0);
   gpu_bind_buffer(cmd, 3, &ws->attn_out, 0);
   gpu_copy_bytes(cmd, 4, &attend_p, sizeof attend_p);
-  gpu_run_kernel(cmd, padded_seq / TILE_M, (uint32_t)DIT_HEADS, 1, MM_THREADS,
-                 1, 1);
+  gpu_run_kernel(cmd, q_tiles * (uint32_t)DIT_HEADS, 1, 1, MM_THREADS, 1, 1);
 
   run_convrot_linear(dit, cmd, &ws->attn_out, &ws->xq, &ws->xscale,
                      &b->out_proj, &ws->norm, seq_len);

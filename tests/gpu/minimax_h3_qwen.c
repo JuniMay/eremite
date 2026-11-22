@@ -188,8 +188,8 @@ static void test_elementwise_and_norm(Gpu *gpu, MemorySlot *slot) {
 static void test_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   int k_heads = gpu_find_kernel(gpu, "minimax_h3_qwen_heads");
   int k_attend = gpu_find_kernel(gpu, "minimax_h3_qwen_attend");
-  // Test sequence length crossing a 64-key tile boundary.
-  int seq_len = 71;
+  // Test sequence length spanning interior, diagonal and tail 64-key tiles.
+  int seq_len = 137;
   uint32_t padded = ((uint32_t)seq_len + ATTN_PAD - 1) / ATTN_PAD * ATTN_PAD;
   uint32_t rng = 0x13579bdfu;
 
@@ -250,8 +250,9 @@ static void test_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &vh, 0);
   gpu_bind_buffer(&cmd, 3, &out, 0);
   gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-  gpu_run_kernel(&cmd, ((uint32_t)seq_len + ATTN_PAD - 1) / ATTN_PAD,
-                 (uint32_t)Q_HEADS, 1, ATTN_THREADS, 1, 1);
+  gpu_run_kernel(
+      &cmd, (((uint32_t)seq_len + ATTN_PAD - 1) / ATTN_PAD) * (uint32_t)Q_HEADS,
+      1, 1, ATTN_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -317,13 +318,13 @@ static void test_heads_and_attention(Gpu *gpu, MemorySlot *slot) {
   // multiple heads and rows spanning both 64-key blocks.
   int attn_ok = 1;
   float scale = 1.0f / sqrtf((float)HEAD_DIM);
-  float scores[128];
+  float scores[256];
   const float *outf = (const float *)out.ptr;
   static const int check_heads[4] = {0, 7, 31, 63};
-  static const int check_rows[5] = {0, 1, 15, 63, 70};
+  static const int check_rows[7] = {0, 1, 15, 63, 70, 128, 136};
   for (int hi = 0; hi < 4; hi++) {
     int h = check_heads[hi], kv = h / SHARING;
-    for (int ri = 0; ri < 5; ri++) {
+    for (int ri = 0; ri < 7; ri++) {
       int r = check_rows[ri];
       const uint16_t *qr = qh16 + ((size_t)h * padded + (size_t)r) * HEAD_DIM;
       float max_s = -INFINITY;

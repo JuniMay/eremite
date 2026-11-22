@@ -211,12 +211,12 @@ static void test_gelu(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&b), gpu_free(&a);
 }
 
-// Tests minimax_h3_vis_heads and minimax_h3_vis_attend across a 64-key tile
-// boundary (grid 8x10 -> 80 tokens).
+// Tests minimax_h3_vis_heads and minimax_h3_vis_attend across interior,
+// boundary and tail 64-key tiles (grid 10x14 -> 140 tokens).
 static void test_heads_and_attend(Gpu *gpu, MemorySlot *slot) {
   int k_heads = gpu_find_kernel(gpu, "minimax_h3_vis_heads");
   int k_attend = gpu_find_kernel(gpu, "minimax_h3_vis_attend");
-  int gh = 8, gw = 10, rows = gh * gw;
+  int gh = 10, gw = 14, rows = gh * gw;
   uint32_t padded = ((uint32_t)rows + TILE_M - 1) / TILE_M * TILE_M;
   uint32_t rng = 0x24681357u;
 
@@ -253,8 +253,8 @@ static void test_heads_and_attend(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &vh, 0);
   gpu_bind_buffer(&cmd, 3, &out, 0);
   gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-  gpu_run_kernel(&cmd, padded / TILE_M, (uint32_t)VIS_HEADS, 1, MM_THREADS, 1,
-                 1);
+  gpu_run_kernel(&cmd, (padded / TILE_M) * (uint32_t)VIS_HEADS, 1, 1,
+                 MM_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -313,7 +313,7 @@ static void test_heads_and_attend(Gpu *gpu, MemorySlot *slot) {
   for (size_t hi = 0; hi < sizeof check_heads / sizeof check_heads[0]; hi++) {
     int h = check_heads[hi];
     for (int q = 0; q < rows; q++) {
-      float scores[80], mx = -INFINITY;
+      float scores[140], mx = -INFINITY;
       size_t qbase = ((size_t)h * padded + (size_t)q) * VIS_PAD_HEAD;
       for (int k = 0; k < rows; k++) {
         size_t kbase = ((size_t)h * padded + (size_t)k) * VIS_PAD_HEAD;

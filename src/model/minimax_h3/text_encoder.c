@@ -661,8 +661,10 @@ int minimax_h3_text_encoder_encode_tokens(
     gpu_bind_buffer(&cmd, 2, &ws.vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws.q, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, ((uint32_t)seq_len + ATTN_PAD - 1) / ATTN_PAD,
-                   (uint32_t)QWEN_HEADS, 1, MM_THREADS, 1, 1);
+    gpu_run_kernel(&cmd,
+                   (((uint32_t)seq_len + ATTN_PAD - 1) / ATTN_PAD) *
+                       (uint32_t)QWEN_HEADS,
+                   1, 1, MM_THREADS, 1, 1);
 
     stage_bf16_x(enc, &cmd, &ws.q, &ws.xb, &l->o_proj, seq_len);
     run_nvfp4_from_xb(enc, &cmd, &ws.xb, &l->o_proj, &ws.norm, seq_len);

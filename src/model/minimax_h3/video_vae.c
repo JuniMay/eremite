@@ -863,7 +863,7 @@ static int decode_tile_3d(MinimaxH3VideoVae *vae, VvaeDecodeWorkspace *ws,
     gpu_bind_buffer(&cmd, 2, &ws->vh, 0);
     gpu_bind_buffer(&cmd, 3, &ws->mid, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, ceil_div(rows, ATTN_GROUP_ROWS), VVAE_HEADS, 1,
+    gpu_run_kernel(&cmd, ceil_div(rows, ATTN_GROUP_ROWS) * VVAE_HEADS, 1, 1,
                    ATTN_THREADS, 1, 1);
 
     enc_i8_lin(vae, &cmd, &b->to_out, &ws->mid, &ws->xq, &ws->x_scale,
