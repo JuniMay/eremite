@@ -184,4 +184,30 @@ fn the_search_ranking_model_must_be_a_served_decision_model() {
         "{error}"
     );
     std::fs::remove_dir_all(&inkling).unwrap();
+
+    // Nemotron-3.5-Transcribe is an audio transcription model and cannot rank
+    // search results.
+    let nemotron =
+        std::env::temp_dir().join(format!("eremite-ranking-nemotron-{}", std::process::id()));
+    std::fs::create_dir_all(&nemotron).unwrap();
+    std::fs::write(
+        nemotron.join("config.json"),
+        json!({"model_type": "nemo_speechlm"}).to_string(),
+    )
+    .unwrap();
+    let config = json!({"port": 0, "host": "127.0.0.1",
+                        "search_ranking_model": "nemotron-3.5-transcribe",
+                        "models": [{"model": nemotron}]});
+    let error = run(
+        "ranking-nemotron",
+        &["--config".into(), "/dev/stdin".into()],
+        Some(config),
+    );
+    assert!(
+        error.contains(
+            "search_ranking_model: nemotron-3.5-transcribe is an audio transcription model: it makes no decisions"
+        ),
+        "{error}"
+    );
+    std::fs::remove_dir_all(&nemotron).unwrap();
 }

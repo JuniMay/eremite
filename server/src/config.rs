@@ -32,6 +32,12 @@ const MAX_SECONDS: f64 = 1e6;
 /// and up to 15 more rows. A model's lookup gives up to this many unless its
 /// entry says otherwise.
 const MOST_LOOKUP_PROPOSALS: i32 = 15;
+/// Default context capacity in tokens for Nemotron-3.5-Transcribe when `ctx`
+/// is omitted (matches the checkpoint's trained context size, fitting 1-hour
+/// recordings plus transcripts).
+const DEFAULT_NEMOTRON_CONTEXT_TOKENS: i32 = 65_536;
+/// Keys of a model entry that belong only to DeepSeek models.
+const DEEPSEEK_ONLY_KEYS: [&str; 4] = ["experts", "ced", "prefill_prune", "packed_state_rows"];
 
 /// One model's settings.
 #[derive(Clone, Debug, PartialEq)]
@@ -188,6 +194,27 @@ impl ModelConfig {
             ));
         }
         self.engine.lookup = 0;
+        Ok(())
+    }
+
+    /// Fits the settings to a Nemotron-3.5-Transcribe audio model. Rejects
+    /// DeepSeek-only and image/video-only keys, defaults an omitted `ctx` to
+    /// 65,536 tokens, and disables context lookup unless explicitly set.
+    pub fn fit_nemotron_model(&mut self) -> Result<(), String> {
+        let model = &self.engine.model;
+        if let Some(key) = self.keys.iter().find(|key| {
+            DEEPSEEK_ONLY_KEYS.contains(&key.as_str()) || MEDIA_MODEL_KEYS.contains(&key.as_str())
+        }) {
+            return Err(format!(
+                "{model}: {key} is not a setting of a Nemotron-3.5-Transcribe model"
+            ));
+        }
+        if !self.keys.iter().any(|key| key == "ctx") {
+            self.engine.ctx = DEFAULT_NEMOTRON_CONTEXT_TOKENS;
+        }
+        if !self.keys.iter().any(|key| key == "lookup") {
+            self.engine.lookup = 0;
+        }
         Ok(())
     }
 
@@ -1445,5 +1472,36 @@ mod tests {
             Server::default().video_folder(Some("/home/user".into())),
             Some(PathBuf::from("/home/user/.local/share/eremite/videos"))
         );
+    }
+
+    #[test]
+    fn a_nemotron_model_defaults_context_and_lookup_and_rejects_other_family_keys() {
+        let fit = |entry: Value| -> Result<ModelConfig, String> {
+            let mut config = parse(&json!({"models": [entry]}))?;
+            let mut model = config.models.remove(0);
+            model.fit_nemotron_model()?;
+            Ok(model)
+        };
+        let model = fit(json!({"model": "/m/nemotron", "memory": 5})).unwrap();
+        assert_eq!(
+            (
+                model.engine.ctx,
+                model.engine.lookup,
+                model.engine.draft,
+                model.engine.memory_gb
+            ),
+            (DEFAULT_NEMOTRON_CONTEXT_TOKENS, 0, 0, 5.0)
+        );
+        let custom = fit(json!({"model": "/m/nemotron", "ctx": 32768, "idle_unload": 30})).unwrap();
+        assert_eq!(custom.engine.ctx, 32_768);
+        assert_eq!(custom.idle_unload, Some(30.0));
+        for bad in [
+            json!({"model": "/m/nemotron", "ced": 512}),
+            json!({"model": "/m/nemotron", "experts": "/m/e.gguf"}),
+            json!({"model": "/m/nemotron", "dit": "/m/dit.safetensors"}),
+            json!({"model": "/m/nemotron", "audio_vae": "/m/avae.safetensors"}),
+        ] {
+            assert!(fit(bad).is_err());
+        }
     }
 }

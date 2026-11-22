@@ -89,8 +89,9 @@ memory included. `build/eremite` alone lists the options.
 `make server` builds `build/eremite-server`. It serves the OpenAI Chat
 Completions and Responses APIs at `http://HOST:PORT/v1`, OpenAI's Decisions API
 at `POST /v1/decisions`, OpenAI's Images API at `POST /v1/images/generations`
-and `POST /v1/images/edits`, OpenAI's Videos API at `/v1/videos`, Codex's model
-catalog at `/v1/codex/models`, and standalone web search at
+and `POST /v1/images/edits`, OpenAI's Videos API at `/v1/videos`, OpenAI's
+Audio API at `POST /v1/audio/transcriptions` and `POST /v1/audio/translations`,
+Codex's model catalog at `/v1/codex/models`, and standalone web search at
 `POST /v1/alpha/search`.
 
 Its settings are in a JSON file: `build/eremite-server --config FILE`, or
@@ -125,6 +126,10 @@ Its settings are in a JSON file: `build/eremite-server --config FILE`, or
       "vae": "/path/to/minimax_h3_video_vae_int8_convrot.safetensors",
       "audio_vae": "/path/to/minimax_h3_audio_vae_fp32.safetensors",
       "variant": "fl2va"
+    },
+    {
+      "model": "/path/to/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4",
+      "memory": 5
     }
   ]
 }
@@ -135,7 +140,8 @@ Without `api_key_file`, the server takes the key from the environment variable
 `EREMITE_API_KEY`.
 
 `docs/server.md` lists every setting, and explains how the server handles
-requests, memory, decision models, image models and video models. `docs/codex.md` explains
+requests, memory, decision models, image models, video models and audio
+transcription models. `docs/codex.md` explains
 how to use eremite with Codex: its configuration, model catalog, image tool
 and web search. `skills/README.md` describes eremite's agent skills.
 
@@ -151,10 +157,11 @@ local inference engine for DeepSeek 4 Flash and Pro. It also builds on:
 - [DeepSeek](https://huggingface.co/deepseek-ai)'s V4.1 Flash,
   [Thinking Machines Lab](https://huggingface.co/thinkingmachines)'s
   Inkling-2-Mini, [Liquid AI](https://www.liquid.ai)'s d1 decision models
-  (with Liquid AI's prompt for reranking), and
+  (with Liquid AI's prompt for reranking),
   [MiniMax](https://huggingface.co/MiniMaxAI)'s MiniMax-H3-Image and
   MiniMax-H3 Video with [Comfy-Org](https://huggingface.co/Comfy-Org)'s
-  quantized checkpoints.
+  quantized checkpoints, and [NVIDIA](https://huggingface.co/nvidia)'s
+  Nemotron-3.5-Transcribe.
 - The ggml library of [llama.cpp](https://github.com/ggml-org/llama.cpp): the
   GGUF format and the codebooks of its i-quants. Their MIT license is in
   `src/kernels/gguf_grids.metal`.

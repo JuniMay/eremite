@@ -2,9 +2,9 @@
 
 `build/eremite-server` serves the models that its configuration file lists
 (README.md, Serve). This document lists every setting, and explains how the
-server handles requests, memory, decision models, image models and video models.
-`docs/codex.md` describes Codex configuration, the Codex model catalog, Codex's
-image tool and Codex's web search.
+server handles requests, memory, decision models, image models, video models
+and audio transcription models. `docs/codex.md` describes Codex configuration,
+the Codex model catalog, Codex's image tool and Codex's web search.
 
 ## Settings
 
@@ -48,7 +48,7 @@ Each entry under `models` holds one model's settings:
 | Key | Meaning | Default |
 | --- | --- | --- |
 | `model` | the checkpoint's folder | required |
-| `id` | the name that requests give in `model` | DeepSeek: `deepseek-v4.1-flash`; Inkling-2-Mini: `inkling-2-mini`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image`; MiniMax-H3 Video: `minimax-h3-video` |
+| `id` | the name that requests give in `model` | DeepSeek: `deepseek-v4.1-flash`; Inkling-2-Mini: `inkling-2-mini`; a d1 model: its folder's name in lower case; MiniMax-H3-Image: `minimax-h3-image`; MiniMax-H3 Video: `minimax-h3-video`; Nemotron-3.5-Transcribe: `nemotron-3.5-transcribe` |
 | `experts` | DeepSeek: a GGUF file, or the first shard of a set, whose routed experts replace the checkpoint's | the checkpoint's |
 | `text_encoder` | MiniMax-H3: the safetensors file of the Qwen3-VL NVFP4 text and vision encoder | required for MiniMax-H3 image and video models |
 | `dit` | MiniMax-H3: the safetensors file of the pruned INT8-ConvRot DiT | required for MiniMax-H3 image and video models |
@@ -61,7 +61,7 @@ Each entry under `models` holds one model's settings:
 | `shift_audio` | MiniMax-H3 Video: default audio flow-matching shift factor | `3.0` |
 | `variant` | MiniMax-H3 Video: checkpoint task variant, `"fl2va"` or `"ref2va"` | `"fl2va"` |
 | `default_size` | MiniMax-H3-Image: the `WIDTHxHEIGHT` of a text-to-image request whose `size` is `auto` or omitted; it must fit the model as it is | `2048x2048`, the default generation canvas |
-| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3 image and video: 4096 |
+| `ctx` | the context in tokens, at most 1048576 and the model's own | the most; a d1 model: its checkpoint's; MiniMax-H3 image and video: 4096; Nemotron-3.5-Transcribe: 65536 |
 | `draft` | the most proposals of the model's draft head per pass: 0 to 5 for DeepSeek, 0 to 7 for Inkling-2-Mini; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
@@ -76,7 +76,8 @@ Each entry under `models` holds one model's settings:
 A request names its model by its `id` in `model`. A request that names no
 served model goes to the only model that answers its endpoint: a chat request
 to the model that generates text, a decision to the decision model, an image
-request to the image model, and a video request to the video model.
+request to the image model, a video request to the video model, and an audio
+request to the audio transcription model.
 
 Each request sets its own sampling and thinking effort. A request that sets
 none samples with temperature 1, top_p 1 and every token, and thinks at high
@@ -345,3 +346,53 @@ GPU throughput when running alone, balances GPU time evenly with other active
 models by slicing heavy DiT stages to the peer's measured turn duration and
 offloading MP4 encoding to a background thread, and reports prompt encoding as
 prefill and denoising/VAE/MP4 work in dedicated video counters.
+
+## Audio transcription models
+
+NVIDIA Nemotron-3.5-Transcribe (`model_type` `nemo_speechlm`) transcribes
+speech and translates speech into English. Its `model` folder holds
+`config.json`, `tokenizer.json`, `model.safetensors.index.json` and its
+safetensors weight shards. Its entry takes `model`, `id`, `ctx` (default
+65,536, fitting up to 1-hour recordings plus transcripts), `memory`,
+`max_cached_states` and `idle_unload`, and refuses DeepSeek-only and
+MiniMax-H3 settings.
+
+An audio transcription model serves OpenAI's Audio API (`multipart/form-data`,
+up to 256 MiB per upload) and refuses chat, decision, image and video
+endpoints; Codex's catalog leaves it out:
+
+- `POST /v1/audio/transcriptions`: transcribes an uploaded recording in its
+  spoken language or a requested language.
+- `POST /v1/audio/translations`: translates an uploaded recording into English.
+
+Request form fields accepted by the audio endpoints:
+
+- `file`: required non-empty audio file (WAV, FLAC, MP3, M4A, AAC, OGG, MP4 or
+  any format macOS AVFoundation decodes; resampled to 16 kHz mono, up to 1 hour
+  long).
+- `model`: optional model id. When omitted or unrecognized and only one audio
+  model is served (for example clients sending `whisper-1`), the request routes
+  to that audio model.
+- `language`: `/v1/audio/transcriptions` only; optional ISO-639-1 or BCP-47
+  language code (for example `en`, `zh`, `ja`, `de`) or English language name.
+  Refused on `/v1/audio/translations`.
+- `prompt`: optional context terms or domain vocabulary passed as biasing hints
+  in the transcription or translation prompt.
+- `response_format`: `"json"` (default: `{"text": "...", "usage": ...}`),
+  `"text"` (`text/plain; charset=utf-8`), or `"verbose_json"` (`task`,
+  `duration`, `text`, `usage`, and `language` when known). `"srt"`, `"vtt"` and
+  `timestamp_granularities` return HTTP 400 until word timestamps are added.
+- `temperature`: optional nonnegative finite number (default `0`, greedy).
+- `seed`: optional nonnegative integer random seed.
+- `stream`: optional `"true"` or `"false"` (default `false`); requires
+  `response_format` `"json"`. Streams `transcript.text.delta` and
+  `transcript.text.done` server-sent events with keepalive comments while the
+  audio encoder and prefill run.
+
+Nemotron-3.5-Transcribe keeps its dense hybrid Mamba-2 and attention backbone
+resident in GPU memory (~3.3 GiB) and loads its 815 MiB Parallel Expert
+Perception audio encoder on demand. Its 2,944 NVFP4 routed experts across 23
+MoE layers live in the shared SSD-backed expert cache (~15.7 GiB when all
+experts stay resident). Setting `memory` (for example `5` GiB) streams routed
+experts from SSD into a bounded cache so transcription runs alongside a large
+language model such as DeepSeek without holding all experts in RAM.

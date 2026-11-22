@@ -903,6 +903,9 @@ pub enum Architecture {
     /// (_class_name MiniMaxH3ModularPipeline, MiniMaxH3Pipeline or model_type
     /// minimax_h3_video).
     MinimaxH3Video,
+    /// NVIDIA Nemotron-3.5-Transcribe audio transcription and translation model
+    /// (model_type nemo_speechlm).
+    NemotronTranscribe,
 }
 
 impl Architecture {
@@ -934,6 +937,7 @@ impl Architecture {
             Some("MiniMaxH3ModularPipeline" | "MiniMaxH3Pipeline" | "minimax_h3_video") => {
                 Ok(Architecture::MinimaxH3Video)
             }
+            Some("nemo_speechlm") => Ok(Architecture::NemotronTranscribe),
             Some(t) => Err(format!(
                 "{}: {key} {t} is not one this server runs",
                 path.display()
@@ -1177,6 +1181,21 @@ impl Options {
             (BackendOptions::DeepSeek(_), Architecture::MinimaxH3Video) => {
                 return Err(format!(
                     "{}: DeepSeek's settings for a video model",
+                    self.model
+                ));
+            }
+            (BackendOptions::Unspecified, Architecture::NemotronTranscribe) => {
+                BackendOptions::Unspecified
+            }
+            (BackendOptions::DeepSeek(_), Architecture::NemotronTranscribe) => {
+                return Err(format!(
+                    "{}: DeepSeek's settings do not apply to Nemotron-3.5-Transcribe",
+                    self.model
+                ));
+            }
+            (BackendOptions::MinimaxH3(_), Architecture::NemotronTranscribe) => {
+                return Err(format!(
+                    "{}: MiniMax-H3 checkpoint paths do not apply to Nemotron-3.5-Transcribe",
                     self.model
                 ));
             }
@@ -2095,7 +2114,7 @@ impl Media {
         let count = unsafe { eremite_media_encode(self.0, from as c_int) };
         if count < 0 {
             Err(
-                "the global model-memory budget cannot fit the image encoder and its workspace"
+                "the global model-memory budget cannot fit the media encoder and its workspace"
                     .into(),
             )
         } else {
@@ -2920,6 +2939,11 @@ mod tests {
             std::fs::write(&config, format!(r#"{{"model_type": "{kind}"}}"#)).unwrap();
             assert_eq!(Architecture::of(dir.path()), Ok(Architecture::Inkling2));
         }
+        std::fs::write(&config, r#"{"model_type": "nemo_speechlm"}"#).unwrap();
+        assert_eq!(
+            Architecture::of(dir.path()),
+            Ok(Architecture::NemotronTranscribe)
+        );
         std::fs::write(
             &config,
             r#"{"model_type": "lfm3_vl", "d1_attention": "set"}"#,
@@ -3053,6 +3077,25 @@ mod tests {
         let mut h3 = Options::default();
         h3.minimax_h3_mut().unwrap().dit = Some("/m/dit.safetensors".into());
         assert!(h3.configure(Architecture::Inkling2).is_err());
+    }
+
+    #[test]
+    fn nemotron_transcribe_rejects_other_family_settings() {
+        let mut options = Options {
+            ctx: 65_536,
+            memory_gb: 5.0,
+            ..Default::default()
+        };
+        options.configure(Architecture::NemotronTranscribe).unwrap();
+        assert_eq!(options.backend, BackendOptions::Unspecified);
+
+        let mut ds = Options::default();
+        ds.deepseek_mut().unwrap().ced = 512;
+        assert!(ds.configure(Architecture::NemotronTranscribe).is_err());
+
+        let mut h3 = Options::default();
+        h3.minimax_h3_mut().unwrap().dit = Some("/m/dit.safetensors".into());
+        assert!(h3.configure(Architecture::NemotronTranscribe).is_err());
     }
 
     #[test]

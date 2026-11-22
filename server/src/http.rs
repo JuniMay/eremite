@@ -10,8 +10,9 @@
 //! - Each part of a body must arrive within the time limit of the one before.
 //!   A late part gets 408.
 //! - A body may be at most 32 MB, 128 MiB on POST /v1/images/edits for
-//!   multipart reference image uploads, or 256 MiB on POST /v1/videos for
-//!   reference image, video and audio uploads. A larger body gets 413.
+//!   multipart reference image uploads, or 256 MiB on POST /v1/videos and
+//!   POST /v1/audio/{transcriptions,translations} for media uploads. A larger
+//!   body gets 413.
 //! - A client may stall the server's writes for at most the time limit.
 //!   Then its connection closes. Closing it cancels its request.
 //!

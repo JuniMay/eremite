@@ -3489,7 +3489,7 @@ impl WorkerModel {
                     }
                     Err(ExpandError::PlacesAndMediaDiffer) => {
                         let message = format!(
-                            "the prompt's image places and its {} media differ",
+                            "the prompt's media places and its {} media differ",
                             job.request.media.len()
                         );
                         return refuse(job, &message);
@@ -4234,7 +4234,7 @@ impl WorkerModel {
         }
         drop(prefill.media);
         generation.next_token = self.model.sample(logits, &mut generation.sampler);
-        if self.settings.options.lookup > 0 {
+        if self.settings.options.lookup > 0 && self.model.max_verify() > 1 {
             let mut lookup =
                 Lookup::new(self.ctx).unwrap_or_else(|| panic!("cannot initialize context lookup"));
             if !lookup.append(&prefill.prompt) {

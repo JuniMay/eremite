@@ -18,7 +18,7 @@
 //! names only that file.
 
 use eremite_server::{
-    chat, codex, config, control, decision, engine, http, image, ui, video, worker,
+    audio, chat, codex, config, control, decision, engine, http, image, ui, video, worker,
 };
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -95,6 +95,10 @@ enum Format {
     /// MiniMax-H3 Video: audio-video generation (T2VA, FL2VA and REF2VA), with
     /// the input and output limits reported by the opened engine model.
     MinimaxH3Video(engine::VideoLimits),
+    /// NVIDIA Nemotron-3.5-Transcribe: audio transcription and English
+    /// translation over POST /v1/audio/transcriptions and
+    /// POST /v1/audio/translations.
+    NemotronTranscribe,
 }
 
 /// What the HTTP handlers share.
@@ -141,6 +145,12 @@ fn generates_images(model: &Served) -> bool {
 /// /v1/videos.
 fn generates_videos(model: &Served) -> bool {
     matches!(model.format, Format::MinimaxH3Video(_))
+}
+
+/// Returns whether `model` is an audio transcription model: whether it answers
+/// POST /v1/audio/transcriptions and POST /v1/audio/translations.
+fn transcribes_audio(model: &Served) -> bool {
+    matches!(model.format, Format::NemotronTranscribe)
 }
 
 /// Finds the index of the model named `name` (in any case). For an unknown
@@ -380,7 +390,10 @@ async fn list_codex_models(State(shared): App) -> Response {
                 context_window: model.ctx,
                 reasoning: codex::CatalogReasoning::Inkling2(defaults.effort),
             }),
-            Format::D1(_) | Format::MinimaxH3Image(_) | Format::MinimaxH3Video(_) => None,
+            Format::D1(_)
+            | Format::MinimaxH3Image(_)
+            | Format::MinimaxH3Video(_)
+            | Format::NemotronTranscribe => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -521,6 +534,12 @@ async fn answer_decisions(
                 }
                 Format::MinimaxH3Video(_) => {
                     format!("{} is a video model: it makes no decisions", model.id)
+                }
+                Format::NemotronTranscribe => {
+                    format!(
+                        "{} is an audio transcription model: it makes no decisions",
+                        model.id
+                    )
                 }
                 Format::D1(_) => unreachable!(),
             };
@@ -695,6 +714,10 @@ async fn answer_generation(
         ))),
         Format::MinimaxH3Video(_) => Err(chat::Error::new_bad_request(format!(
             "{} is a video model: it generates videos and generates no text",
+            handlers.models[index].id
+        ))),
+        Format::NemotronTranscribe => Err(chat::Error::new_bad_request(format!(
+            "{} is an audio transcription model: use /v1/audio/transcriptions or /v1/audio/translations",
             handlers.models[index].id
         ))),
     })
@@ -1271,6 +1294,127 @@ async fn delete_video(State(shared): App, Path(id): Path<String>) -> Response {
     )
 }
 
+/// Finds the served audio transcription model named `name` (or the default
+/// audio model) and returns its index, or an HTTP status and message.
+fn resolve_audio_model(shared: &Shared, name: Option<&str>) -> Result<usize, (StatusCode, String)> {
+    let index = find_model_index_by_name(shared, name, transcribes_audio)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    let model = &shared.models[index];
+    if !matches!(model.format, Format::NemotronTranscribe) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{} does not transcribe audio", model.id),
+        ));
+    }
+    Ok(index)
+}
+
+/// Answers POST /v1/audio/transcriptions.
+async fn answer_audio_transcriptions(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    answer_audio(
+        shared,
+        peer,
+        headers,
+        body,
+        audio::AudioEndpoint::Transcriptions,
+    )
+    .await
+}
+
+/// Answers POST /v1/audio/translations.
+async fn answer_audio_translations(
+    State(shared): App,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    answer_audio(
+        shared,
+        peer,
+        headers,
+        body,
+        audio::AudioEndpoint::Translations,
+    )
+    .await
+}
+
+/// Answers an OpenAI Audio API request (transcription or English translation):
+/// parses the multipart/form-data upload, resolves the audio model, tokenizes
+/// the prompt, submits the job to the worker, and returns JSON, plain text,
+/// verbose JSON or server-sent events.
+async fn answer_audio(
+    shared: Arc<Shared>,
+    peer: SocketAddr,
+    headers: HeaderMap,
+    body: Body,
+    endpoint: audio::AudioEndpoint,
+) -> Response {
+    let peer = peer.ip().to_string();
+    let audio_limits = http::Limits {
+        max_body_bytes: audio::MAX_AUDIO_BODY_BYTES,
+        ..shared.limits
+    };
+    let body = match http::read_body(body, audio_limits).await {
+        Ok(body) => body,
+        Err(error) => return refuse_request(&peer, error),
+    };
+    let arrival = shared.arrivals.fetch_add(1, Ordering::Relaxed) + 1;
+    engine::log(&format!(
+        "http {arrival}: arrived from {peer}, {} body bytes",
+        body.len()
+    ));
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from);
+    let from = peer.clone();
+    let handlers = shared.clone();
+    let queued = tokio::task::spawn_blocking(move || {
+        let parsed = audio::parse_audio_request(endpoint, content_type.as_deref(), &body)?;
+        let index = match resolve_audio_model(&handlers, parsed.model.as_deref()) {
+            Ok(index) => index,
+            Err((status, message)) => {
+                return Err(chat::Error { status, message });
+            }
+        };
+        let audio_bytes = parsed.file.len();
+        let filename = parsed.filename.as_deref().unwrap_or("audio").to_string();
+        let streamed = parsed.stream;
+        let mut prepared = audio::prepare_request(parsed, handlers.models[index].tokenizer)?;
+        let note = format!(
+            "http {arrival} from {from}: audio {} ({filename}, {audio_bytes} bytes), {}",
+            endpoint.task_name(),
+            if streamed { "streamed" } else { "one response" }
+        );
+        let (cancel, events) = submit_request(prepared.build_worker_request(index, note))?;
+        Ok::<_, chat::Error>((prepared, cancel, events))
+    })
+    .await;
+    match queued {
+        Ok(Ok((prepared, cancel, events))) => {
+            if prepared.stream {
+                audio::stream_response(prepared, cancel, events, shared.keepalive).await
+            } else {
+                audio::collect_response(prepared, cancel, events).await
+            }
+        }
+        Ok(Err(error)) if error.status == StatusCode::NOT_FOUND => {
+            chat::build_error_response(error.status, "invalid_request_error", &error.message)
+        }
+        Ok(Err(error)) => refuse_request(&peer, error),
+        Err(error) => chat::build_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &error.to_string(),
+        ),
+    }
+}
+
 /// Answers a request for an unknown path with 404.
 async fn refuse_unknown_endpoint() -> Response {
     chat::build_error_response(
@@ -1375,6 +1519,10 @@ fn main() {
             model.fit_image_model().unwrap_or_else(|error| die(&error));
         } else if family == Family::MinimaxH3Video {
             model.fit_video_model().unwrap_or_else(|error| die(&error));
+        } else if family == Family::NemotronTranscribe {
+            model
+                .fit_nemotron_model()
+                .unwrap_or_else(|error| die(&error));
         } else if let Some(key) = model
             .keys
             .iter()
@@ -1395,6 +1543,7 @@ fn main() {
             Family::D1 => d1::derive_model_names(&model.engine.model).0,
             Family::MinimaxH3Image => image::DEFAULT_MODEL_ID.into(),
             Family::MinimaxH3Video => video::DEFAULT_MODEL_ID.into(),
+            Family::NemotronTranscribe => audio::DEFAULT_MODEL_ID.into(),
         });
         if served
             .iter()
@@ -1434,6 +1583,9 @@ fn main() {
                 )),
                 Family::MinimaxH3Video => die(&format!(
                     "search_ranking_model: {id} is a video model: it makes no decisions"
+                )),
+                Family::NemotronTranscribe => die(&format!(
+                    "search_ranking_model: {id} is an audio transcription model: it makes no decisions"
                 )),
             }
         });
@@ -1503,6 +1655,7 @@ fn main() {
                 worker::video_limits(index)
                     .unwrap_or_else(|| die(&format!("{id}: video model reported no limits"))),
             ),
+            Family::NemotronTranscribe => Format::NemotronTranscribe,
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
@@ -1510,6 +1663,7 @@ fn main() {
             Family::D1 => d1::derive_model_names(&settings.options.model).1,
             Family::MinimaxH3Image => image::DISPLAY_NAME.to_string(),
             Family::MinimaxH3Video => video::DISPLAY_NAME.to_string(),
+            Family::NemotronTranscribe => audio::DISPLAY_NAME.to_string(),
         };
         let extra = match &format {
             Format::MinimaxH3Video(limits) => format!(
@@ -1570,7 +1724,9 @@ fn main() {
                 info: ui::frame::ModelInfo {
                     name: model.id.clone(),
                     kind: match family {
-                        Family::DeepSeek | Family::Inkling2 => ui::frame::Kind::Llm,
+                        Family::DeepSeek | Family::Inkling2 | Family::NemotronTranscribe => {
+                            ui::frame::Kind::Llm
+                        }
                         Family::D1 => ui::frame::Kind::Decision,
                         Family::MinimaxH3Image => ui::frame::Kind::Image,
                         Family::MinimaxH3Video => ui::frame::Kind::Video,
@@ -1580,9 +1736,12 @@ fn main() {
                 find_role: match family {
                     Family::DeepSeek => deepseek::find_role_of_token,
                     Family::Inkling2 => inkling2::find_role_of_token,
-                    // Decision, image and video models keep no sessions whose
-                    // text the view shows.
-                    Family::D1 | Family::MinimaxH3Image | Family::MinimaxH3Video => |_| None,
+                    // Decision, image, video and audio models keep no
+                    // role-delimited chat transcripts for the view.
+                    Family::D1
+                    | Family::MinimaxH3Image
+                    | Family::MinimaxH3Video
+                    | Family::NemotronTranscribe => |_| None,
                 },
             })
             .collect();
@@ -1770,6 +1929,22 @@ fn main() {
         .route(
             "/videos/{id}/content",
             get(get_video_content).fallback(refuse_other_than_get),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(answer_audio_transcriptions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(answer_audio_transcriptions).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(answer_audio_translations).fallback(refuse_other_than_post),
+        )
+        .route(
+            "/audio/translations",
+            post(answer_audio_translations).fallback(refuse_other_than_post),
         )
         .fallback(refuse_unknown_endpoint)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))
