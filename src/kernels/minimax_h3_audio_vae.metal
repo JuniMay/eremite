@@ -42,11 +42,14 @@ constant constexpr uint MINIMAX_H3_AUDIO_ATTN_HEADS = 8,
 // Attention dot-product scale 1 / sqrt(256) = 1 / 16 (audio_vae.py:1349).
 constant constexpr float MINIMAX_H3_AUDIO_ATTN_SCALE = 0.0625f;
 
-// Channels computed per thread and per 4-simdgroup threadgroup in 1D conv tiles.
+// Channels computed per thread and per 4-simdgroup threadgroup in 1D conv tiles,
+// and FP32 linear matmul2d tile dimensions.
 constant constexpr uint MINIMAX_H3_AUDIO_CONV_CO_PER_THREAD = 8,
                         MINIMAX_H3_AUDIO_CONV_WARPS = 4,
                         MINIMAX_H3_AUDIO_CONV_TILE_CO =
-                            MINIMAX_H3_AUDIO_CONV_WARPS * MINIMAX_H3_AUDIO_CONV_CO_PER_THREAD;
+                            MINIMAX_H3_AUDIO_CONV_WARPS * MINIMAX_H3_AUDIO_CONV_CO_PER_THREAD,
+                        MINIMAX_H3_AUDIO_LIN_TILE_M = 64,
+                        MINIMAX_H3_AUDIO_LIN_TILE_N = 32;
 
 // Parameters for FP32 1D convolution with optional bias, center-cropped residual
 // addition, and [-1, 1] waveform clamping.
@@ -303,28 +306,43 @@ kernel void minimax_h3_audio_transpose(device const float *x [[buffer(0)]],
 }
 
 // FP32 row-major linear projection y[m, n] = x[m, k] @ w[n, k]^T + bias (+ res).
-// Dispatched with 1 simdgroup (32 threads) per output element (col = tg.x, row = tg.y)
-// so both x[row, :] and w[col, :] are read with unit stride across lanes.
+// Each threadgroup of 128 threads computes a 64x32 tile using native FP32
+// matmul2d: grid.x = ceil(n / 32), grid.y = ceil(m / 64).
 kernel void minimax_h3_audio_linear_f32(device const float *x [[buffer(0)]],
                                         device const float *w [[buffer(1)]],
                                         device const float *bias [[buffer(2)]],
                                         device const float *res [[buffer(3)]],
                                         device float *y [[buffer(4)]],
                                         constant MinimaxH3AudioLinear &p [[buffer(5)]],
-                                        uint2 tg [[threadgroup_position_in_grid]],
-                                        uint lane [[thread_index_in_threadgroup]]) {
-  uint col = tg.x, row = tg.y;
-  if (col >= p.n || row >= p.m) return;
-  device const float *xr = x + row * p.k;
-  device const float *wr = w + col * p.k;
-  float acc = 0.0f;
-  for (uint i = lane; i < p.k; i += MINIMAX_H3_SIMD_WIDTH) acc = fma(xr[i], wr[i], acc);
-  float sum = simd_sum(acc);
-  if (lane == 0) {
-    if (p.has_bias) sum += bias[col];
-    if (p.add_res) sum += res[row * p.n + col];
-    y[row * p.n + col] = sum;
-  }
+                                        uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc =
+      matmul2d_descriptor(MINIMAX_H3_AUDIO_LIN_TILE_M, MINIMAX_H3_AUDIO_LIN_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
+  tensor<device float, dextents<int32_t, 2>, tensor_inline> tx(
+      (device float *)x, dextents<int32_t, 2>(p.k, p.m));
+  tensor<device float, dextents<int32_t, 2>, tensor_inline> tw(
+      (device float *)w, dextents<int32_t, 2>(p.k, p.n));
+  uint m0 = tg.y * MINIMAX_H3_AUDIO_LIN_TILE_M;
+  uint n0 = tg.x * MINIMAX_H3_AUDIO_LIN_TILE_N;
+  auto a = tx.slice(0, m0);
+  auto b = tw.slice(0, n0);
+  auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
+                                                 float>();
+  op.run(a, b, c);
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (col < p.n && row < p.m) {
+        ulong idx = (ulong)row * p.n + col;
+        float sum = c[i];
+        if (p.has_bias) sum += bias[col];
+        if (p.add_res) sum += res[idx];
+        y[idx] = sum;
+      }
+    }
 }
 
 // Tanh-approximate GeGLU: out[i] = gelu_tanh(gate[i]) * up[i].

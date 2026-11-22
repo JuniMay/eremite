@@ -16,7 +16,9 @@ constant constexpr uint MINIMAX_H3_DIT_DIM = 5376,
                         MINIMAX_H3_DIT_ROPE_FREQS = 16,
                         MINIMAX_H3_DIT_UNROT_DIMS = 32,
                         MINIMAX_H3_DIT_ADALN_RANK = 8,
-                        MINIMAX_H3_DIT_TILE_M = 64;
+                        MINIMAX_H3_DIT_TILE_M = 64,
+                        MINIMAX_H3_F32MM_TILE_M = 64,
+                        MINIMAX_H3_F32MM_TILE_N = 32;
 
 // Parameters for BF16 matrix multiplication with optional FP32 bias.
 struct MinimaxH3Bf16MM {
@@ -168,22 +170,37 @@ kernel void minimax_h3_mm_bf16_add(device const bfloat *w [[buffer(0)]],
 
 // FP32 matrix product with bias: y[r, c] = dot(x[r], w[c]) + bias[c].
 // Used for the checkpoint's FP32 islands (video_patch_proj and final video_out).
-// One simdgroup (32 threads) per (row, col) output element: grid.x = n, grid.y = m.
+// Each threadgroup of 128 threads computes a 64x32 tile using native FP32
+// matmul2d: grid.x = ceil(n / 32), grid.y = ceil(m / 64).
 kernel void minimax_h3_mm_f32(device const float *w [[buffer(0)]],
                               device const float *x [[buffer(1)]],
                               device const float *bias [[buffer(2)]],
                               device float *y [[buffer(3)]],
                               constant MinimaxH3F32MM &p [[buffer(4)]],
-                              uint2 tg [[threadgroup_position_in_grid]],
-                              uint lane [[thread_index_in_simdgroup]]) {
-  uint col = tg.x, row = tg.y;
-  if (col >= p.n || row >= p.m) return;
-  device const float *xr = x + row * p.k;
-  device const float *wr = w + col * p.k;
-  float sum = 0.0f;
-  for (uint j = lane; j < p.k; j += MINIMAX_H3_SIMD_WIDTH) sum += xr[j] * wr[j];
-  sum = simd_sum(sum);
-  if (lane == 0u) y[row * p.ldy + col] = sum + bias[col];
+                              uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr auto desc =
+      matmul2d_descriptor(MINIMAX_H3_F32MM_TILE_M, MINIMAX_H3_F32MM_TILE_N,
+                          static_cast<int>(dynamic_extent), false, true, false,
+                          matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<MINIMAX_H3_MM_SGROUPS>> op;
+  tensor<device float, dextents<int32_t, 2>, tensor_inline> tx(
+      (device float *)x, dextents<int32_t, 2>(p.k, p.m));
+  tensor<device float, dextents<int32_t, 2>, tensor_inline> tw(
+      (device float *)w, dextents<int32_t, 2>(p.k, p.n));
+  uint m0 = tg.y * MINIMAX_H3_F32MM_TILE_M;
+  uint n0 = tg.x * MINIMAX_H3_F32MM_TILE_N;
+  auto a = tx.slice(0, m0);
+  auto b = tw.slice(0, n0);
+  auto c = op.get_destination_cooperative_tensor<decltype(a), decltype(b),
+                                                 float>();
+  op.run(a, b, c);
+  for (uint16_t i = 0; i < c.get_capacity(); i++)
+    if (c.is_valid_element(i)) {
+      auto at = c.get_multidimensional_index(i);
+      uint col = n0 + at[0], row = m0 + at[1];
+      if (col < p.n && row < p.m)
+        y[(ulong)row * p.ldy + col] = c[i] + bias[col];
+    }
 }
 
 // Evaluates a pruned curve-form AdaLN linear layer on num_t rank-8 time

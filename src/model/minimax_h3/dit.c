@@ -105,8 +105,9 @@ static constexpr uint32_t OFF_SHIFT_MSA = 0 * DIT_DIM,
 // Threadgroup and tile sizes matching minimax_h3_quant.metal and
 // minimax_h3_dit.metal.
 static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
-                          CONVROT_THREADS = 256, NORM_THREADS = 256,
-                          HEADS_THREADS = 64, F32MM_THREADS = 32,
+                          F32MM_TILE_M = 64, F32MM_TILE_N = 32,
+                          F32MM_THREADS = 128, CONVROT_THREADS = 256,
+                          NORM_THREADS = 256, HEADS_THREADS = 64,
                           ELEM_THREADS = 256, GRID2D_THREADS = 32;
 
 // Parameters passed to minimax_h3_x_bf16.
@@ -1034,6 +1035,24 @@ static void run_convrot_linear(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
   run_convrot_linear_at(dit, cmd, x, 0, xq, xscale, lin, y, 0, rows);
 }
 
+// Encodes one tiled FP32 matmul with bias into cmd.
+static void run_f32_mm(const MinimaxH3Dit *dit, GpuCommandBuffer *cmd,
+                       const Buf *w, size_t w_off, const Buf *x, size_t x_off,
+                       const Buf *b, size_t b_off, const Buf *y, size_t y_off,
+                       int rows, int out_dim, int in_dim) {
+  F32MMParam ep = {(uint32_t)rows, (uint32_t)out_dim, (uint32_t)in_dim,
+                   (uint32_t)out_dim};
+  gpu_select_kernel(cmd, dit->k_mm_f32);
+  gpu_bind_buffer(cmd, 0, w, w_off);
+  gpu_bind_buffer(cmd, 1, x, x_off);
+  gpu_bind_buffer(cmd, 2, b, b_off);
+  gpu_bind_buffer(cmd, 3, y, y_off);
+  gpu_copy_bytes(cmd, 4, &ep, sizeof ep);
+  gpu_run_kernel(cmd, ((uint32_t)out_dim + F32MM_TILE_N - 1) / F32MM_TILE_N,
+                 ((uint32_t)rows + F32MM_TILE_M - 1) / F32MM_TILE_M, 1,
+                 F32MM_THREADS, 1, 1);
+}
+
 // Picks how many 64-row tiles to dispatch in one contended command buffer from
 // remaining tiles, the remaining measured turn budget in seconds, and the last
 // measured GPU seconds per tile. Runs at least 1 tile and at most remaining.
@@ -1110,17 +1129,9 @@ static int run_f32_linear_sliced(const MinimaxH3Dit *dit, const Buf *w,
     if (row0 + slice_rows > rows) slice_rows = rows - row0;
     size_t x_off = x_base_off + (size_t)row0 * (size_t)in_dim * sizeof(float);
     size_t y_off = y_base_off + (size_t)row0 * (size_t)out_dim * sizeof(float);
-    F32MMParam ep = {(uint32_t)slice_rows, (uint32_t)out_dim, (uint32_t)in_dim,
-                     (uint32_t)out_dim};
     GpuCommandBuffer cmd = gpu_begin(dit->gpu);
-    gpu_select_kernel(&cmd, dit->k_mm_f32);
-    gpu_bind_buffer(&cmd, 0, w, w_off);
-    gpu_bind_buffer(&cmd, 1, x, x_off);
-    gpu_bind_buffer(&cmd, 2, b, b_off);
-    gpu_bind_buffer(&cmd, 3, y, y_off);
-    gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-    gpu_run_kernel(&cmd, (uint32_t)out_dim, (uint32_t)slice_rows, 1,
-                   F32MM_THREADS, 1, 1);
+    run_f32_mm(dit, &cmd, w, w_off, x, x_off, b, b_off, y, y_off, slice_rows,
+               out_dim, in_dim);
     double t0 = now();
     gpu_commit(&cmd);
     minimax_h3_gpu_wait(dit->gpu, cmd.number);
@@ -1747,16 +1758,9 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
     uint64_t prev_cmd = 0;
     if (!minimax_h3_hooks_contended(hooks)) {
       GpuCommandBuffer cmd = gpu_begin(dit->gpu);
-      F32MMParam ep = {(uint32_t)total_vis, (uint32_t)DIT_DIM,
-                       (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
-      gpu_select_kernel(&cmd, dit->k_mm_f32);
-      gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
-      gpu_bind_buffer(&cmd, 1, &ws.patch_in, 0);
-      gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
-      gpu_bind_buffer(&cmd, 3, &ws.h, text_bytes);
-      gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-      gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)total_vis, 1,
-                     F32MM_THREADS, 1, 1);
+      run_f32_mm(dit, &cmd, &dit->patch_proj_w, 0, &ws.patch_in, 0,
+                 &dit->patch_proj_b, 0, &ws.h, text_bytes, total_vis, DIT_DIM,
+                 DIT_PATCH_DIM);
       gpu_commit(&cmd);
       prev_cmd = cmd.number;
     } else if (!run_f32_linear_sliced(dit, &dit->patch_proj_w, 0, &ws.patch_in,
@@ -1801,16 +1805,9 @@ int minimax_h3_dit_sample(MinimaxH3Dit *dit, const Buf *text_hidden,
       gpu_copy_bytes(&cmd, 5, &final_norm_p, sizeof final_norm_p);
       gpu_run_kernel(&cmd, (uint32_t)target_patches, 1, 1, NORM_THREADS, 1, 1);
 
-      F32MMParam fp = {(uint32_t)target_patches, (uint32_t)DIT_PATCH_DIM,
-                       (uint32_t)DIT_DIM, (uint32_t)DIT_PATCH_DIM};
-      gpu_select_kernel(&cmd, dit->k_mm_f32);
-      gpu_bind_buffer(&cmd, 0, &dit->pdd_w, pdd_w_off);
-      gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
-      gpu_bind_buffer(&cmd, 2, &dit->pdd_b, pdd_b_off);
-      gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
-      gpu_copy_bytes(&cmd, 4, &fp, sizeof fp);
-      gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM, (uint32_t)target_patches, 1,
-                     F32MM_THREADS, 1, 1);
+      run_f32_mm(dit, &cmd, &dit->pdd_w, pdd_w_off, &ws.norm, 0, &dit->pdd_b,
+                 pdd_b_off, &ws.patch_out, 0, target_patches, DIT_PATCH_DIM,
+                 DIT_DIM);
 
       gpu_commit(&cmd);
       minimax_h3_gpu_wait(dit->gpu, prev_cmd);
@@ -2448,32 +2445,17 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
             seg.kind == MINIMAX_H3_SEG_VIDEO) {
           size_t p_off =
               (size_t)v_cursor * (size_t)DIT_PATCH_DIM * sizeof(float);
-          F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
-                           (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM};
-          gpu_select_kernel(&cmd, dit->k_mm_f32);
-          gpu_bind_buffer(&cmd, 0, &dit->patch_proj_w, 0);
-          gpu_bind_buffer(&cmd, 1, &ws.patch_in, p_off);
-          gpu_bind_buffer(&cmd, 2, &dit->patch_proj_b, 0);
-          gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
-          gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-          gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
-                         F32MM_THREADS, 1, 1);
+          run_f32_mm(dit, &cmd, &dit->patch_proj_w, 0, &ws.patch_in, p_off,
+                     &dit->patch_proj_b, 0, &ws.h, h_off, seg.count, DIT_DIM,
+                     DIT_PATCH_DIM);
           v_cursor += seg.count;
         } else {
           size_t a_off = (size_t)a_cursor *
                          (size_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS *
                          sizeof(float);
-          F32MMParam ep = {(uint32_t)seg.count, (uint32_t)DIT_DIM,
-                           (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                           (uint32_t)DIT_DIM};
-          gpu_select_kernel(&cmd, dit->k_mm_f32);
-          gpu_bind_buffer(&cmd, 0, &dit->audio_patch_proj_w, 0);
-          gpu_bind_buffer(&cmd, 1, &ws.audio_in, a_off);
-          gpu_bind_buffer(&cmd, 2, &dit->audio_patch_proj_b, 0);
-          gpu_bind_buffer(&cmd, 3, &ws.h, h_off);
-          gpu_copy_bytes(&cmd, 4, &ep, sizeof ep);
-          gpu_run_kernel(&cmd, (uint32_t)DIT_DIM, (uint32_t)seg.count, 1,
-                         F32MM_THREADS, 1, 1);
+          run_f32_mm(dit, &cmd, &dit->audio_patch_proj_w, 0, &ws.audio_in,
+                     a_off, &dit->audio_patch_proj_b, 0, &ws.h, h_off,
+                     seg.count, DIT_DIM, MINIMAX_H3_AUDIO_LATENT_CHANNELS);
           a_cursor += seg.count;
         }
       }
@@ -2543,18 +2525,9 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
       gpu_run_kernel(&cmd, (uint32_t)layout.target_video_rows, 1, 1,
                      NORM_THREADS, 1, 1);
 
-      F32MMParam fvp = {(uint32_t)layout.target_video_rows,
-                        (uint32_t)DIT_PATCH_DIM, (uint32_t)DIT_DIM,
-                        (uint32_t)DIT_PATCH_DIM};
-      gpu_select_kernel(&cmd, dit->k_mm_f32);
-      gpu_bind_buffer(&cmd, 0, &dit->pdd_w, 0);
-      gpu_bind_buffer(&cmd, 1, &ws.norm, 0);
-      gpu_bind_buffer(&cmd, 2, &dit->pdd_b, 0);
-      gpu_bind_buffer(&cmd, 3, &ws.patch_out, 0);
-      gpu_copy_bytes(&cmd, 4, &fvp, sizeof fvp);
-      gpu_run_kernel(&cmd, (uint32_t)DIT_PATCH_DIM,
-                     (uint32_t)layout.target_video_rows, 1, F32MM_THREADS, 1,
-                     1);
+      run_f32_mm(dit, &cmd, &dit->pdd_w, 0, &ws.norm, 0, &dit->pdd_b, 0,
+                 &ws.patch_out, 0, layout.target_video_rows, DIT_PATCH_DIM,
+                 DIT_DIM);
 
       // Modulate and project target audio velocity.
       gpu_select_kernel(&cmd, dit->k_norm_mod);
@@ -2567,19 +2540,10 @@ int minimax_h3_dit_sample_video(MinimaxH3Dit *dit,
       gpu_run_kernel(&cmd, (uint32_t)layout.target_audio_rows, 1, 1,
                      NORM_THREADS, 1, 1);
 
-      F32MMParam fap = {(uint32_t)layout.target_audio_rows,
-                        (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                        (uint32_t)DIT_DIM,
-                        (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS};
-      gpu_select_kernel(&cmd, dit->k_mm_f32);
-      gpu_bind_buffer(&cmd, 0, &dit->audio_out_w, 0);
-      gpu_bind_buffer(&cmd, 1, &ws.norm, audio_norm_off);
-      gpu_bind_buffer(&cmd, 2, &dit->audio_out_b, 0);
-      gpu_bind_buffer(&cmd, 3, &ws.audio_out, 0);
-      gpu_copy_bytes(&cmd, 4, &fap, sizeof fap);
-      gpu_run_kernel(&cmd, (uint32_t)MINIMAX_H3_AUDIO_LATENT_CHANNELS,
-                     (uint32_t)layout.target_audio_rows, 1, F32MM_THREADS, 1,
-                     1);
+      run_f32_mm(dit, &cmd, &dit->audio_out_w, 0, &ws.norm, audio_norm_off,
+                 &dit->audio_out_b, 0, &ws.audio_out, 0,
+                 layout.target_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS,
+                 DIT_DIM);
 
       gpu_commit(&cmd);
       minimax_h3_gpu_wait(dit->gpu, prev_cmd);

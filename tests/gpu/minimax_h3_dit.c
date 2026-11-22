@@ -19,7 +19,8 @@ static constexpr int DIT_HEADS = 56, DIT_HEAD_DIM = 128,
 
 // Tile padding, threadgroup sizes and tolerances.
 static constexpr uint32_t TILE_M = 64, TILE_N = 64, MM_THREADS = 128,
-                          F32MM_THREADS = 32, NORM_THREADS = 256,
+                          F32MM_TILE_M = 64, F32MM_TILE_N = 32,
+                          F32MM_THREADS = 128, NORM_THREADS = 256,
                           HEADS_THREADS = 64, ELEM_THREADS = 256,
                           GRID2D_THREADS = 32;
 static constexpr float NORM_EPS = 1e-5f, FP32_TOL = 1e-4f, BF16_TOL = 5e-2f;
@@ -185,22 +186,32 @@ static void test_mm_bf16(Gpu *gpu, MemorySlot *slot) {
         "minimax_h3_mm_bf16 matches CPU reference with and without bias");
 }
 
-// Tests minimax_h3_mm_f32 for both patch-embed and PDD output shapes.
+// Tests minimax_h3_mm_f32 across patch-embed, PDD output, multi-tile and odd
+// shapes with NaN guard tails past the input buffers.
 static void test_mm_f32(Gpu *gpu, MemorySlot *slot) {
   int k_mm = gpu_find_kernel(gpu, "minimax_h3_mm_f32");
-  static const int shapes[2][3] = {{17, 96, 128}, {11, 128, 96}};
+  static const int shapes[5][3] = {
+      {17, 96, 128}, {11, 128, 96}, {1, 32, 32}, {65, 32, 96}, {73, 19, 37}};
   uint32_t rng = 0x55aa1234u;
   float worst = 0.0f;
+  int all_finite = 1;
 
-  for (int si = 0; si < 2; si++) {
+  for (int si = 0; si < 5; si++) {
     int m = shapes[si][0], k = shapes[si][1], n = shapes[si][2];
-    Buf w = gpu_alloc(gpu, slot, (size_t)n * (size_t)k * sizeof(float));
-    Buf x = gpu_alloc(gpu, slot, (size_t)m * (size_t)k * sizeof(float));
+    size_t guard = 64u * (size_t)k;
+    Buf w =
+        gpu_alloc(gpu, slot, ((size_t)n * (size_t)k + guard) * sizeof(float));
+    Buf x =
+        gpu_alloc(gpu, slot, ((size_t)m * (size_t)k + guard) * sizeof(float));
     Buf b = gpu_alloc(gpu, slot, (size_t)n * sizeof(float));
     Buf y = gpu_alloc(gpu, slot, (size_t)m * (size_t)n * sizeof(float));
     float *wp = (float *)w.ptr, *xp = (float *)x.ptr, *bp = (float *)b.ptr;
     for (int i = 0; i < n * k; i++) wp[i] = 0.5f * rng_float(&rng);
     for (int i = 0; i < m * k; i++) xp[i] = 0.5f * rng_float(&rng);
+    for (size_t i = 0; i < guard; i++) {
+      wp[(size_t)n * (size_t)k + i] = NAN;
+      xp[(size_t)m * (size_t)k + i] = NAN;
+    }
     for (int i = 0; i < n; i++) bp[i] = rng_float(&rng);
 
     F32MMParam p = {(uint32_t)m, (uint32_t)n, (uint32_t)k, (uint32_t)n};
@@ -211,7 +222,9 @@ static void test_mm_f32(Gpu *gpu, MemorySlot *slot) {
     gpu_bind_buffer(&cmd, 2, &b, 0);
     gpu_bind_buffer(&cmd, 3, &y, 0);
     gpu_copy_bytes(&cmd, 4, &p, sizeof p);
-    gpu_run_kernel(&cmd, (uint32_t)n, (uint32_t)m, 1, F32MM_THREADS, 1, 1);
+    gpu_run_kernel(&cmd, ((uint32_t)n + F32MM_TILE_N - 1) / F32MM_TILE_N,
+                   ((uint32_t)m + F32MM_TILE_M - 1) / F32MM_TILE_M, 1,
+                   F32MM_THREADS, 1, 1);
     gpu_commit(&cmd);
     gpu_sync(gpu);
 
@@ -220,7 +233,9 @@ static void test_mm_f32(Gpu *gpu, MemorySlot *slot) {
       for (int c = 0; c < n; c++) {
         float ref = bp[c];
         for (int j = 0; j < k; j++) ref += xp[r * k + j] * wp[c * k + j];
-        float d = fabsf(yp[r * n + c] - ref);
+        float got = yp[r * n + c];
+        if (!isfinite(got)) all_finite = 0;
+        float d = fabsf(got - ref);
         if (d > worst) worst = d;
       }
     }
@@ -230,7 +245,8 @@ static void test_mm_f32(Gpu *gpu, MemorySlot *slot) {
     gpu_free(&x);
     gpu_free(&w);
   }
-  check(worst < FP32_TOL, "minimax_h3_mm_f32 matches CPU reference");
+  check(all_finite && worst < FP32_TOL,
+        "minimax_h3_mm_f32 matches CPU reference across tiled and odd shapes");
 }
 
 // Tests minimax_h3_dit_adaln (F16 weight + BF16 and F16 bias, 2 timesteps).

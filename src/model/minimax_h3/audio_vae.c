@@ -51,6 +51,7 @@ static constexpr int DEC_WORK_BUFS = 6, ENC_WORK_BUFS = 3, ENC_SMALL_BUFS = 4;
 // Metal kernel dispatch parameters matching
 // src/kernels/minimax_h3_audio_vae.metal.
 static constexpr uint32_t SIMD_W = 32, CONV_TILE_CO = 32, CONV_THREADS = 128,
+                          LIN_TILE_M = 64, LIN_TILE_N = 32, LIN_THREADS = 128,
                           ACT_TILE_T = 256, ELEM_THREADS = 64, TRANS_TILE = 16,
                           NORM_THREADS_WIDE = 256, NORM_THREADS_NARROW = 32,
                           ATTN_THREADS = 256;
@@ -457,7 +458,8 @@ static void enc_linear(const MinimaxH3AudioVae *vae, GpuCommandBuffer *cmd,
   gpu_bind_buffer(cmd, 3, res_buf, 0);
   gpu_bind_buffer(cmd, 4, y, 0);
   gpu_copy_bytes(cmd, 5, &p, sizeof p);
-  gpu_run_kernel(cmd, (uint32_t)lin->n, rows, 1, SIMD_W, 1, 1);
+  gpu_run_kernel(cmd, ceil_div((uint32_t)lin->n, LIN_TILE_N),
+                 ceil_div(rows, LIN_TILE_M), 1, LIN_THREADS, 1, 1);
 }
 
 // Registers all BigVGAN decoder weights into vae->dec_weights.

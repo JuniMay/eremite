@@ -11,6 +11,7 @@
 
 // GPU dispatch tile widths matching src/kernels/minimax_h3_audio_vae.metal.
 static constexpr uint32_t SIMD_W = 32, CONV_TILE_CO = 32, CONV_THREADS = 128,
+                          LIN_TILE_M = 64, LIN_TILE_N = 32, LIN_THREADS = 128,
                           ACT_TILE_T = 256, ACT_K = 12, ACT_RATIO = 2,
                           ACT_UP_PAD = 5, ACT_UP_CROP = 15, ACT_DOWN_PAD_L = 5,
                           ACT_DOWN_PAD_R = 6, ATTN_HEADS = 8,
@@ -485,7 +486,8 @@ static void test_helpers_and_causal_attn(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 3, &bres, 0);
   gpu_bind_buffer(&cmd, 4, &blin, 0);
   gpu_copy_bytes(&cmd, 5, &lp, sizeof lp);
-  gpu_run_kernel(&cmd, out_n, rows, 1, SIMD_W, 1, 1);
+  gpu_run_kernel(&cmd, ceil_div(out_n, LIN_TILE_N), ceil_div(rows, LIN_TILE_M),
+                 1, LIN_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
   int lin_ok = 1;
@@ -498,6 +500,42 @@ static void test_helpers_and_causal_attn(Gpu *gpu, MemorySlot *slot) {
     }
   }
   check(lin_ok, "linear_f32 with bias and residual matches");
+
+  // Multi-tile linear_f32 crossing both 64-row and 32-col tile boundaries.
+  const uint32_t m2 = 73, n2 = 71, k2 = 64;
+  Buf bx2 = gpu_alloc(gpu, slot, (size_t)m2 * k2 * sizeof(float));
+  Buf bw2 = gpu_alloc(gpu, slot, (size_t)n2 * k2 * sizeof(float));
+  Buf by2 = gpu_alloc(gpu, slot, (size_t)m2 * n2 * sizeof(float));
+  float *x2 = (float *)bx2.ptr, *w2 = (float *)bw2.ptr, *y2 = (float *)by2.ptr;
+  for (uint32_t i = 0; i < m2 * k2; i++) x2[i] = rng_float(&rng);
+  for (uint32_t i = 0; i < n2 * k2; i++) w2[i] = rng_float(&rng) * 0.5f;
+  AudioLinearParam lp2 = {m2, n2, k2, 0, 0};
+  cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_lin);
+  gpu_bind_buffer(&cmd, 0, &bx2, 0);
+  gpu_bind_buffer(&cmd, 1, &bw2, 0);
+  gpu_bind_buffer(&cmd, 2, &bbias, 0);
+  gpu_bind_buffer(&cmd, 3, &bres, 0);
+  gpu_bind_buffer(&cmd, 4, &by2, 0);
+  gpu_copy_bytes(&cmd, 5, &lp2, sizeof lp2);
+  gpu_run_kernel(&cmd, ceil_div(n2, LIN_TILE_N), ceil_div(m2, LIN_TILE_M), 1,
+                 LIN_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+  int lin2_ok = 1;
+  for (uint32_t r = 0; r < m2; r++) {
+    for (uint32_t cl = 0; cl < n2; cl++) {
+      float acc = 0.0f;
+      for (uint32_t ki = 0; ki < k2; ki++)
+        acc += x2[r * k2 + ki] * w2[cl * k2 + ki];
+      if (!isfinite(y2[r * n2 + cl]) || fabsf(y2[r * n2 + cl] - acc) > FP32_TOL)
+        lin2_ok = 0;
+    }
+  }
+  check(lin2_ok, "linear_f32 multi-tile without bias/residual matches");
+  gpu_free(&by2);
+  gpu_free(&bw2);
+  gpu_free(&bx2);
 
   AudioGeGluParam gp = {total};
   cmd = gpu_begin(gpu);
