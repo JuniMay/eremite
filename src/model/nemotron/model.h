@@ -41,6 +41,7 @@ static constexpr int NEMO_MOE_INTER = 1856;
 static constexpr int NEMO_SHARED_INTER = 3712;
 static constexpr int NEMO_NVFP4_BLOCK = 16;
 static constexpr int NEMO_MAX_BATCH_ROWS = 8;
+static constexpr int NEMO_MAX_VERIFY = 16;
 
 // One grouped-expert work tile matching NemoMoeTile in nemotron.metal.
 typedef struct {

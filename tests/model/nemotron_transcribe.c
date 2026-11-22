@@ -223,15 +223,23 @@ int main(int argc, char **argv) {
   eremite_state_free(m, st2);
   free(ref_logits);
 
-  // Greedy decode full transcript from st.
+  // Capture prompt-end snapshot before greedy decoding so verify()+accept() can
+  // be checked against sequential 1-token decode from the identical state.
+  eremite_snapshot *prompt_end_snap = eremite_snapshot_take(m, st, exp_n, NULL);
+  checkf(prompt_end_snap != NULL, "captured prompt-end snapshot");
+
+  // Greedy decode full transcript from st, recording generated tokens and
+  // per-step logits for verify()+accept() equivalence checks.
   char text[TRANSCRIPT_CAP];
   size_t text_len = 0;
   text[0] = '\0';
+  int32_t gen_toks[MAX_GEN_TOKENS];
   int32_t cur_tok = first_tok;
   int32_t cur_pos = exp_n;
   int gen_count = 0;
   double t_dec0 = now();
   while (gen_count < MAX_GEN_TOKENS && !eremite_is_stop_token(m, cur_tok)) {
+    gen_toks[gen_count] = cur_tok;
     size_t blen = 0;
     const char *bytes = eremite_token_bytes(tk, cur_tok, &blen);
     if (bytes && blen > 0 && text_len + blen < sizeof text - 1) {
@@ -246,6 +254,72 @@ int main(int argc, char **argv) {
     gen_count++;
   }
   double dec_s = now() - t_dec0;
+
+  // Verify multi-token verify() + accept() on both MV (count=5 <= 8) and MM
+  // (count=12 > 8) paths, including partial Mamba-2 state rollback after
+  // rejected garbage draft tokens.
+  if (gen_count >= 12) {
+    // 1. MV verify (count=5): 3 true tokens + 2 wrong tokens -> accept(3) ->
+    // verify next decoded token matches gen_toks[3] and its logits match
+    // sequential decode.
+    eremite_state *sv = eremite_state_new(m);
+    eremite_state_copy(m, sv, st, exp_n);
+    eremite_snapshot_restore(m, sv, prompt_end_snap);
+    int32_t vrows5[5] = {gen_toks[0], gen_toks[1], gen_toks[2], 999, 1000};
+    const float *vl5 = eremite_verify(m, sv, vrows5, 5, exp_n);
+    checkf(vl5 != NULL, "verify(count=5) MV path succeeded");
+    int mv_preds_ok =
+        (argmax_token(vl5, vocab) == gen_toks[1] &&
+         argmax_token(vl5 + (size_t)vocab, vocab) == gen_toks[2] &&
+         argmax_token(vl5 + (size_t)2 * vocab, vocab) == gen_toks[3]);
+    checkf(mv_preds_ok,
+           "verify(count=5) predicted exact next tokens for rows 0..2");
+    eremite_accept(m, sv, vrows5, 3, exp_n);
+    int32_t next_tok = gen_toks[3];
+    int32_t next_pos = exp_n + 3;
+    const float *after_rb =
+        eremite_decode_rows(m, &sv, &next_tok, &next_pos, 1);
+    checkf(
+        after_rb != NULL && argmax_token(after_rb, vocab) == gen_toks[4],
+        "partial accept(3/5) rewound Mamba-2 state accurately (next=%d vs %d)",
+        after_rb ? argmax_token(after_rb, vocab) : -1, gen_toks[4]);
+
+    // 2. MM verify (count=12 > 8): 4 true tokens + 8 wrong tokens -> accept(4)
+    // -> verify subsequent decode matches gen_toks[5], then full accept(7/7).
+    eremite_state_copy(m, sv, st, exp_n);
+    eremite_snapshot_restore(m, sv, prompt_end_snap);
+    int32_t vrows12[12];
+    for (int i = 0; i < 4; i++) vrows12[i] = gen_toks[i];
+    for (int i = 4; i < 12; i++) vrows12[i] = 500 + i;
+    const float *vl12 = eremite_verify(m, sv, vrows12, 12, exp_n);
+    checkf(vl12 != NULL, "verify(count=12) MM path succeeded");
+    int mm_preds_ok =
+        (argmax_token(vl12, vocab) == gen_toks[1] &&
+         argmax_token(vl12 + (size_t)vocab, vocab) == gen_toks[2] &&
+         argmax_token(vl12 + (size_t)2 * vocab, vocab) == gen_toks[3] &&
+         argmax_token(vl12 + (size_t)3 * vocab, vocab) == gen_toks[4]);
+    checkf(mm_preds_ok,
+           "verify(count=12) predicted exact next tokens for rows 0..3");
+    eremite_accept(m, sv, vrows12, 4, exp_n);
+    int32_t p4 = exp_n + 4;
+    const float *vl_full = eremite_verify(m, sv, &gen_toks[4], 7, p4);
+    checkf(vl_full != NULL &&
+               argmax_token(vl_full + (size_t)6 * vocab, vocab) == gen_toks[11],
+           "post-MM-rewind full verify(7) matches sequential decode (tok=%d vs "
+           "%d)",
+           vl_full ? argmax_token(vl_full + (size_t)6 * vocab, vocab) : -1,
+           gen_toks[11]);
+    eremite_accept(m, sv, &gen_toks[4], 7, p4);
+    int32_t t11 = gen_toks[11];
+    int32_t p11 = exp_n + 11;
+    const float *after_full = eremite_decode_rows(m, &sv, &t11, &p11, 1);
+    int32_t expect12 = gen_count > 12 ? gen_toks[12] : cur_tok;
+    checkf(after_full != NULL && argmax_token(after_full, vocab) == expect12,
+           "full accept(7/7) leaves Mamba-2+KV state exact (tok=%d vs %d)",
+           after_full ? argmax_token(after_full, vocab) : -1, expect12);
+    eremite_state_free(m, sv);
+  }
+  eremite_snapshot_free(m, prompt_end_snap);
 
   eremite_refresh_stats();
   eremite_stats stats = {0};
