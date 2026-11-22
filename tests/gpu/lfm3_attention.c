@@ -193,8 +193,9 @@ static void check_attention(const Layout *l, int first, int block_rows,
   gpu_bind_buffer(&c, 2, &vh, 0), gpu_bind_buffer(&c, 3, &gates, 0);
   gpu_bind_buffer(&c, 4, &groups, 0), gpu_bind_buffer(&c, 5, &spans, 0);
   gpu_bind_buffer(&c, 6, &out, 0), gpu_copy_bytes(&c, 7, &p, sizeof p);
-  gpu_run_kernel(&c, (uint32_t)(block_rows + TILE_ROWS - 1) / TILE_ROWS,
-                 QUERY_HEADS, 1, THREADS, 1, 1);
+  gpu_run_kernel(
+      &c, ((uint32_t)(block_rows + TILE_ROWS - 1) / TILE_ROWS) * QUERY_HEADS, 1,
+      1, THREADS, 1, 1);
   gpu_commit(&c);
   gpu_sync(gpu);
   // The probabilities' rounding to BF16 changes an output by about 2^-9 of

@@ -705,8 +705,9 @@ static void run_attention(GpuCommandBuffer *c, const Layer *y, PassBuffers *b,
     gpu_bind_buffer(c, 3, &b->gates, (size_t)first * LFM3_HEADS * 4);
     gpu_bind_buffer(c, 4, &b->groups, 0), gpu_bind_buffer(c, 5, &b->spans, 0);
     gpu_bind_buffer(c, 6, &b->out, 0), gpu_copy_bytes(c, 7, &a, sizeof a);
-    gpu_run_kernel(c, (uint32_t)(m + ATTEND_ROWS - 1) / ATTEND_ROWS, LFM3_HEADS,
-                   1, ATTEND_THREADS, 1, 1);
+    gpu_run_kernel(c,
+                   ((uint32_t)(m + ATTEND_ROWS - 1) / ATTEND_ROWS) * LFM3_HEADS,
+                   1, 1, ATTEND_THREADS, 1, 1);
     multiply(c, &y->o, m, &b->out, 0, LFM3_DIM, &b->projected, 0, LFM3_DIM);
     add_normalized(c, &b->x, row_bytes(first), &b->projected,
                    &y->post_operator_norm, m);
@@ -975,8 +976,9 @@ static void run_vision_layer(GpuCommandBuffer *c, const VisionLayer *y,
     gpu_bind_buffer(c, 0, &b->qh, 0), gpu_bind_buffer(c, 1, &b->kh, 0);
     gpu_bind_buffer(c, 2, &b->vh, 0), gpu_bind_buffer(c, 3, &b->out, 0);
     gpu_copy_bytes(c, 4, &a, sizeof a);
-    gpu_run_kernel(c, (uint32_t)(n + ATTEND_ROWS - 1) / ATTEND_ROWS,
-                   LFM3_VISION_HEADS, 1, ATTEND_THREADS, 1, 1);
+    gpu_run_kernel(
+        c, ((uint32_t)(n + ATTEND_ROWS - 1) / ATTEND_ROWS) * LFM3_VISION_HEADS,
+        1, 1, ATTEND_THREADS, 1, 1);
   } else {
     multiply(c, &y->in_proj, n, &b->normed, 0, width, &b->bcx, 0, 3 * width);
     VisionConvParams p = {(uint32_t)width, (uint32_t)grid_w, (uint32_t)grid_h};

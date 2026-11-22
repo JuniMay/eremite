@@ -18,10 +18,6 @@ constant constexpr uint LFM3_VISION_HEAD_DIM = 64, LFM3_VISION_PAIRS = LFM3_VISI
 // side of the convolution's filter (conv_kernel_size).
 constant constexpr uint LFM3_VISION_MERGE = 2, LFM3_VISION_ROW_PAIRS = LFM3_VISION_PAIRS / 2,
                         LFM3_VISION_FILTER = 3;
-// lfm3_vision_attend's tiles: a simdgroup takes 16 query rows, over blocks of
-// 64 keys; a threadgroup's 4 simdgroups take 64 query rows.
-constant constexpr uint LFM3_VISION_TILE_ROWS = 16, LFM3_VISION_KEY_BLOCK = 64,
-                        LFM3_VISION_TILE_SIMDGROUPS = 4;
 
 // What lfm3_vision_conv needs: the channels, and the grid's columns and rows
 // of patches.
@@ -124,84 +120,87 @@ kernel void lfm3_vision_heads(device const float *q [[buffer(0)]], device const 
 
 // Attention of every patch over every patch of its image, both ways; query
 // head h reads key head h / LFM3_VISION_SHARING, and the scores are scaled by
-// 1 / sqrt(64). Each simdgroup takes 16 query rows on its own, over blocks of
-// 64 keys: the scores and an online softmax are FP32, the probabilities are
-// rounded to BF16 for their product with the values, and the outputs add up in
-// FP32. Scores and probabilities pass through threadgroup memory, a row of 64
-// per query row; two lanes take each row, 32 keys each. qh, kh and vh hold
-// padded rows per head, with zeros in at least 64 rows after the image's. o:
-// the image's patches, one row of 64 per query head.
+// 1 / sqrt(64). Dispatched as a 1D head-coherent grid (ceil(rows / 64) * 16)
+// so concurrent threadgroups share each KV head in cache. All 4 simdgroups
+// cooperate on one 64x64 tile using exact 16 KiB shared threadgroup memory.
+// qh, kh and vh hold padded rows per head, with zeros in at least 64 rows
+// after the image's. o: the image's patches, one row of 64 per query head.
 kernel void lfm3_vision_attend(device const bfloat *qh [[buffer(0)]], device const bfloat *kh [[buffer(1)]],
                                device const bfloat *vh [[buffer(2)]], device float *o [[buffer(3)]],
                                constant Lfm3VisionAttend &p [[buffer(4)]],
-                               uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                               uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-  constexpr uint rows = LFM3_VISION_TILE_ROWS, keys = LFM3_VISION_KEY_BLOCK, half_keys = keys / 2,
-                 dim = LFM3_VISION_HEAD_DIM;
-  threadgroup float scores[LFM3_VISION_TILE_SIMDGROUPS][rows * keys], rescales[LFM3_VISION_TILE_SIMDGROUPS][rows],
-      sums[LFM3_VISION_TILE_SIMDGROUPS][rows];
-  threadgroup bfloat probabilities[LFM3_VISION_TILE_SIMDGROUPS][rows * keys];
-  threadgroup float *ss = scores[sg], *rescale = rescales[sg], *sum = sums[sg];
-  threadgroup bfloat *ps = probabilities[sg];
-  uint h = tg.y, kv = h / LFM3_VISION_SHARING, first = (tg.x * LFM3_VISION_TILE_SIMDGROUPS + sg) * rows;
-  if (first >= p.rows) return;
-  const float scale = rsqrt(float(dim));
-  constexpr auto sdesc = matmul2d_descriptor(rows, keys, dim, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr uint BQ = FLASH_ATTN_64_TILE, BK = FLASH_ATTN_64_TILE, dim = LFM3_VISION_HEAD_DIM;
+  threadgroup FlashAttn64Smem<bfloat> smem;
+
+  uint q_tiles = (p.rows + BQ - 1u) / BQ;
+  uint h = tg / q_tiles, kv = h / LFM3_VISION_SHARING;
+  uint q0 = (tg % q_tiles) * BQ;
+  if (q0 >= p.rows) return;
+  bool full_q = q0 + BQ <= p.rows;
+  const float scale_log2 = rsqrt(float(dim)) * M_LOG2E_F;
+
+  constexpr auto sdesc = matmul2d_descriptor(BQ, BK, dim, false, true, false, matmul2d_descriptor::mode::multiply);
   constexpr auto odesc =
-      matmul2d_descriptor(rows, dim, keys, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<sdesc, execution_simdgroup> sop;
-  matmul2d<odesc, execution_simdgroup> oop;
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq((device bfloat *)qh + h * p.padded * dim,
-                                                                dextents<int32_t, 2>(dim, p.padded));
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk((device bfloat *)kh + kv * p.padded * dim,
-                                                                dextents<int32_t, 2>(dim, p.padded));
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv((device bfloat *)vh + kv * p.padded * dim,
-                                                                dextents<int32_t, 2>(dim, p.padded));
-  tensor<threadgroup bfloat, extents<int32_t, keys, rows>, tensor_inline> tp(ps, extents<int32_t, keys, rows>());
-  auto qt = tq.slice(0, first), kt = tk.slice(0, 0), vt = tv.slice(0, 0);
-  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt), float>();
+      matmul2d_descriptor(BQ, dim, BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> sop;
+  matmul2d<odesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> oop;
+
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq(
+      (device bfloat *)qh + (ulong)h * p.padded * dim, dextents<int32_t, 2>(dim, p.rows));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
+      (device bfloat *)kh + (ulong)kv * p.padded * dim, dextents<int32_t, 2>(dim, p.rows));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
+      (device bfloat *)vh + (ulong)kv * p.padded * dim, dextents<int32_t, 2>(dim, p.rows));
+  tensor<threadgroup bfloat, extents<int32_t, BK, BQ>, tensor_inline> tp(
+      smem.st.probs, extents<int32_t, BK, BQ>());
+
+  auto qt = tq.slice(0, q0), vt0 = tv.slice(0, 0);
+  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
   for (uint16_t i = 0; i < acc.get_capacity(); i++)
-    if (acc.is_valid_element(i)) acc[i] = 0;
-  // Lane pairs: query row lane / 2 of the 16, keys from (lane % 2) * 32 of 64.
-  uint row = lane / 2, column = (lane % 2) * half_keys;
-  float running_max = -INFINITY, running_sum = 0;
-  for (uint k0 = 0; k0 < p.rows; k0 += keys) {
-    kt = tk.slice(0, k0), vt = tv.slice(0, k0);
+    if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+  float rmax = -INFINITY, rsum = 0.0f;
+  for (uint k0 = 0; k0 < p.rows; k0 += BK) {
+    auto kt = tk.slice(0, k0), vt = tv.slice(0, k0);
     auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
     sop.run(qt, kt, sc);
-    for (uint16_t i = 0; i < sc.get_capacity(); i++)
-      if (sc.is_valid_element(i)) {
-        auto at = sc.get_multidimensional_index(i);
-        ss[at[1] * keys + at[0]] = k0 + at[0] < p.rows ? sc[i] * scale : -INFINITY;
-      }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup float *own = ss + row * keys + column;
-    float block_max = -INFINITY;
-    for (uint c = 0; c < half_keys; c++) block_max = max(block_max, own[c]);
-    block_max = max(block_max, simd_shuffle_xor(block_max, 1));
-    float new_max = max(running_max, block_max);
-    float old_scale = running_max == -INFINITY ? 0.0f : exp(running_max - new_max), block_sum = 0;
-    for (uint c = 0; c < half_keys; c++) {
-      float e = own[c] == -INFINITY ? 0.0f : exp(own[c] - new_max);
-      ps[row * keys + column + c] = bfloat(e);
-      block_sum += e;
+    bool full_tile = full_q && (k0 + BK <= p.rows);
+    if (full_tile) {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          smem.scores[at[1] * BK + at[0]] = sc[i] * scale_log2;
+        }
+    } else {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          bool seen = (q0 + at[1] < p.rows) && (k0 + at[0] < p.rows);
+          smem.scores[at[1] * BK + at[0]] = seen ? sc[i] * scale_log2 : -INFINITY;
+        }
     }
-    block_sum += simd_shuffle_xor(block_sum, 1);
-    running_sum = running_sum * old_scale + block_sum, running_max = new_max;
-    if (lane % 2 == 0) rescale[row] = old_scale;
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint16_t i = 0; i < acc.get_capacity(); i++)
-      if (acc.is_valid_element(i)) acc[i] *= rescale[acc.get_multidimensional_index(i)[1]];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (flash_attn_64x64_softmax(smem, sg, lane, !full_tile, rmax, rsum)) {
+      for (uint16_t i = 0; i < acc.get_capacity(); i++)
+        if (acc.is_valid_element(i))
+          acc[i] *= smem.st.row_scale[acc.get_multidimensional_index(i)[1]];
+    }
     oop.run(tp, vt, acc);
-    simdgroup_barrier(mem_flags::mem_threadgroup);  // the next block rewrites the rows' values
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (lane % 2 == 0) sum[row] = running_sum;
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint row = sg * FLASH_ATTN_64_ROWS_PER_SG + (lane >> 1u);
+  if ((lane & 1u) == 0u) smem.st.row_scale[row] = 1.0f / rsum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint16_t i = 0; i < acc.get_capacity(); i++)
     if (acc.is_valid_element(i)) {
       auto at = acc.get_multidimensional_index(i);
-      uint out_row = first + at[1];
-      if (out_row < p.rows) o[out_row * LFM3_VISION_QUERY_WIDTH + h * dim + at[0]] = acc[i] / sum[at[1]];
+      uint out_row = q0 + at[1];
+      if (out_row < p.rows)
+        o[(ulong)out_row * LFM3_VISION_QUERY_WIDTH + h * dim + at[0]] =
+            acc[i] * smem.st.row_scale[at[1]];
     }
 }
 
