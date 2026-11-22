@@ -23,8 +23,8 @@ static constexpr uint32_t HEADS = 24, KV_HEADS = 8, GQA = HEADS / KV_HEADS,
 static constexpr uint32_t ROW_THREADS = 256, QKVR_THREADS = 128,
                           QKVR_HEADS = HEADS + 2 * KV_HEADS + HEADS,
                           DECODE_THREADS = 128, COMBINE_THREADS = 32,
-                          PREFILL_THREADS = 64, PREFILL_Q_GROUP = 32,
-                          Q_PAD = 16, MV_THREADS = 256, MV_ROWS_PER_TG = 32,
+                          PREFILL_THREADS = 128, PREFILL_Q_GROUP = 64,
+                          Q_PAD = 64, MV_THREADS = 256, MV_ROWS_PER_TG = 32,
                           MM_THREADS = 128, MM_TILE = 64, MM_BF16_TILE_N = 64,
                           PART_FLOATS = 130, ELEM_THREADS = 256,
                           ROUTE_THREADS = 128, VEC4_WIDTH = 4, E2M1_MASK = 0xFu,
@@ -691,7 +691,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   int k_pref = gpu_find_kernel(gpu, "ink2_attend_prefill");
 
   uint32_t rng = 0x55aa55aau;
-  uint32_t past = 70, qrows = 37, total = past + qrows;
+  uint32_t past = 70, qrows = 73, total = past + qrows;
   uint32_t q_stride = ((qrows + Q_PAD - 1) / Q_PAD) * Q_PAD;
   uint32_t nparts = 4;
 
@@ -784,8 +784,9 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
          HEADS, qrows, 1, COMBINE_THREADS, 1, 1);
   run_op(&cmd, k_pref,
          (Buf[]){q_hm, k_cache, v_cache, rel_bias, sink, gate, out_pref}, 7,
-         &app, sizeof app, (qrows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP,
-         HEADS, 1, PREFILL_THREADS, 1, 1);
+         &app, sizeof app,
+         ((qrows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
+         PREFILL_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -833,7 +834,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
     uint32_t qpos = past + r;
     for (uint32_t h = 0; h < HEADS; h++) {
       uint32_t kvh = h / GQA;
-      float sc[128], mx = skp[r * HEADS + h];
+      float sc[160], mx = skp[r * HEADS + h];
       for (uint32_t j = 0; j <= qpos; j++) {
         double dotv = 0.0;
         for (uint32_t d = 0; d < HEAD_DIM; d++) {
@@ -874,8 +875,9 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   check_err("ink2_attend_decode global", dec_err, TOL_ATTN);
   check_err("ink2_attend_prefill global", pref_err, TOL_ATTN);
 
-  // Test sliding window with ring wrap-around (pos0 = 1050, ring = 1040).
-  uint32_t ring_rows = WINDOW + 16, sw_pos0 = 1050, sw_rows = 20;
+  // Test sliding window with multi-tile ring wrap-around and NaN in unused
+  // ring slots (pos0 = 1130, ring = 1120, rows = 73).
+  uint32_t ring_rows = WINDOW + 96, sw_pos0 = 1130, sw_rows = 73;
   uint32_t sw_qstride = ((sw_rows + Q_PAD - 1) / Q_PAD) * Q_PAD;
   Buf sw_k =
       gpu_alloc(gpu, slot, (size_t)ring_rows * KV_DIM * sizeof(uint16_t));
@@ -885,6 +887,15 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   for (uint32_t i = 0; i < ring_rows * KV_DIM; i++) {
     swkp[i] = f32_to_bf16(rng_f32(&rng) * 0.8f);
     swvp[i] = f32_to_bf16(rng_f32(&rng) * 0.8f);
+  }
+  // Fill unused ring slots (83..106) with BF16 NaN to prove tail clamping.
+  uint32_t unused_lo = (sw_pos0 + sw_rows) % ring_rows;
+  uint32_t unused_hi = (sw_pos0 + 1 - WINDOW) % ring_rows;
+  for (uint32_t sl = unused_lo; sl < unused_hi; sl++) {
+    for (uint32_t c = 0; c < KV_DIM; c++) {
+      swkp[sl * KV_DIM + c] = 0x7FC0u;
+      swvp[sl * KV_DIM + c] = 0x7FC0u;
+    }
   }
   QkvrParam sw_qp = {.rows = sw_rows,
                      .q_stride = sw_qstride,
@@ -922,8 +933,9 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
          sizeof sw_adp, HEADS, sw_rows, 1, COMBINE_THREADS, 1, 1);
   run_op(&cmd, k_pref,
          (Buf[]){q_hm, sw_k, sw_v, rel_bias, sink, gate, out_pref}, 7, &sw_app,
-         sizeof sw_app, (sw_rows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP,
-         HEADS, 1, PREFILL_THREADS, 1, 1);
+         sizeof sw_app,
+         ((sw_rows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
+         PREFILL_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -933,7 +945,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   check_err("sliding decode vs prefill (ring wrap)", sw_diff, TOL_ATTN);
 
   float sw_cpu_err = 0.0f;
-  uint32_t cr = 19, ch = 7, ckvh = ch / GQA, cqpos = sw_pos0 + cr;
+  uint32_t cr = sw_rows - 1, ch = 7, ckvh = ch / GQA, cqpos = sw_pos0 + cr;
   uint32_t klo = cqpos + 1 - WINDOW;
   float sw_sc[WINDOW], sw_mx = skp[cr * HEADS + ch];
   for (uint32_t j = klo; j <= cqpos; j++) {

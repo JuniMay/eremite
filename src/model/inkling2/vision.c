@@ -36,8 +36,8 @@ static constexpr uint32_t BF16_SHIFT = 16;
 
 // Metal dispatch constants matching src/kernels/inkling2_vision.metal and
 // src/kernels/kernels.metal.
-static constexpr int ATTN_PAD = 16;
-static constexpr int ATTN_Q_GROUP = 32;
+static constexpr int ATTN_PAD = 64;
+static constexpr int ATTN_Q_GROUP = 64;
 static constexpr int MM_TILE_M = 64;
 static constexpr int MM_TILE_N = 64;
 static constexpr uint32_t MM_THREADS = 128;
@@ -45,7 +45,7 @@ static constexpr uint32_t LN_THREADS = 256;
 static constexpr uint32_t ELEM_THREADS = 256;
 static constexpr uint32_t GRID2D_THREADS = 64;
 static constexpr uint32_t HEADS_THREADS = INK2_VIS_ROPE_PAIRS;
-static constexpr uint32_t ATTN_THREADS = 64;
+static constexpr uint32_t ATTN_THREADS = 128;
 static constexpr size_t ALIGN_READ_MIN_BYTES = 1u << 20;
 static constexpr size_t ALIGN_MASK = 15u;
 
@@ -674,8 +674,9 @@ int inkling2_encode_media(Media *im) {
     gpu_bind_buffer(&cmd, 2, &vh_buf, 0);
     gpu_bind_buffer(&cmd, 3, &attn_out, 0);
     gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-    gpu_run_kernel(&cmd, ((uint32_t)seq + ATTN_Q_GROUP - 1u) / ATTN_Q_GROUP,
-                   (uint32_t)INK2_VIS_HEADS, 1, ATTN_THREADS, 1, 1);
+    uint32_t q_tiles = ((uint32_t)seq + ATTN_Q_GROUP - 1u) / ATTN_Q_GROUP;
+    gpu_run_kernel(&cmd, q_tiles * (uint32_t)INK2_VIS_HEADS, 1, 1, ATTN_THREADS,
+                   1, 1);
 
     vis_mm(&cmd, &vl->o_w, &attn_out, 0, &proj_tmp, seq, INK2_VIS_DIM,
            INK2_VIS_DIM, 1);

@@ -50,8 +50,8 @@ static constexpr int START_CAP = 256;
 static constexpr int MAX_DECODE_PARTS = 64;
 static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = INK2_HEAD_DIM + 2;
-static constexpr int PREFILL_Q_PAD = 16;
-static constexpr int PREFILL_Q_GROUP = 32;
+static constexpr int PREFILL_Q_PAD = 64;
+static constexpr int PREFILL_Q_GROUP = 64;
 static constexpr int MM_TILE_M = 64;
 static constexpr int MM_TILE_N = 64;
 static constexpr int MOE_MM_TILE = 64;
@@ -73,7 +73,7 @@ static constexpr uint32_t QKVR_HEADS =
     INK2_HEADS + 2 * INK2_KV_HEADS + INK2_HEADS;
 static constexpr uint32_t DECODE_THREADS = 128;
 static constexpr uint32_t COMBINE_THREADS = 32;
-static constexpr uint32_t PREFILL_THREADS = 64;
+static constexpr uint32_t PREFILL_THREADS = 128;
 static constexpr uint32_t ROUTE_THREADS = 128;
 static constexpr uint32_t MV_THREADS = 256;
 static constexpr uint32_t MM_THREADS = 128;
@@ -2290,9 +2290,10 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
     gpu_bind_buffer(cmd, 5, &work.gate, 0);
     gpu_bind_buffer(cmd, 6, &work.attn_out, 0);
     gpu_copy_bytes(cmd, 7, &app, sizeof app);
-    gpu_run_kernel(cmd,
-                   ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP,
-                   (uint32_t)INK2_HEADS, 1, PREFILL_THREADS, 1, 1);
+    uint32_t q_tiles =
+        ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
+    gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                   1, 1);
   } else {
     int total_k = max_pos + 1;
     if (window && total_k > (int)window) total_k = (int)window;

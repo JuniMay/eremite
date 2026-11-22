@@ -19,9 +19,8 @@ constant constexpr uint INK2_NVFP4_BLOCK = 16, INK2_MXFP8_BLOCK = 32;
 constant constexpr uint INK2_MAX_RES_BLOCKS = 5;
 // Hardware SIMD width and tile sizes for Metal matrix kernels.
 constant constexpr uint INK2_SIMD = 32, INK2_MM_TILE = 64, INK2_MM_SIMDGROUPS = 4,
-                        INK2_PREFILL_Q_TILE = 16, INK2_PREFILL_K_TILE = 64,
-                        INK2_PREFILL_SGS = 2, INK2_DECODE_SGS = 4,
-                        INK2_DECODE_VEC4 = 4, INK2_MV_ROWS = 4, INK2_MV_MAX_M = 8,
+                        INK2_DECODE_SGS = 4, INK2_DECODE_VEC4 = 4,
+                        INK2_MV_ROWS = 4, INK2_MV_MAX_M = 8,
                         INK2_MV_SGS = 8, INK2_MAX_GATE_RANK = 128,
                         INK2_STAGE_HALF_K = 32, INK2_STAGE_VEC4S = 8,
                         INK2_ROUTE_SGS = INK2_EXPERTS / INK2_SIMD;
@@ -97,7 +96,7 @@ struct Ink2KvTarget {
 
 // Parameters for Q/K/V/R head normalization, L2 clipping and log scaling.
 struct Ink2QkvrParam {
-  // Active token count and head-major Q row stride (padded to 16 for prefill).
+  // Active token count and head-major Q row stride (padded to 64 for prefill).
   uint rows, q_stride;
   // Position of row 0 in single-state mode.
   uint pos0;
@@ -129,7 +128,7 @@ struct Ink2AttendDecodeParam {
 
 // Parameters for tiled MPP FlashAttention prefill over a contiguous chunk.
 struct Ink2AttendPrefillParam {
-  // Active query rows, head-major Q row stride (multiple of 16), row-0 pos.
+  // Active query rows, head-major Q row stride (multiple of 64), row-0 pos.
   uint rows, q_stride, pos0;
   // Ring capacity in rows (0 for linear global KV).
   uint ring_rows;
@@ -787,11 +786,11 @@ kernel void ink2_attend_combine(device const float *part [[buffer(0)]],
 }
 
 // Tiled MPP FlashAttention prefill over a contiguous chunk of queries.
-// One threadgroup (2 simdgroups, 64 threads) computes 32 query rows for one
-// head, streaming 64-key tiles from the token-major KV cache into shared
-// threadgroup memory so both linear global KV and wrapping sliding-window rings
-// feed the matrix units directly.
-// Grid: x = ceil(rows / 32), y = heads (24). Threadgroup: 64 threads.
+// Dispatched as a 1D head-coherent grid (ceil(rows / 64) * 24) with 128
+// threads (4 simdgroups) cooperating on one 64x64 tile in exact 16 KiB
+// threadgroup memory. Reads K/V directly from strided device-memory slices of
+// the token-major KV cache without threadgroup KV staging, splitting once at
+// the wrap boundary for sliding-window ring caches.
 kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
                                 device const bfloat *k_cache [[buffer(1)]],
                                 device const bfloat *v_cache [[buffer(2)]],
@@ -800,170 +799,139 @@ kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
                                 device const float *gate [[buffer(5)]],
                                 device float *out [[buffer(6)]],
                                 constant Ink2AttendPrefillParam &p [[buffer(7)]],
-                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint tg [[threadgroup_position_in_grid]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
-                                uint lane [[thread_index_in_simdgroup]],
-                                uint t [[thread_index_in_threadgroup]]) {
-  constexpr uint QR = INK2_PREFILL_Q_TILE, KR = INK2_PREFILL_K_TILE,
-                 HALF_K = KR / 2;
-  threadgroup bfloat kv_tile[KR * INK2_HEAD_DIM];
-  threadgroup float scores[INK2_PREFILL_SGS][QR * KR];
-  threadgroup bfloat probs[INK2_PREFILL_SGS][QR * KR];
-  threadgroup float rescales[INK2_PREFILL_SGS][QR];
-  threadgroup float sums[INK2_PREFILL_SGS][QR];
-  threadgroup float maxes[INK2_PREFILL_SGS][QR];
+                                uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint BQ = FLASH_ATTN_64_TILE, BK = FLASH_ATTN_64_TILE;
+  threadgroup FlashAttn64Smem<bfloat> smem;
 
-  uint h = tg.y, kv_h = h / INK2_GQA;
-  uint block_q0 = tg.x * (INK2_PREFILL_SGS * QR);
-  uint sg_q0 = block_q0 + sg * QR;
-  uint sg_q_end = min(sg_q0 + QR, p.rows);
+  uint q_tiles = (p.rows + BQ - 1u) / BQ;
+  uint h = tg / q_tiles, kv_h = h / INK2_GQA;
+  uint q0 = (tg % q_tiles) * BQ;
+  if (q0 >= p.rows) return;
+  bool full_q = q0 + BQ <= p.rows;
 
-  constexpr auto sdesc = matmul2d_descriptor(
-      QR, KR, INK2_HEAD_DIM, false, true, false, matmul2d_descriptor::mode::multiply);
-  constexpr auto odesc = matmul2d_descriptor(
-      QR, INK2_HEAD_DIM, KR, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<sdesc, execution_simdgroup> sop;
-  matmul2d<odesc, execution_simdgroup> oop;
-
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq_all(
-      (device bfloat *)q + (ulong)h * p.q_stride * INK2_HEAD_DIM,
-      dextents<int32_t, 2>(INK2_HEAD_DIM, p.q_stride));
-  tensor<threadgroup bfloat, extents<int32_t, INK2_HEAD_DIM, KR>, tensor_inline> tkv(
-      kv_tile, extents<int32_t, INK2_HEAD_DIM, KR>());
-  tensor<threadgroup bfloat, extents<int32_t, KR, QR>, tensor_inline> tp(
-      probs[sg], extents<int32_t, KR, QR>());
-
-  auto qt = tq_all.slice(0, min(sg_q0, p.q_stride - QR));
-  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(tkv), float>();
-  for (uint16_t i = 0; i < acc.get_capacity(); i++)
-    if (acc.is_valid_element(i)) acc[i] = 0.0f;
-
-  uint first_pos = p.pos0 + block_q0;
-  uint last_row = min(block_q0 + INK2_PREFILL_SGS * QR, p.rows) - 1u;
+  uint first_pos = p.pos0 + q0;
+  uint last_row = min(q0 + BQ, p.rows) - 1u;
   uint last_pos = p.pos0 + last_row;
   uint k_lo = (p.window && first_pos + 1u > p.window) ? (first_pos + 1u - p.window) : 0u;
   uint k_hi = last_pos + 1u;
-  float scale = rsqrt(float(INK2_HEAD_DIM));
+  const float scale_log2 = rsqrt(float(INK2_HEAD_DIM)) * M_LOG2E_F;
 
-  uint row = lane / 2u, col0 = (lane % 2u) * HALF_K;
-  float running_max = -INFINITY, running_sum = 0.0f;
+  constexpr auto sdesc = matmul2d_descriptor(
+      BQ, BK, INK2_HEAD_DIM, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto odesc = matmul2d_descriptor(
+      BQ, INK2_HEAD_DIM, BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> sop;
+  matmul2d<odesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> oop;
 
-  for (uint k0 = k_lo; k0 < k_hi; k0 += KR) {
-    // Collaboratively load 64 K rows into kv_tile across all 64 threads.
-    for (uint idx = t; idx < KR * (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-         idx += INK2_PREFILL_SGS * INK2_SIMD) {
-      uint kr = idx / (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-      uint v4 = idx % (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-      bfloat4 kv = bfloat4(bfloat(0.0f));
-      uint kpos = k0 + kr;
-      if (kpos < k_hi) {
-        uint slot = p.ring_rows ? (kpos % p.ring_rows) : kpos;
-        device const bfloat4 *src =
-            (device const bfloat4 *)(k_cache + (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM);
-        kv = src[v4];
-      }
-      ((threadgroup bfloat4 *)kv_tile)[idx] = kv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq(
+      (device bfloat *)q + (ulong)h * p.q_stride * INK2_HEAD_DIM,
+      dextents<int32_t, 2>(INK2_HEAD_DIM, p.rows));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv_init(
+      (device bfloat *)v_cache, dextents<int32_t, 2>(INK2_KV_DIM, p.ring_rows ? p.ring_rows : k_hi));
+  tensor<threadgroup bfloat, extents<int32_t, BK, BQ>, tensor_inline> tp(
+      smem.st.probs, extents<int32_t, BK, BQ>());
 
-    if (sg_q0 < p.rows) {
-      auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(tkv), float>();
-      sop.run(qt, tkv, sc);
-      for (uint16_t i = 0; i < sc.get_capacity(); i++) {
+  auto qt = tq.slice(0, q0);
+  auto vt0 = tv_init.slice(kv_h * INK2_HEAD_DIM, 0);
+  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+  float rmax = -INFINITY, rsum = 0.0f;
+  for (uint k0 = k_lo; k0 < k_hi;) {
+    uint slot0 = p.ring_rows ? (k0 % p.ring_rows) : k0;
+    uint chunk = min(BK, k_hi - k0);
+    if (p.ring_rows) chunk = min(chunk, p.ring_rows - slot0);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
+        (device bfloat *)k_cache, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
+        (device bfloat *)v_cache, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
+    auto kt = tk.slice(kv_h * INK2_HEAD_DIM, slot0);
+    auto vt = tv.slice(kv_h * INK2_HEAD_DIM, slot0);
+    auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+    sop.run(qt, kt, sc);
+
+    bool all_visible = full_q && (chunk == BK) && (k0 + BK - 1u <= first_pos) &&
+                       (!p.window || k0 + p.window > last_pos);
+    bool no_rel = all_visible && (first_pos >= k0 + BK - 1u + INK2_REL_EXTENT);
+    if (no_rel) {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          smem.scores[at[1] * BK + at[0]] = sc[i] * scale_log2;
+        }
+    } else if (all_visible) {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
         if (sc.is_valid_element(i)) {
           auto at = sc.get_multidimensional_index(i);
           uint kr = at[0], qr = at[1];
-          uint q_local = sg_q0 + qr;
-          uint kpos = k0 + kr;
+          uint q_local = q0 + qr;
+          uint dist = (p.pos0 + q_local) - (k0 + kr);
+          float val = sc[i] * scale_log2;
+          if (dist < INK2_REL_EXTENT)
+            val += rel_bias[((ulong)q_local * INK2_HEADS + h) * INK2_REL_EXTENT + dist] *
+                   M_LOG2E_F;
+          smem.scores[qr * BK + kr] = val;
+        }
+    } else {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          uint kr = at[0], qr = at[1];
+          uint q_local = q0 + qr;
           float val = -INFINITY;
-          if (q_local < sg_q_end && kpos < k_hi) {
-            uint qpos = p.pos0 + q_local;
+          if (q_local < p.rows && kr < chunk) {
+            uint qpos = p.pos0 + q_local, kpos = k0 + kr;
             if (kpos <= qpos && (!p.window || kpos + p.window > qpos)) {
-              val = sc[i] * scale;
+              val = sc[i] * scale_log2;
               uint dist = qpos - kpos;
               if (dist < INK2_REL_EXTENT)
-                val += rel_bias[((ulong)q_local * INK2_HEADS + h) * INK2_REL_EXTENT + dist];
+                val += rel_bias[((ulong)q_local * INK2_HEADS + h) * INK2_REL_EXTENT + dist] *
+                       M_LOG2E_F;
             }
           }
-          scores[sg][qr * KR + kr] = val;
+          smem.scores[qr * BK + kr] = val;
         }
-      }
-      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      threadgroup float *own = scores[sg] + row * KR + col0;
-      float bmax = -INFINITY;
-      for (uint c = 0; c < HALF_K; c++) bmax = max(bmax, own[c]);
-      bmax = max(bmax, simd_shuffle_xor(bmax, 1));
-      float new_max = max(running_max, bmax);
-      float old_scale = (running_max == -INFINITY || new_max == -INFINITY)
-                            ? 0.0f
-                            : exp(running_max - new_max);
-      float bsum = 0.0f;
-      for (uint c = 0; c < HALF_K; c++) {
-        float e = own[c] == -INFINITY ? 0.0f : exp(own[c] - new_max);
-        probs[sg][row * KR + col0 + c] = bfloat(e);
-        bsum += e;
-      }
-      bsum += simd_shuffle_xor(bsum, 1);
-      running_sum = running_sum * old_scale + bsum;
-      running_max = new_max;
-      if ((lane & 1u) == 0u) rescales[sg][row] = old_scale;
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-
+    if (flash_attn_64x64_softmax(smem, sg, lane, !all_visible, rmax, rsum)) {
       for (uint16_t i = 0; i < acc.get_capacity(); i++)
         if (acc.is_valid_element(i))
-          acc[i] *= rescales[sg][acc.get_multidimensional_index(i)[1]];
+          acc[i] *= smem.st.row_scale[acc.get_multidimensional_index(i)[1]];
     }
+    oop.run(tp, vt, acc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Collaboratively load 64 V rows into kv_tile across all 64 threads.
-    for (uint idx = t; idx < KR * (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-         idx += INK2_PREFILL_SGS * INK2_SIMD) {
-      uint kr = idx / (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-      uint v4 = idx % (INK2_HEAD_DIM / INK2_DECODE_VEC4);
-      bfloat4 vv = bfloat4(bfloat(0.0f));
-      uint kpos = k0 + kr;
-      if (kpos < k_hi) {
-        uint slot = p.ring_rows ? (kpos % p.ring_rows) : kpos;
-        device const bfloat4 *src =
-            (device const bfloat4 *)(v_cache + (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM);
-        vv = src[v4];
-      }
-      ((threadgroup bfloat4 *)kv_tile)[idx] = vv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg_q0 < p.rows) oop.run(tp, tkv, acc);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    k0 += chunk;
   }
 
-  if (sg_q0 >= p.rows) return;
-
-  // Fold per-token sink logit into softmax denominator.
+  // Fold per-token sink logit (converted to base-2 log scale) into denominator.
+  uint row = sg * FLASH_ATTN_64_ROWS_PER_SG + (lane >> 1u);
   if ((lane & 1u) == 0u) {
-    uint q_local = sg_q0 + row;
-    if (q_local < sg_q_end) {
-      float sv = sink[(ulong)q_local * INK2_HEADS + h];
-      float fm = max(running_max, sv);
-      float oscale = running_max == -INFINITY ? 0.0f : exp(running_max - fm);
-      float fl = running_sum * oscale + exp(sv - fm);
-      maxes[sg][row] = oscale;
-      sums[sg][row] = fl;
+    uint q_local = q0 + row;
+    if (q_local < p.rows) {
+      float sv = sink[(ulong)q_local * INK2_HEADS + h] * M_LOG2E_F;
+      float fm = max(rmax, sv);
+      float oscale = rmax == -INFINITY ? 0.0f : exp2(rmax - fm);
+      float fl = rsum * oscale + exp2(sv - fm);
+      smem.st.row_aux[row] = oscale;
+      smem.st.row_scale[row] = fl;
     }
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
     if (acc.is_valid_element(i)) {
       auto at = acc.get_multidimensional_index(i);
-      uint q_local = sg_q0 + at[1];
-      if (q_local < sg_q_end) {
-        float val = bf(acc[i] * maxes[sg][at[1]] / sums[sg][at[1]]);
+      uint q_local = q0 + at[1];
+      if (q_local < p.rows) {
+        float val = bf(acc[i] * smem.st.row_aux[at[1]] / smem.st.row_scale[at[1]]);
         ulong off = (ulong)q_local * INK2_Q_DIM + h * INK2_HEAD_DIM + at[0];
         out[off] = bf(val * sigm(gate[off]));
       }
     }
-  }
 }
 
 // MoE router (modeling_inkling2.py Inkling2TopKRouter): sigmoid scores, top-8

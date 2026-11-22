@@ -14,13 +14,13 @@
 // src/kernels/inkling2_vision.metal against independent CPU references.
 
 // Test geometry, threadgroup sizes and tolerances.
-static constexpr uint32_t TEST_SEQ = 37;
-static constexpr uint32_t TEST_PADDED = 48;
+static constexpr uint32_t TEST_SEQ = 145;
+static constexpr uint32_t TEST_PADDED = 192;
 static constexpr uint32_t ELEM_THREADS = 256;
 static constexpr uint32_t LN_THREADS = 256;
 static constexpr uint32_t GRID2D_THREADS = 64;
-static constexpr uint32_t ATTN_THREADS = 64;
-static constexpr uint32_t ATTN_Q_GROUP = 32;
+static constexpr uint32_t ATTN_THREADS = 128;
+static constexpr uint32_t ATTN_Q_GROUP = 64;
 static constexpr uint32_t BF16_HALF = 0x7FFFu;
 static constexpr uint32_t BF16_MASK = 0xFFFF0000u;
 static constexpr uint32_t BF16_SHIFT = 16;
@@ -327,8 +327,8 @@ static void test_rope_and_attend(Gpu *gpu, MemorySlot *slot) {
     kbp[d] = bf_round(rng_f32(&rng) * 0.1f);
     vbp[d] = bf_round(rng_f32(&rng) * 0.1f);
   }
-  // 37 = 1 + 6 * 6 patches (vh=6, vw=6).
-  inkling2_vision_rope_table(6, 6, (float *)cs.ptr);
+  // 145 = 1 + 12 * 12 patches (vh=12, vw=12), spanning 3 64-row tiles.
+  inkling2_vision_rope_table(12, 12, (float *)cs.ptr);
 
   HeadsParam hp = {seq, padded};
   AttendParam ap = {seq, padded};
@@ -354,8 +354,10 @@ static void test_rope_and_attend(Gpu *gpu, MemorySlot *slot) {
   gpu_bind_buffer(&cmd, 2, &vh, 0);
   gpu_bind_buffer(&cmd, 3, &out, 0);
   gpu_copy_bytes(&cmd, 4, &ap, sizeof ap);
-  gpu_run_kernel(&cmd, (seq + ATTN_Q_GROUP - 1) / ATTN_Q_GROUP,
-                 (uint32_t)INK2_VIS_HEADS, 1, ATTN_THREADS, 1, 1);
+  gpu_run_kernel(&cmd,
+                 ((seq + ATTN_Q_GROUP - 1) / ATTN_Q_GROUP) *
+                     (uint32_t)INK2_VIS_HEADS,
+                 1, 1, ATTN_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 

@@ -10,10 +10,8 @@ constant constexpr uint INK2_VIS_DIM = 1024, INK2_VIS_HEADS = 16,
                         INK2_VIS_MLP_DIM = 4096, INK2_VIS_PROJ_IN = 4096,
                         INK2_VIS_TEXT_DIM = 2304, INK2_VIS_PATCH_K_PAD = 1216,
                         INK2_VIS_BILINEAR_TAPS = 4;
-// Hardware SIMD width and tiled FlashAttention dimensions.
-constant constexpr uint INK2_VIS_SIMD = 32, INK2_VIS_ATTN_Q_TILE = 16,
-                        INK2_VIS_ATTN_K_TILE = 64, INK2_VIS_ATTN_SGS = 2,
-                        INK2_VIS_VEC4 = 4, INK2_VIS_PAIR = 2;
+// Hardware SIMD width and vectorization constants.
+constant constexpr uint INK2_VIS_SIMD = 32, INK2_VIS_VEC4 = 4, INK2_VIS_PAIR = 2;
 // Abramowitz and Stegun 7.1.26 constants for exact GELU via erf(x / sqrt(2)).
 constant constexpr float INK2_VIS_INV_SQRT2 = 0.70710678118654752f,
                          INK2_VIS_ERF_P = 0.3275911f,
@@ -51,13 +49,13 @@ struct Ink2VisBiasActParam {
 
 // Parameters for Q/K/V bias add, pairwise 2D axial RoPE and head transpose.
 struct Ink2VisHeadsParam {
-  // Active sequence length (1 + npatches) and padded head row stride (mult 16).
+  // Active sequence length (1 + npatches) and padded head row stride (mult 64).
   uint seq, padded;
 };
 
 // Parameters for bidirectional tiled MPP vision attention.
 struct Ink2VisAttendParam {
-  // Active sequence length and padded head row stride (multiple of 16).
+  // Active sequence length and padded head row stride (multiple of 64).
   uint seq, padded;
 };
 
@@ -218,137 +216,93 @@ kernel void ink2_vis_heads_rope(device const float *q_in [[buffer(0)]],
 }
 
 // Tiled MPP bidirectional FlashAttention for Inkling2VisionAttention
-// (16 heads, head_dim 64). One threadgroup (2 simdgroups, 64 threads) computes
-// 32 query rows for one head, streaming 64-key tiles through threadgroup RAM.
-// Grid: x = ceil(seq / 32), y = 16 heads. Threadgroup: 64 threads.
+// (16 heads, head_dim 64). Dispatched as a 1D head-coherent grid
+// (ceil(seq / 64) * 16) with 128 threads (4 simdgroups) cooperating on one
+// 64x64 tile in exact 16 KiB threadgroup memory, reading Q/K/V directly from
+// device memory (rows padded to a multiple of 64).
 kernel void ink2_vis_attend(device const bfloat *q [[buffer(0)]],
                             device const bfloat *k [[buffer(1)]],
                             device const bfloat *v [[buffer(2)]],
                             device float *out [[buffer(3)]],
                             constant Ink2VisAttendParam &p [[buffer(4)]],
-                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint tg [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint t [[thread_index_in_threadgroup]]) {
-  constexpr uint QR = INK2_VIS_ATTN_Q_TILE, KR = INK2_VIS_ATTN_K_TILE,
-                 HALF_K = KR / 2;
-  threadgroup bfloat kv_tile[KR * INK2_VIS_HEAD_DIM];
-  threadgroup float scores[INK2_VIS_ATTN_SGS][QR * KR];
-  threadgroup bfloat probs[INK2_VIS_ATTN_SGS][QR * KR];
-  threadgroup float rescales[INK2_VIS_ATTN_SGS][QR];
-  threadgroup float sums[INK2_VIS_ATTN_SGS][QR];
+                            uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint BQ = FLASH_ATTN_64_TILE, BK = FLASH_ATTN_64_TILE;
+  threadgroup FlashAttn64Smem<bfloat> smem;
 
-  uint h = tg.y;
-  uint block_q0 = tg.x * (INK2_VIS_ATTN_SGS * QR);
-  uint sg_q0 = block_q0 + sg * QR;
-  uint sg_q_end = min(sg_q0 + QR, p.seq);
+  uint q_tiles = (p.seq + BQ - 1u) / BQ;
+  uint h = tg / q_tiles;
+  uint q0 = (tg % q_tiles) * BQ;
+  if (q0 >= p.seq) return;
+  bool full_q = q0 + BQ <= p.seq;
+  const float scale_log2 = rsqrt(float(INK2_VIS_HEAD_DIM)) * M_LOG2E_F;
 
   constexpr auto sdesc = matmul2d_descriptor(
-      QR, KR, INK2_VIS_HEAD_DIM, false, true, false, matmul2d_descriptor::mode::multiply);
+      BQ, BK, INK2_VIS_HEAD_DIM, false, true, false, matmul2d_descriptor::mode::multiply);
   constexpr auto odesc = matmul2d_descriptor(
-      QR, INK2_VIS_HEAD_DIM, KR, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<sdesc, execution_simdgroup> sop;
-  matmul2d<odesc, execution_simdgroup> oop;
+      BQ, INK2_VIS_HEAD_DIM, BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> sop;
+  matmul2d<odesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> oop;
 
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq_all(
-      (device bfloat *)q + (ulong)h * p.padded * INK2_VIS_HEAD_DIM,
-      dextents<int32_t, 2>(INK2_VIS_HEAD_DIM, p.padded));
-  tensor<threadgroup bfloat, extents<int32_t, INK2_VIS_HEAD_DIM, KR>, tensor_inline> tkv(
-      kv_tile, extents<int32_t, INK2_VIS_HEAD_DIM, KR>());
-  tensor<threadgroup bfloat, extents<int32_t, KR, QR>, tensor_inline> tp(
-      probs[sg], extents<int32_t, KR, QR>());
+  ulong head_off = (ulong)h * p.padded * INK2_VIS_HEAD_DIM;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq(
+      (device bfloat *)q + head_off, dextents<int32_t, 2>(INK2_VIS_HEAD_DIM, p.seq));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
+      (device bfloat *)k + head_off, dextents<int32_t, 2>(INK2_VIS_HEAD_DIM, p.seq));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
+      (device bfloat *)v + head_off, dextents<int32_t, 2>(INK2_VIS_HEAD_DIM, p.seq));
+  tensor<threadgroup bfloat, extents<int32_t, BK, BQ>, tensor_inline> tp(
+      smem.st.probs, extents<int32_t, BK, BQ>());
 
-  auto qt = tq_all.slice(0, min(sg_q0, p.padded - QR));
-  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(tkv), float>();
+  auto qt = tq.slice(0, q0), vt0 = tv.slice(0, 0);
+  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
   for (uint16_t i = 0; i < acc.get_capacity(); i++)
     if (acc.is_valid_element(i)) acc[i] = 0.0f;
 
-  float scale = rsqrt(float(INK2_VIS_HEAD_DIM));
-  uint row = lane / 2u, col0 = (lane % 2u) * HALF_K;
-  float running_max = -INFINITY, running_sum = 0.0f;
-  device const bfloat *kh_base = k + (ulong)h * p.padded * INK2_VIS_HEAD_DIM;
-  device const bfloat *vh_base = v + (ulong)h * p.padded * INK2_VIS_HEAD_DIM;
-
-  for (uint k0 = 0; k0 < p.seq; k0 += KR) {
-    for (uint idx = t; idx < KR * (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-         idx += INK2_VIS_ATTN_SGS * INK2_VIS_SIMD) {
-      uint kr = idx / (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-      uint v4 = idx % (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-      bfloat4 kv = bfloat4(bfloat(0.0f));
-      if (k0 + kr < p.seq)
-        kv = ((device const bfloat4 *)(kh_base + (ulong)(k0 + kr) * INK2_VIS_HEAD_DIM))[v4];
-      ((threadgroup bfloat4 *)kv_tile)[idx] = kv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg_q0 < p.seq) {
-      auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(tkv), float>();
-      sop.run(qt, tkv, sc);
-      for (uint16_t i = 0; i < sc.get_capacity(); i++) {
+  float rmax = -INFINITY, rsum = 0.0f;
+  for (uint k0 = 0; k0 < p.seq; k0 += BK) {
+    auto kt = tk.slice(0, k0), vt = tv.slice(0, k0);
+    auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+    sop.run(qt, kt, sc);
+    bool full_tile = full_q && (k0 + BK <= p.seq);
+    if (full_tile) {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
         if (sc.is_valid_element(i)) {
           auto at = sc.get_multidimensional_index(i);
-          uint kr = at[0], qr = at[1];
-          float val = (sg_q0 + qr < sg_q_end && k0 + kr < p.seq) ? sc[i] * scale : -INFINITY;
-          scores[sg][qr * KR + kr] = val;
+          smem.scores[at[1] * BK + at[0]] = sc[i] * scale_log2;
         }
-      }
-      simdgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          bool seen = (q0 + at[1] < p.seq) && (k0 + at[0] < p.seq);
+          smem.scores[at[1] * BK + at[0]] = seen ? sc[i] * scale_log2 : -INFINITY;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      threadgroup float *own = scores[sg] + row * KR + col0;
-      float bmax = -INFINITY;
-      for (uint c = 0; c < HALF_K; c++) bmax = max(bmax, own[c]);
-      bmax = max(bmax, simd_shuffle_xor(bmax, 1));
-      float new_max = max(running_max, bmax);
-      float old_scale = (running_max == -INFINITY || new_max == -INFINITY)
-                            ? 0.0f
-                            : exp(running_max - new_max);
-      float bsum = 0.0f;
-      for (uint c = 0; c < HALF_K; c++) {
-        float e = own[c] == -INFINITY ? 0.0f : exp(own[c] - new_max);
-        probs[sg][row * KR + col0 + c] = bfloat(e);
-        bsum += e;
-      }
-      bsum += simd_shuffle_xor(bsum, 1);
-      running_sum = running_sum * old_scale + bsum;
-      running_max = new_max;
-      if ((lane & 1u) == 0u) rescales[sg][row] = old_scale;
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-
+    if (flash_attn_64x64_softmax(smem, sg, lane, !full_tile, rmax, rsum)) {
       for (uint16_t i = 0; i < acc.get_capacity(); i++)
         if (acc.is_valid_element(i))
-          acc[i] *= rescales[sg][acc.get_multidimensional_index(i)[1]];
+          acc[i] *= smem.st.row_scale[acc.get_multidimensional_index(i)[1]];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint idx = t; idx < KR * (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-         idx += INK2_VIS_ATTN_SGS * INK2_VIS_SIMD) {
-      uint kr = idx / (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-      uint v4 = idx % (INK2_VIS_HEAD_DIM / INK2_VIS_VEC4);
-      bfloat4 vv = bfloat4(bfloat(0.0f));
-      if (k0 + kr < p.seq)
-        vv = ((device const bfloat4 *)(vh_base + (ulong)(k0 + kr) * INK2_VIS_HEAD_DIM))[v4];
-      ((threadgroup bfloat4 *)kv_tile)[idx] = vv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg_q0 < p.seq) oop.run(tp, tkv, acc);
+    oop.run(tp, vt, acc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  if (sg_q0 >= p.seq) return;
-  if ((lane & 1u) == 0u) sums[sg][row] = running_sum;
-  simdgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+  uint row = sg * FLASH_ATTN_64_ROWS_PER_SG + (lane >> 1u);
+  if ((lane & 1u) == 0u) smem.st.row_scale[row] = 1.0f / rsum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
     if (acc.is_valid_element(i)) {
       auto at = acc.get_multidimensional_index(i);
-      uint q_local = sg_q0 + at[1];
-      if (q_local < sg_q_end) {
+      uint q_local = q0 + at[1];
+      if (q_local < p.seq) {
         ulong off = (ulong)q_local * INK2_VIS_DIM + h * INK2_VIS_HEAD_DIM + at[0];
-        out[off] = bf(acc[i] / sums[sg][at[1]]);
+        out[off] = bf(acc[i] * smem.st.row_scale[at[1]]);
       }
     }
-  }
 }
 
 // Fused bias + LayerScale residual add (modeling_inkling2.py
