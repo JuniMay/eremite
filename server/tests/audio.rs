@@ -271,14 +271,29 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
 
         let (ct, body) = build_multipart(&[
             ("file", Some("speech.wav"), &speech_wav),
-            ("response_format", None, b"srt"),
+            ("response_format", None, b"xml"),
         ]);
         let (code, _, _) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
         assert_eq!(code, 400);
 
         let (ct, body) = build_multipart(&[
             ("file", Some("speech.wav"), &speech_wav),
-            ("response_format", None, b"text"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
+        let (code, _, _) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 400);
+
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"verbose_json"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
+        let (code, _, _) = post_raw(&server, "/v1/audio/translations", &ct, &body);
+        assert_eq!(code, 400);
+
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"srt"),
             ("stream", None, b"true"),
         ]);
         let (code, _, _) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
@@ -319,7 +334,7 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
         assert!(resp_ct.starts_with("text/plain"), "{resp_ct}");
         assert_eq!(String::from_utf8(resp_body).unwrap(), text);
 
-        // Verbose JSON with language and context prompt.
+        // Verbose JSON with language and context prompt defaults to segment timestamps.
         let (ct, body) = build_multipart(&[
             ("file", Some("speech.wav"), &speech_wav),
             ("language", None, b"en"),
@@ -331,7 +346,8 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
         let verbose: Value = serde_json::from_slice(&resp_body).expect("verbose JSON");
         assert_eq!(verbose["task"], "transcribe");
         assert_eq!(verbose["language"], "english");
-        assert!(verbose["duration"].as_f64().unwrap() > 1.0);
+        let dur = verbose["duration"].as_f64().unwrap();
+        assert!(dur > 1.0);
         assert!(
             verbose["text"]
                 .as_str()
@@ -339,6 +355,71 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
                 .to_ascii_lowercase()
                 .contains("quick brown fox")
         );
+        let default_segs = verbose["segments"].as_array().expect("default segments");
+        assert!(
+            default_segs.len() >= 2,
+            "expected 2 sentence segments: {default_segs:?}"
+        );
+        assert!(verbose.get("words").is_none());
+
+        // Verbose JSON with word + segment timestamp granularities.
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"verbose_json"),
+            ("timestamp_granularities[]", None, b"word"),
+            ("timestamp_granularities[]", None, b"segment"),
+        ]);
+        let (code, _, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        let verbose_ws: Value = serde_json::from_slice(&resp_body).expect("verbose JSON");
+        let words = verbose_ws["words"].as_array().expect("words array");
+        let segs = verbose_ws["segments"].as_array().expect("segments array");
+        assert!(words.len() >= 15, "expected aligned words, got {words:?}");
+        assert!(segs.len() >= 2, "expected sentence segments, got {segs:?}");
+        let mut prev_end = 0.0f64;
+        for w in words {
+            let ws = w["start"].as_f64().unwrap();
+            let we = w["end"].as_f64().unwrap();
+            assert!(!w["word"].as_str().unwrap().is_empty());
+            assert!(ws >= prev_end - 1e-6 && we >= ws && we <= dur + 0.05);
+            prev_end = we;
+        }
+        let joined_words: String = words
+            .iter()
+            .map(|w| w["word"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        assert!(
+            joined_words.contains("quick brown fox") && joined_words.contains("apple silicon"),
+            "unexpected aligned words: {joined_words:?}"
+        );
+
+        // SubRip (SRT) and WebVTT (VTT) caption formats.
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"srt"),
+        ]);
+        let (code, resp_ct, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        assert!(resp_ct.starts_with("text/plain"), "{resp_ct}");
+        let srt = String::from_utf8(resp_body).expect("UTF-8 SRT");
+        assert!(srt.starts_with("1\n00:00:"), "unexpected SRT: {srt:?}");
+        assert!(srt.contains(" --> ") && srt.to_ascii_lowercase().contains("quick brown fox"));
+
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"vtt"),
+        ]);
+        let (code, resp_ct, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        assert!(resp_ct.starts_with("text/vtt"), "{resp_ct}");
+        let vtt = String::from_utf8(resp_body).expect("UTF-8 VTT");
+        assert!(
+            vtt.starts_with("WEBVTT\n\n00:00:"),
+            "unexpected VTT: {vtt:?}"
+        );
+        assert!(vtt.contains(" --> ") && vtt.to_ascii_lowercase().contains("apple silicon"));
 
         // SSE streaming transcription.
         let (ct, body) = build_multipart(&[
@@ -370,7 +451,7 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
         assert_eq!(done_text.as_deref(), Some(streamed.as_str()));
         assert_eq!(streamed.trim(), text);
 
-        // Translation endpoint (/v1/audio/translations).
+        // Translation endpoint (/v1/audio/translations) in JSON and VTT.
         let (ct, body) = build_multipart(&[("file", Some("speech.wav"), &speech_wav)]);
         let (code, _, resp_body) = post_raw(&server, "/v1/audio/translations", &ct, &body);
         assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
@@ -382,6 +463,15 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
                 .to_ascii_lowercase()
                 .contains("quick brown fox")
         );
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"vtt"),
+        ]);
+        let (code, resp_ct, resp_body) = post_raw(&server, "/v1/audio/translations", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        assert!(resp_ct.starts_with("text/vtt"), "{resp_ct}");
+        let trans_vtt = String::from_utf8(resp_body).expect("UTF-8 VTT");
+        assert!(trans_vtt.starts_with("WEBVTT\n\n") && trans_vtt.contains(" --> "));
 
         text
     };
@@ -410,16 +500,32 @@ fn nemotron_transcribe_serves_audio_endpoints_full_and_ssd_streaming() {
         );
     }
 
-    // 3. MTP speculative decoding + SSD streaming (6 GiB cap, draft: 7):
-    // verify model-mtp-fp8.safetensors loads, status reports drafts=7 with
-    // partial expert cache, and transcript matches baseline verbatim.
+    // 3. MTP speculative decoding + SSD streaming + CTC timestamps (6 GiB cap,
+    // draft: 7): verify model-mtp-fp8.safetensors and model-ctc-bf16.safetensors
+    // work together under SSD streaming with verbatim text and word timestamps.
     {
         let server = start_audio_server(&model_dir, json!({"memory": 6, "draft": 7}));
-        let (ct, body) = build_multipart(&[("file", Some("speech.wav"), &speech_wav)]);
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"verbose_json"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
         let (code, _, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
         assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
         let json_resp: Value = serde_json::from_slice(&resp_body).expect("JSON");
         assert_eq!(json_resp["text"].as_str().unwrap(), expected_text);
+        let words = json_resp["words"].as_array().expect("words array");
+        assert!(words.len() >= 15);
+        assert!(json_resp.get("segments").is_none());
+
+        let (ct, body) = build_multipart(&[
+            ("file", Some("speech.wav"), &speech_wav),
+            ("response_format", None, b"srt"),
+        ]);
+        let (code, _, resp_body) = post_raw(&server, "/v1/audio/transcriptions", &ct, &body);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&resp_body));
+        let srt = String::from_utf8(resp_body).expect("SRT");
+        assert!(srt.starts_with("1\n00:00:") && srt.contains(" --> "));
 
         let (code, status) = ask(&server, "GET", "/v1/models/nemotron-3.5-transcribe", None);
         assert_eq!(code, 200);

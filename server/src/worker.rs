@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::calls::CallChooser;
 use crate::control::{self, Action, Control, GIB, Phase, YieldTarget};
@@ -416,6 +416,18 @@ impl ViewOptions {
     }
 }
 
+/// One queued CTC word-level audio alignment job.
+struct AlignJob {
+    /// Index of the audio transcription model.
+    model_index: usize,
+    /// Raw encoded audio file bytes.
+    audio: Vec<u8>,
+    /// Final cleaned UTF-8 transcript to align against the audio.
+    transcript: String,
+    /// Channel receiving the word alignment or an error message.
+    reply: oneshot::Sender<Result<engine::AudioAlignment, String>>,
+}
+
 /// What the HTTP handlers and the worker share under one lock.
 #[derive(Default)]
 struct Queue {
@@ -427,6 +439,8 @@ struct Queue {
     images: Vec<VecDeque<Job<ImageRequest>>>,
     /// Each model's waiting video requests, the oldest first.
     videos: Vec<VecDeque<Job<VideoRequest>>>,
+    /// Waiting CTC audio timestamp alignment jobs, the oldest first.
+    alignments: VecDeque<AlignJob>,
     /// Set at the stop. No request is queued after it.
     closed: bool,
     /// The id of the last queued request. The first request gets 1.
@@ -667,6 +681,8 @@ pub struct SharedModel {
     /// Video generation limits reported by the opened model, or None for text,
     /// decision and image models.
     pub video_limits: Option<engine::VideoLimits>,
+    /// True when the checkpoint includes a CTC word-level timestamp head.
+    pub can_align_audio: bool,
     /// The model's status. The worker updates it.
     status: Mutex<ModelStatus>,
 }
@@ -893,6 +909,15 @@ pub fn video_limits(model_index: usize) -> Option<engine::VideoLimits> {
     clone_shared().models.get(model_index)?.video_limits
 }
 
+/// Returns whether the served model at `model_index` supports CTC word-level
+/// audio timestamp alignment.
+pub fn can_align_audio(model_index: usize) -> bool {
+    clone_shared()
+        .models
+        .get(model_index)
+        .is_some_and(|model| model.can_align_audio)
+}
+
 /// Returns the live stage, 1-based step and total step count of an active
 /// video request `request_id` on `model_index`, or None when not running.
 pub fn video_progress(model_index: usize, request_id: u64) -> Option<(VideoStage, usize, usize)> {
@@ -967,6 +992,7 @@ pub fn start(
                 };
                 let image_limits = model.image_limits();
                 let video_limits = model.video_limits();
+                let can_align_audio = model.can_align_audio();
                 let mut resolved = settings.clone();
                 if let Some(lim) = image_limits {
                     if resolved.options.ctx == 0 {
@@ -991,6 +1017,7 @@ pub fn start(
                     tokenizer: model.tokenizer(),
                     image_limits,
                     video_limits,
+                    can_align_audio,
                     status: Mutex::new(ModelStatus {
                         stats: model.read_stats(),
                         drafts_per_pass: model.drafts_per_pass(),
@@ -1171,6 +1198,33 @@ pub fn submit_video(
     queue_job(request, model_index, &note, &counts, |queue| {
         &mut queue.videos
     })
+}
+
+/// Aligns UTF-8 `transcript` against encoded `audio` bytes on the engine thread
+/// using `model_index`'s CTC timestamp head.
+pub async fn align_audio(
+    model_index: usize,
+    audio: Vec<u8>,
+    transcript: String,
+) -> Result<engine::AudioAlignment, String> {
+    let shared = clone_shared();
+    let (reply, receiver) = oneshot::channel();
+    {
+        let mut queue = lock(&shared.queue);
+        if queue.closed || engine::is_stopping() {
+            return Err("the server is stopping".into());
+        }
+        queue.alignments.push_back(AlignJob {
+            model_index,
+            audio,
+            transcript,
+            reply,
+        });
+        notify_worker(&shared);
+    }
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("the server is stopping".into()))
 }
 
 /// Queues `request` for the model at `model_index` in the queues that
@@ -2821,6 +2875,7 @@ impl Worker {
                     && queue.decisions.iter().all(|jobs| jobs.is_empty())
                     && queue.images.iter().all(|jobs| jobs.is_empty())
                     && queue.videos.iter().all(|jobs| jobs.is_empty())
+                    && queue.alignments.is_empty()
                     && queue.states_to_delete.is_empty()
                     && queue.control.phase == Phase::Running
                     && models.iter().all(|worker_model| {
@@ -2851,6 +2906,40 @@ impl Worker {
             }
             // A deletion runs at the loop's start.
             if queue.control.phase != Phase::Running || !queue.states_to_delete.is_empty() {
+                continue;
+            }
+            if !queue.alignments.is_empty() && !engine::is_stopping() {
+                let jobs: Vec<AlignJob> = queue.alignments.drain(..).collect();
+                drop(queue);
+                for job in jobs {
+                    let result = if let Some(worker_model) = self.models.get_mut(job.model_index) {
+                        let started = Instant::now();
+                        let loaded = if worker_model.model.is_loaded() {
+                            Ok(())
+                        } else {
+                            load_model(&shared, &worker_model.model)
+                        };
+                        match loaded {
+                            Ok(()) => {
+                                let out =
+                                    worker_model.model.align_audio(&job.audio, &job.transcript);
+                                if let Ok(ref aligned) = out {
+                                    worker_model.log_line(&format!(
+                                        "audio align: {} words in {:.3} s",
+                                        aligned.words.len(),
+                                        started.elapsed().as_secs_f64()
+                                    ));
+                                }
+                                worker_model.last_used_at = Instant::now();
+                                out
+                            }
+                            Err(err) => Err(err),
+                        }
+                    } else {
+                        Err("unknown audio model".into())
+                    };
+                    let _ = job.reply.send(result);
+                }
                 continue;
             }
             /// Requests drained from the queue for one model in one worker turn.
@@ -2981,6 +3070,7 @@ impl Worker {
         let decisions: Vec<Vec<Job<DecisionRequest>>>;
         let images: Vec<Vec<Job<ImageRequest>>>;
         let videos: Vec<Vec<Job<VideoRequest>>>;
+        let alignments: Vec<AlignJob>;
         {
             let mut queue = lock(&shared.queue);
             queue.closed = true;
@@ -3004,6 +3094,10 @@ impl Worker {
                 .iter_mut()
                 .map(|jobs| jobs.drain(..).collect())
                 .collect();
+            alignments = queue.alignments.drain(..).collect();
+        }
+        for job in alignments {
+            let _ = job.reply.send(Err("the server is stopping".into()));
         }
         // The deletions asked before the stop run before the stop saves the
         // states. No request runs now, and the closed queue takes no more.

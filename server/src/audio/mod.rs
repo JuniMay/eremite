@@ -2,8 +2,9 @@
 //! /v1/audio/translations) for Nemotron-3.5-Transcribe. Parses
 //! multipart/form-data uploads, maps ISO-639-1 language codes and context terms
 //! into the nemotron3p5 prompt template, runs transcription or English
-//! translation through the shared worker, and formats JSON, plain text,
-//! verbose JSON and server-sent event responses.
+//! translation through the shared worker, aligns CTC word and segment
+//! timestamps when requested, and formats JSON, plain text, verbose JSON,
+//! SubRip (SRT), WebVTT (VTT) and server-sent event responses.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -31,6 +32,26 @@ pub const DEFAULT_MAX_TOKENS: i64 = 16_384;
 const AUDIO_TOKEN_SECONDS: f64 = 0.08;
 /// Scale factor for rounding reported audio duration to two decimal places.
 const DURATION_ROUND_SCALE: f64 = 100.0;
+/// Scale factor for rounding word and segment timestamps to milliseconds.
+const TIMESTAMP_ROUND_SCALE: f64 = 1000.0;
+/// Pause duration in seconds that starts a new transcript or subtitle segment.
+const SEGMENT_PAUSE_SECONDS: f64 = 0.75;
+/// Target segment duration in seconds after which clause punctuation or the
+/// soft character cap splits the segment.
+const SEGMENT_SOFT_MAX_SECONDS: f64 = 7.0;
+/// Maximum segment duration in seconds for long unpunctuated speech.
+const SEGMENT_HARD_MAX_SECONDS: f64 = 12.0;
+/// Target character count per segment (two standard 42-character subtitle
+/// lines).
+const SEGMENT_SOFT_MAX_CHARS: usize = 84;
+/// Hard character cap per segment for long unpunctuated speech.
+const SEGMENT_HARD_MAX_CHARS: usize = 120;
+/// Milliseconds per second for SRT and WebVTT timestamp formatting.
+const MILLISECONDS_PER_SECOND: u64 = 1000;
+/// Seconds per minute for SRT and WebVTT timestamp formatting.
+const SECONDS_PER_MINUTE: u64 = 60;
+/// Seconds per hour for SRT and WebVTT timestamp formatting.
+const SECONDS_PER_HOUR: u64 = 3600;
 
 /// Sentinel byte that eremite_tokenize turns into the checkpoint's audio token.
 const MEDIA_MARK_BYTE: u8 = 0xFF;
@@ -128,8 +149,37 @@ pub enum ResponseFormat {
     Json,
     /// Plain UTF-8 transcript body with `text/plain; charset=utf-8`.
     Text,
-    /// JSON object with `task`, `language`, `duration`, `text` and `usage`.
+    /// JSON object with `task`, `language`, `duration`, `text`, `usage` and
+    /// optional `words` and `segments`.
     VerboseJson,
+    /// SubRip subtitle cues with `text/plain; charset=utf-8`.
+    Srt,
+    /// WebVTT subtitle cues with `text/vtt; charset=utf-8`.
+    Vtt,
+}
+
+/// Requested timestamp granularities for `response_format=verbose_json`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimestampGranularities {
+    /// Include word-level timestamps in `words`.
+    pub word: bool,
+    /// Include segment-level timestamps in `segments`.
+    pub segment: bool,
+    /// True when the request explicitly provided `timestamp_granularities`.
+    pub explicit: bool,
+}
+
+/// One grouped caption or transcript segment derived from aligned words.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlignedSegment {
+    /// Zero-based sequential segment index.
+    pub id: usize,
+    /// Segment start time in seconds.
+    pub start: f64,
+    /// Segment end time in seconds.
+    pub end: f64,
+    /// Verbatim UTF-8 segment text sliced from the cleaned transcript.
+    pub text: String,
 }
 
 /// Validated audio transcription or translation request parsed from a
@@ -148,6 +198,8 @@ pub struct ParsedAudioRequest {
     pub prompt: Option<String>,
     /// Requested output response format.
     pub response_format: ResponseFormat,
+    /// Requested `timestamp_granularities` for `verbose_json`.
+    pub timestamp_granularities: TimestampGranularities,
     /// Sampling temperature (0.0 for greedy decoding).
     pub temperature: f64,
     /// Optional deterministic RNG seed.
@@ -160,18 +212,27 @@ pub struct ParsedAudioRequest {
 
 /// Tokenized audio request ready to submit to the worker and format on return.
 pub struct PreparedAudioRequest {
+    /// Target worker model index.
+    pub model_index: usize,
     /// Tokenized prompt containing one audio placeholder token.
     pub prompt_tokens: Vec<i32>,
     /// Number of tokens in `prompt_tokens` before expanding the audio span.
     pub unexpanded_prompt_tokens: usize,
     /// Uploaded audio bytes passed to the engine media decoder.
     pub file: Vec<u8>,
+    /// Retained copy of uploaded audio bytes when post-decode CTC alignment is
+    /// required, or None when timestamps are not requested.
+    pub align_audio: Option<Vec<u8>>,
     /// Sampling settings for the worker.
     pub sampling: worker::Sampling,
     /// Maximum output tokens to generate.
     pub max_tokens: i64,
     /// Requested response format.
     pub response_format: ResponseFormat,
+    /// Include word-level timestamps in `verbose_json`.
+    pub include_words: bool,
+    /// Include segment-level timestamps in `verbose_json`.
+    pub include_segments: bool,
     /// Resolved language label if known ahead of decoding.
     pub language_label: Option<String>,
     /// Target audio endpoint.
@@ -365,6 +426,50 @@ pub fn resolve_language_name(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// Parses one `timestamp_granularities` form value (single token,
+/// comma-separated tokens, or JSON array of strings) into `out`.
+fn parse_timestamp_granularity_value(
+    raw: &str,
+    out: &mut TimestampGranularities,
+) -> Result<(), chat::Error> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<String> = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).map_err(|_| {
+            chat::Error::new_bad_request(
+                "timestamp_granularities must contain \"word\" and/or \"segment\"",
+            )
+        })?
+    } else {
+        trimmed
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    if items.is_empty() {
+        return Err(chat::Error::new_bad_request(
+            "timestamp_granularities must contain \"word\" and/or \"segment\"",
+        ));
+    }
+    for item in items {
+        if item.eq_ignore_ascii_case("word") {
+            out.word = true;
+            out.explicit = true;
+        } else if item.eq_ignore_ascii_case("segment") {
+            out.segment = true;
+            out.explicit = true;
+        } else {
+            return Err(chat::Error::new_bad_request(format!(
+                "timestamp_granularities value {item:?} is not supported; use \"word\" or \"segment\""
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Parses and validates a multipart/form-data audio request for `endpoint`.
 pub fn parse_audio_request(
     endpoint: AudioEndpoint,
@@ -379,7 +484,7 @@ pub fn parse_audio_request(
     let mut file: Option<Vec<u8>> = None;
     let mut filename: Option<String> = None;
     let mut fields = HashMap::<String, String>::new();
-    let mut has_timestamp_granularities = false;
+    let mut timestamp_granularities = TimestampGranularities::default();
 
     for part in parts {
         if part.name == "file" {
@@ -396,20 +501,13 @@ pub fn parse_audio_request(
             chat::Error::new_bad_request(format!("field {} is not valid UTF-8", part.name))
         })?;
         if part.name == "timestamp_granularities" || part.name == "timestamp_granularities[]" {
-            if !text.trim().is_empty() {
-                has_timestamp_granularities = true;
-            }
+            parse_timestamp_granularity_value(text, &mut timestamp_granularities)?;
             continue;
         }
         fields.insert(part.name, text.to_string());
     }
 
     let file = file.ok_or_else(|| chat::Error::new_bad_request("file is required"))?;
-    if has_timestamp_granularities {
-        return Err(chat::Error::new_bad_request(
-            "timestamp_granularities is not supported yet",
-        ));
-    }
 
     let model = fields
         .get("model")
@@ -443,17 +541,27 @@ pub fn parse_audio_request(
         Some(raw) if raw.eq_ignore_ascii_case("json") => ResponseFormat::Json,
         Some(raw) if raw.eq_ignore_ascii_case("text") => ResponseFormat::Text,
         Some(raw) if raw.eq_ignore_ascii_case("verbose_json") => ResponseFormat::VerboseJson,
-        Some(raw) if raw.eq_ignore_ascii_case("srt") || raw.eq_ignore_ascii_case("vtt") => {
-            return Err(chat::Error::new_bad_request(format!(
-                "response_format {raw:?} requires word timestamps, which are not supported yet; use \"json\", \"text\" or \"verbose_json\""
-            )));
-        }
+        Some(raw) if raw.eq_ignore_ascii_case("srt") => ResponseFormat::Srt,
+        Some(raw) if raw.eq_ignore_ascii_case("vtt") => ResponseFormat::Vtt,
         Some(other) => {
             return Err(chat::Error::new_bad_request(format!(
-                "response_format {other:?} is not supported; use \"json\", \"text\" or \"verbose_json\""
+                "response_format {other:?} is not supported; use \"json\", \"text\", \"verbose_json\", \"srt\" or \"vtt\""
             )));
         }
     };
+
+    if timestamp_granularities.explicit {
+        if endpoint == AudioEndpoint::Translations {
+            return Err(chat::Error::new_bad_request(
+                "timestamp_granularities is only supported for transcriptions",
+            ));
+        }
+        if response_format != ResponseFormat::VerboseJson {
+            return Err(chat::Error::new_bad_request(
+                "timestamp_granularities requires response_format \"verbose_json\"",
+            ));
+        }
+    }
 
     let temperature = match fields
         .get("temperature")
@@ -511,6 +619,7 @@ pub fn parse_audio_request(
         language,
         prompt,
         response_format,
+        timestamp_granularities,
         temperature,
         seed,
         stream,
@@ -574,11 +683,42 @@ pub fn render_prompt_bytes(
     out
 }
 
-/// Tokenizes a validated audio request for submission to the worker.
+/// Tokenizes a validated audio request for submission to the worker and checks
+/// whether requested timestamp formats are supported by the model.
 pub fn prepare_request(
     parsed: ParsedAudioRequest,
+    model_index: usize,
+    can_align_audio: bool,
     tokenizer: engine::Tokenizer,
 ) -> Result<PreparedAudioRequest, chat::Error> {
+    let requires_alignment = matches!(
+        parsed.response_format,
+        ResponseFormat::Srt | ResponseFormat::Vtt
+    ) || parsed.timestamp_granularities.explicit;
+    if requires_alignment && !can_align_audio {
+        return Err(chat::Error::new_bad_request(
+            "word and segment timestamps require model-ctc-bf16.safetensors in the checkpoint",
+        ));
+    }
+    let (include_words, include_segments, needs_alignment) = match parsed.response_format {
+        ResponseFormat::Srt | ResponseFormat::Vtt => (false, true, true),
+        ResponseFormat::VerboseJson => {
+            if parsed.timestamp_granularities.explicit {
+                (
+                    parsed.timestamp_granularities.word,
+                    parsed.timestamp_granularities.segment,
+                    parsed.timestamp_granularities.word || parsed.timestamp_granularities.segment,
+                )
+            } else if can_align_audio {
+                // OpenAI's default verbose_json granularity is ["segment"].
+                (false, true, true)
+            } else {
+                (false, false, false)
+            }
+        }
+        ResponseFormat::Json | ResponseFormat::Text => (false, false, false),
+    };
+
     let rendered = render_prompt_bytes(
         parsed.endpoint,
         parsed.language.as_deref(),
@@ -598,10 +738,17 @@ pub fn prepare_request(
             .as_deref()
             .map(|l| resolve_language_name(l).to_ascii_lowercase()),
     };
+    let align_audio = if needs_alignment {
+        Some(parsed.file.clone())
+    } else {
+        None
+    };
     Ok(PreparedAudioRequest {
+        model_index,
         prompt_tokens,
         unexpanded_prompt_tokens,
         file: parsed.file,
+        align_audio,
         sampling: worker::Sampling {
             temperature: parsed.temperature,
             top_p: 1.0,
@@ -610,6 +757,8 @@ pub fn prepare_request(
         },
         max_tokens: DEFAULT_MAX_TOKENS,
         response_format: parsed.response_format,
+        include_words,
+        include_segments,
         language_label,
         endpoint: parsed.endpoint,
         stream: parsed.stream,
@@ -779,13 +928,152 @@ fn build_usage_json(input_tokens: usize, output_tokens: usize) -> Value {
     })
 }
 
+/// Rounds a timestamp in seconds to millisecond precision without floating
+/// point representation noise.
+fn round_timestamp(seconds: f64) -> f64 {
+    let clamped = if seconds.is_finite() && seconds > 0.0 {
+        seconds
+    } else {
+        0.0
+    };
+    (clamped * TIMESTAMP_ROUND_SCALE).round() / TIMESTAMP_ROUND_SCALE
+}
+
+/// Strips outer sentence punctuation from a word slice for `verbose_json`
+/// `words[].word`, preserving internal apostrophes, hyphens and decimals, and
+/// returning the original slice if stripping would leave an empty string.
+pub fn clean_word_text(raw: &str) -> &str {
+    const OUTER_PUNCT: &[char] = &[
+        '.', ',', '?', '!', ';', ':', '"', '\'', '(', ')', '[', ']', '{', '}', '“', '”', '‘', '’',
+        '。', '，', '、', '？', '！', '；', '：', '（', '）', '「', '」', '《', '》',
+    ];
+    let trimmed = raw.trim_matches(OUTER_PUNCT);
+    if trimmed.is_empty() { raw } else { trimmed }
+}
+
+/// Returns whether `word` ends with sentence-terminating punctuation, ignoring
+/// trailing closing quotes or parentheses.
+fn ends_sentence(word: &str) -> bool {
+    const CLOSERS: &[char] = &['"', '\'', ')', ']', '”', '’', '」', '》', '）'];
+    let core = word.trim_end_matches(CLOSERS);
+    matches!(
+        core.chars().last(),
+        Some('.' | '!' | '?' | '。' | '！' | '？')
+    )
+}
+
+/// Returns whether `word` ends with clause-separating punctuation.
+fn ends_clause(word: &str) -> bool {
+    matches!(
+        word.chars().last(),
+        Some(',' | ';' | ':' | '，' | '；' | '：' | '、')
+    )
+}
+
+/// Groups CTC-aligned `words` into sentence and subtitle-sized segments slicing
+/// verbatim text from `transcript`.
+pub fn build_segments(
+    transcript: &str,
+    words: &[engine::AudioWord],
+    duration: f64,
+) -> Vec<AlignedSegment> {
+    if words.is_empty() {
+        let trimmed = transcript.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        return vec![AlignedSegment {
+            id: 0,
+            start: 0.0,
+            end: round_timestamp(duration),
+            text: trimmed.to_string(),
+        }];
+    }
+    let mut segments = Vec::new();
+    let mut seg_start_idx = 0usize;
+    for idx in 0..words.len() {
+        let is_last = idx + 1 == words.len();
+        let word_slice = &transcript[words[idx].byte_start..words[idx].byte_end];
+        let seg_slice = &transcript[words[seg_start_idx].byte_start..words[idx].byte_end];
+        let seg_dur = words[idx].end - words[seg_start_idx].start;
+        let seg_chars = seg_slice.chars().count();
+        let pause = if is_last {
+            0.0
+        } else {
+            words[idx + 1].start - words[idx].end
+        };
+        let split = is_last
+            || ends_sentence(word_slice)
+            || pause >= SEGMENT_PAUSE_SECONDS
+            || (seg_dur >= SEGMENT_SOFT_MAX_SECONDS
+                && (ends_clause(word_slice) || seg_chars >= SEGMENT_SOFT_MAX_CHARS))
+            || seg_dur >= SEGMENT_HARD_MAX_SECONDS
+            || seg_chars >= SEGMENT_HARD_MAX_CHARS;
+        if split {
+            let text = seg_slice.trim();
+            if !text.is_empty() {
+                segments.push(AlignedSegment {
+                    id: segments.len(),
+                    start: round_timestamp(words[seg_start_idx].start),
+                    end: round_timestamp(words[idx].end),
+                    text: text.to_string(),
+                });
+            }
+            seg_start_idx = idx + 1;
+        }
+    }
+    segments
+}
+
+/// Formats `seconds` as `HH:MM:SS<sep>mmm` for SRT (`','`) or WebVTT (`'.'`).
+fn format_caption_timestamp(seconds: f64, sep: char) -> String {
+    let clamped = if seconds.is_finite() && seconds > 0.0 {
+        seconds
+    } else {
+        0.0
+    };
+    let total_ms = (clamped * MILLISECONDS_PER_SECOND as f64).round() as u64;
+    let ms = total_ms % MILLISECONDS_PER_SECOND;
+    let total_s = total_ms / MILLISECONDS_PER_SECOND;
+    let hours = total_s / SECONDS_PER_HOUR;
+    let minutes = (total_s % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+    let secs = total_s % SECONDS_PER_MINUTE;
+    format!("{hours:02}:{minutes:02}:{secs:02}{sep}{ms:03}")
+}
+
+/// Formats `segments` as SubRip (`srt`) captions.
+pub fn format_srt(segments: &[AlignedSegment]) -> String {
+    let mut out = String::new();
+    for (idx, seg) in segments.iter().enumerate() {
+        let start = format_caption_timestamp(seg.start, ',');
+        let end = format_caption_timestamp(seg.end, ',');
+        out.push_str(&format!("{}\n{start} --> {end}\n{}\n\n", idx + 1, seg.text));
+    }
+    out
+}
+
+/// Formats `segments` as WebVTT (`vtt`) captions.
+pub fn format_vtt(segments: &[AlignedSegment]) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    for seg in segments {
+        let start = format_caption_timestamp(seg.start, '.');
+        let end = format_caption_timestamp(seg.end, '.');
+        out.push_str(&format!("{start} --> {end}\n{}\n\n", seg.text));
+    }
+    out
+}
+
 /// Builds a non-streaming response body for `format`.
+#[allow(clippy::too_many_arguments)]
 fn build_audio_response(
     format: ResponseFormat,
     endpoint: AudioEndpoint,
     language_label: Option<&str>,
     duration: f64,
     text: &str,
+    alignment: Option<&engine::AudioAlignment>,
+    include_words: bool,
+    include_segments: bool,
     input_tokens: usize,
     output_tokens: usize,
 ) -> Response {
@@ -819,10 +1107,62 @@ fn build_audio_response(
             if let Some(lang) = language_label {
                 body["language"] = json!(lang);
             }
+            if let Some(aligned) = alignment {
+                if include_words {
+                    let words_json: Vec<Value> = aligned
+                        .words
+                        .iter()
+                        .map(|w| {
+                            let raw = &text[w.byte_start..w.byte_end];
+                            json!({
+                                "word": clean_word_text(raw),
+                                "start": round_timestamp(w.start),
+                                "end": round_timestamp(w.end),
+                            })
+                        })
+                        .collect();
+                    body["words"] = json!(words_json);
+                }
+                if include_segments {
+                    let segments = build_segments(text, &aligned.words, aligned.duration);
+                    let segs_json: Vec<Value> = segments
+                        .iter()
+                        .map(|seg| {
+                            json!({
+                                "id": seg.id,
+                                "start": seg.start,
+                                "end": seg.end,
+                                "text": seg.text,
+                            })
+                        })
+                        .collect();
+                    body["segments"] = json!(segs_json);
+                }
+            }
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
                 body.to_string(),
+            )
+                .into_response()
+        }
+        ResponseFormat::Srt => {
+            let words = alignment.map_or(&[][..], |a| &a.words[..]);
+            let segments = build_segments(text, words, duration);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format_srt(&segments),
+            )
+                .into_response()
+        }
+        ResponseFormat::Vtt => {
+            let words = alignment.map_or(&[][..], |a| &a.words[..]);
+            let segments = build_segments(text, words, duration);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
+                format_vtt(&segments),
             )
                 .into_response()
         }
@@ -946,13 +1286,33 @@ pub async fn collect_response(
     }
     text.push_str(&decoder.finish());
     let cleaned = cleanup_generation_loops(text.trim());
-    let duration = estimate_duration_seconds(prompt_tokens, request.unexpanded_prompt_tokens);
+    let alignment = if let Some(audio_bytes) = request.align_audio {
+        match worker::align_audio(request.model_index, audio_bytes, cleaned.clone()).await {
+            Ok(aligned) => Some(aligned),
+            Err(message) => {
+                return chat::build_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    &message,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let duration = match alignment.as_ref().filter(|a| a.duration > 0.0) {
+        Some(aligned) => (aligned.duration * DURATION_ROUND_SCALE).round() / DURATION_ROUND_SCALE,
+        None => estimate_duration_seconds(prompt_tokens, request.unexpanded_prompt_tokens),
+    };
     build_audio_response(
         request.response_format,
         request.endpoint,
         request.language_label.as_deref(),
         duration,
         &cleaned,
+        alignment.as_ref(),
+        request.include_words,
+        request.include_segments,
         prompt_tokens,
         output_tokens,
     )
@@ -1157,34 +1517,62 @@ mod tests {
         );
         assert!(parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &two_files).is_err());
 
-        for fmt in [b"srt".as_slice(), b"vtt", b"xml"] {
-            let body = build_multipart(
-                boundary,
-                &[("file", Some("a.wav"), wav), ("response_format", None, fmt)],
-            );
-            assert!(parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &body).is_err());
-        }
+        let bad_fmt = build_multipart(
+            boundary,
+            &[
+                ("file", Some("a.wav"), wav),
+                ("response_format", None, b"xml"),
+            ],
+        );
+        assert!(parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &bad_fmt).is_err());
 
-        let ts = build_multipart(
+        // timestamp_granularities requires verbose_json and transcriptions.
+        let ts_json = build_multipart(
             boundary,
             &[
                 ("file", Some("a.wav"), wav),
                 ("timestamp_granularities[]", None, b"word"),
             ],
         );
-        assert!(parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &ts).is_err());
+        assert!(parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &ts_json).is_err());
 
-        let bad_stream = build_multipart(
+        let ts_bad_val = build_multipart(
             boundary,
             &[
                 ("file", Some("a.wav"), wav),
-                ("response_format", None, b"text"),
-                ("stream", None, b"true"),
+                ("response_format", None, b"verbose_json"),
+                ("timestamp_granularities[]", None, b"character"),
             ],
         );
         assert!(
-            parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &bad_stream).is_err()
+            parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &ts_bad_val).is_err()
         );
+
+        let ts_translate = build_multipart(
+            boundary,
+            &[
+                ("file", Some("a.wav"), wav),
+                ("response_format", None, b"verbose_json"),
+                ("timestamp_granularities[]", None, b"word"),
+            ],
+        );
+        assert!(
+            parse_audio_request(AudioEndpoint::Translations, Some(&ct), &ts_translate).is_err()
+        );
+
+        for fmt in [b"text".as_slice(), b"srt", b"vtt", b"verbose_json"] {
+            let bad_stream = build_multipart(
+                boundary,
+                &[
+                    ("file", Some("a.wav"), wav),
+                    ("response_format", None, fmt),
+                    ("stream", None, b"true"),
+                ],
+            );
+            assert!(
+                parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &bad_stream).is_err()
+            );
+        }
 
         let neg_temp = build_multipart(
             boundary,
@@ -1280,5 +1668,123 @@ mod tests {
         assert!(done.starts_with("event: transcript.text.done\ndata: "));
         assert!(done.contains(r#""text":"Hello world.""#));
         assert!(done.contains(r#""total_tokens":148"#));
+    }
+
+    #[test]
+    fn timestamp_granularities_and_caption_formats_parse_correctly() {
+        let boundary = "ts-boundary";
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let wav = b"fake-audio-bytes";
+
+        // Repeated bracketed fields (curl / OpenAI SDK convention).
+        let repeated = build_multipart(
+            boundary,
+            &[
+                ("file", Some("a.wav"), wav),
+                ("response_format", None, b"verbose_json"),
+                ("timestamp_granularities[]", None, b"word"),
+                ("timestamp_granularities[]", None, b"segment"),
+            ],
+        );
+        let parsed = parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &repeated)
+            .expect("repeated granularities");
+        assert!(parsed.timestamp_granularities.word);
+        assert!(parsed.timestamp_granularities.segment);
+        assert!(parsed.timestamp_granularities.explicit);
+
+        // JSON array form.
+        let json_arr = build_multipart(
+            boundary,
+            &[
+                ("file", Some("a.wav"), wav),
+                ("response_format", None, b"verbose_json"),
+                ("timestamp_granularities", None, br#"["word"]"#),
+            ],
+        );
+        let parsed = parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &json_arr)
+            .expect("json granularities");
+        assert!(parsed.timestamp_granularities.word);
+        assert!(!parsed.timestamp_granularities.segment);
+
+        // SRT and VTT formats parse on both transcriptions and translations.
+        for &(raw, expected) in &[
+            (b"srt".as_slice(), ResponseFormat::Srt),
+            (b"vtt".as_slice(), ResponseFormat::Vtt),
+        ] {
+            let body = build_multipart(
+                boundary,
+                &[("file", Some("a.wav"), wav), ("response_format", None, raw)],
+            );
+            let p1 = parse_audio_request(AudioEndpoint::Transcriptions, Some(&ct), &body).unwrap();
+            let p2 = parse_audio_request(AudioEndpoint::Translations, Some(&ct), &body).unwrap();
+            assert_eq!(p1.response_format, expected);
+            assert_eq!(p2.response_format, expected);
+        }
+    }
+
+    #[test]
+    fn word_cleaning_segments_srt_and_vtt_format_accurately() {
+        assert_eq!(clean_word_text("dog."), "dog");
+        assert_eq!(clean_word_text("\"don't!\""), "don't");
+        assert_eq!(clean_word_text("3.5,"), "3.5");
+        assert_eq!(clean_word_text("..."), "...");
+
+        let transcript = "Hello world. Second sentence here!";
+        let words = vec![
+            engine::AudioWord {
+                byte_start: 0,
+                byte_end: 5,
+                start: 0.0,
+                end: 0.4,
+            },
+            engine::AudioWord {
+                byte_start: 6,
+                byte_end: 12,
+                start: 0.44,
+                end: 1.12,
+            },
+            engine::AudioWord {
+                byte_start: 13,
+                byte_end: 19,
+                start: 1.6,
+                end: 2.05,
+            },
+            engine::AudioWord {
+                byte_start: 20,
+                byte_end: 28,
+                start: 2.1,
+                end: 2.6,
+            },
+            engine::AudioWord {
+                byte_start: 29,
+                byte_end: 34,
+                start: 2.64,
+                end: 3.125,
+            },
+        ];
+        let segments = build_segments(transcript, &words, 3.2);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 1.12);
+        assert_eq!(segments[0].text, "Hello world.");
+        assert_eq!(segments[1].id, 1);
+        assert_eq!(segments[1].start, 1.6);
+        assert_eq!(segments[1].end, 3.125);
+        assert_eq!(segments[1].text, "Second sentence here!");
+
+        let srt = format_srt(&segments);
+        assert_eq!(
+            srt,
+            "1\n00:00:00,000 --> 00:00:01,120\nHello world.\n\n\
+             2\n00:00:01,600 --> 00:00:03,125\nSecond sentence here!\n\n"
+        );
+        let vtt = format_vtt(&segments);
+        assert_eq!(
+            vtt,
+            "WEBVTT\n\n\
+             00:00:00.000 --> 00:00:01.120\nHello world.\n\n\
+             00:00:01.600 --> 00:00:03.125\nSecond sentence here!\n\n"
+        );
     }
 }

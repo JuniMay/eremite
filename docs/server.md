@@ -353,7 +353,8 @@ NVIDIA Nemotron-3.5-Transcribe (`model_type` `nemo_speechlm`) transcribes
 speech and translates speech into English. Its `model` folder holds
 `config.json`, `tokenizer.json`, `model.safetensors.index.json`, its
 safetensors weight shards, `perception.safetensors`, and optionally
-`model-mtp-fp8.safetensors` for speculative drafting. Its entry takes `model`,
+`model-mtp-fp8.safetensors` for speculative drafting and
+`model-ctc-bf16.safetensors` for CTC word-level timestamps. Its entry takes `model`,
 `id`, `ctx` (default 65,536, fitting up to 1-hour recordings plus transcripts),
 `draft` (0 to 8, default 0), `lookup` (`off` or 1 to 15, default `off`),
 `memory`, `max_cached_states` and `idle_unload`, and refuses DeepSeek-only and
@@ -381,9 +382,16 @@ Request form fields accepted by the audio endpoints:
 - `prompt`: optional context terms or domain vocabulary passed as biasing hints
   in the transcription or translation prompt.
 - `response_format`: `"json"` (default: `{"text": "...", "usage": ...}`),
-  `"text"` (`text/plain; charset=utf-8`), or `"verbose_json"` (`task`,
-  `duration`, `text`, `usage`, and `language` when known). `"srt"`, `"vtt"` and
-  `timestamp_granularities` return HTTP 400 until word timestamps are added.
+  `"text"` (`text/plain; charset=utf-8`), `"verbose_json"` (`task`, `duration`,
+  `text`, `usage`, `language` when known, plus `segments` and/or `words` when
+  aligned), `"srt"` (SubRip captions, `text/plain; charset=utf-8`), or `"vtt"`
+  (WebVTT captions, `text/vtt; charset=utf-8`). `"srt"` and `"vtt"` require
+  `model-ctc-bf16.safetensors` in the checkpoint.
+- `timestamp_granularities[]` (or `timestamp_granularities`):
+  `/v1/audio/transcriptions` only; requires `response_format` `"verbose_json"`
+  and `model-ctc-bf16.safetensors`. Accepts `"word"`, `"segment"`, or both
+  (default `["segment"]` for `"verbose_json"` when `model-ctc-bf16.safetensors`
+  is present).
 - `temperature`: optional nonnegative finite number (default `0`, greedy).
 - `seed`: optional nonnegative integer random seed.
 - `stream`: optional `"true"` or `"false"` (default `false`); requires
@@ -393,14 +401,15 @@ Request form fields accepted by the audio endpoints:
 
 Nemotron-3.5-Transcribe keeps its dense hybrid Mamba-2 and attention backbone
 resident in GPU memory (~3.3 GiB) and loads its 815 MiB Parallel Expert
-Perception audio encoder on demand. Its 2,944 NVFP4 routed experts across 23
-MoE layers live in the shared SSD-backed expert cache (~15.7 GiB when all
-experts stay resident). Setting `draft` to `1` through `8` loads the checkpoint's
-repeated `*E` FP8 Multi-Token Prediction head (`model-mtp-fp8.safetensors`,
-~1.25 GiB) and accelerates decoding without changing outputs; `draft: 7` gives
-the fastest measured decode speed in both full-resident and SSD-streaming modes
-because verification stays within the 8-row multi-vector kernels. Setting
-`memory` (for example `5` GiB without `draft`, or `6` GiB with `draft: 7`)
+Perception audio encoder and 96.6 MiB BF16 CTC timestamp head on demand. Its
+2,944 NVFP4 routed experts across 23 MoE layers live in the shared SSD-backed
+expert cache (~15.7 GiB when all experts stay resident). Setting `draft` to `1`
+through `8` loads the checkpoint's repeated `*E` FP8 Multi-Token Prediction head
+(`model-mtp-fp8.safetensors`, ~1.25 GiB) and accelerates decoding without
+changing outputs; `draft: 7` gives the fastest measured decode speed in both
+full-resident and SSD-streaming modes because verification stays within the
+8-row multi-vector kernels. Setting `memory` (for example `5` GiB without
+`draft`, or `6` GiB with `draft: 7`)
 streams routed experts from SSD into a bounded cache so transcription runs
 alongside a large language model such as DeepSeek without holding all experts
 in RAM.

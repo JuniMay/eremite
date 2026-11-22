@@ -731,6 +731,20 @@ unsafe extern "C" {
     ) -> c_int;
     fn eremite_media_encode(x: *mut RawMedia, from: c_int) -> c_int;
     fn eremite_media_close(x: *mut RawMedia);
+    fn eremite_can_align_audio(m: *const RawModel) -> c_int;
+    fn eremite_align_audio(
+        m: *mut RawModel,
+        audio_data: *const u8,
+        audio_len: usize,
+        transcript: *const c_char,
+        transcript_len: usize,
+        out_words: *mut *mut RawAudioWord,
+        out_count: *mut c_int,
+        out_duration: *mut f64,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+    fn eremite_audio_words_free(words: *mut RawAudioWord);
     fn eremite_model_tokenizer(m: *const RawModel) -> *mut RawTokenizer;
     #[cfg(test)]
     fn eremite_tokenizer_open(dir: *const c_char, image: *const c_char) -> *mut RawTokenizer;
@@ -1857,6 +1871,73 @@ impl Model {
         Ok(Media(x))
     }
 
+    /// Returns whether this model supports CTC word-level audio timestamp
+    /// alignment.
+    pub fn can_align_audio(&self) -> bool {
+        unsafe { eremite_can_align_audio(self.raw) != 0 }
+    }
+
+    /// Aligns UTF-8 `transcript` against encoded `audio` bytes using the
+    /// model's CTC timestamp head.
+    pub fn align_audio(&self, audio: &[u8], transcript: &str) -> Result<AudioAlignment, String> {
+        let mut raw_words: *mut RawAudioWord = ptr::null_mut();
+        let mut count: c_int = 0;
+        let mut duration: f64 = 0.0;
+        let mut error = [0 as c_char; MEDIA_MESSAGE_BYTES];
+        let ok = unsafe {
+            eremite_align_audio(
+                self.raw,
+                audio.as_ptr(),
+                audio.len(),
+                transcript.as_ptr().cast::<c_char>(),
+                transcript.len(),
+                &mut raw_words,
+                &mut count,
+                &mut duration,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            if !raw_words.is_null() {
+                unsafe { eremite_audio_words_free(raw_words) };
+            }
+            let message = error_text(&error);
+            return Err(if message.is_empty() {
+                "audio timestamp alignment failed".into()
+            } else {
+                message
+            });
+        }
+        let mut words = Vec::new();
+        if count > 0 && !raw_words.is_null() {
+            let slice = unsafe { std::slice::from_raw_parts(raw_words, count as usize) };
+            words.reserve(slice.len());
+            for item in slice {
+                let byte_start = item.byte_start.max(0) as usize;
+                let byte_end = item
+                    .byte_end
+                    .max(item.byte_start)
+                    .min(transcript.len() as c_int) as usize;
+                if byte_start < byte_end
+                    && transcript.is_char_boundary(byte_start)
+                    && transcript.is_char_boundary(byte_end)
+                {
+                    words.push(AudioWord {
+                        byte_start,
+                        byte_end,
+                        start: item.start,
+                        end: item.end,
+                    });
+                }
+            }
+        }
+        if !raw_words.is_null() {
+            unsafe { eremite_audio_words_free(raw_words) };
+        }
+        Ok(AudioAlignment { words, duration })
+    }
+
     /// Returns the model's tokenizer.
     pub fn tokenizer(&self) -> Tokenizer {
         Tokenizer(unsafe { eremite_model_tokenizer(self.raw) })
@@ -2134,6 +2215,41 @@ impl Drop for Media {
     fn drop(&mut self) {
         unsafe { eremite_media_close(self.0) }
     }
+}
+
+/// C ABI layout of one CTC-aligned audio word (eremite_audio_word).
+#[repr(C)]
+struct RawAudioWord {
+    /// Start byte offset (inclusive) in the input UTF-8 transcript.
+    byte_start: c_int,
+    /// End byte offset (exclusive) in the input UTF-8 transcript.
+    byte_end: c_int,
+    /// Aligned word start time in seconds.
+    start: f64,
+    /// Aligned word end time in seconds.
+    end: f64,
+}
+
+/// One transcript word aligned to an audio clip by the CTC timestamp head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioWord {
+    /// Start byte offset (inclusive) of this word in the input transcript.
+    pub byte_start: usize,
+    /// End byte offset (exclusive) of this word in the input transcript.
+    pub byte_end: usize,
+    /// Aligned word start time in seconds within `[0, duration]`.
+    pub start: f64,
+    /// Aligned word end time in seconds within `[start, duration]`.
+    pub end: f64,
+}
+
+/// Result of aligning a transcript against an audio recording.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioAlignment {
+    /// Aligned words in temporal order referencing byte spans in the transcript.
+    pub words: Vec<AudioWord>,
+    /// Decoded audio duration in seconds.
+    pub duration: f64,
 }
 
 /// Input and output limits of an image generation model (eremite_image_limits).

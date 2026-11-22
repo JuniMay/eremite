@@ -97,8 +97,11 @@ enum Format {
     MinimaxH3Video(engine::VideoLimits),
     /// NVIDIA Nemotron-3.5-Transcribe: audio transcription and English
     /// translation over POST /v1/audio/transcriptions and
-    /// POST /v1/audio/translations.
-    NemotronTranscribe,
+    /// POST /v1/audio/translations, with optional CTC word timestamp alignment.
+    NemotronTranscribe {
+        /// True when `model-ctc-bf16.safetensors` is present in the checkpoint.
+        can_align_audio: bool,
+    },
 }
 
 /// What the HTTP handlers share.
@@ -150,7 +153,7 @@ fn generates_videos(model: &Served) -> bool {
 /// Returns whether `model` is an audio transcription model: whether it answers
 /// POST /v1/audio/transcriptions and POST /v1/audio/translations.
 fn transcribes_audio(model: &Served) -> bool {
-    matches!(model.format, Format::NemotronTranscribe)
+    matches!(model.format, Format::NemotronTranscribe { .. })
 }
 
 /// Finds the index of the model named `name` (in any case). For an unknown
@@ -393,7 +396,7 @@ async fn list_codex_models(State(shared): App) -> Response {
             Format::D1(_)
             | Format::MinimaxH3Image(_)
             | Format::MinimaxH3Video(_)
-            | Format::NemotronTranscribe => None,
+            | Format::NemotronTranscribe { .. } => None,
         });
     build_json_response(codex::build_catalog(models).to_string())
 }
@@ -535,7 +538,7 @@ async fn answer_decisions(
                 Format::MinimaxH3Video(_) => {
                     format!("{} is a video model: it makes no decisions", model.id)
                 }
-                Format::NemotronTranscribe => {
+                Format::NemotronTranscribe { .. } => {
                     format!(
                         "{} is an audio transcription model: it makes no decisions",
                         model.id
@@ -716,7 +719,7 @@ async fn answer_generation(
             "{} is a video model: it generates videos and generates no text",
             handlers.models[index].id
         ))),
-        Format::NemotronTranscribe => Err(chat::Error::new_bad_request(format!(
+        Format::NemotronTranscribe { .. } => Err(chat::Error::new_bad_request(format!(
             "{} is an audio transcription model: use /v1/audio/transcriptions or /v1/audio/translations",
             handlers.models[index].id
         ))),
@@ -1300,7 +1303,7 @@ fn resolve_audio_model(shared: &Shared, name: Option<&str>) -> Result<usize, (St
     let index = find_model_index_by_name(shared, name, transcribes_audio)
         .map_err(|message| (StatusCode::NOT_FOUND, message))?;
     let model = &shared.models[index];
-    if !matches!(model.format, Format::NemotronTranscribe) {
+    if !matches!(model.format, Format::NemotronTranscribe { .. }) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("{} does not transcribe audio", model.id),
@@ -1385,7 +1388,18 @@ async fn answer_audio(
         let audio_bytes = parsed.file.len();
         let filename = parsed.filename.as_deref().unwrap_or("audio").to_string();
         let streamed = parsed.stream;
-        let mut prepared = audio::prepare_request(parsed, handlers.models[index].tokenizer)?;
+        let can_align_audio = matches!(
+            handlers.models[index].format,
+            Format::NemotronTranscribe {
+                can_align_audio: true
+            }
+        );
+        let mut prepared = audio::prepare_request(
+            parsed,
+            index,
+            can_align_audio,
+            handlers.models[index].tokenizer,
+        )?;
         let note = format!(
             "http {arrival} from {from}: audio {} ({filename}, {audio_bytes} bytes), {}",
             endpoint.task_name(),
@@ -1655,7 +1669,9 @@ fn main() {
                 worker::video_limits(index)
                     .unwrap_or_else(|| die(&format!("{id}: video model reported no limits"))),
             ),
-            Family::NemotronTranscribe => Format::NemotronTranscribe,
+            Family::NemotronTranscribe => Format::NemotronTranscribe {
+                can_align_audio: worker::can_align_audio(index),
+            },
         };
         let name = match family {
             Family::DeepSeek => "DeepSeek V4.1 Flash (eremite)".to_string(),
