@@ -56,6 +56,12 @@ static constexpr size_t MAGIC_MIN_BYTES = 12, FOURCC_BYTES = 4,
 static constexpr uint8_t MP3_SYNC_BYTE0 = 0xff, MP3_SYNC_MASK = 0xe0,
                          MP3_LAYER_MASK = 0x06;
 
+// EBML container magic bytes used to identify WebM and Matroska streams.
+static constexpr uint8_t EBML_MAGIC[4] = {0x1a, 0x45, 0xdf, 0xa3};
+
+// Mono channel count for single-channel PCM decoding.
+static constexpr int MONO_AUDIO_CHANNELS = 1;
+
 // Temporary file path buffer capacity.
 static constexpr size_t TEMP_PATH_CAP = 512;
 
@@ -152,6 +158,8 @@ static const char *sniff_media_suffix(const void *data, size_t len,
          memcmp(b + RIFF_TAG_OFFSET, "AIFC", FOURCC_BYTES) == 0))
       return ".aiff";
     if (memcmp(b, "caff", FOURCC_BYTES) == 0) return ".caf";
+    if (memcmp(b, "OggS", FOURCC_BYTES) == 0) return ".ogg";
+    if (memcmp(b, EBML_MAGIC, FOURCC_BYTES) == 0) return ".webm";
     if (memcmp(b + FOURCC_BYTES, "ftyp", FOURCC_BYTES) == 0)
       return is_video ? ".mp4" : ".m4a";
     if (memcmp(b, "ID3", ID3_TAG_BYTES) == 0 ||
@@ -282,10 +290,12 @@ static void copy_bgra_to_rgb(CVPixelBufferRef px, uint8_t *dst, int width,
   CVPixelBufferUnlockBaseAddress(px, kCVPixelBufferLock_ReadOnly);
 }
 
-// Reads all stereo FP32 PCM samples from an audio track of asset at
-// target_sample_rate into a planar buffer [2, *out_samples].
+// Reads all FP32 PCM samples from an audio track of asset at
+// target_sample_rate with the requested channel count (1 for mono, 2 for planar
+// stereo) up to max_seconds.
 static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
-                               int target_sample_rate, int *out_samples,
+                               int target_sample_rate, int channels,
+                               int max_seconds, int *out_samples,
                                const char **error) {
   NSError *ns_err = nil;
   AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset
@@ -297,7 +307,7 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
   NSDictionary *settings = @{
     AVFormatIDKey : @(kAudioFormatLinearPCM),
     AVSampleRateKey : @(target_sample_rate),
-    AVNumberOfChannelsKey : @(VIDEO_AUDIO_CHANNELS),
+    AVNumberOfChannelsKey : @(channels),
     AVLinearPCMBitDepthKey : @(PCM_FLOAT_BITS),
     AVLinearPCMIsFloatKey : @YES,
     AVLinearPCMIsBigEndianKey : @NO,
@@ -321,13 +331,13 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
     return NULL;
   }
 
-  size_t max_samples =
-      (size_t)target_sample_rate * (size_t)VIDEO_MAX_DECODE_AUDIO_SECONDS;
+  size_t max_samples = (size_t)target_sample_rate * (size_t)max_seconds;
   size_t cap = (size_t)target_sample_rate;
   size_t count = 0;
   float *left = malloc(cap * sizeof(float));
-  float *right = malloc(cap * sizeof(float));
-  if (!left || !right) {
+  float *right =
+      channels == VIDEO_AUDIO_CHANNELS ? malloc(cap * sizeof(float)) : NULL;
+  if (!left || (channels == VIDEO_AUDIO_CHANNELS && !right)) {
     free(left);
     free(right);
     [reader cancelReading];
@@ -347,7 +357,7 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
       char *raw = NULL;
       if (CMBlockBufferGetDataPointer(block, 0, NULL, &byte_len, &raw) ==
           kCMBlockBufferNoErr) {
-        size_t avail = byte_len / (VIDEO_AUDIO_CHANNELS * sizeof(float));
+        size_t avail = byte_len / ((size_t)channels * sizeof(float));
         if (n_frames > avail) n_frames = avail;
         if (count + n_frames > max_samples) {
           overflow = 1;
@@ -358,8 +368,10 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
           size_t next = cap * 2;
           while (next < count + n_frames) next *= 2;
           float *nl = realloc(left, next * sizeof(float));
-          float *nr = realloc(right, next * sizeof(float));
-          if (!nl || !nr) {
+          float *nr = channels == VIDEO_AUDIO_CHANNELS
+                          ? realloc(right, next * sizeof(float))
+                          : NULL;
+          if (!nl || (channels == VIDEO_AUDIO_CHANNELS && !nr)) {
             if (nl) left = nl;
             if (nr) right = nr;
             free(left);
@@ -376,9 +388,14 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
           cap = next;
         }
         const float *inter = (const float *)raw;
-        for (size_t i = 0; i < n_frames; i++) {
-          left[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 0]);
-          right[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 1]);
+        if (channels == MONO_AUDIO_CHANNELS) {
+          for (size_t i = 0; i < n_frames; i++)
+            left[count + i] = clamp_pcm(inter[i]);
+        } else {
+          for (size_t i = 0; i < n_frames; i++) {
+            left[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 0]);
+            right[count + i] = clamp_pcm(inter[i * VIDEO_AUDIO_CHANNELS + 1]);
+          }
         }
         count += n_frames;
       }
@@ -400,6 +417,11 @@ static float *read_audio_track(AVAsset *asset, AVAssetTrack *track,
     free(right);
     set_error(error, "cannot decode audio track");
     return NULL;
+  }
+
+  if (channels == MONO_AUDIO_CHANNELS) {
+    *out_samples = (int)count;
+    return left;
   }
 
   float *planar = malloc(count * VIDEO_AUDIO_CHANNELS * sizeof(float));
@@ -804,8 +826,9 @@ int video_decode_mp4(const void *data, size_t len, int target_fps,
     NSArray<AVAssetTrack *> *a_tracks = load_tracks(asset, AVMediaTypeAudio);
     if (a_tracks && a_tracks.count > 0) {
       int a_samples = 0;
-      float *pcm = read_audio_track(asset, a_tracks[0], target_sample_rate,
-                                    &a_samples, error);
+      float *pcm = read_audio_track(
+          asset, a_tracks[0], target_sample_rate, VIDEO_AUDIO_CHANNELS,
+          VIDEO_MAX_DECODE_AUDIO_SECONDS, &a_samples, error);
       [a_tracks release];
       if (!pcm) {
         video_decoded_free(out);
@@ -827,8 +850,12 @@ done:
   return ok;
 }
 
-float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
-                        int *out_samples, const char **error) {
+// Decodes an encoded audio clip into FP32 PCM with the requested channel count
+// and duration limit in seconds.
+static float *decode_audio_pcm_common(const void *data, size_t len,
+                                      int target_sample_rate, int channels,
+                                      int max_seconds, int *out_samples,
+                                      const char **error) {
   if (out_samples) *out_samples = 0;
   if (!data || len == 0) {
     set_error(error, "audio data is empty");
@@ -837,6 +864,10 @@ float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
   if (target_sample_rate < VIDEO_MIN_SAMPLE_RATE ||
       target_sample_rate > VIDEO_MAX_SAMPLE_RATE) {
     set_error(error, "target audio sample rate is out of range");
+    return NULL;
+  }
+  if (max_seconds < 1 || max_seconds > AUDIO_MAX_DECODE_SECONDS) {
+    set_error(error, "maximum audio duration is out of range");
     return NULL;
   }
 
@@ -856,8 +887,8 @@ float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
     set_error(error, "file contains no audio track");
   } else {
     int samples = 0;
-    pcm = read_audio_track(asset, a_tracks[0], target_sample_rate, &samples,
-                           error);
+    pcm = read_audio_track(asset, a_tracks[0], target_sample_rate, channels,
+                           max_seconds, &samples, error);
     if (pcm && out_samples) *out_samples = samples;
   }
   [a_tracks release];
@@ -865,4 +896,19 @@ float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
   objc_autoreleasePoolPop(pool);
   unlink(path);
   return pcm;
+}
+
+float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
+                        int *out_samples, const char **error) {
+  return decode_audio_pcm_common(
+      data, len, target_sample_rate, VIDEO_AUDIO_CHANNELS,
+      VIDEO_MAX_DECODE_AUDIO_SECONDS, out_samples, error);
+}
+
+float *audio_decode_pcm_mono(const void *data, size_t len,
+                             int target_sample_rate, int max_seconds,
+                             int *out_samples, const char **error) {
+  return decode_audio_pcm_common(data, len, target_sample_rate,
+                                 MONO_AUDIO_CHANNELS, max_seconds, out_samples,
+                                 error);
 }

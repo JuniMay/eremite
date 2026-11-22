@@ -22,6 +22,9 @@ static constexpr int VIDEO_MAX_DECODE_FRAMES = 3600;
 // Maximum audio duration decoded from one uploaded clip in seconds.
 static constexpr int VIDEO_MAX_DECODE_AUDIO_SECONDS = 60;
 
+// Maximum mono audio duration decoded for speech transcription in seconds.
+static constexpr int AUDIO_MAX_DECODE_SECONDS = 3600;
+
 // Decoded video frames and optional stereo soundtrack from an input clip.
 typedef struct {
   // Heap-allocated 8-bit RGB frames [frame_count, height, width, 3].
@@ -59,5 +62,12 @@ int video_decode_mp4(const void *data, size_t len, int target_fps,
 // failure.
 float *audio_decode_pcm(const void *data, size_t len, int target_sample_rate,
                         int *out_samples, const char **error);
+
+// Decodes an encoded audio or video clip into mono FP32 PCM [*out_samples] in
+// [-1, 1] at target_sample_rate in a new buffer, rejecting clips longer than
+// max_seconds. Returns null with *error set on failure.
+float *audio_decode_pcm_mono(const void *data, size_t len,
+                             int target_sample_rate, int max_seconds,
+                             int *out_samples, const char **error);
 
 #endif

@@ -132,6 +132,17 @@ static void test_mp4_av_roundtrip(void) {
             channel_rms(only_audio, a_samples) > MIN_AUDIO_RMS,
         "standalone audio_decode_pcm matches track");
 
+  int mono_samples = 0;
+  static constexpr int MONO_SR = 16000;
+  static constexpr int MONO_MAX_SEC = 10;
+  float *mono = audio_decode_pcm_mono(mp4, mp4_len, MONO_SR, MONO_MAX_SEC,
+                                      &mono_samples, &err);
+  check(mono != NULL && mono_samples >= MONO_SR / 2 &&
+            mono_samples <= MONO_SR * 2 &&
+            channel_rms(mono, mono_samples) > MIN_AUDIO_RMS,
+        "audio_decode_pcm_mono downmixes and resamples to 16 kHz");
+
+  free(mono);
   free(only_audio);
   video_decoded_free(&dec);
   free(mp4);

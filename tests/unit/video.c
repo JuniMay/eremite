@@ -51,6 +51,22 @@ int main(void) {
             err != NULL,
         "bad decode sample rate refused");
 
+  err = NULL;
+  check(audio_decode_pcm_mono(NULL, 0, 16000, 60, &samples, &err) == NULL &&
+            err != NULL,
+        "empty mono audio refused");
+  err = NULL;
+  check(audio_decode_pcm_mono(pixel, sizeof pixel, 16000, 0, &samples, &err) ==
+                NULL &&
+            err != NULL,
+        "zero mono duration refused");
+  err = NULL;
+  check(audio_decode_pcm_mono(pixel, sizeof pixel, 16000,
+                              AUDIO_MAX_DECODE_SECONDS + 1, &samples,
+                              &err) == NULL &&
+            err != NULL,
+        "excessive mono duration refused");
+
   video_decoded_free(&dec);
   return failures != 0;
 }
