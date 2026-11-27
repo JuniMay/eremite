@@ -52,6 +52,9 @@ static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = INK2_HEAD_DIM + 2;
 static constexpr int PREFILL_Q_PAD = 64;
 static constexpr int PREFILL_Q_GROUP = 64;
+// Rows dequantized per FP8 prefill slab: 2,048 rows of BF16 K and V take 8 MiB
+// total (hot in SLC/L2) and hold an entire 1,040-row sliding ring in one pass.
+static constexpr int FP8_PREFILL_SLAB_ROWS = 2048;
 static constexpr int MM_TILE_M = 64;
 static constexpr int MM_TILE_N = 64;
 static constexpr int MOE_MM_TILE = 64;
@@ -106,11 +109,8 @@ static constexpr uint8_t ROUTE_SOURCE_AHEAD = 1;
 static constexpr uint8_t ROUTE_SOURCE_LATE = 2;
 static constexpr uint8_t ROUTE_SOURCE_SSD = 4;
 
-// Byte layout of rolling state buffers inside one Ink2State.
-static constexpr size_t SLIDE_KV_ONE_BYTES =
-    (size_t)INK2_SLIDE_RING * INK2_KV_DIM * sizeof(uint16_t);
-static constexpr size_t SLIDE_KV_BYTES =
-    (size_t)INK2_SLIDE_COUNT * 2 * SLIDE_KV_ONE_BYTES;
+// Byte layout of fixed FP32 short-convolution rings and logits inside one
+// Ink2State.
 static constexpr size_t CONV_KV_RING_BYTES =
     (size_t)INK2_SCONV_RING * INK2_KV_DIM * sizeof(float);
 static constexpr size_t CONV_DIM_RING_BYTES =
@@ -124,11 +124,11 @@ static constexpr size_t CONV_LAYER_BYTES =
     2 * CONV_KV_RING_BYTES + 2 * CONV_DIM_RING_BYTES;
 static constexpr size_t CONV_TOTAL_BYTES =
     (size_t)INK2_TOTAL_LAYERS * CONV_LAYER_BYTES;
-static constexpr size_t SNAP_ROLLING_BYTES = SLIDE_KV_BYTES + CONV_TOTAL_BYTES;
-static constexpr size_t GLOBAL_KV_ROW_BYTES =
-    (size_t)INK2_KV_DIM * sizeof(uint16_t);
 static constexpr size_t LOGITS_BYTES = (size_t)INK2_VOCAB * sizeof(float);
 static constexpr int SCONV_RINGS_PER_LAYER = 4;
+// Snapshot metadata flags stored in meta[1] alongside the snapshot position.
+static constexpr int32_t SNAP_FLAG_MTP = 1;
+static constexpr int32_t SNAP_FLAG_FP8_KV = 2;
 
 // Kernel parameter structs matching src/kernels/kernels.metal.
 typedef struct {
@@ -193,7 +193,7 @@ typedef struct {
 } SconvTarget;
 
 typedef struct {
-  // Device GPU addresses of the state's BF16 K and V buffers.
+  // Device GPU addresses of the state's K and V buffers (BF16 or packed FP8).
   uint64_t k, v;
   // Token position and ring capacity (0 for global linear KV).
   uint32_t pos, ring_rows;
@@ -214,6 +214,16 @@ typedef struct {
   // Active rows, Q stride, row-0 pos, ring capacity and sliding window.
   uint32_t rows, q_stride, pos0, ring_rows, window;
 } AttendPrefillParam;
+
+typedef struct {
+  // First source FP8 KV row and number of rows to unpack to BF16.
+  uint32_t start_row, n_rows;
+} Fp8DequantParam;
+
+typedef struct {
+  // Query geometry, global key slab bounds and first/last slab flags.
+  uint32_t rows, q_stride, pos0, k_start, k_count, is_first, is_last;
+} AttendSlabParam;
 
 typedef struct {
   // Active rows, total experts and top-k count.
@@ -331,9 +341,9 @@ typedef struct {
 typedef struct {
   // Allocated global KV capacity in tokens.
   int cap;
-  // Growing BF16 global K and V caches for the 8 global logical visits.
+  // Growing global K and V caches (BF16 or packed FP8) for the 8 global visits.
   Buf gk[INK2_GLOBAL_COUNT], gv[INK2_GLOBAL_COUNT];
-  // Rolling BF16 K and V rings for all 40 sliding logical visits.
+  // Rolling K and V rings (BF16 or packed FP8) for all 40 sliding visits.
   Buf slide_kv;
   // Rolling FP32 short-convolution rings for all 48 logical visits.
   Buf conv_ring;
@@ -365,10 +375,12 @@ typedef struct {
   Buf blk, msg, attn_in, q_in, k_in, v_in;
   // Loop message gate scratch buffers.
   Buf msg_cat, msg_g, msg_gated;
-  // Attention projections, short-conv outputs and FlashDecoding
-  // partials.
+  // Attention projections, short-conv outputs and FlashDecoding partials.
   Buf q_raw, k_raw, k_conv, v_raw, v_conv, dyn_w, r_raw, r_out, gate, sink;
   Buf q_hm, part, attn_out;
+  // Reusable BF16 K/V dequantization slabs and multi-slab softmax state when
+  // fp8_kv is enabled.
+  Buf deq_k, deq_v, slab_ml;
   // MoE routing, tile grouping, per-pass expert table and intermediates.
   Buf route_logits, route_ids, route_w, ptok, pw, tp, tiles, expert_table;
   Buf x_bf16, h_bf16, y_pair;
@@ -441,8 +453,9 @@ static int K_embed_norm, K_rmsnorm, K_rmsnorm_3, K_attn_res, K_attn_res_rmsnorm,
 static int K_sconv_static, K_sconv_static_batched, K_sconv_static_post,
     K_sconv_static_post_batched, K_sconv_dynamic, K_sconv_dynamic_batched,
     K_sconv_ring_save;
-static int K_qkvr_prep, K_sconv_qkvr_m1, K_attend_part_rel, K_attend_combine,
-    K_attend_prefill_rel;
+static int K_qkvr_prep, K_qkvr_prep_fp8, K_sconv_qkvr_m1, K_sconv_qkvr_fp8_m1,
+    K_attend_part_rel, K_attend_part_fp8_rel, K_attend_combine,
+    K_attend_prefill_rel, K_fp8_dequant_kv, K_attend_prefill_slab_rel;
 static int K_route_topk, K_route_topk_m1, K_moe_group, K_moe_gather_bf16;
 static int K_nv_up_m1, K_nv_up_mv, K_nv_dn_mv, K_nv_dn_comb_m1, K_nv_up_mm,
     K_nv_dn_mm;
@@ -589,9 +602,24 @@ static Buf state_try_alloc(size_t size) {
 // Rounds n up to a multiple of align (a power of two).
 static int align_up(int n, int align) { return (n + align - 1) & ~(align - 1); }
 
+// Returns the byte width of one KV cache row for the active format.
+static size_t kv_row_bytes(void) {
+  return opt.inkling2.fp8_kv ? INK2_FP8_KV_ROW_BYTES : INK2_BF16_KV_ROW_BYTES;
+}
+
+// Returns the byte size of one sliding-window K or V ring.
+static size_t slide_kv_one_bytes(void) {
+  return (size_t)INK2_SLIDE_RING * kv_row_bytes();
+}
+
+// Returns the total byte size of all 40 sliding-window K and V rings.
+static size_t slide_kv_bytes(void) {
+  return (size_t)INK2_SLIDE_COUNT * 2 * slide_kv_one_bytes();
+}
+
 // Returns the byte offset of sliding visit slot's K or V ring in slide_kv.
 static size_t slide_ring_off(int slide_slot, int is_v) {
-  return ((size_t)slide_slot * 2 + (size_t)is_v) * SLIDE_KV_ONE_BYTES;
+  return ((size_t)slide_slot * 2 + (size_t)is_v) * slide_kv_one_bytes();
 }
 
 // Returns the byte offset of logical visit v's sub-ring in conv_ring.
@@ -1076,6 +1104,12 @@ static uint64_t estimate_work_bytes(int rows) {
   bytes += gpu_round_up_to_pages((size_t)INK2_TOTAL_LAYERS *
                                  INK2_MAX_BATCH_ROWS * sizeof(KvTarget));
   bytes += gpu_round_up_to_pages((size_t)LOGITS_STRIDE * sizeof(float));
+  if (opt.inkling2.fp8_kv) {
+    bytes += 2 * gpu_round_up_to_pages((size_t)FP8_PREFILL_SLAB_ROWS *
+                                       INK2_BF16_KV_ROW_BYTES);
+    bytes +=
+        gpu_round_up_to_pages((size_t)cap * INK2_HEADS * 2 * sizeof(float));
+  }
   bytes += inkling2_mtp_estimate_work_bytes(cap);
   return bytes;
 }
@@ -1110,9 +1144,11 @@ static uint64_t work_resizable_bytes(void) {
                        &work.gate,
                        &work.sink,
                        &work.q_hm,
-
                        &work.part,
                        &work.attn_out,
+                       &work.deq_k,
+                       &work.deq_v,
+                       &work.slab_ml,
                        &work.route_logits,
                        &work.route_ids,
                        &work.route_w,
@@ -1165,17 +1201,18 @@ static uint64_t work_resizable_bytes(void) {
 // Marks all buffers in w to be freed once prior GPU commands finish.
 static void free_work(Ink2Work *w) {
   Buf *list[] = {
-      &w->ids,          &w->cur,          &w->cur2,      &w->residual,
-      &w->pre_loop_cur, &w->prev_blk,     &w->prev_cur,  &w->blk,
-      &w->msg,          &w->attn_in,      &w->q_in,      &w->k_in,
-      &w->v_in,         &w->msg_cat,      &w->msg_g,     &w->msg_gated,
-      &w->q_raw,        &w->k_raw,        &w->k_conv,    &w->v_raw,
-      &w->v_conv,       &w->dyn_w,        &w->r_raw,     &w->r_out,
-      &w->gate,         &w->sink,         &w->q_hm,      &w->part,
-      &w->attn_out,     &w->route_logits, &w->route_ids, &w->route_w,
-      &w->ptok,         &w->pw,           &w->tp,        &w->tiles,
-      &w->expert_table, &w->x_bf16,       &w->h_bf16,    &w->y_pair,
-      &w->logits,       &w->sconv_tgt,    &w->kv_tgt};
+      &w->ids,          &w->cur,       &w->cur2,     &w->residual,
+      &w->pre_loop_cur, &w->prev_blk,  &w->prev_cur, &w->blk,
+      &w->msg,          &w->attn_in,   &w->q_in,     &w->k_in,
+      &w->v_in,         &w->msg_cat,   &w->msg_g,    &w->msg_gated,
+      &w->q_raw,        &w->k_raw,     &w->k_conv,   &w->v_raw,
+      &w->v_conv,       &w->dyn_w,     &w->r_raw,    &w->r_out,
+      &w->gate,         &w->sink,      &w->q_hm,     &w->part,
+      &w->attn_out,     &w->deq_k,     &w->deq_v,    &w->slab_ml,
+      &w->route_logits, &w->route_ids, &w->route_w,  &w->ptok,
+      &w->pw,           &w->tp,        &w->tiles,    &w->expert_table,
+      &w->x_bf16,       &w->h_bf16,    &w->y_pair,   &w->logits,
+      &w->sconv_tgt,    &w->kv_tgt};
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     if (list[i]->obj) gpu_mark_to_free(list[i]);
   inkling2_mtp_free_work(&w->mtp);
@@ -1239,6 +1276,14 @@ static void ensure_work(int rows, int logits_rows) {
     work.part = work_alloc((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
                            DECODE_PART_FLOATS * sizeof(float));
     work.attn_out = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
+    if (opt.inkling2.fp8_kv) {
+      work.deq_k =
+          work_alloc((size_t)FP8_PREFILL_SLAB_ROWS * INK2_BF16_KV_ROW_BYTES);
+      work.deq_v =
+          work_alloc((size_t)FP8_PREFILL_SLAB_ROWS * INK2_BF16_KV_ROW_BYTES);
+      work.slab_ml =
+          work_alloc((size_t)new_cap * INK2_HEADS * 2 * sizeof(float));
+    }
     work.route_logits =
         work_alloc((size_t)new_cap * INK2_EXPERTS * sizeof(float));
     work.route_ids = work_alloc((size_t)route_id_count * sizeof(uint32_t));
@@ -1508,16 +1553,24 @@ static int grown_cap(int positions) {
 
 // Returns the rolling snapshot byte size, including MTP rings when active.
 static size_t snap_rolling_bytes(void) {
-  return SNAP_ROLLING_BYTES +
+  return slide_kv_bytes() + CONV_TOTAL_BYTES +
          (inkling2_mtp_active_drafts() ? INK2_MTP_SNAP_ROLLING_BYTES : 0);
+}
+
+// Returns the snapshot format flag bitmask matching the active MTP and FP8 KV
+// settings.
+static int32_t snap_flags(void) {
+  return (inkling2_mtp_active_drafts() ? SNAP_FLAG_MTP : 0) |
+         (opt.inkling2.fp8_kv ? SNAP_FLAG_FP8_KV : 0);
 }
 
 // Resizes the 8 global KV buffer pairs (and MTP global KV when active) of s
 // to hold `new_cap` rows, preserving the first `keep` rows. Returns 1 on
 // success or 0 on memory refusal.
 static int state_resize_global(Ink2State *s, int new_cap, int keep) {
-  size_t new_bytes = (size_t)new_cap * GLOBAL_KV_ROW_BYTES;
-  size_t copy_bytes = (size_t)keep * GLOBAL_KV_ROW_BYTES;
+  size_t row_bytes = kv_row_bytes();
+  size_t new_bytes = (size_t)new_cap * row_bytes;
+  size_t copy_bytes = (size_t)keep * row_bytes;
   Buf nk[INK2_GLOBAL_COUNT] = {0}, nv[INK2_GLOBAL_COUNT] = {0};
   for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
     nk[i] = state_try_alloc(new_bytes);
@@ -1566,7 +1619,8 @@ static ModelState *ink2_state_new(void) {
   Ink2State *s = xmalloc(sizeof *s);
   *s = (Ink2State){0};
   int init_cap = grown_cap(1);
-  s->slide_kv = state_try_alloc(SLIDE_KV_BYTES);
+  size_t slide_bytes = slide_kv_bytes();
+  s->slide_kv = state_try_alloc(slide_bytes);
   s->conv_ring = s->slide_kv.obj ? state_try_alloc(CONV_TOTAL_BYTES) : (Buf){0};
   if (!s->conv_ring.obj ||
       !inkling2_mtp_state_init(gpu, &state_slot, &s->mtp) ||
@@ -1577,7 +1631,7 @@ static ModelState *ink2_state_new(void) {
     free(s);
     return NULL;
   }
-  memset(s->slide_kv.ptr, 0, SLIDE_KV_BYTES);
+  memset(s->slide_kv.ptr, 0, slide_bytes);
   memset(s->conv_ring.ptr, 0, CONV_TOTAL_BYTES);
   return (ModelState *)s;
 }
@@ -1602,9 +1656,9 @@ static size_t ink2_state_bytes(const ModelState *ms, int positions) {
   const Ink2State *s = (const Ink2State *)ms;
   int cap = s ? s->cap : grown_cap(positions > 0 ? positions : 1);
   if (positions > cap) cap = grown_cap(positions);
-  size_t gk_one = gpu_round_up_to_pages((size_t)cap * GLOBAL_KV_ROW_BYTES);
+  size_t gk_one = gpu_round_up_to_pages((size_t)cap * kv_row_bytes());
   return (size_t)INK2_GLOBAL_COUNT * 2 * gk_one +
-         gpu_round_up_to_pages(SLIDE_KV_BYTES) +
+         gpu_round_up_to_pages(slide_kv_bytes()) +
          gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
          inkling2_mtp_state_bytes(cap);
 }
@@ -1622,18 +1676,16 @@ static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
     if (s->cap != cap && !state_resize_global(s, cap, 0))
       die("out of memory sizing Inkling-2-Mini state to %d tokens", cap);
   }
+  uint32_t row_bytes = (uint32_t)kv_row_bytes();
   int n = 0;
   for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    out[n++] =
-        (StateRegion){s->gk[i].ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
-    out[n++] =
-        (StateRegion){s->gv[i].ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+    out[n++] = (StateRegion){s->gk[i].ptr, row_bytes, 1, 0, 0};
+    out[n++] = (StateRegion){s->gv[i].ptr, row_bytes, 1, 0, 0};
   }
   if (inkling2_mtp_active_drafts()) {
-    out[n++] =
-        (StateRegion){s->mtp.gk.ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
-    out[n++] =
-        (StateRegion){s->mtp.gv.ptr, (uint32_t)GLOBAL_KV_ROW_BYTES, 1, 0, 0};
+    uint32_t mtp_row_bytes = (uint32_t)INK2_BF16_KV_ROW_BYTES;
+    out[n++] = (StateRegion){s->mtp.gk.ptr, mtp_row_bytes, 1, 0, 0};
+    out[n++] = (StateRegion){s->mtp.gv.ptr, mtp_row_bytes, 1, 0, 0};
   }
   return n;
 }
@@ -1654,17 +1706,19 @@ static ModelSnapshot *ink2_snapshot_take(ModelState *ms, int pos,
                                          const float *lg) {
   Ink2State *s = (Ink2State *)ms;
   model_sync();
+  size_t slide_bytes = slide_kv_bytes();
+  size_t base_rolling = slide_bytes + CONV_TOTAL_BYTES;
   size_t rolling = snap_rolling_bytes();
   Ink2Snapshot *x = xmalloc(sizeof *x);
   *x = (Ink2Snapshot){.pos = pos,
                       .rows = memory_host_alloc_required(&state_slot, rolling)};
-  memcpy(x->rows, s->slide_kv.ptr, SLIDE_KV_BYTES);
-  memcpy(x->rows + SLIDE_KV_BYTES, s->conv_ring.ptr, CONV_TOTAL_BYTES);
+  memcpy(x->rows, s->slide_kv.ptr, slide_bytes);
+  memcpy(x->rows + slide_bytes, s->conv_ring.ptr, CONV_TOTAL_BYTES);
   if (inkling2_mtp_active_drafts()) {
-    memcpy(x->rows + SNAP_ROLLING_BYTES, s->mtp.slide_kv.ptr,
+    memcpy(x->rows + base_rolling, s->mtp.slide_kv.ptr,
            INK2_MTP_SLIDE_KV_BYTES);
-    memcpy(x->rows + SNAP_ROLLING_BYTES + INK2_MTP_SLIDE_KV_BYTES,
-           s->mtp.frnn.ptr, INK2_MTP_FRNN_BYTES);
+    memcpy(x->rows + base_rolling + INK2_MTP_SLIDE_KV_BYTES, s->mtp.frnn.ptr,
+           INK2_MTP_FRNN_BYTES);
   }
   if (lg) {
     x->logits = memory_host_alloc_required(&state_slot, LOGITS_BYTES);
@@ -1679,13 +1733,14 @@ static void ink2_snapshot_restore(ModelState *ms, const ModelSnapshot *mx) {
   Ink2State *s = (Ink2State *)ms;
   const Ink2Snapshot *x = (const Ink2Snapshot *)mx;
   model_sync();
-  memcpy(s->slide_kv.ptr, x->rows, SLIDE_KV_BYTES);
-  memcpy(s->conv_ring.ptr, x->rows + SLIDE_KV_BYTES, CONV_TOTAL_BYTES);
+  size_t slide_bytes = slide_kv_bytes();
+  size_t base_rolling = slide_bytes + CONV_TOTAL_BYTES;
+  memcpy(s->slide_kv.ptr, x->rows, slide_bytes);
+  memcpy(s->conv_ring.ptr, x->rows + slide_bytes, CONV_TOTAL_BYTES);
   if (inkling2_mtp_active_drafts()) {
-    memcpy(s->mtp.slide_kv.ptr, x->rows + SNAP_ROLLING_BYTES,
+    memcpy(s->mtp.slide_kv.ptr, x->rows + base_rolling,
            INK2_MTP_SLIDE_KV_BYTES);
-    memcpy(s->mtp.frnn.ptr,
-           x->rows + SNAP_ROLLING_BYTES + INK2_MTP_SLIDE_KV_BYTES,
+    memcpy(s->mtp.frnn.ptr, x->rows + base_rolling + INK2_MTP_SLIDE_KV_BYTES,
            INK2_MTP_FRNN_BYTES);
   }
 }
@@ -1720,7 +1775,7 @@ static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
   Ink2State *s = (Ink2State *)ms;
   int mtp_on = inkling2_mtp_active_drafts() ? 1 : 0;
   *nmeta = 2;
-  meta[1] = mtp_on;
+  meta[1] = snap_flags();
   int n = 0;
   if (x) {
     meta[0] = x->pos;
@@ -1729,7 +1784,7 @@ static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
     return n;
   }
   meta[0] = pos;
-  out[n++] = (SnapshotPart){s->slide_kv.ptr, SLIDE_KV_BYTES};
+  out[n++] = (SnapshotPart){s->slide_kv.ptr, slide_kv_bytes()};
   out[n++] = (SnapshotPart){s->conv_ring.ptr, CONV_TOTAL_BYTES};
   if (mtp_on) {
     out[n++] = (SnapshotPart){s->mtp.slide_kv.ptr, INK2_MTP_SLIDE_KV_BYTES};
@@ -1741,8 +1796,7 @@ static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
 // Allocates an empty snapshot matching the serialized metadata.
 static ModelSnapshot *ink2_snapshot_new_empty(const int32_t *meta, int nmeta,
                                               int with_logits) {
-  int mtp_on = inkling2_mtp_active_drafts() ? 1 : 0;
-  if (nmeta != 2 || meta[0] < 0 || meta[1] != mtp_on) return NULL;
+  if (nmeta != 2 || meta[0] < 0 || meta[1] != snap_flags()) return NULL;
   Ink2Snapshot *x = xmalloc(sizeof *x);
   *x = (Ink2Snapshot){
       .pos = meta[0],
@@ -2553,12 +2607,10 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
     run_bf16_linear3(cmd, &pl->wk, &work.k_raw, &pl->wv, &work.v_raw,
                      &pl->sink_proj, &work.sink, q_src, rows, 1, is_prefill);
     if (!fuse_kv_prep_m1) {
-      if (!fuse_kv_prep_m1) {
-        run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
-                         CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
-        run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
-                         CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
-      }
+      run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
+                       CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
+      run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
+                       CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
     }
   } else {
     run_bf16_linear(cmd, &pl->sink_proj.w, q_src, &work.sink, rows,
@@ -2579,10 +2631,12 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                       pl->wk.k, pl->wk.n, 1, is_prefill);
       run_bf16_linear(cmd, &pl->wv.w, v_src, &work.v_raw, rows, pl->wv.n,
                       pl->wv.k, pl->wv.n, 1, is_prefill);
-      run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
-                       CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
-      run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
-                       CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+      if (!fuse_kv_prep_m1) {
+        run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
+                         CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
+        run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
+                         CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+      }
     }
   }
 
@@ -2599,7 +2653,8 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   QkvrParam qp = {(uint32_t)rows, (uint32_t)work.q_stride, (uint32_t)pos0,
                   ring_rows,      (uint32_t)pl->is_global, (uint32_t)batched};
   if (fuse_kv_prep_m1) {
-    gpu_select_kernel(cmd, K_sconv_qkvr_m1);
+    gpu_select_kernel(cmd, opt.inkling2.fp8_kv ? K_sconv_qkvr_fp8_m1
+                                               : K_sconv_qkvr_m1);
     gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
     gpu_bind_buffer(cmd, 1, &work.k_raw, 0);
     gpu_bind_buffer(cmd, 2, &work.v_raw, 0);
@@ -2617,7 +2672,7 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
     gpu_copy_bytes(cmd, 14, &qp, sizeof qp);
     gpu_run_kernel(cmd, QKVR_HEADS, 1, 1, QKVR_THREADS, 1, 1);
   } else {
-    gpu_select_kernel(cmd, K_qkvr_prep);
+    gpu_select_kernel(cmd, opt.inkling2.fp8_kv ? K_qkvr_prep_fp8 : K_qkvr_prep);
     gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
     gpu_bind_buffer(cmd, 1, &work.k_conv, 0);
     gpu_bind_buffer(cmd, 2, &work.v_conv, 0);
@@ -2638,24 +2693,91 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   if (is_prefill) {
     uint32_t q_tiles =
         ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
-    AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
-                              (uint32_t)pos0, ring_rows, window};
-    gpu_select_kernel(cmd, K_attend_prefill_rel);
-    gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
-    gpu_bind_buffer(cmd, 1, k_buf, k_off);
-    gpu_bind_buffer(cmd, 2, v_buf, v_off);
-    gpu_bind_buffer(cmd, 3, &work.r_out, 0);
-    gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
-    gpu_bind_buffer(cmd, 5, &work.sink, 0);
-    gpu_bind_buffer(cmd, 6, &work.gate, 0);
-    gpu_bind_buffer(cmd, 7, &work.attn_out, 0);
-    gpu_copy_bytes(cmd, 8, &app, sizeof app);
-    gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
-                   1, 1);
+    if (!opt.inkling2.fp8_kv) {
+      AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
+                                (uint32_t)pos0, ring_rows, window};
+      gpu_select_kernel(cmd, K_attend_prefill_rel);
+      gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
+      gpu_bind_buffer(cmd, 1, k_buf, k_off);
+      gpu_bind_buffer(cmd, 2, v_buf, v_off);
+      gpu_bind_buffer(cmd, 3, &work.r_out, 0);
+      gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
+      gpu_bind_buffer(cmd, 5, &work.sink, 0);
+      gpu_bind_buffer(cmd, 6, &work.gate, 0);
+      gpu_bind_buffer(cmd, 7, &work.attn_out, 0);
+      gpu_copy_bytes(cmd, 8, &app, sizeof app);
+      gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                     1, 1);
+    } else if (!pl->is_global || pos0 + rows <= FP8_PREFILL_SLAB_ROWS) {
+      uint32_t n_deq =
+          pl->is_global ? (uint32_t)(pos0 + rows) : (uint32_t)INK2_SLIDE_RING;
+      if (!pl->is_global && (uint32_t)(pos0 + rows) < n_deq)
+        n_deq = (uint32_t)(pos0 + rows);
+      Fp8DequantParam dp = {0u, n_deq};
+      gpu_select_kernel(cmd, K_fp8_dequant_kv);
+      gpu_bind_buffer(cmd, 0, k_buf, k_off);
+      gpu_bind_buffer(cmd, 1, v_buf, v_off);
+      gpu_bind_buffer(cmd, 2, &work.deq_k, 0);
+      gpu_bind_buffer(cmd, 3, &work.deq_v, 0);
+      gpu_copy_bytes(cmd, 4, &dp, sizeof dp);
+      gpu_run_kernel(cmd, n_deq, 1, 1, ROW_THREADS, 1, 1);
+
+      AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
+                                (uint32_t)pos0, ring_rows, window};
+      gpu_select_kernel(cmd, K_attend_prefill_rel);
+      gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
+      gpu_bind_buffer(cmd, 1, &work.deq_k, 0);
+      gpu_bind_buffer(cmd, 2, &work.deq_v, 0);
+      gpu_bind_buffer(cmd, 3, &work.r_out, 0);
+      gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
+      gpu_bind_buffer(cmd, 5, &work.sink, 0);
+      gpu_bind_buffer(cmd, 6, &work.gate, 0);
+      gpu_bind_buffer(cmd, 7, &work.attn_out, 0);
+      gpu_copy_bytes(cmd, 8, &app, sizeof app);
+      gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                     1, 1);
+    } else {
+      uint32_t total_k = (uint32_t)(pos0 + rows);
+      for (uint32_t ks = 0; ks < total_k;
+           ks += (uint32_t)FP8_PREFILL_SLAB_ROWS) {
+        uint32_t kc = total_k - ks;
+        if (kc > (uint32_t)FP8_PREFILL_SLAB_ROWS)
+          kc = (uint32_t)FP8_PREFILL_SLAB_ROWS;
+        Fp8DequantParam dp = {ks, kc};
+        gpu_select_kernel(cmd, K_fp8_dequant_kv);
+        gpu_bind_buffer(cmd, 0, k_buf, k_off);
+        gpu_bind_buffer(cmd, 1, v_buf, v_off);
+        gpu_bind_buffer(cmd, 2, &work.deq_k, 0);
+        gpu_bind_buffer(cmd, 3, &work.deq_v, 0);
+        gpu_copy_bytes(cmd, 4, &dp, sizeof dp);
+        gpu_run_kernel(cmd, kc, 1, 1, ROW_THREADS, 1, 1);
+
+        AttendSlabParam sp = {(uint32_t)rows,
+                              (uint32_t)work.q_stride,
+                              (uint32_t)pos0,
+                              ks,
+                              kc,
+                              ks == 0u ? 1u : 0u,
+                              ks + kc == total_k ? 1u : 0u};
+        gpu_select_kernel(cmd, K_attend_prefill_slab_rel);
+        gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
+        gpu_bind_buffer(cmd, 1, &work.deq_k, 0);
+        gpu_bind_buffer(cmd, 2, &work.deq_v, 0);
+        gpu_bind_buffer(cmd, 3, &work.r_out, 0);
+        gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
+        gpu_bind_buffer(cmd, 5, &work.sink, 0);
+        gpu_bind_buffer(cmd, 6, &work.gate, 0);
+        gpu_bind_buffer(cmd, 7, &work.attn_out, 0);
+        gpu_bind_buffer(cmd, 8, &work.slab_ml, 0);
+        gpu_copy_bytes(cmd, 9, &sp, sizeof sp);
+        gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1,
+                       PREFILL_THREADS, 1, 1);
+      }
+    }
   } else {
-    int max_len = pl->is_global ? max_pos + 1 : INK2_WINDOW;
-    if (max_len > max_pos + 1) max_len = max_pos + 1;
-    int nparts = (max_len + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
+    int total_k = max_pos + 1;
+    if (window && total_k > (int)window) total_k = (int)window;
+    int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
     if (nparts < 1) nparts = 1;
     if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
     AttendDecodeParam adp = {(uint32_t)rows,
@@ -2666,7 +2788,8 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                              (uint32_t)nparts,
                              (uint32_t)MAX_DECODE_PARTS,
                              (uint32_t)batched};
-    gpu_select_kernel(cmd, K_attend_part_rel);
+    gpu_select_kernel(cmd, opt.inkling2.fp8_kv ? K_attend_part_fp8_rel
+                                               : K_attend_part_rel);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
     gpu_bind_buffer(cmd, 1, k_buf, k_off);
     gpu_bind_buffer(cmd, 2, v_buf, v_off);
@@ -2677,6 +2800,7 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
     gpu_copy_bytes(cmd, 7, &adp, sizeof adp);
     gpu_run_kernel(cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
                    (uint32_t)rows, DECODE_THREADS, 1, 1);
+
     gpu_select_kernel(cmd, K_attend_combine);
     gpu_bind_buffer(cmd, 0, &work.part, 0);
     gpu_bind_buffer(cmd, 1, &work.sink, 0);
@@ -3135,10 +3259,15 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     K(K_sconv_dynamic_batched, "ink2_sconv_dynamic_batched");
     K(K_sconv_ring_save, "ink2_sconv_ring_save");
     K(K_qkvr_prep, "ink2_qkvr_prep");
+    K(K_qkvr_prep_fp8, "ink2_qkvr_prep_fp8");
     K(K_sconv_qkvr_m1, "ink2_sconv_qkvr_prep_m1");
+    K(K_sconv_qkvr_fp8_m1, "ink2_sconv_qkvr_prep_fp8_m1");
     K(K_attend_part_rel, "ink2_attend_part_rel");
+    K(K_attend_part_fp8_rel, "ink2_attend_part_fp8_rel");
     K(K_attend_combine, "ink2_attend_combine");
     K(K_attend_prefill_rel, "ink2_attend_prefill_rel");
+    K(K_fp8_dequant_kv, "ink2_fp8_dequant_kv");
+    K(K_attend_prefill_slab_rel, "ink2_attend_prefill_slab_rel");
     K(K_route_topk, "ink2_route_topk");
     K(K_route_topk_m1, "ink2_route_topk_m1");
     K(K_moe_group, "ink2_moe_group");

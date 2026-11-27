@@ -73,6 +73,15 @@ static constexpr int INK2_REWIND_MARGIN = 16;
 static constexpr int INK2_SLIDE_RING = INK2_WINDOW + INK2_REWIND_MARGIN;
 static constexpr int INK2_SCONV_RING = INK2_SCONV_HIST + INK2_REWIND_MARGIN;
 
+// KV cache row byte sizes: BF16 holds 1,024 two-byte values; FP8 E4M3 holds
+// 1,024 one-byte codes followed by 8 two-byte FP16 per-head scales (1,040 B,
+// 16-byte aligned).
+static constexpr size_t INK2_BF16_KV_ROW_BYTES =
+    (size_t)INK2_KV_DIM * sizeof(uint16_t);
+static constexpr size_t INK2_FP8_KV_SCALES_OFF = (size_t)INK2_KV_DIM;
+static constexpr size_t INK2_FP8_KV_ROW_BYTES =
+    INK2_FP8_KV_SCALES_OFF + (size_t)INK2_KV_HEADS * sizeof(uint16_t);
+
 // One logical layer visit in the 48-step unrolled execution schedule.
 typedef struct {
   // Physical layer index in 0..23.

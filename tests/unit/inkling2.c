@@ -156,6 +156,12 @@ static void test_chat_and_ops(void) {
             c.experts_per_row == INK2_TOTAL_LAYERS * INK2_TOPK &&
             c.experts == INK2_PHYS_LAYERS * INK2_EXPERTS && c.dense_bytes == 0,
         "read_counters reports 48 logical routed visits and 3072 experts");
+  check(INK2_BF16_KV_ROW_BYTES == (size_t)INK2_KV_DIM * 2 &&
+            INK2_FP8_KV_SCALES_OFF == (size_t)INK2_KV_DIM &&
+            INK2_FP8_KV_ROW_BYTES ==
+                (size_t)INK2_KV_DIM + (size_t)INK2_KV_HEADS * 2 &&
+            INK2_FP8_KV_ROW_BYTES % 16 == 0,
+        "FP8 KV row geometry is 1040 bytes and 16-byte aligned");
 }
 
 int main(void) {

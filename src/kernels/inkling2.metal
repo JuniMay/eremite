@@ -16,6 +16,19 @@ constant constexpr uint INK2_HEADS = 24, INK2_KV_HEADS = 8,
                         INK2_INTER = 1152, INK2_DIM = 2304;
 // Block sizes of quantized expert weights (hf_quant_config.json).
 constant constexpr uint INK2_NVFP4_BLOCK = 16, INK2_MXFP8_BLOCK = 32;
+// Packed FP8 E4M3 KV row geometry: 1,024 codes followed by 8 half per-head
+// scales (scaled by 256 to cancel fp8x4's 2^-8), 16-byte aligned.
+constant constexpr uint INK2_FP8_KV_SCALES_OFF = INK2_KV_DIM,
+                        INK2_FP8_KV_ROW_BYTES = INK2_KV_DIM + INK2_KV_HEADS * 2u,
+                        INK2_FP8_SIGN_SHIFT = 24u,
+                        INK2_FP8_SIGN_MASK = 0x80u,
+                        INK2_FP8_MAX_CODE = 0x7Eu,
+                        INK2_FP8_EXP_BIAS = 7u,
+                        INK2_FP8_MANT_BITS = 3u,
+                        INK2_FP8_MANT_BASE = 8u,
+                        INK2_F32_EXP_SHIFT = 23u,
+                        INK2_F32_EXP_MASK = 0xFFu,
+                        INK2_F32_EXP_BIAS = 127u;
 // Maximum queries in AttnRes and simdgroups in 256-thread row kernels.
 constant constexpr uint INK2_MAX_RES_BLOCKS = 5, INK2_MAX_RES_QUERIES = 4,
                         INK2_ROW_SGS = 8, INK2_ROW_MAX_V4 = 3;
@@ -37,7 +50,13 @@ constant constexpr float INK2_RMS_EPS = 1e-6f, INK2_CLIP_EPS = 1e-6f,
                          INK2_ROUTE_EPS = 1e-20f, INK2_LOGIT_CAP = 30.0f,
                          INK2_SCONV_STATIC_SCALE = 0.44721359549995793f,   // 1 / sqrt(4 + 1)
                          INK2_SCONV_DYNAMIC_SCALE = 0.33333333333333331f,  // 1 / sqrt(2 * 4 + 1)
-                         INK2_FP8_SCALE = 256.0f;                          // cancels fp8x4's 2^-8
+                         INK2_FP8_SCALE = 256.0f,                          // cancels fp8x4's 2^-8
+                         INK2_FP8_MAX_VAL = 448.0f,                        // largest finite E4M3 magnitude
+                         INK2_FP8_MIN_NORMAL = 0.015625f,                  // 2^-6 smallest normal E4M3
+                         INK2_FP8_SUBNORMAL_INV = 512.0f,                  // 2^9 subnormal quantum reciprocal
+                         INK2_FP8_SCALE_RATIO = 256.0f / 448.0f,           // (1 / 448) * 256
+                         INK2_HALF_MIN_NORMAL = 6.103515625e-5f,           // 2^-14 smallest normal FP16
+                         INK2_HALF_MAX_VAL = 65504.0f;                     // largest finite FP16 magnitude
 
 // Parameters for weighted RMSNorm and embedding lookup + norm.
 struct Ink2NormParam {
@@ -134,6 +153,25 @@ struct Ink2AttendPrefillParam {
   uint window;
 };
 
+// Parameters for dequantizing a contiguous slice of packed FP8 KV rows into
+// BF16 prefill slab buffers.
+struct Ink2Fp8DequantParam {
+  // First row index in the source FP8 KV buffers.
+  uint start_row;
+  // Number of rows to dequantize into destination rows 0..n_rows-1.
+  uint n_rows;
+};
+
+// Parameters for one slab of multi-slab global FlashAttention prefill.
+struct Ink2AttendSlabParam {
+  // Active query rows, head-major Q row stride, position of query row 0.
+  uint rows, q_stride, pos0;
+  // Global key position of slab row 0 and number of valid rows in the slab.
+  uint k_start, k_count;
+  // Nonzero on the first slab (zero-init state) and last slab (apply sink/gate).
+  uint is_first, is_last;
+};
+
 // Parameters for MoE top-8 routing.
 struct Ink2RouteParam {
   // Active token count, total experts (128), selected experts per token (8).
@@ -190,6 +228,26 @@ inline float ink2_softcapped_swiglu(float gate, float up, float gate_cap, float 
   float gc = gate_cap * tanh(gate / gate_cap);
   float uc = up_cap * tanh(up / up_cap);
   return bf(gc * s * uc);
+}
+
+// Encodes one float into a finite FP8 E4M3 byte with round-to-nearest-even,
+// clamped to [-448, 448] so NaN codes are never emitted.
+inline uchar ink2_fp8_encode(float v) {
+  uint sign = (as_type<uint>(v) >> INK2_FP8_SIGN_SHIFT) & INK2_FP8_SIGN_MASK;
+  float a = min(fabs(v), INK2_FP8_MAX_VAL);
+  if (a < INK2_FP8_MIN_NORMAL) return uchar(sign | uint(rint(a * INK2_FP8_SUBNORMAL_INV)));
+  int e = int((as_type<uint>(a) >> INK2_F32_EXP_SHIFT) & INK2_F32_EXP_MASK) - int(INK2_F32_EXP_BIAS);
+  float scaled = a * as_type<float>(uint(int(INK2_FP8_MANT_BITS) - e + int(INK2_F32_EXP_BIAS)) << INK2_F32_EXP_SHIFT);
+  uint q = uint(rint(scaled));
+  uint code = (uint(e + int(INK2_FP8_EXP_BIAS)) << INK2_FP8_MANT_BITS) + (q - INK2_FP8_MANT_BASE);
+  return uchar(sign | min(code, INK2_FP8_MAX_CODE));
+}
+
+// Computes the FP16 per-head scale (multiplied by 256 to cancel fp8x4's 2^-8)
+// from a head's maximum absolute magnitude.
+inline half ink2_fp8_head_scale256(float amax) {
+  if (!(amax > 0.0f)) return half(0.0f);
+  return half(clamp(amax * INK2_FP8_SCALE_RATIO, INK2_HALF_MIN_NORMAL, INK2_HALF_MAX_VAL));
 }
 
 // Embedding lookup plus weighted RMSNorm (modeling_inkling2.py
@@ -1273,6 +1331,96 @@ kernel void ink2_sconv_qkvr_prep_m1(device const float *q_in [[buffer(0)]],
   r_out[h * INK2_D_REL + t] = bf(v * min(INK2_REL_CLIP / (sqrt(sq) + INK2_CLIP_EPS), 1.0f));
 }
 
+// Fused m = 1 static K/V short convolution + Q/K/V/R head prep + FP8 KV store
+// for sliding layers. Grid: x = 64 heads, y = 1. Threadgroup: 128 threads.
+kernel void ink2_sconv_qkvr_prep_fp8_m1(device const float *q_in [[buffer(0)]],
+                                        device const float *k_raw [[buffer(1)]],
+                                        device const float *v_raw [[buffer(2)]],
+                                        device const float *r_in [[buffer(3)]],
+                                        device float *k_ring [[buffer(4)]],
+                                        device const float *k_sconv_w [[buffer(5)]],
+                                        device float *v_ring [[buffer(6)]],
+                                        device const float *v_sconv_w [[buffer(7)]],
+                                        device const float *q_scale [[buffer(8)]],
+                                        device const float *r_scale [[buffer(9)]],
+                                        device bfloat *q_out [[buffer(10)]],
+                                        device uchar *k_cache [[buffer(11)]],
+                                        device uchar *v_cache [[buffer(12)]],
+                                        device float *r_out [[buffer(13)]],
+                                        constant Ink2QkvrParam &p [[buffer(14)]],
+                                        uint head [[threadgroup_position_in_grid]],
+                                        uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float tmp[INK2_SIMD];
+  uint pos = p.pos0;
+  uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+
+  if (head < INK2_HEADS) {
+    uint h = head;
+    float v = q_in[h * INK2_HEAD_DIM + t] * q_scale[h * INK2_HEAD_DIM + t];
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = bf(v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f));
+    q_out[(ulong)h * p.q_stride * INK2_HEAD_DIM + t] = bfloat(clipped);
+    return;
+  }
+
+  if (head < INK2_HEADS + INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS;
+    uint c = h * INK2_HEAD_DIM + t;
+    device const float *wc = k_sconv_w + (ulong)c * INK2_SCONV_K;
+    float xt = k_raw[c];
+    float csum = wc[INK2_SCONV_K - 1u] * xt;
+#pragma unroll
+    for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+      if (pos >= lag)
+        csum += wc[INK2_SCONV_K - 1u - lag] *
+                k_ring[(ulong)((pos - lag) % INK2_SCONV_RING) * INK2_KV_DIM + c];
+    }
+    k_ring[(ulong)(pos % INK2_SCONV_RING) * INK2_KV_DIM + c] = xt;
+    float v = bf((csum + xt) * INK2_SCONV_STATIC_SCALE);
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f);
+    float amax = tg_max(fabs(clipped), tmp, t, INK2_HEAD_DIM);
+    half h_s256 = ink2_fp8_head_scale256(amax);
+    uchar code = amax > 0.0f ? ink2_fp8_encode(clipped * (INK2_FP8_SCALE / float(h_s256))) : 0u;
+    device uchar *dst = k_cache + (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    dst[c] = code;
+    if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
+    return;
+  }
+
+  if (head < INK2_HEADS + 2u * INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS - INK2_KV_HEADS;
+    uint c = h * INK2_HEAD_DIM + t;
+    device const float *wc = v_sconv_w + (ulong)c * INK2_SCONV_K;
+    float xt = v_raw[c];
+    float csum = wc[INK2_SCONV_K - 1u] * xt;
+#pragma unroll
+    for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+      if (pos >= lag)
+        csum += wc[INK2_SCONV_K - 1u - lag] *
+                v_ring[(ulong)((pos - lag) % INK2_SCONV_RING) * INK2_KV_DIM + c];
+    }
+    v_ring[(ulong)(pos % INK2_SCONV_RING) * INK2_KV_DIM + c] = xt;
+    float v = bf((csum + xt) * INK2_SCONV_STATIC_SCALE);
+    float inv = rsqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM) / float(INK2_HEAD_DIM) + INK2_RMS_EPS);
+    float normed = v * inv;
+    float amax = tg_max(fabs(normed), tmp, t, INK2_HEAD_DIM);
+    half h_s256 = ink2_fp8_head_scale256(amax);
+    uchar code = amax > 0.0f ? ink2_fp8_encode(normed * (INK2_FP8_SCALE / float(h_s256))) : 0u;
+    device uchar *dst = v_cache + (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    dst[c] = code;
+    if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
+    return;
+  }
+
+  uint h = head - INK2_HEADS - 2u * INK2_KV_HEADS;
+  if (t >= INK2_D_REL) return;
+  float v = r_in[h * INK2_D_REL + t] * r_scale[h * INK2_D_REL + t];
+  float sq = v * v;
+  for (uint off = INK2_D_REL / 2u; off > 0u; off >>= 1u) sq += simd_shuffle_xor(sq, off);
+  r_out[h * INK2_D_REL + t] = bf(v * min(INK2_REL_CLIP / (sqrt(sq) + INK2_CLIP_EPS), 1.0f));
+}
+
 // Writes the last `min(rows, ring_rows)` rows of a contiguous chunk into the
 // short-convolution ring buffer after the convolution kernel completes.
 kernel void ink2_sconv_ring_save(device const float *x [[buffer(0)]],
@@ -1363,6 +1511,90 @@ kernel void ink2_qkvr_prep(device const float *q_in [[buffer(0)]],
   r_out[((ulong)row * INK2_HEADS + h) * INK2_D_REL + t] = final_v;
 }
 
+// Per-head Q/K/V/R normalization, L2 clipping and optional global log scaling
+// storing K and V as packed FP8 E4M3 rows with per-head FP16 scales.
+// Grid: x = 24 (Q) + 8 (K) + 8 (V) + 24 (R) = 64 heads; y = rows.
+// Threadgroup: 128 threads.
+kernel void ink2_qkvr_prep_fp8(device const float *q_in [[buffer(0)]],
+                               device const float *k_in [[buffer(1)]],
+                               device const float *v_in [[buffer(2)]],
+                               device const float *r_in [[buffer(3)]],
+                               device const float *q_scale [[buffer(4)]],
+                               device const float *r_scale [[buffer(5)]],
+                               device bfloat *q_out [[buffer(6)]],
+                               device uchar *k_cache [[buffer(7)]],
+                               device uchar *v_cache [[buffer(8)]],
+                               device float *r_out [[buffer(9)]],
+                               device const Ink2KvTarget *targets [[buffer(10)]],
+                               constant Ink2QkvrParam &p [[buffer(11)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float tmp[INK2_SIMD];
+  uint head = tg.x, row = tg.y;
+  if (row >= p.rows) return;
+  uint pos = p.batched ? targets[row].pos : p.pos0 + row;
+  uint ring_rows = p.batched ? targets[row].ring_rows : p.ring_rows;
+  uint slot = ring_rows ? (pos % ring_rows) : pos;
+  float tau = p.is_global
+                  ? 1.0f + INK2_LOG_ALPHA * log(max(float(pos + 1u) / INK2_LOG_FLOOR, 1.0f))
+                  : 1.0f;
+
+  // Query heads 0..23: scaled L2 clip + optional log scale -> head-major BF16.
+  if (head < INK2_HEADS) {
+    uint h = head;
+    float v = q_in[(ulong)row * INK2_Q_DIM + h * INK2_HEAD_DIM + t] *
+              q_scale[h * INK2_HEAD_DIM + t];
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = bf(v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f));
+    float final_v = p.is_global ? bf(clipped * tau) : clipped;
+    q_out[((ulong)h * p.q_stride + row) * INK2_HEAD_DIM + t] = bfloat(final_v);
+    return;
+  }
+
+  // Key heads 24..31: unweighted L2 clip -> packed FP8 E4M3 KV cache.
+  if (head < INK2_HEADS + INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS;
+    float v = k_in[(ulong)row * INK2_KV_DIM + h * INK2_HEAD_DIM + t];
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f);
+    float amax = tg_max(fabs(clipped), tmp, t, INK2_HEAD_DIM);
+    half h_s256 = ink2_fp8_head_scale256(amax);
+    uchar code = amax > 0.0f ? ink2_fp8_encode(clipped * (INK2_FP8_SCALE / float(h_s256))) : 0u;
+    device uchar *dst = (p.batched ? (device uchar *)targets[row].k : k_cache) +
+                        (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    dst[h * INK2_HEAD_DIM + t] = code;
+    if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
+    return;
+  }
+
+  // Value heads 32..39: unweighted RMSNorm -> packed FP8 E4M3 KV cache.
+  if (head < INK2_HEADS + 2 * INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS - INK2_KV_HEADS;
+    float v = v_in[(ulong)row * INK2_KV_DIM + h * INK2_HEAD_DIM + t];
+    float inv = rsqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM) / float(INK2_HEAD_DIM) + INK2_RMS_EPS);
+    float normed = v * inv;
+    float amax = tg_max(fabs(normed), tmp, t, INK2_HEAD_DIM);
+    half h_s256 = ink2_fp8_head_scale256(amax);
+    uchar code = amax > 0.0f ? ink2_fp8_encode(normed * (INK2_FP8_SCALE / float(h_s256))) : 0u;
+    device uchar *dst = (p.batched ? (device uchar *)targets[row].v : v_cache) +
+                        (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    dst[h * INK2_HEAD_DIM + t] = code;
+    if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
+    return;
+  }
+
+  // Relative heads 40..63 (16 dims each): scaled L2 clip + optional log scale.
+  uint h = head - INK2_HEADS - 2 * INK2_KV_HEADS;
+  if (t >= INK2_D_REL) return;
+  float v = r_in[((ulong)row * INK2_HEADS + h) * INK2_D_REL + t] *
+            r_scale[h * INK2_D_REL + t];
+  float sq = v * v;
+  for (uint off = INK2_D_REL / 2; off > 0; off >>= 1) sq += simd_shuffle_xor(sq, off);
+  float clipped = bf(v * min(INK2_REL_CLIP / (sqrt(sq) + INK2_CLIP_EPS), 1.0f));
+  float final_v = p.is_global ? bf(clipped * tau) : clipped;
+  r_out[((ulong)row * INK2_HEADS + h) * INK2_D_REL + t] = final_v;
+}
+
 // Floats per (row, head, partition) in FlashDecoding partials: m, l, acc[128].
 constant constexpr uint INK2_PART_FLOATS = INK2_HEAD_DIM + 2;
 
@@ -1403,6 +1635,32 @@ kernel void ink2_attend_combine(device const float *part [[buffer(0)]],
   for (uint c = 0; c < INK2_DECODE_VEC4; c++)
     res[c] = bf(bf(o_all[c] * inv_l) * sigm(gv[c]));
   *(device float4 *)(out + off) = res;
+}
+
+// Unpacks a contiguous slice of packed FP8 E4M3 K and V rows into BF16 slab
+// buffers once per attention pass so FlashAttention prefill reads BF16 directly
+// from SLC/L2 cache with 16 KiB threadgroup memory.
+// Grid: x = n_rows, y = 1, z = 1. Threadgroup: 256 threads (8 simdgroups = 8 KV
+// heads, 32 lanes = 4 dims each).
+kernel void ink2_fp8_dequant_kv(device const uchar *k_src [[buffer(0)]],
+                                device const uchar *v_src [[buffer(1)]],
+                                device bfloat *k_dst [[buffer(2)]],
+                                device bfloat *v_dst [[buffer(3)]],
+                                constant Ink2Fp8DequantParam &p [[buffer(4)]],
+                                uint row [[threadgroup_position_in_grid]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  if (row >= p.n_rows) return;
+  ulong src_off = ulong(p.start_row + row) * INK2_FP8_KV_ROW_BYTES;
+  device const uchar *kr = k_src + src_off;
+  device const uchar *vr = v_src + src_off;
+  float ksc = float(((device const half *)(kr + INK2_FP8_KV_SCALES_OFF))[sg]);
+  float vsc = float(((device const half *)(vr + INK2_FP8_KV_SCALES_OFF))[sg]);
+  uint kp = ((device const uint *)(kr + sg * INK2_HEAD_DIM))[lane];
+  uint vp = ((device const uint *)(vr + sg * INK2_HEAD_DIM))[lane];
+  ulong dst_off = ulong(row) * INK2_KV_DIM + sg * INK2_HEAD_DIM;
+  ((device bfloat4 *)(k_dst + dst_off))[lane] = bfloat4(fp8x4(kp) * ksc);
+  ((device bfloat4 *)(v_dst + dst_off))[lane] = bfloat4(fp8x4(vp) * vsc);
 }
 
 // Phase 1 of FlashDecoding attention with on-the-fly relative position bias
@@ -1469,6 +1727,104 @@ kernel void ink2_attend_part_rel(device const bfloat *q [[buffer(0)]],
       float a = m_run[g] == -INFINITY ? 0.0f : exp(m_run[g] - mn);
       float b = exp(s - mn);
       o_run[g] = o_run[g] * a + vv * b;
+      l_run[g] = l_run[g] * a + b;
+      m_run[g] = mn;
+    }
+  }
+
+  for (uint g = 0u; g < INK2_GQA; g++) {
+    if (lane == 0u) sg_m[g][sg] = m_run[g], sg_l[g][sg] = l_run[g];
+    sg_o[g][sg][lane] = o_run[g];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg < INK2_GQA) {
+    uint g = sg, h = kv_h * INK2_GQA + g;
+    float m_all = max(max(sg_m[g][0], sg_m[g][1]), max(sg_m[g][2], sg_m[g][3]));
+    float l_all = 0.0f;
+    float4 o_all = float4(0.0f);
+    if (m_all > -INFINITY) {
+      for (uint s = 0u; s < INK2_DECODE_SGS; s++) {
+        if (sg_m[g][s] == -INFINITY) continue;
+        float w = exp(sg_m[g][s] - m_all);
+        l_all += sg_l[g][s] * w;
+        o_all += sg_o[g][s][lane] * w;
+      }
+    }
+    device float *dst =
+        part + (((ulong)row * INK2_HEADS + h) * p.part_stride + part_idx) * INK2_PART_FLOATS;
+    if (lane == 0u) dst[0] = m_all, dst[1] = l_all;
+    ((device float4 *)(dst + 2))[lane] = o_all;
+  }
+}
+
+// Phase 1 of FP8 FlashDecoding attention with on-the-fly relative position bias.
+kernel void ink2_attend_part_fp8_rel(device const bfloat *q [[buffer(0)]],
+                                     device const uchar *k_cache [[buffer(1)]],
+                                     device const uchar *v_cache [[buffer(2)]],
+                                     device const float *r_out [[buffer(3)]],
+                                     device const ushort *rel_proj_t [[buffer(4)]],
+                                     device const Ink2KvTarget *targets [[buffer(5)]],
+                                     device float *part [[buffer(6)]],
+                                     constant Ink2AttendDecodeParam &p [[buffer(7)]],
+                                     uint3 tg [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sg_m[INK2_GQA][INK2_DECODE_SGS];
+  threadgroup float sg_l[INK2_GQA][INK2_DECODE_SGS];
+  threadgroup float4 sg_o[INK2_GQA][INK2_DECODE_SGS][INK2_SIMD];
+
+  uint kv_h = tg.x, part_idx = tg.y, row = tg.z;
+  if (row >= p.rows || kv_h >= INK2_KV_HEADS || part_idx >= p.nparts) return;
+
+  uint q_pos = p.batched ? targets[row].pos : p.pos0 + row;
+  uint ring_rows = p.batched ? targets[row].ring_rows : p.ring_rows;
+  device const uchar *k_base = p.batched ? (device const uchar *)targets[row].k : k_cache;
+  device const uchar *v_base = p.batched ? (device const uchar *)targets[row].v : v_cache;
+
+  uint kv_lo = (p.window && q_pos + 1u > p.window) ? (q_pos + 1u - p.window) : 0u;
+  uint kv_hi = q_pos + 1u;
+  uint total_k = kv_hi - kv_lo;
+  uint per_part = (total_k + p.nparts - 1u) / p.nparts;
+  uint k_start = kv_lo + part_idx * per_part;
+  uint k_end = min(kv_hi, k_start + per_part);
+
+  float scale = rsqrt(float(INK2_HEAD_DIM));
+  float4 qv[INK2_GQA];
+  float r_rel[INK2_GQA] = {0.0f, 0.0f, 0.0f};
+  for (uint g = 0u; g < INK2_GQA; g++) {
+    uint h = kv_h * INK2_GQA + g;
+    device const bfloat4 *qp =
+        (device const bfloat4 *)(q + ((ulong)h * p.q_stride + row) * INK2_HEAD_DIM);
+    qv[g] = float4(qp[lane]) * scale;
+    if (lane < INK2_D_REL)
+      r_rel[g] = r_out[((ulong)row * INK2_HEADS + h) * INK2_D_REL + lane];
+  }
+
+  float m_run[INK2_GQA] = {-INFINITY, -INFINITY, -INFINITY};
+  float l_run[INK2_GQA] = {0.0f, 0.0f, 0.0f};
+  float4 o_run[INK2_GQA] = {float4(0.0f), float4(0.0f), float4(0.0f)};
+
+  for (uint j = k_start + sg; j < k_end; j += INK2_DECODE_SGS) {
+    uint slot = ring_rows ? (j % ring_rows) : j;
+    ulong row_off = (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    device const uchar *krow = k_base + row_off;
+    device const uchar *vrow = v_base + row_off;
+    float ksc = float(((device const half *)(krow + INK2_FP8_KV_SCALES_OFF))[kv_h]);
+    float vsc = float(((device const half *)(vrow + INK2_FP8_KV_SCALES_OFF))[kv_h]);
+    float4 kv = fp8x4(((device const uint *)(krow + kv_h * INK2_HEAD_DIM))[lane]);
+    float4 vv = fp8x4(((device const uint *)(vrow + kv_h * INK2_HEAD_DIM))[lane]);
+    uint dist = q_pos - j;
+    float pw = (dist < INK2_REL_EXTENT && lane < INK2_D_REL)
+                   ? bf16f(rel_proj_t[(ulong)dist * INK2_D_REL + lane])
+                   : 0.0f;
+#pragma unroll
+    for (uint g = 0u; g < INK2_GQA; g++) {
+      float s = simd_sum(dot(qv[g], kv) * ksc + r_rel[g] * pw);
+      float mn = max(m_run[g], s);
+      float a = m_run[g] == -INFINITY ? 0.0f : exp(m_run[g] - mn);
+      float b = exp(s - mn);
+      o_run[g] = o_run[g] * a + vv * (b * vsc);
       l_run[g] = l_run[g] * a + b;
       m_run[g] = mn;
     }
@@ -1659,6 +2015,212 @@ kernel void ink2_attend_prefill_rel(device const bfloat *q [[buffer(0)]],
       smem.st.row_aux[row] = oscale;
       smem.st.row_scale[row] = fl;
     }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint16_t i = 0; i < acc.get_capacity(); i++)
+    if (acc.is_valid_element(i)) {
+      auto at = acc.get_multidimensional_index(i);
+      uint q_local = q0 + at[1];
+      if (q_local < p.rows) {
+        float val = bf(acc[i] * smem.st.row_aux[at[1]] / smem.st.row_scale[at[1]]);
+        ulong off = (ulong)q_local * INK2_Q_DIM + h * INK2_HEAD_DIM + at[0];
+        out[off] = bf(val * sigm(gate[off]));
+      }
+    }
+}
+
+// Multi-slab global MPP FlashAttention prefill with on-the-fly relative bias.
+kernel void ink2_attend_prefill_slab_rel(device const bfloat *q [[buffer(0)]],
+                                         device const bfloat *k_slab [[buffer(1)]],
+                                         device const bfloat *v_slab [[buffer(2)]],
+                                         device const float *r_out [[buffer(3)]],
+                                         device const ushort *rel_proj_t [[buffer(4)]],
+                                         device const float *sink [[buffer(5)]],
+                                         device const float *gate [[buffer(6)]],
+                                         device float *out [[buffer(7)]],
+                                         device float *slab_ml [[buffer(8)]],
+                                         constant Ink2AttendSlabParam &p [[buffer(9)]],
+                                         uint tg [[threadgroup_position_in_grid]],
+                                         uint sg [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint BQ = FLASH_ATTN_64_TILE, BK = FLASH_ATTN_64_TILE;
+  threadgroup FlashAttn64Smem<bfloat> smem;
+
+  uint q_tiles = (p.rows + BQ - 1u) / BQ;
+  uint h = tg / q_tiles, kv_h = h / INK2_GQA;
+  uint q0 = (tg % q_tiles) * BQ;
+  if (q0 >= p.rows) return;
+  bool full_q = q0 + BQ <= p.rows;
+
+  uint first_pos = p.pos0 + q0;
+  uint last_row = min(q0 + BQ, p.rows) - 1u;
+  uint last_pos = p.pos0 + last_row;
+  uint k_lo = p.k_start;
+  uint k_hi = min(p.k_start + p.k_count, last_pos + 1u);
+  if (k_hi <= k_lo && !p.is_last) return;
+
+  const float scale_log2 = rsqrt(float(INK2_HEAD_DIM)) * M_LOG2E_F;
+
+  constexpr auto sdesc = matmul2d_descriptor(
+      BQ, BK, INK2_HEAD_DIM, false, true, false, matmul2d_descriptor::mode::multiply);
+  constexpr auto odesc = matmul2d_descriptor(
+      BQ, INK2_HEAD_DIM, BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<sdesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> sop;
+  matmul2d<odesc, execution_simdgroups<FLASH_ATTN_64_SGROUPS>> oop;
+
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq(
+      (device bfloat *)q + (ulong)h * p.q_stride * INK2_HEAD_DIM,
+      dextents<int32_t, 2>(INK2_HEAD_DIM, p.rows));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv_init(
+      (device bfloat *)v_slab, dextents<int32_t, 2>(INK2_KV_DIM, p.k_count));
+  tensor<threadgroup bfloat, extents<int32_t, BK, BQ>, tensor_inline> tp(
+      smem.st.probs, extents<int32_t, BK, BQ>());
+
+  auto qt = tq.slice(0, q0);
+  auto vt0 = tv_init.slice(kv_h * INK2_HEAD_DIM, 0);
+  auto acc = oop.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
+
+  uint row = sg * FLASH_ATTN_64_ROWS_PER_SG + (lane >> 1u);
+  uint row_local = q0 + row;
+  float rmax = -INFINITY, rsum = 0.0f;
+  if (p.is_first) {
+    for (uint16_t i = 0; i < acc.get_capacity(); i++)
+      if (acc.is_valid_element(i)) acc[i] = 0.0f;
+  } else {
+    if (row_local < p.rows) {
+      ulong mloff = ((ulong)row_local * INK2_HEADS + h) * 2u;
+      rmax = slab_ml[mloff];
+      rsum = slab_ml[mloff + 1u];
+    }
+    for (uint16_t i = 0; i < acc.get_capacity(); i++)
+      if (acc.is_valid_element(i)) {
+        auto at = acc.get_multidimensional_index(i);
+        uint q_local = q0 + at[1];
+        acc[i] = q_local < p.rows
+                     ? out[(ulong)q_local * INK2_Q_DIM + h * INK2_HEAD_DIM + at[0]]
+                     : 0.0f;
+      }
+  }
+
+  for (uint k0 = k_lo; k0 < k_hi;) {
+    uint local_k0 = k0 - p.k_start;
+    uint chunk = min(BK, k_hi - k0);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
+        (device bfloat *)k_slab, dextents<int32_t, 2>(INK2_KV_DIM, local_k0 + chunk));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
+        (device bfloat *)v_slab, dextents<int32_t, 2>(INK2_KV_DIM, local_k0 + chunk));
+    auto kt = tk.slice(kv_h * INK2_HEAD_DIM, local_k0);
+    auto vt = tv.slice(kv_h * INK2_HEAD_DIM, local_k0);
+
+    auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+    sop.run(qt, kt, sc);
+
+    bool all_visible = full_q && (chunk == BK) && (k0 + BK - 1u <= first_pos);
+    bool no_rel = all_visible && (first_pos >= k0 + BK - 1u + INK2_REL_EXTENT);
+    if (no_rel) {
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          smem.scores[at[1] * BK + at[0]] = sc[i] * scale_log2;
+        }
+    } else if (all_visible) {
+      uint cached_qr = 0xFFFFFFFFu;
+      float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          uint kr = at[0], qr = at[1];
+          uint q_local = q0 + qr;
+          uint dist = (p.pos0 + q_local) - (k0 + kr);
+          float val = sc[i] * scale_log2;
+          if (dist < INK2_REL_EXTENT) {
+            if (qr != cached_qr) {
+              cached_qr = qr;
+              device const float4 *rp =
+                  (device const float4 *)(r_out + ((ulong)q_local * INK2_HEADS + h) * INK2_D_REL);
+              r0 = rp[0] * M_LOG2E_F;
+              r1 = rp[1] * M_LOG2E_F;
+              r2 = rp[2] * M_LOG2E_F;
+              r3 = rp[3] * M_LOG2E_F;
+            }
+            device const uint4 *pt = (device const uint4 *)(rel_proj_t + (ulong)dist * INK2_D_REL);
+            uint4 q0p = pt[0], q1p = pt[1];
+            val += dot(r0, bf16x4(q0p.xy)) + dot(r1, bf16x4(q0p.zw)) +
+                   dot(r2, bf16x4(q1p.xy)) + dot(r3, bf16x4(q1p.zw));
+          }
+          smem.scores[qr * BK + kr] = val;
+        }
+    } else {
+      uint cached_qr = 0xFFFFFFFFu;
+      float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+      for (uint16_t i = 0; i < sc.get_capacity(); i++)
+        if (sc.is_valid_element(i)) {
+          auto at = sc.get_multidimensional_index(i);
+          uint kr = at[0], qr = at[1];
+          uint q_local = q0 + qr;
+          float val = -INFINITY;
+          if (q_local < p.rows && kr < chunk) {
+            uint qpos = p.pos0 + q_local, kpos = k0 + kr;
+            if (kpos <= qpos) {
+              val = sc[i] * scale_log2;
+              uint dist = qpos - kpos;
+              if (dist < INK2_REL_EXTENT) {
+                if (qr != cached_qr) {
+                  cached_qr = qr;
+                  device const float4 *rp =
+                      (device const float4 *)(r_out + ((ulong)q_local * INK2_HEADS + h) * INK2_D_REL);
+                  r0 = rp[0] * M_LOG2E_F;
+                  r1 = rp[1] * M_LOG2E_F;
+                  r2 = rp[2] * M_LOG2E_F;
+                  r3 = rp[3] * M_LOG2E_F;
+                }
+                device const uint4 *pt =
+                    (device const uint4 *)(rel_proj_t + (ulong)dist * INK2_D_REL);
+                uint4 q0p = pt[0], q1p = pt[1];
+                val += dot(r0, bf16x4(q0p.xy)) + dot(r1, bf16x4(q0p.zw)) +
+                       dot(r2, bf16x4(q1p.xy)) + dot(r3, bf16x4(q1p.zw));
+              }
+            }
+          }
+          smem.scores[qr * BK + kr] = val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (flash_attn_64x64_softmax(smem, sg, lane, !all_visible, rmax, rsum)) {
+      for (uint16_t i = 0; i < acc.get_capacity(); i++)
+        if (acc.is_valid_element(i))
+          acc[i] *= smem.st.row_scale[acc.get_multidimensional_index(i)[1]];
+    }
+    oop.run(tp, vt, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    k0 += chunk;
+  }
+
+  if (!p.is_last) {
+    if ((lane & 1u) == 0u && row_local < p.rows) {
+      ulong mloff = ((ulong)row_local * INK2_HEADS + h) * 2u;
+      slab_ml[mloff] = rmax;
+      slab_ml[mloff + 1u] = rsum;
+    }
+    for (uint16_t i = 0; i < acc.get_capacity(); i++)
+      if (acc.is_valid_element(i)) {
+        auto at = acc.get_multidimensional_index(i);
+        uint q_local = q0 + at[1];
+        if (q_local < p.rows)
+          out[(ulong)q_local * INK2_Q_DIM + h * INK2_HEAD_DIM + at[0]] = acc[i];
+      }
+    return;
+  }
+
+  if ((lane & 1u) == 0u && row_local < p.rows) {
+    float sv = sink[(ulong)row_local * INK2_HEADS + h] * M_LOG2E_F;
+    float fm = max(rmax, sv);
+    float oscale = rmax == -INFINITY ? 0.0f : exp2(rmax - fm);
+    float fl = rsum * oscale + exp2(sv - fm);
+    smem.st.row_aux[row] = oscale;
+    smem.st.row_scale[row] = fl;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2881,7 +3443,7 @@ kernel void ink2_add(device const float *a [[buffer(0)]],
 }
 
 // Groups up to 16 tokens' top-8 routed (token, expert) pairs on GPU into one
-// tile per active expert, eliminating CPU-GPU syncs during decode and verify.
+// tile per active expert for decode and verification batches.
 // Grid: 1 threadgroup of 128 threads (one thread per expert 0..127).
 kernel void ink2_moe_group(device const uint *route_ids [[buffer(0)]],
                            device const float *route_w [[buffer(1)]],

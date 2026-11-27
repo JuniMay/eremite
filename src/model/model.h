@@ -35,6 +35,13 @@ typedef struct {
   int packed_state_rows;
 } DeepSeekOptions;
 
+// Inkling-2-Mini's options.
+typedef struct {
+  // Whether a state stores global, sliding-window and draft-head KV caches as
+  // approximate FP8 E4M3 with per-head scales instead of BF16.
+  int fp8_kv;
+} Inkling2Options;
+
 // MiniMax-H3-Image's checkpoint files.
 typedef struct {
   // Safetensors file of the Qwen3-VL text and vision encoder.
@@ -94,6 +101,7 @@ typedef struct {
 
   union {
     DeepSeekOptions deepseek;
+    Inkling2Options inkling2;
     MinimaxH3ImageOptions minimax_h3_image;
     MinimaxH3VideoOptions minimax_h3_video;
   };

@@ -1,4 +1,5 @@
 #include "check.h"
+#include "base/clock.h"
 #include "base/error.h"
 #include "gpu/gpu.h"
 #include "kernels/library.h"
@@ -42,7 +43,13 @@ static constexpr float RMS_EPS = 1e-6f, CLIP_EPS = 1e-6f,
                        DYNAMIC_SCONV_SCALE = 0.33333333333333331f;
 
 // Verification tolerances for FP32 and BF16-rounded kernel outputs.
-static constexpr float TOL_F32 = 1e-4f, TOL_BF16 = 3e-2f, TOL_ATTN = 2e-2f;
+static constexpr float TOL_F32 = 1e-4f, TOL_BF16 = 3e-2f, TOL_ATTN = 2e-2f,
+                       TOL_FP8_VS_BF16 = 0.15f;
+
+// Packed FP8 E4M3 KV cache row geometry matching src/kernels/inkling2.metal.
+static constexpr uint32_t FP8_KV_SCALES_OFF = KV_DIM,
+                          FP8_KV_ROW_BYTES = KV_DIM + KV_HEADS * 2;
+static constexpr float FP8_SCALE_FACTOR = 256.0f, FP8_MAX_VAL = 448.0f;
 
 // NVFP4 E2M1 lookup table (core_model_loading.py
 // Inkling2LoopDequantizeExperts).
@@ -109,6 +116,16 @@ typedef struct {
   // Active query rows, Q stride, row-0 pos, ring capacity, sliding window.
   uint32_t rows, q_stride, pos0, ring_rows, window;
 } AttendPrefillParam;
+
+typedef struct {
+  // First source FP8 KV row and row count to unpack into BF16 slab buffers.
+  uint32_t start_row, n_rows;
+} Fp8DequantParam;
+
+typedef struct {
+  // Query geometry, global key slab bounds and first/last slab flags.
+  uint32_t rows, q_stride, pos0, k_start, k_count, is_first, is_last;
+} AttendSlabParam;
 
 typedef struct {
   // Active rows, total experts, top-k count.
@@ -198,6 +215,82 @@ static float e4m3_to_f32(uint8_t b) {
 // Decodes a UE8M0 byte to its exact power-of-two FP32 scale.
 static float e8m0_to_f32(uint8_t b) {
   return ldexpf(1.0f, (int)b - (int)FP8_EXP_BIAS);
+}
+
+// Decodes an IEEE 754 binary16 bit pattern to FP32.
+static float fp16_to_f32(uint16_t h) {
+  int sign = (h >> 15) & 1;
+  int exp = (h >> 10) & 0x1F;
+  int mant = h & 0x3FF;
+  float v;
+  if (exp == 0)
+    v = ldexpf((float)mant, -24);
+  else if (exp == 31)
+    v = mant ? NAN : INFINITY;
+  else
+    v = ldexpf(1.0f + (float)mant / 1024.0f, exp - 15);
+  return sign ? -v : v;
+}
+
+// Encodes an FP32 value to a finite IEEE 754 binary16 bit pattern.
+static uint16_t f32_to_fp16(float x) {
+  uint32_t u;
+  memcpy(&u, &x, sizeof u);
+  uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+  int exp = (int)((u >> 23) & 0xFFu) - 127 + 15;
+  uint32_t mant = u & 0x7FFFFFu;
+  if (exp <= 0) return sign;
+  if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+  uint32_t m = mant + 0x1000u + ((mant >> 13) & 1u);
+  if (m & 0x800000u) m = 0, exp++;
+  if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+  return (uint16_t)(sign | ((uint16_t)exp << 10) | (uint16_t)(m >> 13));
+}
+
+// Encodes an FP32 value to finite FP8 E4M3 round-to-nearest-even.
+static uint8_t f32_to_e4m3(float v) {
+  uint8_t sign = signbit(v) ? 0x80u : 0u;
+  float a = fabsf(v);
+  if (a > FP8_MAX_VAL) a = FP8_MAX_VAL;
+  if (a < 0.015625f) return (uint8_t)(sign | (uint8_t)lrintf(a * 512.0f));
+  int e = 0;
+  (void)frexpf(a, &e);
+  int exp = e - 1;
+  uint32_t q = (uint32_t)lrintf(ldexpf(a, 3 - exp));
+  uint32_t code = ((uint32_t)(exp + 7) << 3) + (q - 8u);
+  if (code > 0x7Eu) code = 0x7Eu;
+  return (uint8_t)(sign | code);
+}
+
+// Packs one KV head of 128 floats into a packed FP8 E4M3 KV cache row.
+static void fp8_kv_pack_head(uint8_t *base, uint32_t slot, uint32_t kvh,
+                             const float *src) {
+  uint8_t *row = base + (size_t)slot * FP8_KV_ROW_BYTES;
+  float amax = 0.0f;
+  for (uint32_t d = 0; d < HEAD_DIM; d++) amax = fmaxf(amax, fabsf(src[d]));
+  uint16_t hscale = 0;
+  float inv = 0.0f;
+  if (amax > 0.0f) {
+    float s256 = amax * (FP8_SCALE_FACTOR / FP8_MAX_VAL);
+    if (s256 < 6.103515625e-5f) s256 = 6.103515625e-5f;
+    if (s256 > 65504.0f) s256 = 65504.0f;
+    hscale = f32_to_fp16(s256);
+    inv = FP8_SCALE_FACTOR / fp16_to_f32(hscale);
+  }
+  memcpy(row + FP8_KV_SCALES_OFF + (size_t)kvh * 2, &hscale, sizeof hscale);
+  for (uint32_t d = 0; d < HEAD_DIM; d++)
+    row[(size_t)kvh * HEAD_DIM + d] =
+        amax > 0.0f ? f32_to_e4m3(src[d] * inv) : 0u;
+}
+
+// Decodes one element from a packed FP8 E4M3 KV cache row.
+static float fp8_kv_get(const uint8_t *base, uint32_t slot, uint32_t kvh,
+                        uint32_t d) {
+  const uint8_t *row = base + (size_t)slot * FP8_KV_ROW_BYTES;
+  uint16_t hscale;
+  memcpy(&hscale, row + FP8_KV_SCALES_OFF + (size_t)kvh * 2, sizeof hscale);
+  float scale = fp16_to_f32(hscale) / FP8_SCALE_FACTOR;
+  return e4m3_to_f32(row[(size_t)kvh * HEAD_DIM + d]) * scale;
 }
 
 // Logistic sigmoid in FP32.
@@ -1023,6 +1116,598 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&sw_v);
 }
 
+// Tests ink2_qkvr_prep_fp8, ink2_attend_part_fp8_rel + ink2_attend_combine,
+// ink2_fp8_dequant_kv + ink2_attend_prefill_rel (sliding wrap with NaN
+// sentinels), and multi-slab ink2_attend_prefill_slab_rel, and reports kernel
+// timing vs BF16.
+static void test_attention_fp8(Gpu *gpu, MemorySlot *slot) {
+  int k_prep = gpu_find_kernel(gpu, "ink2_qkvr_prep_fp8");
+  int k_prep_bf = gpu_find_kernel(gpu, "ink2_qkvr_prep");
+  int k_part = gpu_find_kernel(gpu, "ink2_attend_part_fp8_rel");
+  int k_part_bf = gpu_find_kernel(gpu, "ink2_attend_part_rel");
+  int k_comb = gpu_find_kernel(gpu, "ink2_attend_combine");
+  int k_deq = gpu_find_kernel(gpu, "ink2_fp8_dequant_kv");
+  int k_slab = gpu_find_kernel(gpu, "ink2_attend_prefill_slab_rel");
+  int k_pref_bf = gpu_find_kernel(gpu, "ink2_attend_prefill_rel");
+
+  uint32_t rng = 0x91827364u;
+  uint32_t past = 70, qrows = 73, total = past + qrows;
+  uint32_t q_stride = ((qrows + Q_PAD - 1) / Q_PAD) * Q_PAD;
+  uint32_t nparts = 4;
+  uint32_t slab_cap = 2048;
+
+  Buf q_in = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
+  Buf k_in = gpu_alloc(gpu, slot, (size_t)qrows * KV_DIM * sizeof(float));
+  Buf v_in = gpu_alloc(gpu, slot, (size_t)qrows * KV_DIM * sizeof(float));
+  Buf r_in =
+      gpu_alloc(gpu, slot, (size_t)qrows * HEADS * D_REL * sizeof(float));
+  Buf q_sc = gpu_alloc(gpu, slot, (size_t)Q_DIM * sizeof(float));
+  Buf r_sc = gpu_alloc(gpu, slot, (size_t)HEADS * D_REL * sizeof(float));
+  Buf rel_proj_t =
+      gpu_alloc(gpu, slot, (size_t)REL_EXTENT * D_REL * sizeof(uint16_t));
+  Buf q_hm = gpu_alloc(gpu, slot,
+                       (size_t)HEADS * q_stride * HEAD_DIM * sizeof(uint16_t));
+  Buf k_fp8 = gpu_alloc(gpu, slot, (size_t)total * FP8_KV_ROW_BYTES);
+  Buf v_fp8 = gpu_alloc(gpu, slot, (size_t)total * FP8_KV_ROW_BYTES);
+  Buf k_bf = gpu_alloc(gpu, slot, (size_t)total * KV_DIM * sizeof(uint16_t));
+  Buf v_bf = gpu_alloc(gpu, slot, (size_t)total * KV_DIM * sizeof(uint16_t));
+  Buf deq_k =
+      gpu_alloc(gpu, slot, (size_t)slab_cap * KV_DIM * sizeof(uint16_t));
+  Buf deq_v =
+      gpu_alloc(gpu, slot, (size_t)slab_cap * KV_DIM * sizeof(uint16_t));
+  Buf slab_ml = gpu_alloc(gpu, slot, (size_t)512 * HEADS * 2 * sizeof(float));
+  Buf r_out =
+      gpu_alloc(gpu, slot, (size_t)qrows * HEADS * D_REL * sizeof(float));
+  Buf sink = gpu_alloc(gpu, slot, (size_t)qrows * HEADS * sizeof(float));
+  Buf gate = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
+  Buf part = gpu_alloc(
+      gpu, slot, (size_t)qrows * HEADS * nparts * PART_FLOATS * sizeof(float));
+  Buf out_dec = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
+  Buf out_pref = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
+  Buf out_bf = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
+  Buf dummy_tgt = gpu_alloc(gpu, slot, sizeof(KvTarget));
+
+  float *qip = (float *)q_in.ptr, *kip = (float *)k_in.ptr,
+        *vip = (float *)v_in.ptr, *rip = (float *)r_in.ptr;
+  float *qsp = (float *)q_sc.ptr, *rsp = (float *)r_sc.ptr,
+        *skp = (float *)sink.ptr, *gtp = (float *)gate.ptr;
+  uint16_t *rpp = (uint16_t *)rel_proj_t.ptr, *kbfp = (uint16_t *)k_bf.ptr,
+           *vbfp = (uint16_t *)v_bf.ptr;
+  uint8_t *kfp = (uint8_t *)k_fp8.ptr, *vfp = (uint8_t *)v_fp8.ptr;
+
+  for (uint32_t i = 0; i < qrows * Q_DIM; i++) qip[i] = rng_f32(&rng) * 4.0f;
+  for (uint32_t i = 0; i < qrows * KV_DIM; i++) {
+    kip[i] = rng_f32(&rng) * 4.0f;
+    vip[i] = rng_f32(&rng) * 2.0f;
+  }
+  // Force row 0 head 0 of K and V to exact zeros to verify zero-amax handling.
+  for (uint32_t d = 0; d < HEAD_DIM; d++) {
+    kip[d] = 0.0f;
+    vip[d] = 0.0f;
+  }
+  for (uint32_t i = 0; i < qrows * HEADS * D_REL; i++)
+    rip[i] = rng_f32(&rng) * 3.0f;
+  for (uint32_t i = 0; i < Q_DIM; i++) qsp[i] = 0.5f + rng_f32(&rng) * 0.5f;
+  for (uint32_t i = 0; i < HEADS * D_REL; i++)
+    rsp[i] = 0.5f + rng_f32(&rng) * 0.5f;
+  for (uint32_t k = 0; k < D_REL; k++)
+    for (uint32_t d = 0; d < REL_EXTENT; d++)
+      rpp[d * D_REL + k] = f32_to_bf16(rng_f32(&rng) * 0.2f);
+  for (uint32_t j = 0; j < past; j++) {
+    for (uint32_t kh = 0; kh < KV_HEADS; kh++) {
+      float khv[HEAD_DIM], vhv[HEAD_DIM];
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        khv[d] = rng_f32(&rng) * 1.2f;
+        vhv[d] = rng_f32(&rng) * 1.2f;
+        kbfp[(size_t)j * KV_DIM + kh * HEAD_DIM + d] = f32_to_bf16(khv[d]);
+        vbfp[(size_t)j * KV_DIM + kh * HEAD_DIM + d] = f32_to_bf16(vhv[d]);
+      }
+      fp8_kv_pack_head(kfp, j, kh, khv);
+      fp8_kv_pack_head(vfp, j, kh, vhv);
+    }
+  }
+  for (uint32_t i = 0; i < qrows * HEADS; i++) skp[i] = rng_f32(&rng) * 2.0f;
+  for (uint32_t i = 0; i < qrows * Q_DIM; i++) gtp[i] = rng_f32(&rng) * 2.0f;
+  memset(q_hm.ptr, 0, q_hm.size);
+
+  QkvrParam qp = {.rows = qrows,
+                  .q_stride = q_stride,
+                  .pos0 = past,
+                  .ring_rows = 0,
+                  .is_global = 1,
+                  .batched = 0};
+  AttendDecodeParam adp = {.rows = qrows,
+                           .q_stride = q_stride,
+                           .pos0 = past,
+                           .ring_rows = 0,
+                           .window = 0,
+                           .nparts = nparts,
+                           .part_stride = nparts,
+                           .batched = 0};
+  AttendPrefillParam app = {.rows = qrows,
+                            .q_stride = q_stride,
+                            .pos0 = past,
+                            .ring_rows = 0,
+                            .window = 0};
+
+  // Exercise 3-slab global attention (64 + 72 + 7 = 143): Q-tile 0 ends at
+  // pos 133, so slab 2 (k_start=136, is_last=1) exercises the skip+finalize
+  // path for Q-tile 0 while extending Q-tile 1.
+  uint32_t slabs[3][2] = {{0, 64}, {64, 72}, {136, total - 136}};
+  uint32_t qt_grid = ((qrows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS;
+
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  run_op(&cmd, k_prep_bf,
+         (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, k_bf, v_bf, r_out,
+                 dummy_tgt},
+         11, &qp, sizeof qp, QKVR_HEADS, qrows, 1, QKVR_THREADS, 1, 1);
+  run_op(&cmd, k_pref_bf,
+         (Buf[]){q_hm, k_bf, v_bf, r_out, rel_proj_t, sink, gate, out_bf}, 8,
+         &app, sizeof app, qt_grid, 1, 1, PREFILL_THREADS, 1, 1);
+  run_op(&cmd, k_prep,
+         (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, k_fp8, v_fp8, r_out,
+                 dummy_tgt},
+         11, &qp, sizeof qp, QKVR_HEADS, qrows, 1, QKVR_THREADS, 1, 1);
+  run_op(&cmd, k_part,
+         (Buf[]){q_hm, k_fp8, v_fp8, r_out, rel_proj_t, dummy_tgt, part}, 7,
+         &adp, sizeof adp, KV_HEADS, nparts, qrows, DECODE_THREADS, 1, 1);
+  run_op(&cmd, k_comb, (Buf[]){part, sink, gate, out_dec}, 4, &adp, sizeof adp,
+         HEADS, qrows, 1, COMBINE_THREADS, 1, 1);
+  for (int si = 0; si < 3; si++) {
+    Fp8DequantParam dp = {slabs[si][0], slabs[si][1]};
+    AttendSlabParam sp = {qrows,
+                          q_stride,
+                          past,
+                          slabs[si][0],
+                          slabs[si][1],
+                          si == 0 ? 1u : 0u,
+                          si == 2 ? 1u : 0u};
+    run_op(&cmd, k_deq, (Buf[]){k_fp8, v_fp8, deq_k, deq_v}, 4, &dp, sizeof dp,
+           slabs[si][1], 1, 1, ROW_THREADS, 1, 1);
+    run_op(&cmd, k_slab,
+           (Buf[]){q_hm, deq_k, deq_v, r_out, rel_proj_t, sink, gate, out_pref,
+                   slab_ml},
+           9, &sp, sizeof sp, qt_grid, 1, 1, PREFILL_THREADS, 1, 1);
+  }
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  // Verify no FP8 NaN codes (0x7F/0xFF), zero head encodes cleanly, and
+  // dequantized values match CPU K clip / V RMSNorm within FP8 step bounds.
+  int no_nan = 1, zero_head_ok = 1;
+  float kv_rel_err = 0.0f;
+  for (uint32_t r = 0; r < qrows; r++) {
+    uint32_t sl = past + r;
+    const uint8_t *kr = kfp + (size_t)sl * FP8_KV_ROW_BYTES;
+    const uint8_t *vr = vfp + (size_t)sl * FP8_KV_ROW_BYTES;
+    for (uint32_t i = 0; i < KV_DIM; i++)
+      if ((kr[i] & 0x7Fu) == 0x7Fu || (vr[i] & 0x7Fu) == 0x7Fu) no_nan = 0;
+    for (uint32_t kh = 0; kh < KV_HEADS; kh++) {
+      double ksq = 0.0, vsq = 0.0;
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        float kv = kip[r * KV_DIM + kh * HEAD_DIM + d];
+        float vv = vip[r * KV_DIM + kh * HEAD_DIM + d];
+        ksq += (double)kv * kv;
+        vsq += (double)vv * vv;
+      }
+      float ks = fminf(QK_CLIP / (sqrtf((float)ksq) + CLIP_EPS), 1.0f);
+      float vinv = 1.0f / sqrtf((float)(vsq / HEAD_DIM) + RMS_EPS);
+      float kamax = 0.0f, vamax = 0.0f;
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        kamax = fmaxf(kamax, fabsf(kip[r * KV_DIM + kh * HEAD_DIM + d] * ks));
+        vamax = fmaxf(vamax, fabsf(vip[r * KV_DIM + kh * HEAD_DIM + d] * vinv));
+      }
+      if (r == 0 && kh == 0) {
+        uint16_t ks16, vs16;
+        memcpy(&ks16, kr + FP8_KV_SCALES_OFF, sizeof ks16);
+        memcpy(&vs16, vr + FP8_KV_SCALES_OFF, sizeof vs16);
+        if (ks16 != 0 || vs16 != 0) zero_head_ok = 0;
+        for (uint32_t d = 0; d < HEAD_DIM; d++)
+          if (kr[d] != 0 || vr[d] != 0) zero_head_ok = 0;
+        continue;
+      }
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        float rk = kip[r * KV_DIM + kh * HEAD_DIM + d] * ks;
+        float rv = vip[r * KV_DIM + kh * HEAD_DIM + d] * vinv;
+        float gk = fp8_kv_get(kfp, sl, kh, d);
+        float gv = fp8_kv_get(vfp, sl, kh, d);
+        kv_rel_err = fmaxf(kv_rel_err, fabsf(gk - rk) / fmaxf(kamax, 1e-6f));
+        kv_rel_err = fmaxf(kv_rel_err, fabsf(gv - rv) / fmaxf(vamax, 1e-6f));
+      }
+    }
+  }
+  check(no_nan, "ink2_qkvr_prep_fp8 never emits FP8 NaN codes");
+  check(zero_head_ok, "ink2_qkvr_prep_fp8 encodes all-zero head to 0");
+  check_err("ink2_qkvr_prep_fp8 relative quantization error", kv_rel_err,
+            0.07f);
+
+  float scale = 1.0f / sqrtf((float)HEAD_DIM);
+  float dec_err = 0.0f, pref_err = 0.0f, vs_bf_err = 0.0f;
+  const uint16_t *qhmp = (const uint16_t *)q_hm.ptr;
+  const float *rop = (const float *)r_out.ptr,
+              *odp = (const float *)out_dec.ptr,
+              *opp = (const float *)out_pref.ptr,
+              *obp = (const float *)out_bf.ptr;
+  for (uint32_t r = 0; r < qrows; r++) {
+    uint32_t qpos = past + r;
+    for (uint32_t h = 0; h < HEADS; h++) {
+      uint32_t kvh = h / GQA;
+      float sc[160], mx = skp[r * HEADS + h];
+      for (uint32_t j = 0; j <= qpos; j++) {
+        double dotv = 0.0;
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+          float qv = bf16_to_f32(qhmp[(h * q_stride + r) * HEAD_DIM + d]);
+          dotv += (double)qv * fp8_kv_get(kfp, j, kvh, d);
+        }
+        float val = (float)dotv * scale;
+        uint32_t dist = qpos - j;
+        if (dist < REL_EXTENT) {
+          float rb = 0.0f;
+          for (uint32_t k = 0; k < D_REL; k++)
+            rb += rop[(r * HEADS + h) * D_REL + k] *
+                  bf16_to_f32(rpp[dist * D_REL + k]);
+          val += rb;
+        }
+        sc[j] = val;
+        mx = fmaxf(mx, val);
+      }
+      float denom = expf(skp[r * HEADS + h] - mx);
+      for (uint32_t j = 0; j <= qpos; j++) {
+        sc[j] = expf(sc[j] - mx);
+        denom += sc[j];
+      }
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        float acc = 0.0f;
+        for (uint32_t j = 0; j <= qpos; j++)
+          acc += sc[j] * fp8_kv_get(vfp, j, kvh, d);
+        float v = bf_round(acc / denom);
+        float ref = bf_round(v * cpu_sigm(gtp[r * Q_DIM + h * HEAD_DIM + d]));
+        uint32_t idx = r * Q_DIM + h * HEAD_DIM + d;
+        dec_err = fmaxf(dec_err, fabsf(odp[idx] - ref));
+        pref_err = fmaxf(pref_err, fabsf(opp[idx] - ref));
+        vs_bf_err = fmaxf(vs_bf_err, fabsf(opp[idx] - obp[idx]));
+      }
+    }
+  }
+  check_err("ink2_attend_part_fp8_rel global", dec_err, TOL_ATTN);
+  check_err("ink2_attend_prefill_slab_rel global (3 slabs)", pref_err,
+            TOL_ATTN);
+  check_err("FP8 vs BF16 global attention", vs_bf_err, TOL_FP8_VS_BF16);
+
+  // Sliding window with ring wrap-around and NaN sentinels in unused slots.
+  uint32_t ring_rows = WINDOW + 96, sw_pos0 = 1130, sw_rows = 73;
+  uint32_t sw_qstride = ((sw_rows + Q_PAD - 1) / Q_PAD) * Q_PAD;
+  Buf sw_k = gpu_alloc(gpu, slot, (size_t)ring_rows * FP8_KV_ROW_BYTES);
+  Buf sw_v = gpu_alloc(gpu, slot, (size_t)ring_rows * FP8_KV_ROW_BYTES);
+  uint8_t *swkp = (uint8_t *)sw_k.ptr, *swvp = (uint8_t *)sw_v.ptr;
+  for (uint32_t sl = 0; sl < ring_rows; sl++) {
+    for (uint32_t kh = 0; kh < KV_HEADS; kh++) {
+      float khv[HEAD_DIM], vhv[HEAD_DIM];
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        khv[d] = rng_f32(&rng) * 0.8f;
+        vhv[d] = rng_f32(&rng) * 0.8f;
+      }
+      fp8_kv_pack_head(swkp, sl, kh, khv);
+      fp8_kv_pack_head(swvp, sl, kh, vhv);
+    }
+  }
+  uint32_t unused_lo = (sw_pos0 + sw_rows) % ring_rows;
+  uint32_t unused_hi = (sw_pos0 + 1 - WINDOW) % ring_rows;
+  for (uint32_t sl = unused_lo; sl < unused_hi; sl++) {
+    uint8_t *kr = swkp + (size_t)sl * FP8_KV_ROW_BYTES;
+    uint8_t *vr = swvp + (size_t)sl * FP8_KV_ROW_BYTES;
+    memset(kr, 0x7F, KV_DIM);
+    memset(vr, 0x7F, KV_DIM);
+    for (uint32_t kh = 0; kh < KV_HEADS; kh++) {
+      uint16_t hnan = 0x7E00u;
+      memcpy(kr + FP8_KV_SCALES_OFF + (size_t)kh * 2, &hnan, sizeof hnan);
+      memcpy(vr + FP8_KV_SCALES_OFF + (size_t)kh * 2, &hnan, sizeof hnan);
+    }
+  }
+  QkvrParam sw_qp = {.rows = sw_rows,
+                     .q_stride = sw_qstride,
+                     .pos0 = sw_pos0,
+                     .ring_rows = ring_rows,
+                     .is_global = 0,
+                     .batched = 0};
+  AttendDecodeParam sw_adp = {.rows = sw_rows,
+                              .q_stride = sw_qstride,
+                              .pos0 = sw_pos0,
+                              .ring_rows = ring_rows,
+                              .window = WINDOW,
+                              .nparts = nparts,
+                              .part_stride = nparts,
+                              .batched = 0};
+  AttendPrefillParam sw_app = {.rows = sw_rows,
+                               .q_stride = sw_qstride,
+                               .pos0 = sw_pos0,
+                               .ring_rows = ring_rows,
+                               .window = WINDOW};
+
+  Fp8DequantParam sw_dp = {0u, ring_rows};
+  cmd = gpu_begin(gpu);
+  run_op(&cmd, k_prep,
+         (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, sw_k, sw_v, r_out,
+                 dummy_tgt},
+         11, &sw_qp, sizeof sw_qp, QKVR_HEADS, sw_rows, 1, QKVR_THREADS, 1, 1);
+  run_op(&cmd, k_part,
+         (Buf[]){q_hm, sw_k, sw_v, r_out, rel_proj_t, dummy_tgt, part}, 7,
+         &sw_adp, sizeof sw_adp, KV_HEADS, nparts, sw_rows, DECODE_THREADS, 1,
+         1);
+  run_op(&cmd, k_comb, (Buf[]){part, sink, gate, out_dec}, 4, &sw_adp,
+         sizeof sw_adp, HEADS, sw_rows, 1, COMBINE_THREADS, 1, 1);
+  run_op(&cmd, k_deq, (Buf[]){sw_k, sw_v, deq_k, deq_v}, 4, &sw_dp,
+         sizeof sw_dp, ring_rows, 1, 1, ROW_THREADS, 1, 1);
+  run_op(&cmd, k_pref_bf,
+         (Buf[]){q_hm, deq_k, deq_v, r_out, rel_proj_t, sink, gate, out_pref},
+         8, &sw_app, sizeof sw_app,
+         ((sw_rows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
+         PREFILL_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float sw_diff = 0.0f;
+  int sw_finite = 1;
+  for (uint32_t i = 0; i < sw_rows * Q_DIM; i++) {
+    if (!isfinite(odp[i]) || !isfinite(opp[i])) sw_finite = 0;
+    sw_diff = fmaxf(sw_diff, fabsf(odp[i] - opp[i]));
+  }
+  check(sw_finite, "sliding FP8 decode and prefill outputs are finite");
+  check_err("sliding FP8 decode vs prefill (ring wrap)", sw_diff, TOL_ATTN);
+
+  // Batched multi-state FP8 prep + decode across 2 resident states.
+  gpu_set_resident(&k_fp8, 1);
+  gpu_set_resident(&v_fp8, 1);
+  gpu_set_resident(&sw_k, 1);
+  gpu_set_resident(&sw_v, 1);
+  gpu_commit_residency(gpu);
+
+  Buf btgt = gpu_alloc(gpu, slot, 2 * sizeof(KvTarget));
+  KvTarget *bt = (KvTarget *)btgt.ptr;
+  bt[0] = (KvTarget){.k = k_fp8.address + k_fp8.off,
+                     .v = v_fp8.address + v_fp8.off,
+                     .pos = past + 2,
+                     .ring_rows = 0};
+  bt[1] = (KvTarget){.k = sw_k.address + sw_k.off,
+                     .v = sw_v.address + sw_v.off,
+                     .pos = sw_pos0 + 5,
+                     .ring_rows = ring_rows};
+  QkvrParam bqp = {.rows = 2,
+                   .q_stride = Q_PAD,
+                   .pos0 = 0,
+                   .ring_rows = 0,
+                   .is_global = 0,
+                   .batched = 1};
+  AttendDecodeParam badp = {.rows = 2,
+                            .q_stride = Q_PAD,
+                            .pos0 = 0,
+                            .ring_rows = 0,
+                            .window = WINDOW,
+                            .nparts = nparts,
+                            .part_stride = nparts,
+                            .batched = 1};
+  cmd = gpu_begin(gpu);
+  run_op(&cmd, k_prep,
+         (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, k_fp8, v_fp8, r_out,
+                 btgt},
+         11, &bqp, sizeof bqp, QKVR_HEADS, 2, 1, QKVR_THREADS, 1, 1);
+  run_op(&cmd, k_part,
+         (Buf[]){q_hm, k_fp8, v_fp8, r_out, rel_proj_t, btgt, part}, 7, &badp,
+         sizeof badp, KV_HEADS, nparts, 2, DECODE_THREADS, 1, 1);
+  run_op(&cmd, k_comb, (Buf[]){part, sink, gate, out_dec}, 4, &badp,
+         sizeof badp, HEADS, 2, 1, COMBINE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float bat_err = 0.0f;
+  for (uint32_t br = 0; br < 2; br++) {
+    uint32_t bpos = bt[br].pos, bring = bt[br].ring_rows;
+    const uint8_t *bk = br == 0 ? kfp : swkp;
+    const uint8_t *bv = br == 0 ? vfp : swvp;
+    uint32_t klo = bpos + 1 > WINDOW ? bpos + 1 - WINDOW : 0;
+    for (uint32_t h = 0; h < HEADS; h++) {
+      uint32_t kvh = h / GQA;
+      float sc[WINDOW], mx = skp[br * HEADS + h];
+      for (uint32_t j = klo; j <= bpos; j++) {
+        uint32_t sl = bring ? (j % bring) : j;
+        double dotv = 0.0;
+        for (uint32_t d = 0; d < HEAD_DIM; d++)
+          dotv += (double)bf16_to_f32(qhmp[(h * Q_PAD + br) * HEAD_DIM + d]) *
+                  fp8_kv_get(bk, sl, kvh, d);
+        float val = (float)dotv * scale;
+        uint32_t dist = bpos - j;
+        if (dist < REL_EXTENT) {
+          for (uint32_t k = 0; k < D_REL; k++)
+            val += rop[(br * HEADS + h) * D_REL + k] *
+                   bf16_to_f32(rpp[dist * D_REL + k]);
+        }
+        sc[j - klo] = val;
+        mx = fmaxf(mx, val);
+      }
+      float den = expf(skp[br * HEADS + h] - mx);
+      for (uint32_t j = 0; j <= bpos - klo; j++) {
+        sc[j] = expf(sc[j] - mx);
+        den += sc[j];
+      }
+      for (uint32_t d = 0; d < HEAD_DIM; d++) {
+        float acc = 0.0f;
+        for (uint32_t j = klo; j <= bpos; j++) {
+          uint32_t sl = bring ? (j % bring) : j;
+          acc += sc[j - klo] * fp8_kv_get(bv, sl, kvh, d);
+        }
+        float ref = bf_round(bf_round(acc / den) *
+                             cpu_sigm(gtp[br * Q_DIM + h * HEAD_DIM + d]));
+        bat_err =
+            fmaxf(bat_err, fabsf(odp[br * Q_DIM + h * HEAD_DIM + d] - ref));
+      }
+    }
+  }
+  check_err("batched FP8 prep + attend_part_fp8_rel", bat_err, TOL_ATTN);
+
+  // Isolated kernel timing: BF16 vs FP8 prefill (512 @4096 global) and decode
+  // (1 @8192 global).
+  uint32_t b_rows = 512, b_pos0 = 4096, b_kv = 8192 + 1, b_parts = 16;
+  Buf bq = gpu_alloc(gpu, slot,
+                     (size_t)HEADS * b_rows * HEAD_DIM * sizeof(uint16_t));
+  Buf bkb = gpu_alloc(gpu, slot, (size_t)b_kv * KV_DIM * sizeof(uint16_t));
+  Buf bvb = gpu_alloc(gpu, slot, (size_t)b_kv * KV_DIM * sizeof(uint16_t));
+  Buf bkf = gpu_alloc(gpu, slot, (size_t)b_kv * FP8_KV_ROW_BYTES);
+  Buf bvf = gpu_alloc(gpu, slot, (size_t)b_kv * FP8_KV_ROW_BYTES);
+  Buf brout =
+      gpu_alloc(gpu, slot, (size_t)b_rows * HEADS * D_REL * sizeof(float));
+  Buf bsink = gpu_alloc(gpu, slot, (size_t)b_rows * HEADS * sizeof(float));
+  Buf bgate = gpu_alloc(gpu, slot, (size_t)b_rows * Q_DIM * sizeof(float));
+  Buf bout = gpu_alloc(gpu, slot, (size_t)b_rows * Q_DIM * sizeof(float));
+  Buf bpart = gpu_alloc(gpu, slot,
+                        (size_t)HEADS * b_parts * PART_FLOATS * sizeof(float));
+  memset(bq.ptr, 0, bq.size);
+  memset(bkb.ptr, 0, bkb.size);
+  memset(bvb.ptr, 0, bvb.size);
+  memset(bkf.ptr, 0, bkf.size);
+  memset(bvf.ptr, 0, bvf.size);
+  memset(brout.ptr, 0, brout.size);
+  memset(bsink.ptr, 0, bsink.size);
+  memset(bgate.ptr, 0, bgate.size);
+
+  AttendPrefillParam bp = {.rows = b_rows,
+                           .q_stride = b_rows,
+                           .pos0 = b_pos0,
+                           .ring_rows = 0,
+                           .window = 0};
+  AttendPrefillParam bsw = {.rows = b_rows,
+                            .q_stride = b_rows,
+                            .pos0 = 2048,
+                            .ring_rows = 1040,
+                            .window = WINDOW};
+  AttendDecodeParam bd = {.rows = 1,
+                          .q_stride = b_rows,
+                          .pos0 = 8192,
+                          .ring_rows = 0,
+                          .window = 0,
+                          .nparts = b_parts,
+                          .part_stride = b_parts,
+                          .batched = 0};
+  uint32_t b_tg = (b_rows / PREFILL_Q_GROUP) * HEADS;
+  double t_pref_bf = 0.0, t_pref_fp8 = 0.0, t_sw_bf = 0.0, t_sw_fp8 = 0.0,
+         t_dec_bf = 0.0, t_dec_fp8 = 0.0;
+  for (int it = 0; it < 13; it++) {
+    double t0 = now();
+    cmd = gpu_begin(gpu);
+    run_op(&cmd, k_pref_bf,
+           (Buf[]){bq, bkb, bvb, brout, rel_proj_t, bsink, bgate, bout}, 8, &bp,
+           sizeof bp, b_tg, 1, 1, PREFILL_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_pref_bf += now() - t0;
+
+    t0 = now();
+    cmd = gpu_begin(gpu);
+    uint32_t g_total = b_pos0 + b_rows;
+    for (uint32_t ks = 0; ks < g_total; ks += slab_cap) {
+      uint32_t kc = g_total - ks;
+      if (kc > slab_cap) kc = slab_cap;
+      Fp8DequantParam dp = {ks, kc};
+      AttendSlabParam sp = {b_rows,
+                            b_rows,
+                            b_pos0,
+                            ks,
+                            kc,
+                            ks == 0u ? 1u : 0u,
+                            ks + kc == g_total ? 1u : 0u};
+      run_op(&cmd, k_deq, (Buf[]){bkf, bvf, deq_k, deq_v}, 4, &dp, sizeof dp,
+             kc, 1, 1, ROW_THREADS, 1, 1);
+      run_op(&cmd, k_slab,
+             (Buf[]){bq, deq_k, deq_v, brout, rel_proj_t, bsink, bgate, bout,
+                     slab_ml},
+             9, &sp, sizeof sp, b_tg, 1, 1, PREFILL_THREADS, 1, 1);
+    }
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_pref_fp8 += now() - t0;
+
+    t0 = now();
+    cmd = gpu_begin(gpu);
+    run_op(&cmd, k_pref_bf,
+           (Buf[]){bq, bkb, bvb, brout, rel_proj_t, bsink, bgate, bout}, 8,
+           &bsw, sizeof bsw, b_tg, 1, 1, PREFILL_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_sw_bf += now() - t0;
+
+    t0 = now();
+    cmd = gpu_begin(gpu);
+    Fp8DequantParam bsw_dp = {0u, 1040u};
+    run_op(&cmd, k_deq, (Buf[]){bkf, bvf, deq_k, deq_v}, 4, &bsw_dp,
+           sizeof bsw_dp, 1040u, 1, 1, ROW_THREADS, 1, 1);
+    run_op(&cmd, k_pref_bf,
+           (Buf[]){bq, deq_k, deq_v, brout, rel_proj_t, bsink, bgate, bout}, 8,
+           &bsw, sizeof bsw, b_tg, 1, 1, PREFILL_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_sw_fp8 += now() - t0;
+
+    t0 = now();
+    cmd = gpu_begin(gpu);
+    run_op(&cmd, k_part_bf,
+           (Buf[]){bq, bkb, bvb, brout, rel_proj_t, dummy_tgt, bpart}, 7, &bd,
+           sizeof bd, KV_HEADS, b_parts, 1, DECODE_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_dec_bf += now() - t0;
+
+    t0 = now();
+    cmd = gpu_begin(gpu);
+    run_op(&cmd, k_part,
+           (Buf[]){bq, bkf, bvf, brout, rel_proj_t, dummy_tgt, bpart}, 7, &bd,
+           sizeof bd, KV_HEADS, b_parts, 1, DECODE_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(gpu);
+    if (it >= 3) t_dec_fp8 += now() - t0;
+  }
+  printf("timing (10-run mean): global 512@4096 BF16 %.3f ms vs FP8 %.3f ms; "
+         "slide 512@2048 BF16 %.3f ms vs FP8 %.3f ms; "
+         "decode 1@8192 BF16 %.3f ms vs FP8 %.3f ms\n",
+         100.0 * t_pref_bf, 100.0 * t_pref_fp8, 100.0 * t_sw_bf,
+         100.0 * t_sw_fp8, 100.0 * t_dec_bf, 100.0 * t_dec_fp8);
+
+  gpu_free(&q_in);
+  gpu_free(&k_in);
+  gpu_free(&v_in);
+  gpu_free(&r_in);
+  gpu_free(&q_sc);
+  gpu_free(&r_sc);
+  gpu_free(&rel_proj_t);
+  gpu_free(&q_hm);
+  gpu_free(&k_fp8);
+  gpu_free(&v_fp8);
+  gpu_free(&k_bf);
+  gpu_free(&v_bf);
+  gpu_free(&deq_k);
+  gpu_free(&deq_v);
+  gpu_free(&slab_ml);
+  gpu_free(&r_out);
+  gpu_free(&sink);
+  gpu_free(&gate);
+  gpu_free(&part);
+  gpu_free(&out_dec);
+  gpu_free(&out_pref);
+  gpu_free(&out_bf);
+  gpu_free(&dummy_tgt);
+  gpu_free(&sw_k);
+  gpu_free(&sw_v);
+  gpu_free(&btgt);
+  gpu_free(&bq);
+  gpu_free(&bkb);
+  gpu_free(&bvb);
+  gpu_free(&bkf);
+  gpu_free(&bvf);
+  gpu_free(&brout);
+  gpu_free(&bsink);
+  gpu_free(&bgate);
+  gpu_free(&bout);
+  gpu_free(&bpart);
+}
+
 // Tests ink2_route_topk, NVFP4 MoE (mv and mm paths), MXFP8 MoE (mv and mm
 // paths), and ink2_moe_combine.
 static void test_router_and_moe(Gpu *gpu, MemorySlot *slot) {
@@ -1537,6 +2222,7 @@ int main(void) {
   test_attn_res_and_msg_gate(gpu, slot);
   test_short_convs(gpu, slot);
   test_attention(gpu, slot);
+  test_attention_fp8(gpu, slot);
   test_router_and_moe(gpu, slot);
   test_copy_and_moe_group(gpu, slot);
   test_mm_bf16(gpu, slot);
