@@ -419,7 +419,9 @@ Nemotron-3.5-Transcribe keeps its dense hybrid Mamba-2 and attention backbone
 resident in GPU memory (~3.3 GiB) and loads its 815 MiB Parallel Expert
 Perception audio encoder and 96.6 MiB BF16 CTC timestamp head on demand. Its
 2,944 NVFP4 routed experts across 23 MoE layers live in the shared SSD-backed
-expert cache (~15.7 GiB when all experts stay resident). Setting `draft` to `1`
+expert cache (~15.7 GiB when all experts stay resident). Its 6 attention layers
+(and its draft head's attention layer when drafting is enabled) store KV caches
+in 256-token pages shared copy-on-write across forked branches in memory. Setting `draft` to `1`
 through `8` loads the checkpoint's repeated `*E` FP8 Multi-Token Prediction head
 (`model-mtp-fp8.safetensors`, ~1.25 GiB) and accelerates decoding without
 changing outputs; `draft: 7` gives the fastest measured decode speed in both

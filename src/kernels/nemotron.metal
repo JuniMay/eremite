@@ -113,12 +113,21 @@ struct NemoQkvParam {
   // Active token count, head-major Q row stride (multiple of 64 for prefill),
   // row-0 position (single-state mode), and batched-decode flag.
   uint rows, q_stride, pos0, batched;
+  // Base byte offset of this layer's 4 KV slices (k0, k1, v0, v1) inside a
+  // page; ignored when page_shift is 0.
+  ulong kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint slice_bytes, page_shift;
 };
 
 // Parameters for causal NoPE GQA 32/2 FlashAttention prefill.
 struct NemoAttnPrefillParam {
   // Active query rows, head-major Q stride, row-0 position and KV buffer cap.
   uint rows, q_stride, pos0, kv_cap;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  ulong kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint slice_bytes, page_shift;
 };
 
 // Parameters for causal NoPE GQA 32/2 FlashDecoding decode.
@@ -126,6 +135,10 @@ struct NemoAttnDecodeParam {
   // Active rows, Q stride, row-0 position, partition count, max partitions
   // stride, and batched-decode flag.
   uint rows, q_stride, pos0, nparts, part_stride, batched;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  ulong kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint slice_bytes, page_shift;
 };
 
 // Parameters for NemotronHTopkRouter (sigmoid + bias, top-6, scale 2.5).
@@ -1008,6 +1021,23 @@ kernel void nemo_qkv_store(device const float *q_raw [[buffer(0)]],
                    : k_raw[(ulong)row * NEMO_KV_DIM + kvh * NEMO_HEAD_DIM + d];
   device bfloat *dst_buf;
   uint pos;
+  if (p.page_shift) {
+    device const ulong *addrs;
+    if (p.batched) {
+      NemoKvTarget kt = targets[row];
+      pos = kt.pos;
+      addrs = (device const ulong *)kt.k0;
+    } else {
+      pos = p.pos0 + row;
+      addrs = (device const ulong *)k0;
+    }
+    uint page_mask = (1u << p.page_shift) - 1u;
+    ulong slice_off =
+        p.kv_base_off + (ulong)(is_v * NEMO_KV_HEADS + kvh) * p.slice_bytes;
+    dst_buf = (device bfloat *)(addrs[pos >> p.page_shift] + slice_off);
+    dst_buf[(ulong)(pos & page_mask) * NEMO_HEAD_DIM + d] = bfloat(val);
+    return;
+  }
   if (p.batched) {
     NemoKvTarget kt = targets[row];
     pos = kt.pos;
@@ -1037,6 +1067,12 @@ kernel void nemo_attend_prefill(device const bfloat *q_hm [[buffer(0)]],
   uint kvh = h / NEMO_GQA;
   device const bfloat *k_buf = kvh ? k1 : k0;
   device const bfloat *v_buf = kvh ? v1 : v0;
+  device const ulong *page_addrs =
+      p.page_shift ? (device const ulong *)k0 : nullptr;
+  uint page_rows = p.page_shift ? (1u << p.page_shift) : p.kv_cap;
+  uint page_mask = p.page_shift ? (page_rows - 1u) : 0u;
+  ulong k_slice_off = p.kv_base_off + (ulong)kvh * p.slice_bytes;
+  ulong v_slice_off = p.kv_base_off + (ulong)(NEMO_KV_HEADS + kvh) * p.slice_bytes;
 
   threadgroup FlashAttn64Smem<bfloat> smem;
   constexpr auto qk_desc = matmul2d_descriptor(
@@ -1051,17 +1087,15 @@ kernel void nemo_attend_prefill(device const bfloat *q_hm [[buffer(0)]],
   tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tq(
       (device bfloat *)(q_hm + (ulong)h * p.q_stride * NEMO_HEAD_DIM),
       dextents<int32_t, 2>(NEMO_HEAD_DIM, p.q_stride));
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
-      (device bfloat *)k_buf, dextents<int32_t, 2>(NEMO_HEAD_DIM, p.kv_cap));
-  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
-      (device bfloat *)v_buf, dextents<int32_t, 2>(NEMO_HEAD_DIM, p.kv_cap));
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv_init(
+      (device bfloat *)v_buf, dextents<int32_t, 2>(NEMO_HEAD_DIM, page_rows));
   tensor<threadgroup bfloat, extents<int32_t, NEMO_TILE, NEMO_TILE>,
          tensor_inline>
       tp(smem.st.probs, extents<int32_t, NEMO_TILE, NEMO_TILE>());
 
   auto q_tile = tq.slice(0, q0);
   auto acc = pv_op.get_destination_cooperative_tensor<decltype(tp),
-                                                      decltype(tv.slice(0, 0)),
+                                                      decltype(tv_init.slice(0, 0)),
                                                       float>();
   for (uint16_t i = 0; i < acc.get_capacity(); i++)
     if (acc.is_valid_element(i)) acc[i] = 0.0f;
@@ -1070,7 +1104,20 @@ kernel void nemo_attend_prefill(device const bfloat *q_hm [[buffer(0)]],
   float rmax = -INFINITY, rsum = 0.0f;
   for (uint kv0 = 0; kv0 < kv_end; kv0 += NEMO_TILE) {
     bool has_mask = (kv0 + NEMO_TILE) > (p.pos0 + q0);
-    auto k_tile = tk.slice(0, kv0);
+    device bfloat *kp = (device bfloat *)k_buf;
+    device bfloat *vp = (device bfloat *)v_buf;
+    uint slot0 = kv0;
+    if (p.page_shift) {
+      ulong page_base = page_addrs[kv0 >> p.page_shift];
+      kp = (device bfloat *)(page_base + k_slice_off);
+      vp = (device bfloat *)(page_base + v_slice_off);
+      slot0 = kv0 & page_mask;
+    }
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
+        kp, dextents<int32_t, 2>(NEMO_HEAD_DIM, page_rows));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
+        vp, dextents<int32_t, 2>(NEMO_HEAD_DIM, page_rows));
+    auto k_tile = tk.slice(0, slot0);
     auto s = qk_op.get_destination_cooperative_tensor<decltype(q_tile),
                                                       decltype(k_tile), float>();
     qk_op.run(q_tile, k_tile, s);
@@ -1096,7 +1143,7 @@ kernel void nemo_attend_prefill(device const bfloat *q_hm [[buffer(0)]],
         }
       }
     }
-    auto v_tile = tv.slice(0, kv0);
+    auto v_tile = tv.slice(0, slot0);
     pv_op.run(tp, v_tile, acc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1135,9 +1182,19 @@ kernel void nemo_attend_part(device const bfloat *q_hm [[buffer(0)]],
   uint kvh = tg.x, part = tg.y, row = tg.z;
   uint h = kvh * NEMO_GQA + sg;
   uint pos;
-  device const bfloat *k_buf;
-  device const bfloat *v_buf;
-  if (p.batched) {
+  device const bfloat *k_buf = nullptr;
+  device const bfloat *v_buf = nullptr;
+  device const ulong *page_addrs = nullptr;
+  if (p.page_shift) {
+    if (p.batched) {
+      NemoKvTarget kt = targets[row];
+      pos = kt.pos;
+      page_addrs = (device const ulong *)kt.k0;
+    } else {
+      pos = p.pos0 + row;
+      page_addrs = (device const ulong *)k0;
+    }
+  } else if (p.batched) {
     NemoKvTarget kt = targets[row];
     pos = kt.pos;
     k_buf = kvh ? kt.k1 : kt.k0;
@@ -1170,17 +1227,44 @@ kernel void nemo_attend_part(device const bfloat *q_hm [[buffer(0)]],
   float4 acc = float4(0.0f);
   float rmax = -INFINITY, rsum = 0.0f;
 
-  device const bfloat4 *k4 = (device const bfloat4 *)k_buf;
-  device const bfloat4 *v4 = (device const bfloat4 *)v_buf;
-  for (uint t = t0; t < t1; t++) {
-    float4 kv = float4(k4[(ulong)t * NEMO_SIMD + lane]);
-    float score = simd_sum(dot(qv, kv));
-    float m_new = max(rmax, score);
-    float a = exp(rmax - m_new);
-    float b = exp(score - m_new);
-    acc = acc * a + float4(v4[(ulong)t * NEMO_SIMD + lane]) * b;
-    rsum = rsum * a + b;
-    rmax = m_new;
+  if (p.page_shift) {
+    uint page_mask = (1u << p.page_shift) - 1u;
+    ulong k_off = p.kv_base_off + (ulong)kvh * p.slice_bytes;
+    ulong v_off = p.kv_base_off + (ulong)(NEMO_KV_HEADS + kvh) * p.slice_bytes;
+    uint cached_page = 0xFFFFFFFFu;
+    device const bfloat4 *k4 = nullptr;
+    device const bfloat4 *v4 = nullptr;
+    for (uint t = t0; t < t1; t++) {
+      uint p_idx = t >> p.page_shift;
+      if (p_idx != cached_page) {
+        cached_page = p_idx;
+        ulong page_base = page_addrs[p_idx];
+        k4 = (device const bfloat4 *)(page_base + k_off);
+        v4 = (device const bfloat4 *)(page_base + v_off);
+      }
+      uint slot = t & page_mask;
+      float4 kv = float4(k4[(ulong)slot * NEMO_SIMD + lane]);
+      float score = simd_sum(dot(qv, kv));
+      float m_new = max(rmax, score);
+      float a = exp(rmax - m_new);
+      float b = exp(score - m_new);
+      acc = acc * a + float4(v4[(ulong)slot * NEMO_SIMD + lane]) * b;
+      rsum = rsum * a + b;
+      rmax = m_new;
+    }
+  } else {
+    device const bfloat4 *k4 = (device const bfloat4 *)k_buf;
+    device const bfloat4 *v4 = (device const bfloat4 *)v_buf;
+    for (uint t = t0; t < t1; t++) {
+      float4 kv = float4(k4[(ulong)t * NEMO_SIMD + lane]);
+      float score = simd_sum(dot(qv, kv));
+      float m_new = max(rmax, score);
+      float a = exp(rmax - m_new);
+      float b = exp(score - m_new);
+      acc = acc * a + float4(v4[(ulong)t * NEMO_SIMD + lane]) * b;
+      rsum = rsum * a + b;
+      rmax = m_new;
+    }
   }
 
   ((device float4 *)dst)[lane] = acc;
@@ -1769,6 +1853,24 @@ kernel void nemo_kv_store(device const float *k_raw [[buffer(0)]],
                    : k_raw[(ulong)row * NEMO_KV_DIM + kvh * NEMO_HEAD_DIM + d];
   device bfloat *dst_buf;
   uint pos;
+  if (p.page_shift) {
+    device const ulong *addrs;
+    if (p.batched) {
+      NemoKvTarget kt = targets[row];
+      if (kt.pos == NEMO_KV_SKIP_POS) return;
+      pos = kt.pos;
+      addrs = (device const ulong *)kt.k0;
+    } else {
+      pos = p.pos0 + row;
+      addrs = (device const ulong *)k0;
+    }
+    uint page_mask = (1u << p.page_shift) - 1u;
+    ulong slice_off =
+        p.kv_base_off + (ulong)(is_v * NEMO_KV_HEADS + kvh) * p.slice_bytes;
+    dst_buf = (device bfloat *)(addrs[pos >> p.page_shift] + slice_off);
+    dst_buf[(ulong)(pos & page_mask) * NEMO_HEAD_DIM + d] = bfloat(val);
+    return;
+  }
   if (p.batched) {
     NemoKvTarget kt = targets[row];
     if (kt.pos == NEMO_KV_SKIP_POS) return;

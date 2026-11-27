@@ -1,5 +1,6 @@
 #include "check.h"
 #include "base/error.h"
+#include "engine/kv_pages.h"
 #include "engine/memory.h"
 #include "gpu/gpu.h"
 #include "kernels/library.h"
@@ -94,16 +95,28 @@ typedef struct {
 typedef struct {
   // Active rows, Q stride, row-0 pos and batched flag.
   uint32_t rows, q_stride, pos0, batched;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint32_t slice_bytes, page_shift;
 } QkvParam;
 
 typedef struct {
   // Active rows, Q stride, row-0 pos and KV capacity.
   uint32_t rows, q_stride, pos0, kv_cap;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint32_t slice_bytes, page_shift;
 } AttnPrefillParam;
 
 typedef struct {
   // Active rows, Q stride, row-0 pos, partitions, stride and batched flag.
   uint32_t rows, q_stride, pos0, nparts, part_stride, batched;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens) (0: flat).
+  uint32_t slice_bytes, page_shift;
 } AttnDecodeParam;
 
 typedef struct {
@@ -812,8 +825,9 @@ static void test_nope_attention(Gpu *g, MemorySlot *work) {
       memcpy(v_raw.ptr, v_all[b] + (size_t)pos0 * NEMO_KV_DIM,
              (size_t)rows * NEMO_KV_DIM * sizeof(float));
 
-      QkvParam qp = {(uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, 0u};
-      AttnPrefillParam ap = {(uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, CAP};
+      QkvParam qp = {(uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, 0u, 0, 0, 0};
+      AttnPrefillParam ap = {
+          (uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, CAP, 0, 0, 0};
       GpuCommandBuffer cmd = gpu_begin(g);
       gpu_select_kernel(&cmd, k_store);
       gpu_bind_buffer(&cmd, 0, &q_raw, 0);
@@ -863,8 +877,8 @@ static void test_nope_attention(Gpu *g, MemorySlot *work) {
            v_all[b] + (size_t)dec_pos * NEMO_KV_DIM,
            (size_t)NEMO_KV_DIM * sizeof(float));
   }
-  QkvParam qp = {NB, NB, 0u, 1u};
-  AttnDecodeParam dp = {NB, NB, 0u, NPARTS, PART_STRIDE, 1u};
+  QkvParam qp = {NB, NB, 0u, 1u, 0, 0, 0};
+  AttnDecodeParam dp = {NB, NB, 0u, NPARTS, PART_STRIDE, 1u, 0, 0, 0};
   GpuCommandBuffer cmd = gpu_begin(g);
   gpu_select_kernel(&cmd, k_store);
   gpu_bind_buffer(&cmd, 0, &q_raw, 0);
@@ -1266,7 +1280,7 @@ static void test_mtp_kernels(Gpu *g, MemorySlot *work) {
     ((float *)k_raw.ptr)[i] = round_bf(randf());
     ((float *)v_raw.ptr)[i] = round_bf(randf());
   }
-  QkvParam qp_single = {KV_ROWS, KV_ROWS, KV_POS0, 0u};
+  QkvParam qp_single = {KV_ROWS, KV_ROWS, KV_POS0, 0u, 0, 0, 0};
   GpuCommandBuffer cmd = gpu_begin(g);
   int k_kv_store = gpu_find_kernel(g, "nemo_kv_store");
   gpu_select_kernel(&cmd, k_kv_store);
@@ -1306,7 +1320,7 @@ static void test_mtp_kernels(Gpu *g, MemorySlot *work) {
   ((KvTarget *)kt.ptr)[1] =
       (KvTarget){k0.address + k0.off, k1.address + k1.off, v0.address + v0.off,
                  v1.address + v1.off, KV_SKIP_POS,         0u};
-  QkvParam qp_batch = {KV_ROWS, KV_ROWS, 0u, 1u};
+  QkvParam qp_batch = {KV_ROWS, KV_ROWS, 0u, 1u, 0, 0, 0};
   cmd = gpu_begin(g);
   gpu_select_kernel(&cmd, k_kv_store);
   gpu_bind_buffer(&cmd, 0, &k_raw, 0);
@@ -1553,6 +1567,431 @@ static void test_mtp_kernels(Gpu *g, MemorySlot *work) {
   gpu_free(&uw), gpu_free(&ux), gpu_free(&uparts), gpu_free(&utok);
 }
 
+// Tests paged NoPE GQA 32/2 attention across the 256-token page boundary:
+// chunked prefill (190 + 115 = 305), copy-on-write fork at 305, divergent
+// single-state and 2-state batched decode, and paged nemo_kv_store with skip.
+// Compares every output bit-for-bit against the flat reference kernels.
+static void test_paged_attention(Gpu *g, MemorySlot *work) {
+  static constexpr int C1 = 190, C2 = 115, PREFIX = C1 + C2;
+  static constexpr int EXTRA = 2, TOT = PREFIX + EXTRA, CAP = 512;
+  static constexpr int NB = 2, NPARTS = 4, PART_STRIDE = 4;
+  static constexpr int LAYERS = 2, LAYER_IDX = 1;
+
+  size_t slice_bytes =
+      (size_t)NEMO_KV_PAGE_TOKENS * NEMO_HEAD_DIM * sizeof(uint16_t);
+  StateGrowthPolicy growth = {4, 2, 16, 4, 64};
+  KvPageLayout layout =
+      kv_page_layout_init(NEMO_KV_PAGE_TOKENS, slice_bytes,
+                          LAYERS * NEMO_KV_SLICES_PER_LAYER, growth);
+  KvPageBackend backend = kv_page_backend_gpu(g, work);
+  uint64_t kv_base_off =
+      (uint64_t)(LAYER_IDX * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
+
+  KvPageTable pt[NB];
+  for (int b = 0; b < NB; b++) kv_page_table_init(&pt[b], backend, &layout);
+  check(kv_page_table_prepare_write(&pt[0], 0, PREFIX),
+        "allocate paged KV for Nemotron prefix across page boundary");
+
+  Buf fk0[NB], fk1[NB], fv0[NB], fv1[NB];
+  float *q_all[NB], *k_all[NB], *v_all[NB];
+  for (int b = 0; b < NB; b++) {
+    fk0[b] = make_buf(g, work, (size_t)CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+    fk1[b] = make_buf(g, work, (size_t)CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+    fv0[b] = make_buf(g, work, (size_t)CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+    fv1[b] = make_buf(g, work, (size_t)CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+    memset(fk0[b].ptr, 0, fk0[b].size), memset(fk1[b].ptr, 0, fk1[b].size);
+    memset(fv0[b].ptr, 0, fv0[b].size), memset(fv1[b].ptr, 0, fv1[b].size);
+    q_all[b] = xmalloc((size_t)TOT * NEMO_Q_DIM * sizeof(float));
+    k_all[b] = xmalloc((size_t)TOT * NEMO_KV_DIM * sizeof(float));
+    v_all[b] = xmalloc((size_t)TOT * NEMO_KV_DIM * sizeof(float));
+    for (int i = 0; i < TOT * NEMO_Q_DIM; i++)
+      q_all[b][i] = round_bf(randf() * 0.4f);
+    for (int i = 0; i < TOT * NEMO_KV_DIM; i++) {
+      k_all[b][i] = round_bf(randf() * 0.4f);
+      v_all[b][i] = round_bf(randf() * 0.4f);
+    }
+  }
+  // Branch 1 shares prefix [0, PREFIX) with branch 0 and diverges afterward.
+  memcpy(q_all[1], q_all[0], (size_t)PREFIX * NEMO_Q_DIM * sizeof(float));
+  memcpy(k_all[1], k_all[0], (size_t)PREFIX * NEMO_KV_DIM * sizeof(float));
+  memcpy(v_all[1], v_all[0], (size_t)PREFIX * NEMO_KV_DIM * sizeof(float));
+
+  Buf q_raw = make_buf(g, work, (size_t)CAP * NEMO_Q_DIM * sizeof(float));
+  Buf k_raw = make_buf(g, work, (size_t)CAP * NEMO_KV_DIM * sizeof(float));
+  Buf v_raw = make_buf(g, work, (size_t)CAP * NEMO_KV_DIM * sizeof(float));
+  Buf q_hm = make_buf(
+      g, work, (size_t)NEMO_HEADS * CAP * NEMO_HEAD_DIM * sizeof(uint16_t));
+  Buf out_flat = make_buf(g, work, (size_t)CAP * NEMO_Q_DIM * sizeof(float));
+  Buf out_paged = make_buf(g, work, (size_t)CAP * NEMO_Q_DIM * sizeof(float));
+  Buf part = make_buf(g, work,
+                      (size_t)NB * NEMO_HEADS * PART_STRIDE *
+                          (NEMO_HEAD_DIM + 2) * sizeof(float));
+  Buf kt_flat = make_buf(g, work, (size_t)NB * sizeof(KvTarget));
+  Buf kt_paged = make_buf(g, work, (size_t)NB * sizeof(KvTarget));
+
+  int k_store = gpu_find_kernel(g, "nemo_qkv_store");
+  int k_kv = gpu_find_kernel(g, "nemo_kv_store");
+  int k_pre = gpu_find_kernel(g, "nemo_attend_prefill");
+  int k_part = gpu_find_kernel(g, "nemo_attend_part");
+  int k_comb = gpu_find_kernel(g, "nemo_attend_combine");
+
+  // 1. Chunked causal prefill across page boundary 256 (190 + 115 = 305).
+  float pre_diff = 0.0f;
+  int chunks[2] = {C1, C2}, pos0 = 0;
+  for (int ci = 0; ci < 2; ci++) {
+    int rows = chunks[ci];
+    int qs = ((rows + 63) / 64) * 64;
+    memcpy(q_raw.ptr, q_all[0] + (size_t)pos0 * NEMO_Q_DIM,
+           (size_t)rows * NEMO_Q_DIM * sizeof(float));
+    memcpy(k_raw.ptr, k_all[0] + (size_t)pos0 * NEMO_KV_DIM,
+           (size_t)rows * NEMO_KV_DIM * sizeof(float));
+    memcpy(v_raw.ptr, v_all[0] + (size_t)pos0 * NEMO_KV_DIM,
+           (size_t)rows * NEMO_KV_DIM * sizeof(float));
+
+    QkvParam qf = {(uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, 0u, 0, 0, 0};
+    AttnPrefillParam af = {
+        (uint32_t)rows, (uint32_t)qs, (uint32_t)pos0, CAP, 0, 0, 0};
+    QkvParam qp = {(uint32_t)rows, (uint32_t)qs,          (uint32_t)pos0,   0u,
+                   kv_base_off,    (uint32_t)slice_bytes, layout.page_shift};
+    AttnPrefillParam ap = {
+        (uint32_t)rows,   (uint32_t)qs,
+        (uint32_t)pos0,   (uint32_t)(pt[0].npages * NEMO_KV_PAGE_TOKENS),
+        kv_base_off,      (uint32_t)slice_bytes,
+        layout.page_shift};
+
+    GpuCommandBuffer cmd = gpu_begin(g);
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 5, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 6, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 7, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 8, &kt_flat, 0);
+    gpu_copy_bytes(&cmd, 9, &qf, sizeof qf);
+    gpu_run_kernel(&cmd, 36, (uint32_t)qs, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_pre);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 2, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 3, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 4, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 5, &out_flat, 0);
+    gpu_copy_bytes(&cmd, 6, &af, sizeof af);
+    gpu_run_kernel(&cmd, (uint32_t)(qs / 64), NEMO_HEADS, 1, PREFILL_THREADS, 1,
+                   1);
+
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 6, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 7, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 8, &kt_paged, 0);
+    gpu_copy_bytes(&cmd, 9, &qp, sizeof qp);
+    gpu_run_kernel(&cmd, 36, (uint32_t)qs, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_pre);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 2, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 3, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &out_paged, 0);
+    gpu_copy_bytes(&cmd, 6, &ap, sizeof ap);
+    gpu_run_kernel(&cmd, (uint32_t)(qs / 64), NEMO_HEADS, 1, PREFILL_THREADS, 1,
+                   1);
+    gpu_commit(&cmd);
+    gpu_sync(g);
+
+    float d =
+        max_abs_diff((const float *)out_paged.ptr, (const float *)out_flat.ptr,
+                     (size_t)rows * NEMO_Q_DIM);
+    if (d > pre_diff) pre_diff = d;
+    pos0 += rows;
+  }
+  checkf(pre_diff == 0.0f,
+         "paged nemo_attend_prefill matches flat across 256-token boundary "
+         "(max=%.2e)",
+         pre_diff);
+
+  // 2. Fork branch 1 from branch 0 at PREFIX (page 0 shared, page 1 copied).
+  check(kv_page_table_fork(&pt[1], &pt[0], PREFIX),
+        "fork Nemotron paged KV at 305 tokens");
+  check(pt[0].pages[0] == pt[1].pages[0] && pt[0].pages[0]->refs == 2 &&
+            pt[0].pages[1] != pt[1].pages[1] && pt[1].pages[1]->refs == 1,
+        "Nemotron fork shares full prefix page 0 and copies partial page 1");
+  memcpy(fk0[1].ptr, fk0[0].ptr,
+         (size_t)PREFIX * NEMO_HEAD_DIM * sizeof(uint16_t));
+  memcpy(fk1[1].ptr, fk1[0].ptr,
+         (size_t)PREFIX * NEMO_HEAD_DIM * sizeof(uint16_t));
+  memcpy(fv0[1].ptr, fv0[0].ptr,
+         (size_t)PREFIX * NEMO_HEAD_DIM * sizeof(uint16_t));
+  memcpy(fv1[1].ptr, fv1[0].ptr,
+         (size_t)PREFIX * NEMO_HEAD_DIM * sizeof(uint16_t));
+
+  // 3. Single-state paged FlashDecoding on branch 0 at pos = PREFIX.
+  check(kv_page_table_prepare_write(&pt[0], PREFIX, 1),
+        "prepare write for single-state decode");
+  memcpy(q_raw.ptr, q_all[0] + (size_t)PREFIX * NEMO_Q_DIM,
+         (size_t)NEMO_Q_DIM * sizeof(float));
+  memcpy(k_raw.ptr, k_all[0] + (size_t)PREFIX * NEMO_KV_DIM,
+         (size_t)NEMO_KV_DIM * sizeof(float));
+  memcpy(v_raw.ptr, v_all[0] + (size_t)PREFIX * NEMO_KV_DIM,
+         (size_t)NEMO_KV_DIM * sizeof(float));
+  {
+    QkvParam qf = {1u, 1u, (uint32_t)PREFIX, 0u, 0, 0, 0};
+    AttnDecodeParam df = {1u, 1u, (uint32_t)PREFIX, NPARTS, PART_STRIDE, 0u, 0,
+                          0,  0};
+    QkvParam qp = {1u,
+                   1u,
+                   (uint32_t)PREFIX,
+                   0u,
+                   kv_base_off,
+                   (uint32_t)slice_bytes,
+                   layout.page_shift};
+    AttnDecodeParam dp = {
+        1u, 1u,          (uint32_t)PREFIX,      NPARTS,           PART_STRIDE,
+        0u, kv_base_off, (uint32_t)slice_bytes, layout.page_shift};
+    GpuCommandBuffer cmd = gpu_begin(g);
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 5, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 6, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 7, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 8, &kt_flat, 0);
+    gpu_copy_bytes(&cmd, 9, &qf, sizeof qf);
+    gpu_run_kernel(&cmd, 36, 1, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_part);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 2, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 3, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 4, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 5, &kt_flat, 0);
+    gpu_bind_buffer(&cmd, 6, &part, 0);
+    gpu_copy_bytes(&cmd, 7, &df, sizeof df);
+    gpu_run_kernel(&cmd, NEMO_KV_HEADS, NPARTS, 1, DECODE_PART_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_comb);
+    gpu_bind_buffer(&cmd, 0, &part, 0);
+    gpu_bind_buffer(&cmd, 1, &out_flat, 0);
+    gpu_copy_bytes(&cmd, 2, &df, sizeof df);
+    gpu_run_kernel(&cmd, NEMO_HEADS, 1, 1, DECODE_COMBINE_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 6, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 7, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 8, &kt_paged, 0);
+    gpu_copy_bytes(&cmd, 9, &qp, sizeof qp);
+    gpu_run_kernel(&cmd, 36, 1, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_part);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 2, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 3, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &kt_paged, 0);
+    gpu_bind_buffer(&cmd, 6, &part, 0);
+    gpu_copy_bytes(&cmd, 7, &dp, sizeof dp);
+    gpu_run_kernel(&cmd, NEMO_KV_HEADS, NPARTS, 1, DECODE_PART_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_comb);
+    gpu_bind_buffer(&cmd, 0, &part, 0);
+    gpu_bind_buffer(&cmd, 1, &out_paged, 0);
+    gpu_copy_bytes(&cmd, 2, &dp, sizeof dp);
+    gpu_run_kernel(&cmd, NEMO_HEADS, 1, 1, DECODE_COMBINE_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(g);
+  }
+  float dec1_diff = max_abs_diff((const float *)out_paged.ptr,
+                                 (const float *)out_flat.ptr, NEMO_Q_DIM);
+  checkf(dec1_diff == 0.0f,
+         "paged single-state FlashDecoding matches flat (max=%.2e)", dec1_diff);
+
+  // 4. Batched 2-state decode at differing positions (PREFIX + 1 vs PREFIX).
+  int bpos[NB] = {PREFIX + 1, PREFIX};
+  for (int b = 0; b < NB; b++) {
+    check(kv_page_table_prepare_write(&pt[b], bpos[b], 1),
+          "prepare write for batched decode");
+    ((KvTarget *)kt_flat.ptr)[b] =
+        (KvTarget){fk0[b].address + fk0[b].off, fk1[b].address + fk1[b].off,
+                   fv0[b].address + fv0[b].off, fv1[b].address + fv1[b].off,
+                   (uint32_t)bpos[b],           0u};
+    ((KvTarget *)kt_paged.ptr)[b] =
+        (KvTarget){pt[b].gpu_addrs.address + pt[b].gpu_addrs.off,
+                   0,
+                   0,
+                   0,
+                   (uint32_t)bpos[b],
+                   0u};
+    memcpy((float *)q_raw.ptr + (size_t)b * NEMO_Q_DIM,
+           q_all[b] + (size_t)bpos[b] * NEMO_Q_DIM,
+           (size_t)NEMO_Q_DIM * sizeof(float));
+    memcpy((float *)k_raw.ptr + (size_t)b * NEMO_KV_DIM,
+           k_all[b] + (size_t)bpos[b] * NEMO_KV_DIM,
+           (size_t)NEMO_KV_DIM * sizeof(float));
+    memcpy((float *)v_raw.ptr + (size_t)b * NEMO_KV_DIM,
+           v_all[b] + (size_t)bpos[b] * NEMO_KV_DIM,
+           (size_t)NEMO_KV_DIM * sizeof(float));
+  }
+  {
+    QkvParam qf = {NB, NB, 0u, 1u, 0, 0, 0};
+    AttnDecodeParam df = {NB, NB, 0u, NPARTS, PART_STRIDE, 1u, 0, 0, 0};
+    QkvParam qp = {
+        NB, NB, 0u, 1u, kv_base_off, (uint32_t)slice_bytes, layout.page_shift};
+    AttnDecodeParam dp = {NB,
+                          NB,
+                          0u,
+                          NPARTS,
+                          PART_STRIDE,
+                          1u,
+                          kv_base_off,
+                          (uint32_t)slice_bytes,
+                          layout.page_shift};
+    GpuCommandBuffer cmd = gpu_begin(g);
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 5, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 6, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 7, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 8, &kt_flat, 0);
+    gpu_copy_bytes(&cmd, 9, &qf, sizeof qf);
+    gpu_run_kernel(&cmd, 36, NB, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_part);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &fk0[0], 0);
+    gpu_bind_buffer(&cmd, 2, &fk1[0], 0);
+    gpu_bind_buffer(&cmd, 3, &fv0[0], 0);
+    gpu_bind_buffer(&cmd, 4, &fv1[0], 0);
+    gpu_bind_buffer(&cmd, 5, &kt_flat, 0);
+    gpu_bind_buffer(&cmd, 6, &part, 0);
+    gpu_copy_bytes(&cmd, 7, &df, sizeof df);
+    gpu_run_kernel(&cmd, NEMO_KV_HEADS, NPARTS, NB, DECODE_PART_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_comb);
+    gpu_bind_buffer(&cmd, 0, &part, 0);
+    gpu_bind_buffer(&cmd, 1, &out_flat, 0);
+    gpu_copy_bytes(&cmd, 2, &df, sizeof df);
+    gpu_run_kernel(&cmd, NEMO_HEADS, NB, 1, DECODE_COMBINE_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_store);
+    gpu_bind_buffer(&cmd, 0, &q_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 3, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 6, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 7, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 8, &kt_paged, 0);
+    gpu_copy_bytes(&cmd, 9, &qp, sizeof qp);
+    gpu_run_kernel(&cmd, 36, NB, 1, QKV_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_part);
+    gpu_bind_buffer(&cmd, 0, &q_hm, 0);
+    gpu_bind_buffer(&cmd, 1, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 2, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 3, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &kt_paged, 0);
+    gpu_bind_buffer(&cmd, 6, &part, 0);
+    gpu_copy_bytes(&cmd, 7, &dp, sizeof dp);
+    gpu_run_kernel(&cmd, NEMO_KV_HEADS, NPARTS, NB, DECODE_PART_THREADS, 1, 1);
+
+    gpu_select_kernel(&cmd, k_comb);
+    gpu_bind_buffer(&cmd, 0, &part, 0);
+    gpu_bind_buffer(&cmd, 1, &out_paged, 0);
+    gpu_copy_bytes(&cmd, 2, &dp, sizeof dp);
+    gpu_run_kernel(&cmd, NEMO_HEADS, NB, 1, DECODE_COMBINE_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(g);
+  }
+  float decb_diff =
+      max_abs_diff((const float *)out_paged.ptr, (const float *)out_flat.ptr,
+                   (size_t)NB * NEMO_Q_DIM);
+  checkf(decb_diff == 0.0f,
+         "paged batched FlashDecoding matches flat on CoW branches (max=%.2e)",
+         decb_diff);
+
+  // 5. Paged nemo_kv_store (layer 0, batched with KV_SKIP_POS on row 1) writes
+  // into page 1 without corrupting shared page 0 or branch 1.
+  uint32_t target_pos = NEMO_KV_PAGE_TOKENS + 7u;
+  ((KvTarget *)kt_paged.ptr)[0] = (KvTarget){
+      pt[0].gpu_addrs.address + pt[0].gpu_addrs.off, 0, 0, 0, target_pos, 0u};
+  ((KvTarget *)kt_paged.ptr)[1] = (KvTarget){
+      pt[1].gpu_addrs.address + pt[1].gpu_addrs.off, 0, 0, 0, KV_SKIP_POS, 0u};
+  memset((uint8_t *)pt[1].pages[1]->buf.ptr, 0, slice_bytes * 4);
+  {
+    QkvParam qp = {NB, NB, 0u, 1u, 0, (uint32_t)slice_bytes, layout.page_shift};
+    GpuCommandBuffer cmd = gpu_begin(g);
+    gpu_select_kernel(&cmd, k_kv);
+    gpu_bind_buffer(&cmd, 0, &k_raw, 0);
+    gpu_bind_buffer(&cmd, 1, &v_raw, 0);
+    gpu_bind_buffer(&cmd, 2, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 3, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 4, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &pt[0].gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 6, &kt_paged, 0);
+    gpu_copy_bytes(&cmd, 7, &qp, sizeof qp);
+    gpu_run_kernel(&cmd, 2u * NEMO_KV_HEADS, NB, 1, QKV_THREADS, 1, 1);
+    gpu_commit(&cmd);
+    gpu_sync(g);
+  }
+  int pkv_ok = 1;
+  uint32_t slot = target_pos & (NEMO_KV_PAGE_TOKENS - 1u);
+  const uint8_t *p0 = (const uint8_t *)pt[0].pages[1]->buf.ptr;
+  const uint8_t *p1 = (const uint8_t *)pt[1].pages[1]->buf.ptr;
+  for (int d = 0; d < NEMO_HEAD_DIM; d++) {
+    uint16_t k0v = ((const uint16_t *)p0)[slot * NEMO_HEAD_DIM + d];
+    uint16_t k1v =
+        ((const uint16_t *)(p0 + slice_bytes))[slot * NEMO_HEAD_DIM + d];
+    uint16_t v0v =
+        ((const uint16_t *)(p0 + 2 * slice_bytes))[slot * NEMO_HEAD_DIM + d];
+    uint16_t v1v =
+        ((const uint16_t *)(p0 + 3 * slice_bytes))[slot * NEMO_HEAD_DIM + d];
+    if (bf16_to_f32(k0v) != ((const float *)k_raw.ptr)[d] ||
+        bf16_to_f32(k1v) != ((const float *)k_raw.ptr)[NEMO_HEAD_DIM + d] ||
+        bf16_to_f32(v0v) != ((const float *)v_raw.ptr)[d] ||
+        bf16_to_f32(v1v) != ((const float *)v_raw.ptr)[NEMO_HEAD_DIM + d])
+      pkv_ok = 0;
+    if (((const uint16_t *)p1)[slot * NEMO_HEAD_DIM + d] != 0) pkv_ok = 0;
+  }
+  checkf(pkv_ok, "paged nemo_kv_store batched+skip matches CPU");
+
+  for (int b = 0; b < NB; b++) {
+    kv_page_table_free(&pt[b]);
+    free(q_all[b]), free(k_all[b]), free(v_all[b]);
+    gpu_free(&fk0[b]), gpu_free(&fk1[b]), gpu_free(&fv0[b]), gpu_free(&fv1[b]);
+  }
+  gpu_free(&q_raw), gpu_free(&k_raw), gpu_free(&v_raw), gpu_free(&q_hm),
+      gpu_free(&out_flat), gpu_free(&out_paged), gpu_free(&part),
+      gpu_free(&kt_flat), gpu_free(&kt_paged);
+}
+
 int main(void) {
   Memory *mem = memory_new();
   MemoryAccount account;
@@ -1571,6 +2010,7 @@ int main(void) {
   test_nvfp4_linear(g, &work);
   test_mamba2(g, &work);
   test_nope_attention(g, &work);
+  test_paged_attention(g, &work);
   test_moe_pipeline(g, &work);
   test_mtp_kernels(g, &work);
   return failures != 0;

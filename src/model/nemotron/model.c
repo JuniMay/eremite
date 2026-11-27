@@ -5,11 +5,11 @@
 #include "base/json.h"
 #include "base/shutdown.h"
 #include "engine/expert_store.h"
+#include "engine/kv_pages.h"
 #include "engine/media.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/safetensors.h"
-#include "engine/state_growth.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
 #include "model/model.h"
@@ -33,13 +33,14 @@ static constexpr float RMS_EPS = 1e-5f;
 static constexpr float ROUTE_SCALE = 2.5f;
 static constexpr float FP8_UNDO = 256.0f;
 
-// Prefill chunking, KV allocation growth, FlashDecoding split bounds and
+// Prefill chunking, KV page-table growth, FlashDecoding split bounds and
 // aligned direct-read thresholds.
 static constexpr int PREFILL_CHUNK = 512;
-static constexpr int START_CAP = 256;
-static constexpr int KV_CAP_ALIGN = 64;
-// Maximum bytes added in one linear KV growth step above doubling.
-static constexpr size_t KV_MAX_GROW_STEP_BYTES = 128ull << 20;
+// Initial, maximum linear step, and alignment (in pages) for the GPU KV
+// page-address table growth policy.
+static constexpr int KV_TABLE_START_PAGES = 16;
+static constexpr int KV_TABLE_MAX_GROW_PAGES = 64;
+static constexpr int KV_TABLE_ALIGN_PAGES = 16;
 static constexpr int MAX_DECODE_PARTS = 64;
 static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = NEMO_HEAD_DIM + 2;
@@ -202,16 +203,28 @@ typedef struct {
 typedef struct {
   // Active rows, head-major Q stride, row-0 pos and batched-decode flag.
   uint32_t rows, q_stride, pos0, batched;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens).
+  uint32_t slice_bytes, page_shift;
 } QkvParam;
 
 typedef struct {
   // Active query rows, head-major Q stride, row-0 pos and KV buffer cap.
   uint32_t rows, q_stride, pos0, kv_cap;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens).
+  uint32_t slice_bytes, page_shift;
 } AttnPrefillParam;
 
 typedef struct {
   // Active rows, Q stride, row-0 pos, partition count, stride and batch flag.
   uint32_t rows, q_stride, pos0, nparts, part_stride, batched;
+  // Base byte offset of this layer's 4 KV slices inside a page.
+  uint64_t kv_base_off;
+  // Byte size of one head slice inside a page, and log2(page_tokens).
+  uint32_t slice_bytes, page_shift;
 } AttnDecodeParam;
 
 typedef struct {
@@ -359,16 +372,11 @@ typedef struct {
 
 // Per-sequence hybrid KV and Mamba-2 recurrent state.
 typedef struct {
-  // Allocated KV capacity in tokens (multiple of KV_CAP_ALIGN).
-  int cap;
   // Exact sequence position matching the live Mamba conv_state and ssm_state.
   int pos;
-  // Growing BF16 K and V buffers for the 6 attention layers and 2 KV heads.
-  Buf k[NEMO_ATTN_LAYERS][NEMO_KV_HEADS];
-  Buf v[NEMO_ATTN_LAYERS][NEMO_KV_HEADS];
-  // Growing BF16 K and V buffers for MTP layer 0 (allocated when drafting).
-  Buf mtp_k[NEMO_KV_HEADS];
-  Buf mtp_v[NEMO_KV_HEADS];
+  // Paged copy-on-write BF16 KV cache for the 6 attention layers (plus optional
+  // MTP layer 0 when drafting).
+  KvPageTable kv;
   // Rolling FP32 Mamba-2 conv1d history [23, 3, 6144].
   Buf conv_state;
   // Rolling FP32 Mamba-2 SSM state [23, 64, 64, 128].
@@ -1546,163 +1554,56 @@ static void prefetch_all_layer_experts(int m) {
 
 // ---- State and snapshot management ----
 
-// Returns the configurable KV growth policy for Nemotron attention layers.
-static StateGrowthPolicy kv_growth_policy(void) {
-  int kv_layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
-  size_t per_pos = (size_t)kv_layers * NEMO_KV_HEADS * 2 * KV_HEAD_ROW_BYTES;
-  int max_cap = align_up(opt.ctx, KV_CAP_ALIGN);
-  return state_growth_policy_for_bytes(START_CAP, per_pos,
-                                       KV_MAX_GROW_STEP_BYTES, START_CAP,
-                                       KV_CAP_ALIGN, max_cap);
-}
-
-// Returns the next KV capacity >= positions from `current` (0 for a fresh
-// state), aligned to KV_CAP_ALIGN and capped at opt.ctx.
-static int grown_cap_from(int current, int positions) {
-  if (positions > opt.ctx)
-    die("nemotron: sequence length %d exceeds context limit %d", positions,
-        opt.ctx);
-  int need = align_up(positions > 0 ? positions : 1, KV_CAP_ALIGN);
-  StateGrowthPolicy policy = kv_growth_policy();
-  int cap = state_growth_next(&policy, current, need);
-  if (cap < 0)
-    die("nemotron: sequence length %d exceeds context limit %d", positions,
-        opt.ctx);
-  return cap;
-}
-
-static int grown_cap(int positions) { return grown_cap_from(0, positions); }
-
-// Replaces one KV buffer with a buffer of `new_bytes`, copying `copy_bytes`,
-// zeroing the tail, and freeing the old buffer right away.
-static int replace_kv_buf(Buf *slot, size_t new_bytes, size_t copy_bytes) {
-  Buf nb = state_try_alloc(new_bytes);
-  if (!nb.obj) return 0;
-  if (copy_bytes && slot->obj) memcpy(nb.ptr, slot->ptr, copy_bytes);
-  if (new_bytes > copy_bytes)
-    memset((uint8_t *)nb.ptr + copy_bytes, 0, new_bytes - copy_bytes);
-  if (slot->obj) gpu_mark_to_free(slot);
-  *slot = nb;
-  return 1;
-}
-
 // Returns the byte size of one snapshot's rolling payload.
 static size_t snap_rolling_bytes(void) {
   return active_drafts > 0 ? SNAP_MTP_ROLLING_BYTES : SNAP_ROLLING_BYTES;
 }
 
-// Resizes the growing backbone (and optional MTP) KV buffers of s to `new_cap`
-// rows, preserving the first `keep` rows and zero-initializing the newly added
-// tail. Returns 1 on success or 0 on memory refusal.
-static int state_resize_kv(NemoState *s, int new_cap, int keep) {
-  size_t new_bytes = (size_t)new_cap * KV_HEAD_ROW_BYTES;
-  size_t copy_bytes = (size_t)keep * KV_HEAD_ROW_BYTES;
-  if (s->cap > 0) {
-    for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
-      for (int h = 0; h < NEMO_KV_HEADS; h++) {
-        if (!replace_kv_buf(&s->k[a][h], new_bytes, copy_bytes) ||
-            !replace_kv_buf(&s->v[a][h], new_bytes, copy_bytes))
-          return 0;
-      }
-    }
-    if (active_drafts > 0) {
-      for (int h = 0; h < NEMO_KV_HEADS; h++) {
-        if (!replace_kv_buf(&s->mtp_k[h], new_bytes, copy_bytes) ||
-            !replace_kv_buf(&s->mtp_v[h], new_bytes, copy_bytes))
-          return 0;
-      }
-    }
-    s->cap = new_cap;
-    return 1;
-  }
-  Buf nk[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
-  Buf nv[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
-  Buf mk[NEMO_KV_HEADS] = {0};
-  Buf mv[NEMO_KV_HEADS] = {0};
-  int ok = 1;
-  for (int a = 0; a < NEMO_ATTN_LAYERS && ok; a++) {
-    for (int h = 0; h < NEMO_KV_HEADS && ok; h++) {
-      nk[a][h] = state_try_alloc(new_bytes);
-      nv[a][h] = nk[a][h].obj ? state_try_alloc(new_bytes) : (Buf){0};
-      if (!nv[a][h].obj) {
-        ok = 0;
-        break;
-      }
-      if (copy_bytes && s->k[a][h].obj) {
-        memcpy(nk[a][h].ptr, s->k[a][h].ptr, copy_bytes);
-        memcpy(nv[a][h].ptr, s->v[a][h].ptr, copy_bytes);
-      }
-      if (new_bytes > copy_bytes) {
-        memset((uint8_t *)nk[a][h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
-        memset((uint8_t *)nv[a][h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
-      }
-    }
-  }
-  if (ok && active_drafts > 0) {
-    for (int h = 0; h < NEMO_KV_HEADS && ok; h++) {
-      mk[h] = state_try_alloc(new_bytes);
-      mv[h] = mk[h].obj ? state_try_alloc(new_bytes) : (Buf){0};
-      if (!mv[h].obj) {
-        ok = 0;
-        break;
-      }
-      if (copy_bytes && s->mtp_k[h].obj) {
-        memcpy(mk[h].ptr, s->mtp_k[h].ptr, copy_bytes);
-        memcpy(mv[h].ptr, s->mtp_v[h].ptr, copy_bytes);
-      }
-      if (new_bytes > copy_bytes) {
-        memset((uint8_t *)mk[h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
-        memset((uint8_t *)mv[h].ptr + copy_bytes, 0, new_bytes - copy_bytes);
-      }
-    }
-  }
-  if (!ok) {
-    for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
-      for (int h = 0; h < NEMO_KV_HEADS; h++) {
-        if (nk[a][h].obj) gpu_free(&nk[a][h]);
-        if (nv[a][h].obj) gpu_free(&nv[a][h]);
-      }
-    }
-    for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      if (mk[h].obj) gpu_free(&mk[h]);
-      if (mv[h].obj) gpu_free(&mv[h]);
-    }
-    return 0;
-  }
-  for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
-    for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      if (s->k[a][h].obj) gpu_mark_to_free(&s->k[a][h]);
-      if (s->v[a][h].obj) gpu_mark_to_free(&s->v[a][h]);
-      s->k[a][h] = nk[a][h];
-      s->v[a][h] = nv[a][h];
-    }
-  }
-  if (active_drafts > 0) {
-    for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      if (s->mtp_k[h].obj) gpu_mark_to_free(&s->mtp_k[h]);
-      if (s->mtp_v[h].obj) gpu_mark_to_free(&s->mtp_v[h]);
-      s->mtp_k[h] = mk[h];
-      s->mtp_v[h] = mv[h];
-    }
-  }
-  s->cap = new_cap;
-  return 1;
+// Returns the fixed GPU rolling-state bytes owned by one NemoState.
+static size_t state_rolling_bytes(void) {
+  size_t bytes = gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
+                 gpu_round_up_to_pages(SSM_TOTAL_BYTES);
+  if (active_drafts > 0) bytes += gpu_round_up_to_pages(LAST_HIDDEN_BYTES);
+  return bytes;
 }
 
-// Ensures s holds at least `need` positions in its KV buffers.
-static void state_ensure_cap(NemoState *s, int need) {
-  if (need <= s->cap) return;
+// Returns the paged KV layout for Nemotron's 6 backbone attention layers (24
+// head slices) plus optional MTP layer 0 (4 head slices when drafting).
+static KvPageLayout kv_page_layout(void) {
+  int layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
+  int slices = layers * NEMO_KV_SLICES_PER_LAYER;
+  size_t slice_bytes = (size_t)NEMO_KV_PAGE_TOKENS * KV_HEAD_ROW_BYTES;
+  int max_pages = (opt.ctx + NEMO_KV_PAGE_TOKENS - 1) / NEMO_KV_PAGE_TOKENS;
+  StateGrowthPolicy table_growth = {
+      .start_cap = KV_TABLE_START_PAGES,
+      .factor = 2,
+      .max_step = KV_TABLE_MAX_GROW_PAGES,
+      .align = KV_TABLE_ALIGN_PAGES,
+      .max_cap = max_pages,
+  };
+  return kv_page_layout_init(NEMO_KV_PAGE_TOKENS, slice_bytes, slices,
+                             table_growth);
+}
+
+// Ensures KV pages covering `[pos, pos + count)` are allocated and privately
+// owned (copy-on-write on shared pages), syncing the GPU only when needed.
+static void state_prepare_write(NemoState *s, int pos, int count) {
+  if (count <= 0) return;
+  if (pos < 0 || pos + count > opt.ctx)
+    die("nemotron: sequence length %d exceeds context limit %d", pos + count,
+        opt.ctx);
+  if (!kv_page_table_needs_sync(&s->kv, pos, count)) return;
   model_sync();
-  int next = grown_cap_from(s->cap, need);
-  if (!state_resize_kv(s, next, s->cap))
-    die("nemotron: out of memory growing KV cache to %d tokens", next);
+  if (!kv_page_table_prepare_write(&s->kv, pos, count))
+    die("nemotron: out of memory growing KV cache to %d tokens", pos + count);
 }
 
 // Allocates a new NemoState, or returns null when memory does not fit.
 static ModelState *nemo_state_new(void) {
   NemoState *s = xmalloc(sizeof *s);
   *s = (NemoState){0};
-  int init_cap = grown_cap(1);
+  KvPageLayout layout = kv_page_layout();
+  kv_page_table_init(&s->kv, kv_page_backend_gpu(gpu, &state_slot), &layout);
   s->conv_state = state_try_alloc(CONV_TOTAL_BYTES);
   s->ssm_state =
       s->conv_state.obj ? state_try_alloc(SSM_TOTAL_BYTES) : (Buf){0};
@@ -1710,10 +1611,11 @@ static ModelState *nemo_state_new(void) {
     s->last_hidden = state_try_alloc(LAST_HIDDEN_BYTES);
   int rolling_ok =
       s->ssm_state.obj && (active_drafts == 0 || s->last_hidden.obj);
-  if (!rolling_ok || !state_resize_kv(s, init_cap, 0)) {
+  if (!rolling_ok) {
     if (s->conv_state.obj) gpu_free(&s->conv_state);
     if (s->ssm_state.obj) gpu_free(&s->ssm_state);
     if (s->last_hidden.obj) gpu_free(&s->last_hidden);
+    kv_page_table_free(&s->kv);
     free(s);
     return NULL;
   }
@@ -1727,87 +1629,130 @@ static ModelState *nemo_state_new(void) {
 static void nemo_state_free(ModelState *ms) {
   NemoState *s = (NemoState *)ms;
   if (!s) return;
-  for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
-    for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      if (s->k[a][h].obj) gpu_mark_to_free(&s->k[a][h]);
-      if (s->v[a][h].obj) gpu_mark_to_free(&s->v[a][h]);
-    }
-  }
-  for (int h = 0; h < NEMO_KV_HEADS; h++) {
-    if (s->mtp_k[h].obj) gpu_mark_to_free(&s->mtp_k[h]);
-    if (s->mtp_v[h].obj) gpu_mark_to_free(&s->mtp_v[h]);
-  }
+  kv_page_table_free(&s->kv);
   if (s->conv_state.obj) gpu_mark_to_free(&s->conv_state);
   if (s->ssm_state.obj) gpu_mark_to_free(&s->ssm_state);
   if (s->last_hidden.obj) gpu_mark_to_free(&s->last_hidden);
   free(s);
 }
 
-// Returns the byte footprint of state s (or a new state when s is null) at
-// `positions` tokens.
+// Returns the proportional byte footprint of state s (or a new state when s is
+// null) at `positions` tokens.
 static size_t nemo_state_bytes(const ModelState *ms, int positions) {
   const NemoState *s = (const NemoState *)ms;
-  int cap = s ? grown_cap_from(s->cap, positions > 0 ? positions : s->cap)
-              : grown_cap(positions > 0 ? positions : 1);
-  size_t kv_one = gpu_round_up_to_pages((size_t)cap * KV_HEAD_ROW_BYTES);
-  int kv_layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
-  size_t bytes = (size_t)(kv_layers * NEMO_KV_HEADS * 2) * kv_one +
-                 gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
-                 gpu_round_up_to_pages(SSM_TOTAL_BYTES);
-  if (active_drafts > 0) bytes += gpu_round_up_to_pages(LAST_HIDDEN_BYTES);
-  return bytes;
+  KvPageLayout layout = kv_page_layout();
+  KvPageBackend backend = kv_page_backend_gpu(gpu, &state_slot);
+  return kv_page_table_bytes(s ? &s->kv : NULL, &backend, &layout, positions) +
+         state_rolling_bytes();
 }
 
-// Writes the growing KV regions of s (24 backbone + 4 lag-1 MTP when drafting).
-// When fill is nonzero and keep is 0, sizes s from 0; when keep > 0, preserves
-// rows before keep while growing to `positions` if needed.
+// Returns the extra bytes allocated when copying `positions` tokens from `src`
+// into a new state that grows to `target_positions`.
+static size_t nemo_state_copy_bytes(const ModelState *src_ms, int positions,
+                                    int target_positions) {
+  const NemoState *src = (const NemoState *)src_ms;
+  // When MTP drafting is active, lag-1 MTP writes touch position `positions -
+  // 1`, splitting the final shared page if `positions` lands on a page
+  // boundary.
+  int shared_pos =
+      (active_drafts > 0 && positions > 0) ? positions - 1 : positions;
+  return kv_page_table_fork_delta_bytes(&src->kv, shared_pos,
+                                        target_positions) +
+         state_rolling_bytes();
+}
+
+// Writes the paged KV regions of s (24 backbone + 4 lag-1 MTP when drafting).
+// When fill is nonzero and keep is 0, resets s to hold privately owned pages
+// for `positions` tokens; when keep > 0, preserves prefix rows and shared CoW
+// pages before the first written row and makes the suffix writable.
 static int nemo_write_state_regions(ModelState *ms, int keep, int positions,
                                     int fill, StateRegion *out) {
   NemoState *s = (NemoState *)ms;
+  int cap_tokens = s->kv.npages * NEMO_KV_PAGE_TOKENS;
   if (positions < 0 || keep < 0 || keep > positions ||
-      (!fill && positions > s->cap))
+      (!fill && positions > cap_tokens))
     die("nemotron: invalid state regions for %d..%d positions", keep,
         positions);
   model_sync();
   if (fill) {
     if (keep == 0) {
-      int cap = grown_cap(positions > 0 ? positions : 1);
-      if (s->cap != cap && !state_resize_kv(s, cap, 0))
-        die("nemotron: out of memory sizing state to %d tokens", cap);
-    } else if (positions > s->cap) {
-      int cap = grown_cap_from(s->cap, positions);
-      if (!state_resize_kv(s, cap, keep))
-        die("nemotron: out of memory sizing state to %d tokens", cap);
+      if (!kv_page_table_reset_writable(&s->kv, positions))
+        die("nemotron: out of memory sizing state to %d tokens", positions);
+    } else {
+      if (keep > cap_tokens)
+        die("nemotron: kept prefix %d exceeds state pages %d", keep,
+            cap_tokens);
+      if (positions > keep) {
+        int write_from = (active_drafts > 0 && keep > 0) ? keep - 1 : keep;
+        if (!kv_page_table_prepare_write(&s->kv, write_from,
+                                         positions - write_from))
+          die("nemotron: out of memory extending state from %d to %d tokens",
+              keep, positions);
+      }
     }
   }
+  size_t slice_bytes = s->kv.layout.slice_bytes;
   int n = 0;
   for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
+    size_t base = (size_t)(a * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
     for (int h = 0; h < NEMO_KV_HEADS; h++) {
       out[n++] = (StateRegion){
-          s->k[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0, 0, 0};
+          .data = s->kv.host_ptrs,
+          .unit = (uint32_t)KV_HEAD_ROW_BYTES,
+          .ratio = 1,
+          .guard = 0,
+          .lag = 0,
+          .page_rows = NEMO_KV_PAGE_TOKENS,
+          .page_offset = base + (size_t)h * slice_bytes,
+      };
       out[n++] = (StateRegion){
-          s->v[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0, 0, 0};
+          .data = s->kv.host_ptrs,
+          .unit = (uint32_t)KV_HEAD_ROW_BYTES,
+          .ratio = 1,
+          .guard = 0,
+          .lag = 0,
+          .page_rows = NEMO_KV_PAGE_TOKENS,
+          .page_offset = base + (size_t)(NEMO_KV_HEADS + h) * slice_bytes,
+      };
     }
   }
   if (active_drafts > 0) {
+    size_t base =
+        (size_t)(NEMO_ATTN_LAYERS * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
     for (int h = 0; h < NEMO_KV_HEADS; h++) {
       out[n++] = (StateRegion){
-          s->mtp_k[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1, 0, 0};
+          .data = s->kv.host_ptrs,
+          .unit = (uint32_t)KV_HEAD_ROW_BYTES,
+          .ratio = 1,
+          .guard = 0,
+          .lag = 1,
+          .page_rows = NEMO_KV_PAGE_TOKENS,
+          .page_offset = base + (size_t)h * slice_bytes,
+      };
       out[n++] = (StateRegion){
-          s->mtp_v[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1, 0, 0};
+          .data = s->kv.host_ptrs,
+          .unit = (uint32_t)KV_HEAD_ROW_BYTES,
+          .ratio = 1,
+          .guard = 0,
+          .lag = 1,
+          .page_rows = NEMO_KV_PAGE_TOKENS,
+          .page_offset = base + (size_t)(NEMO_KV_HEADS + h) * slice_bytes,
+      };
     }
   }
   return n;
 }
 
-// Copies the growing KV rows before `positions` from src into dst.
+// Shares complete KV prefix pages from src into dst via copy-on-write and
+// copies only any partial trailing boundary page before `positions`.
 static void nemo_state_copy(ModelState *dst_ms, const ModelState *src_ms,
                             int positions) {
   if (dst_ms == src_ms) die("nemotron: cannot copy a state onto itself");
-  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
-  int n = nemo_write_state_regions(dst_ms, 0, positions, 1, to);
-  nemo_write_state_regions((ModelState *)src_ms, 0, positions, 0, from);
-  regions_copy(to, from, n, positions);
+  NemoState *dst = (NemoState *)dst_ms;
+  const NemoState *src = (const NemoState *)src_ms;
+  model_sync();
+  if (!kv_page_table_fork(&dst->kv, &src->kv, positions))
+    die("nemotron: out of memory forking KV cache at %d tokens", positions);
 }
 
 // Captures the rolling Mamba-2 conv/SSM states (and optional MTP last_hidden)
@@ -2277,30 +2222,38 @@ static void run_attn_layer(GpuCommandBuffer *cmd, int a_idx, int rows, int pos0,
 
   size_t kv_tgt_off = (size_t)a_idx * NEMO_MAX_BATCH_ROWS * sizeof(KvTarget);
   int q_stride = use_tiled ? align_up(rows, PREFILL_Q_PAD) : rows;
-  QkvParam qp = {(uint32_t)rows, (uint32_t)q_stride, (uint32_t)pos0,
-                 (uint32_t)batched};
+  uint32_t slice_bytes = (uint32_t)s->kv.layout.slice_bytes;
+  uint32_t page_shift = s->kv.layout.page_shift;
+  uint64_t kv_base_off =
+      (uint64_t)(a_idx * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
+  QkvParam qp = {(uint32_t)rows,    (uint32_t)q_stride, (uint32_t)pos0,
+                 (uint32_t)batched, kv_base_off,        slice_bytes,
+                 page_shift};
   gpu_select_kernel(cmd, K_qkv_store);
   gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
   gpu_bind_buffer(cmd, 1, &work.k_raw, 0);
   gpu_bind_buffer(cmd, 2, &work.v_raw, 0);
   gpu_bind_buffer(cmd, 3, &work.q_hm, 0);
-  gpu_bind_buffer(cmd, 4, &s->k[a_idx][0], 0);
-  gpu_bind_buffer(cmd, 5, &s->k[a_idx][1], 0);
-  gpu_bind_buffer(cmd, 6, &s->v[a_idx][0], 0);
-  gpu_bind_buffer(cmd, 7, &s->v[a_idx][1], 0);
+  gpu_bind_buffer(cmd, 4, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 5, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 6, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 7, &s->kv.gpu_addrs, 0);
   gpu_bind_buffer(cmd, 8, &work.kv_tgt, kv_tgt_off);
   gpu_copy_bytes(cmd, 9, &qp, sizeof qp);
   gpu_run_kernel(cmd, QKV_SLOTS, (uint32_t)q_stride, 1, QKV_THREADS, 1, 1);
 
   if (use_tiled) {
-    AttnPrefillParam app = {(uint32_t)rows, (uint32_t)q_stride, (uint32_t)pos0,
-                            (uint32_t)s->cap};
+    AttnPrefillParam app = {
+        (uint32_t)rows, (uint32_t)q_stride,
+        (uint32_t)pos0, (uint32_t)(s->kv.npages * NEMO_KV_PAGE_TOKENS),
+        kv_base_off,    slice_bytes,
+        page_shift};
     gpu_select_kernel(cmd, K_attend_prefill);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
-    gpu_bind_buffer(cmd, 1, &s->k[a_idx][0], 0);
-    gpu_bind_buffer(cmd, 2, &s->k[a_idx][1], 0);
-    gpu_bind_buffer(cmd, 3, &s->v[a_idx][0], 0);
-    gpu_bind_buffer(cmd, 4, &s->v[a_idx][1], 0);
+    gpu_bind_buffer(cmd, 1, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 2, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 3, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 4, &s->kv.gpu_addrs, 0);
     gpu_bind_buffer(cmd, 5, &work.attn_out, 0);
     gpu_copy_bytes(cmd, 6, &app, sizeof app);
     uint32_t q_tiles = ((uint32_t)rows + PREFILL_Q_PAD - 1u) / PREFILL_Q_PAD;
@@ -2311,15 +2264,21 @@ static void run_attn_layer(GpuCommandBuffer *cmd, int a_idx, int rows, int pos0,
     int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
     if (nparts < 1) nparts = 1;
     if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
-    AttnDecodeParam adp = {
-        (uint32_t)rows,   (uint32_t)q_stride,         (uint32_t)pos0,
-        (uint32_t)nparts, (uint32_t)MAX_DECODE_PARTS, (uint32_t)batched};
+    AttnDecodeParam adp = {(uint32_t)rows,
+                           (uint32_t)q_stride,
+                           (uint32_t)pos0,
+                           (uint32_t)nparts,
+                           (uint32_t)MAX_DECODE_PARTS,
+                           (uint32_t)batched,
+                           kv_base_off,
+                           slice_bytes,
+                           page_shift};
     gpu_select_kernel(cmd, K_attend_part);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
-    gpu_bind_buffer(cmd, 1, &s->k[a_idx][0], 0);
-    gpu_bind_buffer(cmd, 2, &s->k[a_idx][1], 0);
-    gpu_bind_buffer(cmd, 3, &s->v[a_idx][0], 0);
-    gpu_bind_buffer(cmd, 4, &s->v[a_idx][1], 0);
+    gpu_bind_buffer(cmd, 1, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 2, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 3, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(cmd, 4, &s->kv.gpu_addrs, 0);
     gpu_bind_buffer(cmd, 5, &work.kv_tgt, kv_tgt_off);
     gpu_bind_buffer(cmd, 6, &work.attn_part, 0);
     gpu_copy_bytes(cmd, 7, &adp, sizeof adp);
@@ -2514,15 +2473,20 @@ static void encode_mtp_kv_sync(GpuCommandBuffer *cmd, const Buf *emb,
   run_fp8_linear(cmd, &mtp.v, &work.normed, NULL, &work.v_raw, 0, rows,
                  ACT_NONE, prepacked);
 
-  QkvParam qp = {(uint32_t)rows, (uint32_t)rows, (uint32_t)kv_pos0,
-                 (uint32_t)batched};
+  uint32_t slice_bytes = (uint32_t)s->kv.layout.slice_bytes;
+  uint32_t page_shift = s->kv.layout.page_shift;
+  uint64_t kv_base_off =
+      (uint64_t)(NEMO_ATTN_LAYERS * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
+  QkvParam qp = {(uint32_t)rows,    (uint32_t)rows, (uint32_t)kv_pos0,
+                 (uint32_t)batched, kv_base_off,    slice_bytes,
+                 page_shift};
   gpu_select_kernel(cmd, K_kv_store);
   gpu_bind_buffer(cmd, 0, &work.k_raw, 0);
   gpu_bind_buffer(cmd, 1, &work.v_raw, 0);
-  gpu_bind_buffer(cmd, 2, &s->mtp_k[0], 0);
-  gpu_bind_buffer(cmd, 3, &s->mtp_k[1], 0);
-  gpu_bind_buffer(cmd, 4, &s->mtp_v[0], 0);
-  gpu_bind_buffer(cmd, 5, &s->mtp_v[1], 0);
+  gpu_bind_buffer(cmd, 2, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 3, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 4, &s->kv.gpu_addrs, 0);
+  gpu_bind_buffer(cmd, 5, &s->kv.gpu_addrs, 0);
   gpu_bind_buffer(cmd, 6, &work.mtp_kv_tgt, 0);
   gpu_copy_bytes(cmd, 7, &qp, sizeof qp);
   gpu_run_kernel(cmd, (uint32_t)(2 * NEMO_KV_HEADS), (uint32_t)rows, 1,
@@ -2546,7 +2510,8 @@ static int run_forward(NemoState *const *states, const int *tokens,
   int pos0 = pos[0], max_pos = pos[0];
   if (batched) {
     for (int r = 0; r < rows; r++) {
-      state_ensure_cap(states[r], pos[r] + 1);
+      int start = (active_drafts > 0 && pos[r] > 0) ? pos[r] - 1 : pos[r];
+      state_prepare_write(states[r], start, pos[r] - start + 1);
       if (pos[r] > max_pos) max_pos = pos[r];
     }
     MambaTarget *mt = (MambaTarget *)work.mamba_tgt.ptr;
@@ -2564,31 +2529,26 @@ static int run_forward(NemoState *const *states, const int *tokens,
     for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
       for (int r = 0; r < rows; r++) {
         const NemoState *sr = states[r];
+        uint64_t addrs = sr->kv.gpu_addrs.address + sr->kv.gpu_addrs.off;
         kt[(size_t)a * NEMO_MAX_BATCH_ROWS + r] =
-            (KvTarget){sr->k[a][0].address + sr->k[a][0].off,
-                       sr->k[a][1].address + sr->k[a][1].off,
-                       sr->v[a][0].address + sr->v[a][0].off,
-                       sr->v[a][1].address + sr->v[a][1].off,
-                       (uint32_t)pos[r],
-                       0u};
+            (KvTarget){addrs, 0, 0, 0, (uint32_t)pos[r], 0u};
       }
     }
     if (active_drafts > 0) {
       KvTarget *mkt = (KvTarget *)work.mtp_kv_tgt.ptr;
       for (int r = 0; r < rows; r++) {
         const NemoState *sr = states[r];
+        uint64_t addrs = sr->kv.gpu_addrs.address + sr->kv.gpu_addrs.off;
         memcpy((float *)work.mtp_h_prev.ptr + (size_t)r * NEMO_DIM,
                sr->last_hidden.ptr, LAST_HIDDEN_BYTES);
-        mkt[r] = (KvTarget){sr->mtp_k[0].address + sr->mtp_k[0].off,
-                            sr->mtp_k[1].address + sr->mtp_k[1].off,
-                            sr->mtp_v[0].address + sr->mtp_v[0].off,
-                            sr->mtp_v[1].address + sr->mtp_v[1].off,
-                            pos[r] > 0 ? (uint32_t)(pos[r] - 1) : KV_SKIP_POS,
-                            0u};
+        mkt[r] = (KvTarget){
+            addrs, 0, 0, 0, pos[r] > 0 ? (uint32_t)(pos[r] - 1) : KV_SKIP_POS,
+            0u};
       }
     }
   } else {
-    state_ensure_cap(states[0], pos0 + rows);
+    int start = (active_drafts > 0 && pos0 > 0) ? pos0 - 1 : pos0;
+    state_prepare_write(states[0], start, (pos0 + rows) - start);
     max_pos = pos0 + rows - 1;
     inject_media_rows(tokens, pos0, rows);
   }
@@ -3323,7 +3283,7 @@ static const double *nemo_propose_drafts(ModelState *ms, int token, int pos,
   if (!prepare_rows(1, 0, 0))
     die("nemotron: out of memory preparing MTP draft pass");
   ensure_work(1, 0);
-  state_ensure_cap(s, pos + n);
+  state_prepare_write(s, pos - 1, n);
 
   ((int32_t *)work.mtp_tok.ptr)[0] = token;
 
@@ -3378,16 +3338,21 @@ static const double *nemo_propose_drafts(ModelState *ms, int token, int pos,
     run_fp8_linear(&cmd, &mtp.v, &work.normed, NULL, &work.v_raw, 0, 1,
                    ACT_NONE, 0);
 
-    QkvParam qp = {1u, 1u, (uint32_t)kv_pos, 0u};
+    uint32_t slice_bytes = (uint32_t)s->kv.layout.slice_bytes;
+    uint32_t page_shift = s->kv.layout.page_shift;
+    uint64_t kv_base_off =
+        (uint64_t)(NEMO_ATTN_LAYERS * NEMO_KV_SLICES_PER_LAYER) * slice_bytes;
+    QkvParam qp = {1u,          1u,          (uint32_t)kv_pos, 0u,
+                   kv_base_off, slice_bytes, page_shift};
     gpu_select_kernel(&cmd, K_qkv_store);
     gpu_bind_buffer(&cmd, 0, &work.q_raw, 0);
     gpu_bind_buffer(&cmd, 1, &work.k_raw, 0);
     gpu_bind_buffer(&cmd, 2, &work.v_raw, 0);
     gpu_bind_buffer(&cmd, 3, &work.q_hm, 0);
-    gpu_bind_buffer(&cmd, 4, &s->mtp_k[0], 0);
-    gpu_bind_buffer(&cmd, 5, &s->mtp_k[1], 0);
-    gpu_bind_buffer(&cmd, 6, &s->mtp_v[0], 0);
-    gpu_bind_buffer(&cmd, 7, &s->mtp_v[1], 0);
+    gpu_bind_buffer(&cmd, 4, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 5, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 6, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 7, &s->kv.gpu_addrs, 0);
     gpu_bind_buffer(&cmd, 8, &work.mtp_kv_tgt, 0);
     gpu_copy_bytes(&cmd, 9, &qp, sizeof qp);
     gpu_run_kernel(&cmd, QKV_SLOTS, 1, 1, QKV_THREADS, 1, 1);
@@ -3397,13 +3362,14 @@ static const double *nemo_propose_drafts(ModelState *ms, int token, int pos,
     if (nparts < 1) nparts = 1;
     if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
     AttnDecodeParam adp = {
-        1u, 1u, (uint32_t)kv_pos, (uint32_t)nparts, MAX_DECODE_PARTS, 0u};
+        1u, 1u,          (uint32_t)kv_pos, (uint32_t)nparts, MAX_DECODE_PARTS,
+        0u, kv_base_off, slice_bytes,      page_shift};
     gpu_select_kernel(&cmd, K_attend_part);
     gpu_bind_buffer(&cmd, 0, &work.q_hm, 0);
-    gpu_bind_buffer(&cmd, 1, &s->mtp_k[0], 0);
-    gpu_bind_buffer(&cmd, 2, &s->mtp_k[1], 0);
-    gpu_bind_buffer(&cmd, 3, &s->mtp_v[0], 0);
-    gpu_bind_buffer(&cmd, 4, &s->mtp_v[1], 0);
+    gpu_bind_buffer(&cmd, 1, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 2, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 3, &s->kv.gpu_addrs, 0);
+    gpu_bind_buffer(&cmd, 4, &s->kv.gpu_addrs, 0);
     gpu_bind_buffer(&cmd, 5, &work.mtp_kv_tgt, 0);
     gpu_bind_buffer(&cmd, 6, &work.attn_part, 0);
     gpu_copy_bytes(&cmd, 7, &adp, sizeof adp);
@@ -3726,6 +3692,7 @@ const ModelOps nemotron_ops = {.family = "Nemotron-H",
                                .state_new = nemo_state_new,
                                .state_free = nemo_state_free,
                                .state_bytes = nemo_state_bytes,
+                               .state_copy_bytes = nemo_state_copy_bytes,
                                .state_copy = nemo_state_copy,
                                .snapshot_take = nemo_snapshot_take,
                                .snapshot_restore = nemo_snapshot_restore,

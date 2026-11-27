@@ -44,6 +44,11 @@ static constexpr int NEMO_NVFP4_BLOCK = 16;
 static constexpr int NEMO_MAX_BATCH_ROWS = 8;
 static constexpr int NEMO_MAX_VERIFY = 16;
 static constexpr int NEMO_MTP_MAX_DRAFTS = 8;
+// Fixed power-of-two token count per shared KV page (multiple of the 64-row
+// FlashAttention tile so every tile stays contiguous inside one page).
+static constexpr int NEMO_KV_PAGE_TOKENS = 256;
+// Packed KV head slices per attention layer inside a page (k0, k1, v0, v1).
+static constexpr int NEMO_KV_SLICES_PER_LAYER = 2 * NEMO_KV_HEADS;
 
 // One grouped-expert work tile matching NemoMoeTile in nemotron.metal.
 typedef struct {
