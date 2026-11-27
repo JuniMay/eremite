@@ -202,10 +202,13 @@ kernel void mv_bf16(device const ushort *w [[buffer(0)]], device const float *x 
     device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.k);
     device const float4 *xr = (device const float4 *)x;
     for (uint c = (sg % p.split) * 32 + lane; c < chunks; c += 32 * p.split) {
+      uint4 q[4];  // weights first so their loads issue ahead of the input vector
+#pragma unroll
+      for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
       float4 x0 = xr[2 * c], x1 = xr[2 * c + 1];
+#pragma unroll
       for (uint r = 0; r < 4; r++) {
-        uint4 q = wr[r * chunks + c];
-        float4 d = bf16x4(q.xy) * x0 + bf16x4(q.zw) * x1;
+        float4 d = bf16x4(q[r].xy) * x0 + bf16x4(q[r].zw) * x1;
         acc[r] += d.x + d.y + d.z + d.w;
       }
     }
@@ -272,6 +275,24 @@ kernel void mvm_fp8(device const uchar *w [[buffer(0)]], device const uchar *s [
   mvm_store(acc, part, y, p, n, ldy, row, sg, lane);
 }
 
+// Reduces and stores one batch row j from a register accumulator without
+// dynamic array indexing so the compiler keeps all row accumulators in registers.
+inline void mvm_reduce_row(thread float4 &a, uint j, threadgroup float4 (*part)[8],
+                           uint split, uint sg, uint lane) {
+  a = float4(simd_sum(a.x), simd_sum(a.y), simd_sum(a.z), simd_sum(a.w));
+  if (split > 1u && lane == 0u) part[j][sg] = a;
+}
+
+inline void mvm_emit_row(float4 a, uint j, threadgroup float4 (*part)[8],
+                         device float *y, constant MVM &p, uint n, uint ldy,
+                         uint row, uint sg, uint lane) {
+  if (p.mv.split > 1u) {
+    for (uint i = 1u; i < p.mv.split; i++) a += part[j][sg + i];
+  }
+  if (lane < 4u && row < n)
+    y[(ulong)j * ldy + row + lane] = p.mv.round ? bf(a[lane]) : a[lane];
+}
+
 template <uint N>
 kernel void mvm_bf16(device const ushort *w [[buffer(0)]], device const float *x [[buffer(2)]],
                      device float *y [[buffer(3)]], constant MVM &p [[buffer(4)]],
@@ -283,31 +304,133 @@ kernel void mvm_bf16(device const ushort *w [[buffer(0)]], device const float *x
   if (N > 1 && g.y) w = g.y == 1 ? w1 : w2, y = g.y == 1 ? y1 : y2;
   uint tg = g.x, n = N > 1 ? rows[g.y].x : p.mv.n, ldy = N > 1 ? rows[g.y].y : p.ldy;
   uint row = (tg * (8 / p.mv.split) + sg / p.mv.split) * 4, chunks = p.mv.k / 8;
-  float4 acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  if (row < n) {
-    device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.mv.k);
-    for (uint c = (sg % p.mv.split) * 32 + lane; c < chunks; c += 32 * p.mv.split) {
-      float4 a[4][2];
-      for (uint r = 0; r < 4; r++) {
-        uint4 q = wr[r * chunks + c];
-        a[r][0] = bf16x4(q.xy), a[r][1] = bf16x4(q.zw);
-      }
-      for (uint j = 0; j < p.m; j++) {
-        device const float4 *xr = (device const float4 *)(x + j * p.lda);
-        float4 x0 = xr[2 * c], x1 = xr[2 * c + 1];
+  uint c_start = (sg % p.mv.split) * 32 + lane;
+  uint c_step = 32 * p.mv.split;
+  device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.mv.k);
+
+#define MVM_BF16_DOT(j, av)                                                             \
+  {                                                                                     \
+    device const float4 *xr = (device const float4 *)(x + (ulong)(j) * p.lda);          \
+    float4 d = w0 * xr[2u * c] + w1v * xr[2u * c + 1u];                                 \
+    av[r] += d.x + d.y + d.z + d.w;                                                     \
+  }
+
+  if (p.m <= 2u) {
+    float4 a0 = 0, a1 = 0;
+    if (row < n) {
+      for (uint c = c_start; c < chunks; c += c_step) {
+        uint4 q[4];
+#pragma unroll
+        for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
+        device const float4 *xr0 = (device const float4 *)x;
+        float4 x00 = xr0[2u * c], x01 = xr0[2u * c + 1u];
+        float4 x10 = 0, x11 = 0;
+        if (p.m > 1u) {
+          device const float4 *xr1 = (device const float4 *)(x + p.lda);
+          x10 = xr1[2u * c], x11 = xr1[2u * c + 1u];
+        }
+#pragma unroll
         for (uint r = 0; r < 4; r++) {
-          float4 d = a[r][0] * x0 + a[r][1] * x1;
-          acc[j][r] += d.x + d.y + d.z + d.w;
+          float4 w0 = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+          float4 d0 = w0 * x00 + w1v * x01;
+          a0[r] += d0.x + d0.y + d0.z + d0.w;
+          if (p.m > 1u) {
+            float4 d1 = w0 * x10 + w1v * x11;
+            a1[r] += d1.x + d1.y + d1.z + d1.w;
+          }
         }
       }
     }
+    mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+    if (p.m > 1u) mvm_reduce_row(a1, 1u, part, p.mv.split, sg, lane);
+    if (p.mv.split > 1u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg % p.mv.split) return;
+    }
+    mvm_emit_row(a0, 0u, part, y, p, n, ldy, row, sg, lane);
+    if (p.m > 1u) mvm_emit_row(a1, 1u, part, y, p, n, ldy, row, sg, lane);
+    return;
   }
-  mvm_store(acc, part, y, p, n, ldy, row, sg, lane);
+
+  if (p.m <= 4u) {
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    if (row < n) {
+      for (uint c = c_start; c < chunks; c += c_step) {
+        uint4 q[4];
+#pragma unroll
+        for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+        for (uint r = 0; r < 4; r++) {
+          float4 w0 = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+          MVM_BF16_DOT(0u, a0);
+          MVM_BF16_DOT(1u, a1);
+          MVM_BF16_DOT(2u, a2);
+          if (p.m > 3u) MVM_BF16_DOT(3u, a3);
+        }
+      }
+    }
+    mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+    mvm_reduce_row(a1, 1u, part, p.mv.split, sg, lane);
+    mvm_reduce_row(a2, 2u, part, p.mv.split, sg, lane);
+    if (p.m > 3u) mvm_reduce_row(a3, 3u, part, p.mv.split, sg, lane);
+    if (p.mv.split > 1u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg % p.mv.split) return;
+    }
+    mvm_emit_row(a0, 0u, part, y, p, n, ldy, row, sg, lane);
+    mvm_emit_row(a1, 1u, part, y, p, n, ldy, row, sg, lane);
+    mvm_emit_row(a2, 2u, part, y, p, n, ldy, row, sg, lane);
+    if (p.m > 3u) mvm_emit_row(a3, 3u, part, y, p, n, ldy, row, sg, lane);
+    return;
+  }
+
+  float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+  if (row < n) {
+    for (uint c = c_start; c < chunks; c += c_step) {
+      uint4 q[4];
+#pragma unroll
+      for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+      for (uint r = 0; r < 4; r++) {
+        float4 w0 = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+        MVM_BF16_DOT(0u, a0);
+        MVM_BF16_DOT(1u, a1);
+        MVM_BF16_DOT(2u, a2);
+        MVM_BF16_DOT(3u, a3);
+        MVM_BF16_DOT(4u, a4);
+        if (p.m > 5u) MVM_BF16_DOT(5u, a5);
+        if (p.m > 6u) MVM_BF16_DOT(6u, a6);
+        if (p.m > 7u) MVM_BF16_DOT(7u, a7);
+      }
+    }
+  }
+  mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a1, 1u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a2, 2u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a3, 3u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a4, 4u, part, p.mv.split, sg, lane);
+  if (p.m > 5u) mvm_reduce_row(a5, 5u, part, p.mv.split, sg, lane);
+  if (p.m > 6u) mvm_reduce_row(a6, 6u, part, p.mv.split, sg, lane);
+  if (p.m > 7u) mvm_reduce_row(a7, 7u, part, p.mv.split, sg, lane);
+  if (p.mv.split > 1u) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg % p.mv.split) return;
+  }
+  mvm_emit_row(a0, 0u, part, y, p, n, ldy, row, sg, lane);
+  mvm_emit_row(a1, 1u, part, y, p, n, ldy, row, sg, lane);
+  mvm_emit_row(a2, 2u, part, y, p, n, ldy, row, sg, lane);
+  mvm_emit_row(a3, 3u, part, y, p, n, ldy, row, sg, lane);
+  mvm_emit_row(a4, 4u, part, y, p, n, ldy, row, sg, lane);
+  if (p.m > 5u) mvm_emit_row(a5, 5u, part, y, p, n, ldy, row, sg, lane);
+  if (p.m > 6u) mvm_emit_row(a6, 6u, part, y, p, n, ldy, row, sg, lane);
+  if (p.m > 7u) mvm_emit_row(a7, 7u, part, y, p, n, ldy, row, sg, lane);
+#undef MVM_BF16_DOT
 }
 
 #define MV_KERNELS(k)                                              \
   typedef decltype(k<1>) k##_t;                                    \
   template [[host_name(#k)]] kernel k##_t k<1>;                    \
+  template [[host_name(#k "_2")]] kernel k##_t k<2>;               \
   template [[host_name(#k "_3")]] kernel k##_t k<3>;
 MV_KERNELS(mv_fp8)
 MV_KERNELS(mv_bf16)
