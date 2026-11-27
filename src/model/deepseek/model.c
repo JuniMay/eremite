@@ -8,6 +8,7 @@
 #include "engine/io.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
+#include "engine/state_growth.h"
 #include "engine/tokenizer.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
@@ -3724,11 +3725,31 @@ static void remember_state_layout(void) {
     state_drafts[d] = opt.draft ? D[d].ring.size : 0;
 }
 
+// Maximum bytes added in one linear KV growth step once doubling reaches it.
+static constexpr size_t KV_MAX_GROW_STEP_BYTES = 128ull << 20;
+// Alignment granularity in tokens for capacities above CAP.
+static constexpr int KV_GROW_ALIGN = 1024;
+// Sample span in positions used to compute bytes per token across KV ratios.
+static constexpr int KV_RATE_SAMPLE = 1024;
+
+// Returns the configurable KV growth policy for the active DeepSeek row format.
+static StateGrowthPolicy kv_growth_policy(void) {
+  size_t sample_bytes = 0;
+  for (int l = 0; l < LAYERS; l++)
+    if (L[l].kv_source)
+      sample_bytes += (size_t)(KV_RATE_SAMPLE / L[l].ratio) *
+                      (size_t)(comp_row_bytes() + key_row_bytes());
+  size_t per_pos = sample_bytes / KV_RATE_SAMPLE;
+  return state_growth_policy_for_bytes(CAP, per_pos, KV_MAX_GROW_STEP_BYTES,
+                                       CAP, KV_GROW_ALIGN, opt.ctx);
+}
+
 static int start_cap(void) { return opt.ctx < CAP ? opt.ctx : CAP; }
 
 static int grown(int cap, int need) {
-  while (cap < need) cap *= 2;
-  return cap < opt.ctx ? cap : opt.ctx;
+  StateGrowthPolicy policy = kv_growth_policy();
+  int next = state_growth_next(&policy, cap, need);
+  return next >= 0 ? next : opt.ctx;
 }
 
 // A KV source's compressed rows or index keys for cap positions.

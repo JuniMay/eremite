@@ -9,6 +9,7 @@
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/safetensors.h"
+#include "engine/state_growth.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
 #include "model/model.h"
@@ -37,6 +38,8 @@ static constexpr float FP8_UNDO = 256.0f;
 static constexpr int PREFILL_CHUNK = 512;
 static constexpr int START_CAP = 256;
 static constexpr int KV_CAP_ALIGN = 64;
+// Maximum bytes added in one linear KV growth step above doubling.
+static constexpr size_t KV_MAX_GROW_STEP_BYTES = 128ull << 20;
 static constexpr int MAX_DECODE_PARTS = 64;
 static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = NEMO_HEAD_DIM + 2;
@@ -1543,18 +1546,44 @@ static void prefetch_all_layer_experts(int m) {
 
 // ---- State and snapshot management ----
 
-// Returns the next power-of-two KV capacity >= positions (multiple of 64,
-// capped at opt.ctx).
-static int grown_cap(int positions) {
-  int need = align_up(positions > 0 ? positions : 1, KV_CAP_ALIGN);
-  int cap = START_CAP;
-  while (cap < need && cap < opt.ctx) cap *= 2;
+// Returns the configurable KV growth policy for Nemotron attention layers.
+static StateGrowthPolicy kv_growth_policy(void) {
+  int kv_layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
+  size_t per_pos = (size_t)kv_layers * NEMO_KV_HEADS * 2 * KV_HEAD_ROW_BYTES;
   int max_cap = align_up(opt.ctx, KV_CAP_ALIGN);
-  if (cap > max_cap) cap = max_cap;
+  return state_growth_policy_for_bytes(START_CAP, per_pos,
+                                       KV_MAX_GROW_STEP_BYTES, START_CAP,
+                                       KV_CAP_ALIGN, max_cap);
+}
+
+// Returns the next KV capacity >= positions from `current` (0 for a fresh
+// state), aligned to KV_CAP_ALIGN and capped at opt.ctx.
+static int grown_cap_from(int current, int positions) {
   if (positions > opt.ctx)
     die("nemotron: sequence length %d exceeds context limit %d", positions,
         opt.ctx);
+  int need = align_up(positions > 0 ? positions : 1, KV_CAP_ALIGN);
+  StateGrowthPolicy policy = kv_growth_policy();
+  int cap = state_growth_next(&policy, current, need);
+  if (cap < 0)
+    die("nemotron: sequence length %d exceeds context limit %d", positions,
+        opt.ctx);
   return cap;
+}
+
+static int grown_cap(int positions) { return grown_cap_from(0, positions); }
+
+// Replaces one KV buffer with a buffer of `new_bytes`, copying `copy_bytes`,
+// zeroing the tail, and freeing the old buffer right away.
+static int replace_kv_buf(Buf *slot, size_t new_bytes, size_t copy_bytes) {
+  Buf nb = state_try_alloc(new_bytes);
+  if (!nb.obj) return 0;
+  if (copy_bytes && slot->obj) memcpy(nb.ptr, slot->ptr, copy_bytes);
+  if (new_bytes > copy_bytes)
+    memset((uint8_t *)nb.ptr + copy_bytes, 0, new_bytes - copy_bytes);
+  if (slot->obj) gpu_mark_to_free(slot);
+  *slot = nb;
+  return 1;
 }
 
 // Returns the byte size of one snapshot's rolling payload.
@@ -1568,6 +1597,24 @@ static size_t snap_rolling_bytes(void) {
 static int state_resize_kv(NemoState *s, int new_cap, int keep) {
   size_t new_bytes = (size_t)new_cap * KV_HEAD_ROW_BYTES;
   size_t copy_bytes = (size_t)keep * KV_HEAD_ROW_BYTES;
+  if (s->cap > 0) {
+    for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
+      for (int h = 0; h < NEMO_KV_HEADS; h++) {
+        if (!replace_kv_buf(&s->k[a][h], new_bytes, copy_bytes) ||
+            !replace_kv_buf(&s->v[a][h], new_bytes, copy_bytes))
+          return 0;
+      }
+    }
+    if (active_drafts > 0) {
+      for (int h = 0; h < NEMO_KV_HEADS; h++) {
+        if (!replace_kv_buf(&s->mtp_k[h], new_bytes, copy_bytes) ||
+            !replace_kv_buf(&s->mtp_v[h], new_bytes, copy_bytes))
+          return 0;
+      }
+    }
+    s->cap = new_cap;
+    return 1;
+  }
   Buf nk[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
   Buf nv[NEMO_ATTN_LAYERS][NEMO_KV_HEADS] = {0};
   Buf mk[NEMO_KV_HEADS] = {0};
@@ -1646,7 +1693,7 @@ static int state_resize_kv(NemoState *s, int new_cap, int keep) {
 static void state_ensure_cap(NemoState *s, int need) {
   if (need <= s->cap) return;
   model_sync();
-  int next = grown_cap(need);
+  int next = grown_cap_from(s->cap, need);
   if (!state_resize_kv(s, next, s->cap))
     die("nemotron: out of memory growing KV cache to %d tokens", next);
 }
@@ -1700,8 +1747,8 @@ static void nemo_state_free(ModelState *ms) {
 // `positions` tokens.
 static size_t nemo_state_bytes(const ModelState *ms, int positions) {
   const NemoState *s = (const NemoState *)ms;
-  int cap = s ? s->cap : grown_cap(positions > 0 ? positions : 1);
-  if (positions > cap) cap = grown_cap(positions);
+  int cap = s ? grown_cap_from(s->cap, positions > 0 ? positions : s->cap)
+              : grown_cap(positions > 0 ? positions : 1);
   size_t kv_one = gpu_round_up_to_pages((size_t)cap * KV_HEAD_ROW_BYTES);
   int kv_layers = NEMO_ATTN_LAYERS + (active_drafts > 0 ? 1 : 0);
   size_t bytes = (size_t)(kv_layers * NEMO_KV_HEADS * 2) * kv_one +
