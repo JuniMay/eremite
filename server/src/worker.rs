@@ -519,9 +519,6 @@ struct ModelStatus {
     state_committed_bytes: u64,
     /// The bytes that the model's states and their snapshots may take.
     state_limit_bytes: u64,
-    /// The bytes that the engine allocated for the model's states and their
-    /// snapshots.
-    state_allocated_bytes: u64,
 }
 
 /// A request of a model, for the model's status.
@@ -1312,13 +1309,13 @@ fn build_model_memory_json(shared: &Shared) -> Vec<Value> {
             let tracked = stats.dense_bytes
                 + stats.cache_bytes
                 + stats.model_workspace
-                + status.state_allocated_bytes;
+                + stats.own_state_bytes;
             json!({
                 "model": shared_model.settings.id,
                 "weights": stats.dense_bytes,
                 "experts": stats.cache_bytes,
                 "workspace": stats.model_workspace,
-                "states": status.state_allocated_bytes,
+                "states": stats.own_state_bytes,
                 "states_committed": status.state_committed_bytes,
                 "sessions": status.sessions.len(),
                 "tracked": tracked,
@@ -2201,19 +2198,6 @@ impl States {
                 .collect();
             status.state_committed_bytes = self.cache.count_model_bytes(model_index);
             status.state_limit_bytes = self.cache.limits[model_index].bytes;
-            status.state_allocated_bytes = entries
-                .iter()
-                .map(|(state_id, entry)| {
-                    self.handles[state_id]
-                        .owner
-                        .state_bytes(Some(self.handles[state_id].engine_state), 0)
-                        + entry
-                            .snapshots
-                            .iter()
-                            .map(|snapshot| snapshot.bytes)
-                            .sum::<u64>()
-                })
-                .sum();
         }
         if let Some((model_index, number)) = lock(&shared.session_tokens_wanted).take() {
             *lock(&shared.session_tokens) = find_session_tokens(&self.cache, model_index, number)

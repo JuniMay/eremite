@@ -121,6 +121,8 @@ static void change(MemorySlot *slot, uint64_t bytes) {
   if (slot->kind == MEMORY_STATE)
     slot->account->state_bytes =
         slot->account->state_bytes - slot->bytes + bytes;
+  slot->account->role_bytes[slot->role] =
+      slot->account->role_bytes[slot->role] - slot->bytes + bytes;
   uint64_t before = counted(slot->account);
   slot->account->bytes -= slot->bytes;
   slot->account->bytes += bytes;
@@ -233,9 +235,12 @@ void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
   Memory *memory = account->memory;
   if (dependency && dependency->account->memory != memory)
     die("%s: depends on a slot of another Memory", name);
+  MemoryRole role =
+      kind == MEMORY_STATE ? MEMORY_ROLE_STATE : MEMORY_ROLE_WORKSPACE;
   *slot = (MemorySlot){.next = memory->slots,
                        .account = account,
                        .kind = kind,
+                       .role = role,
                        .dependency = dependency,
                        .name = name,
                        .evict = evict,
@@ -247,6 +252,17 @@ void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
     dependency->children = slot;
   }
   memory->slots = slot;
+}
+
+void memory_slot_set_role(MemorySlot *slot, MemoryRole role) {
+  if (role < 0 || role >= MEMORY_ROLE_COUNT)
+    die("%s: invalid memory role %d", slot->name, (int)role);
+  if ((slot->kind == MEMORY_STATE) != (role == MEMORY_ROLE_STATE))
+    die("%s: slot kind and reporting role disagree", slot->name);
+  if (slot->role == role) return;
+  slot->account->role_bytes[slot->role] -= slot->bytes;
+  slot->role = role;
+  slot->account->role_bytes[slot->role] += slot->bytes;
 }
 
 void memory_slot_remove(MemorySlot *slot) {
@@ -791,6 +807,15 @@ uint64_t memory_room(const MemoryAccount *account) {
 
 uint64_t memory_counted(const MemoryAccount *account) {
   return counted(account);
+}
+
+MemoryAccountBreakdown memory_account_breakdown(const MemoryAccount *account) {
+  return (MemoryAccountBreakdown){
+      .weights = account->role_bytes[MEMORY_ROLE_WEIGHTS],
+      .experts = account->role_bytes[MEMORY_ROLE_EXPERTS],
+      .workspace = account->role_bytes[MEMORY_ROLE_WORKSPACE],
+      .states = account->role_bytes[MEMORY_ROLE_STATE],
+      .total = account->bytes};
 }
 
 MemorySlot *memory_shared(Memory *memory) { return &memory->shared; }

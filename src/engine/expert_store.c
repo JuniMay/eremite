@@ -685,6 +685,7 @@ void expert_store_start(ExpertStore *st, uint64_t budget, int layers) {
       memory_slot_init(&st->slots[i].memory, st->cache_backbone->account,
                        MEMORY_MODEL, st->cache_backbone, "routed expert",
                        pool_evict, &st->slots[i]);
+      memory_slot_set_role(&st->slots[i].memory, MEMORY_ROLE_EXPERTS);
       st->slots[i].memory.can_evict = pool_can_evict;
       st->slots[i].memory.automatic = 1;
     }

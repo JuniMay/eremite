@@ -65,6 +65,34 @@ typedef enum {
   MEMORY_STATE
 } MemoryKind;
 
+// Reporting category of a slot within its account.
+typedef enum {
+  // Pass workspaces and shared runtime allocations.
+  MEMORY_ROLE_WORKSPACE = 0,
+  // Resident model weights.
+  MEMORY_ROLE_WEIGHTS,
+  // Routed expert cache slots.
+  MEMORY_ROLE_EXPERTS,
+  // Request and conversation states and snapshots.
+  MEMORY_ROLE_STATE,
+  // Number of reporting categories.
+  MEMORY_ROLE_COUNT
+} MemoryRole;
+
+// Canonical byte breakdown of one account by slot role, plus their sum.
+typedef struct {
+  // Bytes counted in weight slots.
+  uint64_t weights;
+  // Bytes counted in routed expert cache slots.
+  uint64_t experts;
+  // Bytes counted in workspace slots.
+  uint64_t workspace;
+  // Bytes counted in state slots.
+  uint64_t states;
+  // Total bytes counted across all slots of the account.
+  uint64_t total;
+} MemoryAccountBreakdown;
+
 struct MemoryAccount {
   // The Memory that holds the account.
   Memory *memory;
@@ -78,6 +106,8 @@ struct MemoryAccount {
   int admitting;
   // Bytes counted for its state slots.
   uint64_t state_bytes;
+  // Bytes counted per reporting category.
+  uint64_t role_bytes[MEMORY_ROLE_COUNT];
   // The most bytes that it may count, its state slots included: its own
   // limit. UINT64_MAX for none.
   uint64_t limit;
@@ -88,6 +118,8 @@ struct MemorySlot {
   MemorySlot *next;
   MemoryAccount *account;
   MemoryKind kind;
+  // Reporting category within the account.
+  MemoryRole role;
   // This slot is evicted before its dependency.
   MemorySlot *dependency;
   // First slot that depends on this one, and next slot with the same
@@ -198,6 +230,9 @@ void memory_slot_init(MemorySlot *slot, MemoryAccount *account, MemoryKind kind,
                       MemorySlot *dependency, const char *name,
                       void (*evict)(void *), void *context);
 
+// Sets the reporting category of slot within its account.
+void memory_slot_set_role(MemorySlot *slot, MemoryRole role);
+
 // Removes the slot and its bytes.
 void memory_slot_remove(MemorySlot *slot);
 
@@ -278,6 +313,9 @@ uint64_t memory_room(const MemoryAccount *account);
 // minimum if larger, and its state memory's bytes. Its own limit applies to
 // them.
 uint64_t memory_counted(const MemoryAccount *account);
+
+// Returns the account's counted bytes split canonically by slot role.
+MemoryAccountBreakdown memory_account_breakdown(const MemoryAccount *account);
 
 // Reclaims memory: evicts idle slots until bytes are freed or none is left.
 // Returns the bytes freed.

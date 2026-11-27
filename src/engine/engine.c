@@ -1822,7 +1822,9 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->video_stage = c.video_stage;
   s->video_step = c.video_step;
   s->video_steps_total = c.video_steps_total;
-  s->dense_bytes = model.dense_bytes;
+  const MemoryAccount *own = &m->m->memory;
+  MemoryAccountBreakdown breakdown = memory_account_breakdown(own);
+  s->dense_bytes = breakdown.weights;
   s->layers = model.layers;
   s->experts_per_row = model.experts_per_row;
   s->routed_layers = model.routed_layers;
@@ -1833,11 +1835,10 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->model_memory_committed = usage.committed;
   s->model_memory_peak = usage.peak;
   s->state_allocated = state_bytes();
-  s->model_workspace = m->m->memory.bytes - c.dense_bytes - c.cache_bytes;
-  const MemoryAccount *own = &m->m->memory;
+  s->model_workspace = breakdown.workspace;
   s->own_memory_limit = own->limit == UINT64_MAX ? 0 : own->limit;
   s->own_memory_counted = memory_counted(own);
-  s->own_state_bytes = own->state_bytes;
+  s->own_state_bytes = breakdown.states;
   s->required_bytes = c.required_bytes;
   s->cache = counts(&c.cache);
   s->slots = c.cache_slots;
@@ -1846,7 +1847,7 @@ void eremite_read_stats(const eremite_model *m, eremite_stats *s) {
   s->max_slots = c.max_slots;
   s->experts = c.experts;
   s->slot_bytes = c.slot_bytes;
-  s->cache_bytes = c.cache_bytes;
+  s->cache_bytes = breakdown.experts;
   s->uncached_bytes = c.uncached_bytes;
   s->uncached = c.uncached;
   _Static_assert(THREAD_STATES == sizeof s->thread_s / sizeof *s->thread_s,

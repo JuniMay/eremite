@@ -56,6 +56,7 @@ WeightGroup *weight_group_new(Gpu *gpu, MemoryAccount *account,
   group->gpu = gpu;
   memory_slot_init(&group->slot, account, MEMORY_MODEL, NULL, name, unload,
                    group);
+  memory_slot_set_role(&group->slot, MEMORY_ROLE_WEIGHTS);
   return group;
 }
 
@@ -65,6 +66,7 @@ WeightGroup *weight_group_new_dependent(WeightGroup *backbone,
   group->gpu = backbone->gpu;
   memory_slot_init(&group->slot, backbone->slot.account, MEMORY_MODEL,
                    &backbone->slot, name, unload, group);
+  memory_slot_set_role(&group->slot, MEMORY_ROLE_WEIGHTS);
   return group;
 }
 
