@@ -1550,6 +1550,7 @@ fn build_engine_counters_json(stats: &engine::Stats) -> Value {
             "free": stats.free,
             "file": stats.file,
             "file_kept": stats.file_kept,
+            "occupied": stats.memory_occupied,
             "wired": stats.wired,
             "swap_used": stats.swap_used,
             "pressure": stats.pressure,
@@ -2135,6 +2136,8 @@ impl States {
                 .sum::<u64>();
         let snapshots = self.cache.remove_state(state_id);
         self.free_snapshots_and_states(Vec::new(), vec![(state_id, snapshots)]);
+        // Immediately occupy released headroom so OS file cache cannot absorb it.
+        engine::maintain_memory(0);
         format!(
             "session {number} deleted from memory, not saved to the SSD: {tokens} tokens, {:.2} GiB",
             bytes as f64 / GIB
@@ -2478,6 +2481,7 @@ impl Worker {
             }
             let freed = worker_model.model.unload();
             if freed > 0 {
+                engine::maintain_memory(0);
                 worker_model.log_line(&format!(
                     "{}: unloaded after {after:.0} s without requests; {:.1} GiB back",
                     worker_model.settings.id,
@@ -2494,7 +2498,13 @@ impl Worker {
     /// the engine frees idle memory. After that, the state cache evicts idle
     /// states. Last, it publishes the counters.
     fn keep_reserve_free(&mut self) {
+        /// Maximum guard-pool growth per periodic maintenance tick (1 GiB).
+        const PERIODIC_OCCUPY_STEP_BYTES: u64 = 1u64 << 30;
         self.unload_idle_models();
+        // Maintain the platform guard pool first: yields immediately if other
+        // programs pushed available memory below reserve, or occupies idle
+        // headroom above reserve + hysteresis.
+        engine::maintain_memory(PERIODIC_OCCUPY_STEP_BYTES);
         engine::refresh_stats();
         let mut freed = 0;
         for worker_model in &self.models {

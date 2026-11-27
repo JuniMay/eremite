@@ -1,5 +1,6 @@
 #ifndef EREMITE_ENGINE_MEMORY_H
 #define EREMITE_ENGINE_MEMORY_H
+#include "platform/memory_policy.h"
 #include "platform/system_memory.h"
 #include <stdatomic.h>
 #include <stddef.h>
@@ -195,6 +196,25 @@ void memory_set_limit(Memory *memory, uint64_t bytes);
 void memory_set_reserve(Memory *memory, uint64_t reserve,
                         SystemMemoryCounters (*read)(void),
                         uint64_t (*unwritten)(void));
+
+// Attaches a platform memory policy backend to `memory`. When set, system
+// availability, pre-existing file-cache tracking, pressure yield and optional
+// guard-pool occupation delegate to `policy`. Pass null to detach.
+void memory_set_policy(Memory *memory, PlatformMemory *policy);
+
+// Returns the bytes currently held in the platform policy's guard pool.
+uint64_t memory_occupied(const Memory *memory);
+
+// Releases guard-pool memory immediately when OS pressure rises, this process's
+// own compressed bytes grow, or external available memory drops below reserve.
+// Never allocates; safe on active inference paths. Returns released bytes.
+uint64_t memory_yield_if_pressured(Memory *memory);
+
+// Maintains the platform policy's guard pool: yields under pressure or below
+// reserve, or occupies idle headroom above reserve + hysteresis within the
+// configured limit, growing by at most `max_grow_bytes` (0: unbounded).
+// Returns occupied bytes afterward.
+uint64_t memory_maintain(Memory *memory, uint64_t max_grow_bytes);
 
 // Reads the kernel's page counters now. *available gets the bytes available
 // to this program: the free pages, and the file cache above the file cache

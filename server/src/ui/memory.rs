@@ -117,12 +117,11 @@ pub fn draw_memory(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
     let others = in_use.saturating_sub(memory.footprint.max(tracked));
     let reserve = memory.free.min((first.reserve_gib * GIB) as u64);
     let kept_file_cache = memory.file_kept.min(memory.file);
-    let rest = [
-        (
-            "other server memory",
-            memory.footprint.saturating_sub(tracked),
-            theme.brown,
-        ),
+    let other_server = memory
+        .footprint
+        .saturating_sub(tracked.saturating_add(memory.occupied));
+    let mut rest = vec![
+        ("other server memory", other_server, theme.brown),
         ("other programs", others, theme.label),
         ("file cache", kept_file_cache, theme.rule),
         (
@@ -133,7 +132,10 @@ pub fn draw_memory(buf: &mut Buffer, area: Rect, screen: &Screen, choices: &Choi
         ("reserve", reserve, theme.green),
         ("free", memory.free - reserve, theme.faint),
     ];
-    for (name, bytes, tone) in rest {
+    if memory.occupied > 0 {
+        rest.insert(1, ("guard pool", memory.occupied, theme.sources[1]));
+    }
+    for &(name, bytes, tone) in &rest {
         tiles.push(Tile::part(name, bytes, tone));
     }
     let map = Rect {

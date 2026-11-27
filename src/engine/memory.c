@@ -29,6 +29,12 @@ struct Memory {
   void (*eviction_callback)(void *context);
   // The eviction callback's argument.
   void *eviction_context;
+  // Optional platform memory policy backend (owns OS-specific file-cache floor
+  // and guard-pool occupation).
+  PlatformMemory *policy;
+  // Last observed process-local compressed bytes, used to detect active local
+  // memory compression.
+  uint64_t last_own_compressed;
   // The kernel's count of available memory lags behind this program. So each
   // reading is corrected for what this program used since, and bytes counted
   // but not yet written count as used.
@@ -58,8 +64,15 @@ static constexpr double LONG_AGO = -1e9;
 static constexpr double GIB_F = 1073741824.0;
 // Evictions that free at least this much at once are logged.
 static constexpr uint64_t LOGGED_EVICTION = 1ull << 30;
+// Process-local compression increase (16 MiB) treated as active squeeze.
+static constexpr uint64_t OWN_COMPRESSED_DELTA = 16ull << 20;
 
 static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
+
+// Returns whether `memory` has a system availability source (policy or reader).
+static int has_system_source(const Memory *memory) {
+  return memory->policy != NULL || memory->read_counters != NULL;
+}
 
 // The bytes available to this program in the counters c: the free pages, and
 // the file cache above the one that the kernel keeps. A smaller file cache
@@ -67,6 +80,34 @@ static uint64_t in_use(const Memory *memory) { return memory->usage.allocated; }
 static uint64_t available_in(Memory *memory, SystemMemoryCounters c) {
   if (c.file < memory->kept_file_cache) memory->kept_file_cache = c.file;
   return c.free + (c.file - memory->kept_file_cache);
+}
+
+// Reads system availability through the attached platform policy when present,
+// or falls back to read_counters. Returns total bytes usable by this program
+// (external available plus synchronously releasable guard-pool bytes).
+static uint64_t read_usable(Memory *memory, PlatformMemoryState *out) {
+  if (memory->policy) {
+    PlatformMemoryState s = platform_memory_read(memory->policy);
+    memory->kept_file_cache = s.file_cache_kept;
+    if (out) *out = s;
+    return s.available + s.occupied;
+  }
+  SystemMemoryCounters c = memory->read_counters ? memory->read_counters()
+                                                 : (SystemMemoryCounters){0};
+  uint64_t avail = memory->read_counters ? available_in(memory, c) : 0;
+  if (out) {
+    *out =
+        (PlatformMemoryState){.total = c.total,
+                              .free = c.free,
+                              .file_cache = c.file,
+                              .file_cache_kept = memory_kept_file_cache(memory),
+                              .available = avail,
+                              .occupied = 0,
+                              .swapouts = c.swapouts,
+                              .compressions = c.compressions,
+                              .pressure = SYSTEM_MEMORY_NORMAL};
+  }
+  return avail;
 }
 
 // The available memory. A new reading is taken after
@@ -80,7 +121,7 @@ static uint64_t available(Memory *memory, uint64_t adding) {
        t - memory->read_at >= times->available_memory_reading_max_age) &&
       (adding >= 1ull << 30 ||
        t - memory->read_at >= times->available_memory_reading_interval)) {
-    memory->read_bytes = available_in(memory, memory->read_counters());
+    memory->read_bytes = read_usable(memory, NULL);
     memory->read_used = in_use(memory);
     memory->read_at = t;
     memory->read_pending =
@@ -102,7 +143,7 @@ static uint64_t available(Memory *memory, uint64_t adding) {
 
 // How far adding bytes would go below the reserve.
 static uint64_t shortage(Memory *memory, uint64_t bytes) {
-  if (!memory->read_counters || !bytes) return 0;
+  if (!has_system_source(memory) || !bytes) return 0;
   uint64_t a = available(memory, bytes),
            room = a > memory->reserve ? a - memory->reserve : 0;
   return bytes > room ? bytes - room : 0;
@@ -180,11 +221,101 @@ void memory_set_reserve(Memory *memory, uint64_t bytes,
   memory->read_at = LONG_AGO;  // the next use takes a new reading
 }
 
+void memory_set_policy(Memory *memory, PlatformMemory *policy) {
+  memory->policy = policy;
+  memory->last_own_compressed = 0;
+  memory->read_at = LONG_AGO;
+}
+
+uint64_t memory_occupied(const Memory *memory) {
+  return memory && memory->policy
+             ? platform_memory_occupied_bytes(memory->policy)
+             : 0;
+}
+
+uint64_t memory_yield_if_pressured(Memory *memory) {
+  if (!memory || !memory->policy) return 0;
+  uint64_t held = platform_memory_occupied_bytes(memory->policy);
+  if (!held) return 0;
+  PlatformMemoryState s = platform_memory_read(memory->policy);
+  memory->kept_file_cache = s.file_cache_kept;
+  int compressed_grew =
+      memory->last_own_compressed > 0 &&
+      s.process_compressed > memory->last_own_compressed + OWN_COMPRESSED_DELTA;
+  memory->last_own_compressed = s.process_compressed;
+  uint64_t freed = 0;
+  if (s.pressure >= SYSTEM_MEMORY_WARNING || compressed_grew) {
+    freed = platform_memory_release_occupied(memory->policy, held);
+  } else if (s.available < memory->reserve) {
+    freed = platform_memory_release_occupied(memory->policy,
+                                             memory->reserve - s.available);
+  }
+  if (freed) memory->read_at = LONG_AGO;
+  return freed;
+}
+
+uint64_t memory_maintain(Memory *memory, uint64_t max_grow_bytes) {
+  if (!memory || !memory->policy) return 0;
+  PlatformMemoryState s = platform_memory_read(memory->policy);
+  memory->kept_file_cache = s.file_cache_kept;
+  int compressed_grew =
+      memory->last_own_compressed > 0 &&
+      s.process_compressed > memory->last_own_compressed + OWN_COMPRESSED_DELTA;
+  memory->last_own_compressed = s.process_compressed;
+
+  if (s.pressure >= SYSTEM_MEMORY_WARNING || compressed_grew) {
+    if (s.occupied) {
+      platform_memory_set_occupied(memory->policy, 0, 0);
+      memory->read_at = LONG_AGO;
+    }
+    return 0;
+  }
+
+  if (s.available < memory->reserve) {
+    if (s.occupied) {
+      platform_memory_release_occupied(memory->policy,
+                                       memory->reserve - s.available);
+      memory->read_at = LONG_AGO;
+    }
+    return platform_memory_occupied_bytes(memory->policy);
+  }
+
+  uint64_t used = in_use(memory);
+  uint64_t limit_room =
+      memory->usage.limit > used ? memory->usage.limit - used : 0;
+  if (s.occupied > limit_room) {
+    platform_memory_set_occupied(memory->policy, limit_room, 0);
+    memory->read_at = LONG_AGO;
+    return platform_memory_occupied_bytes(memory->policy);
+  }
+
+  if (!platform_memory_occupy_enabled(memory->policy)) return s.occupied;
+
+  uint64_t hyst = platform_memory_hysteresis_bytes(memory->policy);
+  uint64_t floor =
+      UINT64_MAX - memory->reserve < hyst ? UINT64_MAX : memory->reserve + hyst;
+  if (s.available > floor) {
+    uint64_t headroom = s.available - floor;
+    uint64_t want =
+        UINT64_MAX - s.occupied < headroom ? UINT64_MAX : s.occupied + headroom;
+    if (want > limit_room) want = limit_room;
+    if (want > s.occupied) {
+      platform_memory_set_occupied(memory->policy, want, max_grow_bytes);
+      memory->read_at = LONG_AGO;
+    }
+  }
+  return platform_memory_occupied_bytes(memory->policy);
+}
+
 SystemMemoryCounters memory_read_system(Memory *memory, uint64_t *available) {
-  SystemMemoryCounters c = {0};
-  if (memory->read_counters) c = memory->read_counters();
-  *available = memory->read_counters ? available_in(memory, c) : 0;
-  return c;
+  PlatformMemoryState s = {0};
+  uint64_t usable = read_usable(memory, &s);
+  *available = has_system_source(memory) ? usable : 0;
+  return (SystemMemoryCounters){.free = s.free,
+                                .file = s.file_cache,
+                                .swapouts = s.swapouts,
+                                .compressions = s.compressions,
+                                .total = s.total};
 }
 
 uint64_t memory_kept_file_cache(const Memory *memory) {
@@ -192,6 +323,7 @@ uint64_t memory_kept_file_cache(const Memory *memory) {
 }
 
 void memory_keep_file_cache(Memory *memory, uint64_t bytes) {
+  if (memory->policy) return;
   if (memory->kept_file_cache == UINT64_MAX ||
       bytes > memory->kept_file_cache) {
     memory->kept_file_cache = bytes;
@@ -201,7 +333,7 @@ void memory_keep_file_cache(Memory *memory, uint64_t bytes) {
 
 uint64_t memory_current_limit(Memory *memory) {
   const MemoryUsage *usage = &memory->usage;
-  if (!memory->read_counters) return usage->limit;
+  if (!has_system_source(memory)) return usage->limit;
   uint64_t a = available(memory, 0),
            room = a > memory->reserve ? a - memory->reserve : 0;
   uint64_t limit = UINT64_MAX - usage->committed < room
@@ -212,8 +344,10 @@ uint64_t memory_current_limit(Memory *memory) {
 
 uint64_t memory_ceiling(Memory *memory) {
   uint64_t ceiling = memory->usage.limit;
-  if (!memory->read_counters) return ceiling;
-  uint64_t machine = memory->read_counters().total;
+  if (!has_system_source(memory)) return ceiling;
+  PlatformMemoryState s = {0};
+  read_usable(memory, &s);
+  uint64_t machine = s.total;
   // A reading without the machine's RAM sets no bound of its own.
   if (!machine) return ceiling;
   uint64_t room = machine > memory->reserve ? machine - memory->reserve : 0;
@@ -478,18 +612,24 @@ static uint64_t evict_slot(MemorySlot *slot) {
 }
 
 uint64_t memory_reclaim(Memory *memory, uint64_t bytes) {
+  uint64_t guard_freed =
+      memory->policy ? platform_memory_release_occupied(memory->policy, bytes)
+                     : 0;
+  if (guard_freed) memory->read_at = LONG_AGO;
+  if (guard_freed >= bytes) return guard_freed;
+  uint64_t remain = bytes - guard_freed;
   const MemoryUsage *usage = &memory->usage;
   uint64_t before = usage->allocated;
-  while (before - usage->allocated < bytes) {
+  while (before - usage->allocated < remain) {
     MemorySlot *slot = victim(memory, NULL, NULL, NULL, 0, MEMORY_REQUIRED,
-                              bytes - (before - usage->allocated), 0);
+                              remain - (before - usage->allocated), 0);
     if (!slot) break;
     evict_slot(slot);
   }
   uint64_t freed = before - usage->allocated;
   if (freed && memory->eviction_callback)
     memory->eviction_callback(memory->eviction_context);
-  return freed;
+  return guard_freed + freed;
 }
 
 uint64_t memory_unload(MemoryAccount *account) {
@@ -613,6 +753,12 @@ static int admit(Memory *memory, MemorySlot *const *wanted,
         "slots, %.2f GiB",
         wanted[0]->name, extra / GIB_F, short_by / GIB_F,
         memory->reserve / GIB_F, now() - memory->read_at, taken, freed / GIB_F);
+  if (memory->policy && extra > 0 &&
+      platform_memory_occupied_bytes(memory->policy) > 0) {
+    // Release guard-pool chunks synchronously so physical pages back the
+    // admitted allocation without dipping below the OS reserve.
+    platform_memory_release_occupied(memory->policy, extra);
+  }
   for (size_t i = 0; i < n; i++)
     change(wanted[i],
            sizes[i] > wanted[i]->payload ? sizes[i] : wanted[i]->payload);
@@ -671,12 +817,11 @@ int memory_set_minimum(MemoryAccount *account, uint64_t bytes,
 static int retry_while_memory_returns(Memory *memory,
                                       int (*attempt)(void *context),
                                       void *context) {
-  uint64_t seen =
-      memory->read_counters ? available_in(memory, memory->read_counters()) : 0;
+  uint64_t seen = has_system_source(memory) ? read_usable(memory, NULL) : 0;
   while (!attempt(context)) {
-    if (!memory->read_counters || shutdown_requested()) return 0;
+    if (!has_system_source(memory) || shutdown_requested()) return 0;
     sleep_seconds(memory->times.freed_memory_delay);
-    uint64_t now_available = available_in(memory, memory->read_counters());
+    uint64_t now_available = read_usable(memory, NULL);
     if (now_available <= seen) return 0;
     seen = now_available;
     memory->read_at = LONG_AGO;  // the next try takes a new reading

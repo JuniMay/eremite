@@ -116,13 +116,18 @@ In the terminal UI, 4 Models: States deletes the chosen session's state from
 memory when `d` is pressed twice. The state is not saved on the SSD. A session
 that a request runs in keeps its state.
 
-Free memory means the free pages and the file cache above the part that macOS
-keeps. That part is the smallest file cache read since the server started:
-when memory runs short, macOS drops the file cache above it first. If macOS
-compresses other memory instead while that file cache counts as free, the file
-cache at that moment becomes the part that macOS keeps. So a growing file cache
-does not make the models' memory shrink. The memory view shows the part that
-macOS keeps as file cache, and the rest as free file cache.
+Free memory means the free pages and the file cache above the pre-existing
+floor that macOS already held. That floor is the smallest file cache read since
+the server started, so pre-existing file cache stays respected until macOS
+drains or purges it, while file cache growing above the floor counts as
+available. On macOS unified memory, the server also holds released and idle
+headroom above `reserve` (and within `memory`) in a releasable guard pool of
+incompressible anonymous pages so OS file cache cannot grow into it. The guard
+pool yields synchronously whenever eremite allocates memory, and sheds chunks
+immediately when another program pushes available memory below `reserve`, when
+macOS signals memory pressure, or when eremite's own pages compress. The memory
+view shows the pre-existing floor as file cache, the rest as free file cache,
+and active guard memory as guard pool.
 
 ## GPU sharing
 

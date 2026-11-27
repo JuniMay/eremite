@@ -174,10 +174,12 @@ struct ExpertStore {
   // [layers]: passes whose GPU work reaches the layer through its table.
   unsigned *layer_holds;
   // The resizing's readings and clocks; the clock of the last give-back is
-  // shared.
-  uint64_t swapouts, compressions;
+  // shared. own_compressed tracks this process's own compressed bytes rather
+  // than noisy system-wide compression or swap-out counters.
+  uint64_t own_compressed;
   int calm, init;
-  // The last swap-out while the cache could release memory.
+  // Last time this process's own memory was compressed while the cache could
+  // release slots.
   double bad;
   int calm_map;
   // When the GPU's excess was last unmapped: the driver shows it within
@@ -1643,56 +1645,51 @@ void expert_store_cancel_read_aheads(ExpertStore *st, int layer,
 // Resizes the cache. It gives slots back, the least recently used of the
 // layers below below first, on memory pressure or when the available memory
 // falls below the reserve: a sixteenth of the cache under pressure or
-// swapping, a quarter at critical pressure, and otherwise the slots that
-// restore the reserve. Swap-outs shrink a cache above its minimum; a
-// swap-out cannot take back memory from an empty cache. Growth uses a
-// quarter of the headroom above expert_cache_growth_margin_gib after 32 calm
-// calls, and for free_pages_only_after_swapout after a swap-out only free
-// pages. When the kernel compressed memory while the file cache above the one
-// kept counted as available, it keeps that file cache: the memory counts it
-// as kept from then on, and only the free pages as available.
+// Minimum increase in this process's own compressed bytes (16 MiB) before
+// treating compression as active squeeze on this process.
+static constexpr uint64_t SELF_COMPRESS_THRESHOLD = 16ull << 20;
+
+// Resizes the cache's slot and map limits against available memory, OS
+// pressure, this process's own compressed memory, and GPU residency room.
+// System-wide compressions or swap-outs from unrelated processes do not
+// ratchet kept file cache or shrink the cache.
 static void resize(ExpertStore *st, int below) {
+  if (cache_memory) memory_yield_if_pressured(cache_memory);
   uint64_t avail;
   SystemMemoryCounters counters = read_counters(&avail);
   uint64_t free = counters.free, slot = st->SLOT_SIZE,
            growth_margin =
                (uint64_t)(cache_settings.expert_cache_growth_margin_gib * GiB);
-  double freed_memory_delay = cache_settings.times.freed_memory_delay,
-         caution = cache_settings.free_pages_only_after_swapout;
-  if (!st->init)
-    st->swapouts = counters.swapouts, st->compressions = counters.compressions,
-    st->init = 1;
-  if (counters.compressions > st->compressions && avail > free &&
-      cache_memory) {
-    memory_keep_file_cache(cache_memory, counters.file);
-    avail = free;
-  }
-  st->compressions = counters.compressions;
+  double freed_memory_delay = cache_settings.times.freed_memory_delay;
+  uint64_t own_compressed = system_memory_compressed(0);
+  if (!st->init) st->own_compressed = own_compressed, st->init = 1;
+  uint64_t comp_delta = own_compressed > st->own_compressed
+                            ? own_compressed - st->own_compressed
+                            : 0;
+  st->own_compressed = own_compressed;
   int64_t room = gpu_room(st);
   // The driver still counts a slot taken out of the residency sets for up to
   // freed_memory_delay, so the mapped slots leave this much of the GPU's room
   // unused.
   int64_t gpu_margin =
       (int64_t)(cache_settings.gpu_memory_limit_margin_gib * GiB);
-  uint64_t swap_delta =
-      counters.swapouts > st->swapouts ? counters.swapouts - st->swapouts : 0;
   // What the cache holds and maps, in the unit of its limits, and the most
   // they may be.
   int used = used_units(st), mapped = mapped_units(st),
       ceiling = cap_ceiling(st);
   SystemMemoryPressure level = system_memory_pressure();
-  int swapped = swap_delta && used > st->minimum_slots;
-  int low = level >= SYSTEM_MEMORY_WARNING || swapped || avail < reserve;
-  if (swapped) st->bad = now();
-  st->swapouts = counters.swapouts;
+  int squeezed =
+      comp_delta >= SELF_COMPRESS_THRESHOLD && used > st->minimum_slots;
+  int low = level >= SYSTEM_MEMORY_WARNING || squeezed || avail < reserve;
+  if (squeezed) st->bad = now();
   int old_cap = st->cap, old_mcap = st->mcap;
-  uint64_t headroom = now() - st->bad > caution ? avail : free;
-  if (low && (level >= SYSTEM_MEMORY_CRITICAL || swapped ||
+  uint64_t headroom = avail;
+  if (low && (level >= SYSTEM_MEMORY_CRITICAL || squeezed ||
               now() - gave > freed_memory_delay)) {
     uint64_t to = avail;
-    int64_t give = level >= SYSTEM_MEMORY_CRITICAL             ? used / 4
-                   : level >= SYSTEM_MEMORY_WARNING || swapped ? used / 16 + 1
-                                                               : 0;
+    int64_t give = level >= SYSTEM_MEMORY_CRITICAL              ? used / 4
+                   : level >= SYSTEM_MEMORY_WARNING || squeezed ? used / 16 + 1
+                                                                : 0;
     if (to < reserve && (int64_t)((reserve - to) / slot) + 1 > give)
       give = (reserve - to) / slot + 1;
     st->cap = used - (int)give > st->minimum_slots ? used - (int)give
@@ -1745,13 +1742,12 @@ static void resize(ExpertStore *st, int below) {
         stderr,
         "cache resize: limit %d -> %d, allocated %d, map limit %d -> %d, "
         "mapped %d, "
-        "maximum %d, pressure %d, swap-outs +%llu, available %.2f GiB, free "
-        "%.2f GiB, "
-        "slots not yet written %.2f GiB, GPU room %.2f GiB, growth uses %s\n",
+        "maximum %d, pressure %d, self-compressed +%.2f MiB, available %.2f "
+        "GiB, free %.2f GiB, "
+        "slots not yet written %.2f GiB, GPU room %.2f GiB\n",
         old_cap, st->cap, st->nslots, old_mcap, st->mcap, st->nmapped,
-        st->max_slots, level, (unsigned long long)swap_delta, avail / GiB,
-        free / GiB, cache_unwritten() / GiB, room / GiB,
-        now() - st->bad > caution ? "available memory" : "free pages");
+        st->max_slots, level, comp_delta / 1048576.0, avail / GiB, free / GiB,
+        cache_unwritten() / GiB, room / GiB);
 }
 
 // Between tokens no GPU work of this pass references a slot. In a prompt pass
@@ -1767,6 +1763,7 @@ void expert_store_resize_in_prompt(ExpertStore *st, int pass) {
     MemorySlot growth;
     memory_slot_init(&growth, st->cache_backbone->account, MEMORY_MODEL, NULL,
                      "cache growth", NULL, NULL);
+    memory_slot_set_role(&growth, MEMORY_ROLE_EXPERTS);
     MemorySlot *wanted[] = {&growth};
     uint64_t bytes = 4 * st->SLOT_SIZE;
     memory_admit(wanted, &bytes, 1, MEMORY_CACHE);

@@ -141,20 +141,21 @@ static void child_case(int kind) {
     vm_fixture.free_count = (11ull << 30) / vm_page_size;
     vm_fixture.external_page_count = (10ull << 30) / vm_page_size;
   }
-  if (kind == 3) vm_fixture.compressions++, compressed_fixture = 128ull << 20;
-  if (kind == 13) {  // compression while the file cache above the one kept
-                     // counts: that file cache counts as kept from then on
+  if (kind == 3) vm_fixture.compressions++, compressed_fixture = 0;
+  if (kind == 13) {  // unrelated system-wide compression while file cache
+                     // above the floor counts: floor stays at 10 GiB and cache
+                     // does NOT shrink
     vm_fixture.compressions++;
     resize(st, -1);
-    int kept = memory_kept_file_cache(cache_memory) == 20ull << 30;
-    _exit(st->cap < before && kept ? 0 : 1);
+    int kept = memory_kept_file_cache(cache_memory) == 10ull << 30;
+    _exit(st->cap == before && kept ? 0 : 1);
   }
-  if (kind == 4) vm_fixture.swapouts++;
+  if (kind == 4) compressed_fixture = 128ull << 20;
   if (kind == 6) wakeups_fixture++;
-  if (kind == 7 || kind == 8) vm_fixture.swapouts++;
+  if (kind == 7 || kind == 8) compressed_fixture = 128ull << 20;
   if (kind == 5) {
     for (int i = 0; i < 32; i++) {
-      vm_fixture.compressions++, compressed_fixture += 128ull << 20;
+      vm_fixture.compressions++;
       resize(st, -1);
     }
     _exit(st->cap > before && st->cap <= st->max_slots ? 0 : 1);
@@ -256,11 +257,11 @@ int main(void) {
       "cache",
       "calm growth uses the file cache above the one kept",
       "memory pressure shrinks the cache",
-      "compression alone does not shrink the cache",
-      "a new swap-out shrinks the cache",
-      "compression alone does not prevent growth",
-      "a swapper wakeup without swap-outs does not shrink the cache",
-      "a swap-out cannot take memory back from an empty cache",
+      "system-wide compression alone does not shrink the cache",
+      "process-local compression growth shrinks the cache",
+      "system-wide compression alone does not prevent growth",
+      "a swapper wakeup without local compression does not shrink the cache",
+      "local compression cannot take memory back from an empty cache",
       "a cache at its minimum grows again with available memory",
       "a file cache smaller than the one kept lowers it, so few free pages "
       "shrink the cache",
@@ -269,8 +270,8 @@ int main(void) {
       "two stores give one shortfall back once, and both stores' unwritten "
       "slots count",
       "a store that starts short of the reserve holds its minimum slots",
-      "compression while the file cache above the one kept counts makes it "
-      "kept, so few free pages shrink the cache"};
+      "system-wide compression while file cache above floor counts keeps the "
+      "floor intact and does not shrink the cache"};
   for (int kind = 0; kind < 14; kind++) {
     fflush(stdout);
     pid_t pid = fork();

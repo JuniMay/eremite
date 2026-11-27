@@ -303,6 +303,8 @@ pub struct SystemMemory {
     /// The part of the file cache that the system keeps rather than give up
     /// for other memory. The rest of the file cache counts as free.
     pub file_kept: u64,
+    /// Bytes held by the platform policy's releasable guard pool.
+    pub occupied: u64,
     /// The wired memory.
     pub wired: u64,
     /// The swap in use.

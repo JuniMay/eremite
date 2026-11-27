@@ -17,6 +17,7 @@
 #include "model/deepseek/model.h"
 #include "model/model.h"
 #include "platform/image.h"
+#include "platform/memory_policy.h"
 #include "platform/system_memory.h"
 #include "platform/threads.h"
 #include <math.h>
@@ -65,9 +66,11 @@ static int initialized;
 // The models registered, one of each family.
 static eremite_model *models[8];
 static int nmodels;
-// The memory that every model is counted in, made by eremite_init, and the
-// GPU that the models run on, made when the first model loads.
+// The memory that every model is counted in, made by eremite_init, its
+// platform memory policy backend, and the GPU that the models run on, made
+// when the first model loads.
 static Memory *memory;
+static PlatformMemory *memory_policy;
 static Gpu *gpu;
 // The calls posted to streams since the process started. Each stream keeps
 // the number of its call.
@@ -152,6 +155,8 @@ int eremite_init(const eremite_process *p) {
   for (size_t i = 0; i < sizeof settings / sizeof *settings; i++)
     if (!isfinite(settings[i]) || settings[i] < 0) return -1;
   memory = memory_new();
+  memory_policy = platform_memory_new_macos(&(PlatformMemoryMacosConfig){
+      .enable_occupy = p->occupy_free_memory != 0});
   expert_store_set_memory(
       memory,
       (MemorySettings){
@@ -168,6 +173,7 @@ int eremite_init(const eremite_process *p) {
               p->free_pages_only_after_swapout_seconds,
           .expert_cache_growth_margin_gib = p->expert_cache_growth_margin_gb,
           .gpu_memory_limit_margin_gib = p->gpu_memory_limit_margin_gb});
+  memory_set_policy(memory, memory_policy);
   proc = *p;
   die_hook = p->on_die;
   log_hook = p->on_log;
@@ -1754,6 +1760,7 @@ void eremite_refresh_stats(void) {
                       .free = mi.free,
                       .file = mi.file,
                       .file_kept = memory ? memory_kept_file_cache(memory) : 0,
+                      .memory_occupied = memory ? memory_occupied(memory) : 0,
                       .wired = mi.wired,
                       .compressor = mi.compressor,
                       .compressed = mi.compressed,
@@ -1764,6 +1771,10 @@ void eremite_refresh_stats(void) {
 
 uint64_t eremite_reclaim(uint64_t bytes) {
   return memory_reclaim(memory, bytes);
+}
+
+uint64_t eremite_maintain_memory(uint64_t max_grow_bytes) {
+  return memory ? memory_maintain(memory, max_grow_bytes) : 0;
 }
 
 uint64_t eremite_unload(eremite_model *m) {

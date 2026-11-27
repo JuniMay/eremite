@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 14
+#define EREMITE_ABI 15
 
 // ---- the process ----
 
@@ -64,6 +64,9 @@ typedef struct {
   // GiB kept unused below the GPU's memory limit, for slots that the GPU
   // driver still counts after they leave its list (default 3).
   double gpu_memory_limit_margin_gb;
+  // Nonzero enables the platform backend's releasable guard pool so released
+  // and idle headroom above reserve cannot be absorbed by OS file cache.
+  int occupy_free_memory;
   // The log's lines, each with its time, go to on_log instead of stderr when
   // it is set. It runs on the thread that logs, one line at a time under the
   // log's lock: it must return quickly and must not call eremite_log.
@@ -197,6 +200,11 @@ uint64_t eremite_unload(eremite_model *m);
 // Evicts idle memory until bytes are freed or none is left. Returns the bytes
 // freed.
 uint64_t eremite_reclaim(uint64_t bytes);
+// Maintains the platform memory policy's releasable guard pool: yields under
+// pressure or below reserve, or occupies idle headroom above reserve +
+// hysteresis within the limit, growing by at most max_grow_bytes (0:
+// unbounded). Returns occupied bytes afterward.
+uint64_t eremite_maintain_memory(uint64_t max_grow_bytes);
 
 // Process controls run on the engine thread, between completed model calls.
 // eremite_read_memory: the memory limit, the bytes counted for the models
@@ -962,11 +970,11 @@ typedef struct {
   uint64_t footprint, gpu_in_use, available;
   // Metal's working-set recommendation; INT64_MAX before GPU initialization.
   int64_t gpu_limit;
-  // The system's memory. file_kept is the file cache that the kernel keeps
-  // rather than give up for other memory: the smallest file cache read, or
-  // more when the kernel compressed other memory instead.
-  uint64_t total, free, file, file_kept, wired, compressor, compressed,
-      swap_used, swapouts;
+  // The system's memory. file_kept is the pre-existing file cache respected
+  // until drained or purged (the smallest file cache read). memory_occupied is
+  // the bytes currently held in the platform policy's releasable guard pool.
+  uint64_t total, free, file, file_kept, memory_occupied, wired, compressor,
+      compressed, swap_used, swapouts;
   // 1 normal, 2 warn, 4 critical.
   int pressure;
   // The layers, and the experts a row chooses: 0 without routed experts.

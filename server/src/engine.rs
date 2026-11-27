@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 14;
+const ABI: c_int = 15;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -29,6 +29,7 @@ struct RawProcess {
     free_pages_only_after_swapout_seconds: f64,
     expert_cache_growth_margin_gb: f64,
     gpu_memory_limit_margin_gb: f64,
+    occupy_free_memory: c_int,
     on_log: Option<extern "C" fn(*const c_char)>,
     on_die: Option<extern "C" fn()>,
     on_stop: Option<extern "C" fn()>,
@@ -466,9 +467,10 @@ pub struct Stats {
     /// File-backed memory.
     pub file: u64,
     /// The part of the file cache that the system keeps rather than give up
-    /// for other memory: the smallest file cache read, or more when the
-    /// system compressed other memory instead.
+    /// for other memory: the smallest file cache read.
     pub file_kept: u64,
+    /// Bytes currently held in the platform policy's releasable guard pool.
+    pub memory_occupied: u64,
     /// Wired memory.
     pub wired: u64,
     /// The compressor's memory.
@@ -565,6 +567,7 @@ unsafe extern "C" {
     fn eremite_set_request_running(m: *mut RawModel, active: c_int);
     fn eremite_run_idle_work(m: *mut RawModel) -> c_int;
     fn eremite_reclaim(bytes: u64) -> u64;
+    fn eremite_maintain_memory(max_grow_bytes: u64) -> u64;
     fn eremite_read_memory() -> MemoryInfo;
     fn eremite_set_memory_limit(bytes: u64);
     fn eremite_refresh_stats();
@@ -842,6 +845,7 @@ pub fn init(
         free_pages_only_after_swapout_seconds: 0.0,
         expert_cache_growth_margin_gb: 0.0,
         gpu_memory_limit_margin_gb: 0.0,
+        occupy_free_memory: 1,
         on_log,
         on_die,
         on_stop,
@@ -878,6 +882,14 @@ pub fn drain() {
 /// Reads the process's memory once, for every model's statistics.
 pub fn refresh_stats() {
     unsafe { eremite_refresh_stats() };
+}
+
+/// Maintains the platform policy's releasable guard pool: yields under
+/// pressure or below reserve, or occupies idle headroom above reserve +
+/// hysteresis within the limit, growing by at most `max_grow_bytes` (0:
+/// unbounded). Returns occupied bytes afterward.
+pub fn maintain_memory(max_grow_bytes: u64) -> u64 {
+    unsafe { eremite_maintain_memory(max_grow_bytes) }
 }
 
 /// Evicts idle memory until `bytes` are freed or none is left. Returns the
