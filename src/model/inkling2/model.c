@@ -205,11 +205,6 @@ typedef struct {
 } QkvrParam;
 
 typedef struct {
-  // Active rows, heads, relative dim and relative bias extent.
-  uint32_t rows, heads, d_rel, extent;
-} RelBiasParam;
-
-typedef struct {
   // Active rows, Q stride, row-0 pos, ring capacity, window, partitions, flag.
   uint32_t rows, q_stride, pos0, ring_rows, window, nparts, part_stride,
       batched;
@@ -299,8 +294,9 @@ typedef struct {
 
   // Attention linear projections in BF16.
   Bf16Lin wq, wk, wv, wr, gate_attn, sink_proj, wo;
-  // Relative position bias projection BF16 [16, 1024] and clip scales (FP32).
-  Buf rel_proj, q_clip_scale, rel_clip_scale;
+  // Relative position bias projection transposed to BF16 [1024, 16] and clip
+  // scales (FP32).
+  Buf rel_proj_t, q_clip_scale, rel_clip_scale;
   // Key/value short convolution weights: static [1024, 4] FP32 on sliding
   // layers, or static_w [4, 1024] FP32 + weight_proj [32, 2304] BF16 on global.
   Buf k_sconv_w, v_sconv_w;
@@ -369,10 +365,10 @@ typedef struct {
   Buf blk, msg, attn_in, q_in, k_in, v_in;
   // Loop message gate scratch buffers.
   Buf msg_cat, msg_g, msg_gated;
-  // Attention projections, short-conv outputs, relative bias and FlashDecoding
+  // Attention projections, short-conv outputs and FlashDecoding
   // partials.
   Buf q_raw, k_raw, k_conv, v_raw, v_conv, dyn_w, r_raw, r_out, gate, sink;
-  Buf q_hm, rel_bias, part, attn_out;
+  Buf q_hm, part, attn_out;
   // MoE routing, tile grouping, per-pass expert table and intermediates.
   Buf route_logits, route_ids, route_w, ptok, pw, tp, tiles, expert_table;
   Buf x_bf16, h_bf16, y_pair;
@@ -445,8 +441,8 @@ static int K_embed_norm, K_rmsnorm, K_rmsnorm_3, K_attn_res, K_attn_res_rmsnorm,
 static int K_sconv_static, K_sconv_static_batched, K_sconv_static_post,
     K_sconv_static_post_batched, K_sconv_dynamic, K_sconv_dynamic_batched,
     K_sconv_ring_save;
-static int K_qkvr_prep, K_rel_bias, K_attend_part, K_attend_combine,
-    K_attend_prefill;
+static int K_qkvr_prep, K_sconv_qkvr_m1, K_attend_part_rel, K_attend_combine,
+    K_attend_prefill_rel;
 static int K_route_topk, K_route_topk_m1, K_moe_group, K_moe_gather_bf16;
 static int K_nv_up_m1, K_nv_up_mv, K_nv_dn_mv, K_nv_dn_comb_m1, K_nv_up_mm,
     K_nv_dn_mm;
@@ -733,6 +729,24 @@ static void fill_msg_queries(Buf *buf, const void *ctx) {
   free(kv);
 }
 
+// Transposes rel_logits_proj.proj from BF16 [16, 1024] to BF16 [1024, 16] so
+// attention kernels compute dot(r, rel_proj_t[dist]) with coalesced 32-byte
+// reads without materializing a [rows, 24, 1024] bias tensor.
+static void fill_rel_proj_t(Buf *buf, const void *ctx) {
+  const Tensor *src_t = ctx;
+  size_t count = (size_t)INK2_D_REL * INK2_REL_EXTENT;
+  uint16_t *raw = xmalloc(count * sizeof(uint16_t));
+  read_tensor_exact(*src_t, raw);
+  uint16_t *dst = (uint16_t *)buf->ptr;
+  for (int j = 0; j < INK2_D_REL; j++) {
+    for (int d = 0; d < INK2_REL_EXTENT; d++) {
+      dst[(size_t)d * INK2_D_REL + (size_t)j] =
+          raw[(size_t)j * INK2_REL_EXTENT + (size_t)d];
+    }
+  }
+  free(raw);
+}
+
 // Registers one loop layer's message controller tensors in text_weights.
 static void add_controller(MsgController *c, int l, const char *name) {
   add_bf16_lin(&c->down,
@@ -858,10 +872,15 @@ static void register_text_weights(void) {
                                   "model.llm.layers.%d.attn.wo_ud.weight", l),
                  INK2_DIM, INK2_Q_DIM);
 
-    add_raw(&pl->rel_proj,
-            tensor_index_get(checkpoint,
-                             "model.llm.layers.%d.attn.rel_logits_proj.proj",
-                             l));
+    Tensor rel_t = tensor_index_get(
+        checkpoint, "model.llm.layers.%d.attn.rel_logits_proj.proj", l);
+    if (rel_t.dtype != 'b' || rel_t.ndim != 2 || rel_t.shape[0] != INK2_D_REL ||
+        rel_t.shape[1] != INK2_REL_EXTENT)
+      die("unexpected rel_logits_proj.proj shape on layer %d", l);
+    weight_group_add_generated(text_weights, &pl->rel_proj_t,
+                               (size_t)INK2_REL_EXTENT * INK2_D_REL *
+                                   sizeof(uint16_t),
+                               fill_rel_proj_t, &rel_t, sizeof rel_t);
     weight_group_add_vector(
         text_weights, &pl->q_clip_scale,
         tensor_index_get(checkpoint, "model.llm.layers.%d.attn.q_l2_clip.scale",
@@ -1036,8 +1055,6 @@ static uint64_t estimate_work_bytes(int rows) {
   bytes += gpu_round_up_to_pages((size_t)cap * INK2_HEADS * sizeof(float));
   bytes += gpu_round_up_to_pages((size_t)INK2_HEADS * q_stride * INK2_HEAD_DIM *
                                  sizeof(uint16_t));
-  bytes += gpu_round_up_to_pages((size_t)cap * INK2_HEADS * INK2_REL_EXTENT *
-                                 sizeof(float));
   bytes +=
       gpu_round_up_to_pages((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
                             DECODE_PART_FLOATS * sizeof(float));
@@ -1093,7 +1110,7 @@ static uint64_t work_resizable_bytes(void) {
                        &work.gate,
                        &work.sink,
                        &work.q_hm,
-                       &work.rel_bias,
+
                        &work.part,
                        &work.attn_out,
                        &work.route_logits,
@@ -1148,17 +1165,17 @@ static uint64_t work_resizable_bytes(void) {
 // Marks all buffers in w to be freed once prior GPU commands finish.
 static void free_work(Ink2Work *w) {
   Buf *list[] = {
-      &w->ids,          &w->cur,          &w->cur2,         &w->residual,
-      &w->pre_loop_cur, &w->prev_blk,     &w->prev_cur,     &w->blk,
-      &w->msg,          &w->attn_in,      &w->q_in,         &w->k_in,
-      &w->v_in,         &w->msg_cat,      &w->msg_g,        &w->msg_gated,
-      &w->q_raw,        &w->k_raw,        &w->k_conv,       &w->v_raw,
-      &w->v_conv,       &w->dyn_w,        &w->r_raw,        &w->r_out,
-      &w->gate,         &w->sink,         &w->q_hm,         &w->rel_bias,
-      &w->part,         &w->attn_out,     &w->route_logits, &w->route_ids,
-      &w->route_w,      &w->ptok,         &w->pw,           &w->tp,
-      &w->tiles,        &w->expert_table, &w->x_bf16,       &w->h_bf16,
-      &w->y_pair,       &w->logits,       &w->sconv_tgt,    &w->kv_tgt};
+      &w->ids,          &w->cur,          &w->cur2,      &w->residual,
+      &w->pre_loop_cur, &w->prev_blk,     &w->prev_cur,  &w->blk,
+      &w->msg,          &w->attn_in,      &w->q_in,      &w->k_in,
+      &w->v_in,         &w->msg_cat,      &w->msg_g,     &w->msg_gated,
+      &w->q_raw,        &w->k_raw,        &w->k_conv,    &w->v_raw,
+      &w->v_conv,       &w->dyn_w,        &w->r_raw,     &w->r_out,
+      &w->gate,         &w->sink,         &w->q_hm,      &w->part,
+      &w->attn_out,     &w->route_logits, &w->route_ids, &w->route_w,
+      &w->ptok,         &w->pw,           &w->tp,        &w->tiles,
+      &w->expert_table, &w->x_bf16,       &w->h_bf16,    &w->y_pair,
+      &w->logits,       &w->sconv_tgt,    &w->kv_tgt};
   for (size_t i = 0; i < sizeof list / sizeof *list; i++)
     if (list[i]->obj) gpu_mark_to_free(list[i]);
   inkling2_mtp_free_work(&w->mtp);
@@ -1219,8 +1236,6 @@ static void ensure_work(int rows, int logits_rows) {
     work.sink = work_alloc((size_t)new_cap * INK2_HEADS * sizeof(float));
     work.q_hm = work_alloc((size_t)INK2_HEADS * work.q_stride * INK2_HEAD_DIM *
                            sizeof(uint16_t));
-    work.rel_bias = work_alloc((size_t)new_cap * INK2_HEADS * INK2_REL_EXTENT *
-                               sizeof(float));
     work.part = work_alloc((size_t)part_rows * INK2_HEADS * MAX_DECODE_PARTS *
                            DECODE_PART_FLOATS * sizeof(float));
     work.attn_out = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
@@ -2531,15 +2546,20 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   }
 
   // Q, R, gate, sink, K and V projections and K/V short convolutions.
+  int fuse_kv_prep_m1 = (!pl->is_global && rows == 1 && !batched);
   run_bf16_linear3(cmd, &pl->wq, &work.q_raw, &pl->gate_attn, &work.gate,
                    &pl->wr, &work.r_raw, q_src, rows, 1, is_prefill);
   if (!pl->is_global && !use_msg) {
     run_bf16_linear3(cmd, &pl->wk, &work.k_raw, &pl->wv, &work.v_raw,
                      &pl->sink_proj, &work.sink, q_src, rows, 1, is_prefill);
-    run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
-                     CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
-    run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
-                     CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+    if (!fuse_kv_prep_m1) {
+      if (!fuse_kv_prep_m1) {
+        run_sconv_static(cmd, &work.k_raw, &pl->k_sconv_w, &work.k_conv, s, v,
+                         CONV_K_OFF, 0, rows, INK2_KV_DIM, pos0, batched);
+        run_sconv_static(cmd, &work.v_raw, &pl->v_sconv_w, &work.v_conv, s, v,
+                         CONV_V_OFF, 1, rows, INK2_KV_DIM, pos0, batched);
+      }
+    }
   } else {
     run_bf16_linear(cmd, &pl->sink_proj.w, q_src, &work.sink, rows,
                     pl->sink_proj.n, pl->sink_proj.k, pl->sink_proj.n, 1,
@@ -2566,7 +2586,9 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
     }
   }
 
-  // Q/K/V/R head prep, KV cache store, and relative position bias projection.
+  // Q/K/V/R head prep and KV cache store (fused with K/V sconv on m = 1
+  // sliding visits; relative position bias is computed on the fly in
+  // attention).
   const Buf *k_buf = pl->is_global ? &s->gk[vis->global_slot] : &s->slide_kv;
   const Buf *v_buf = pl->is_global ? &s->gv[vis->global_slot] : &s->slide_kv;
   size_t k_off = pl->is_global ? 0 : slide_ring_off(vis->slide_slot, 0);
@@ -2576,53 +2598,64 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
 
   QkvrParam qp = {(uint32_t)rows, (uint32_t)work.q_stride, (uint32_t)pos0,
                   ring_rows,      (uint32_t)pl->is_global, (uint32_t)batched};
-  gpu_select_kernel(cmd, K_qkvr_prep);
-  gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
-  gpu_bind_buffer(cmd, 1, &work.k_conv, 0);
-  gpu_bind_buffer(cmd, 2, &work.v_conv, 0);
-  gpu_bind_buffer(cmd, 3, &work.r_raw, 0);
-  gpu_bind_buffer(cmd, 4, &pl->q_clip_scale, 0);
-  gpu_bind_buffer(cmd, 5, &pl->rel_clip_scale, 0);
-  gpu_bind_buffer(cmd, 6, &work.q_hm, 0);
-  gpu_bind_buffer(cmd, 7, k_buf, k_off);
-  gpu_bind_buffer(cmd, 8, v_buf, v_off);
-  gpu_bind_buffer(cmd, 9, &work.r_out, 0);
-  gpu_bind_buffer(cmd, 10, &work.kv_tgt, kv_tgt_off);
-  gpu_copy_bytes(cmd, 11, &qp, sizeof qp);
-  gpu_run_kernel(cmd, QKVR_HEADS, (uint32_t)rows, 1, QKVR_THREADS, 1, 1);
-
-  RelBiasParam rbp = {(uint32_t)rows, (uint32_t)INK2_HEADS,
-                      (uint32_t)INK2_D_REL, (uint32_t)INK2_REL_EXTENT};
-  gpu_select_kernel(cmd, K_rel_bias);
-  gpu_bind_buffer(cmd, 0, &work.r_out, 0);
-  gpu_bind_buffer(cmd, 1, &pl->rel_proj, 0);
-  gpu_bind_buffer(cmd, 2, &work.rel_bias, 0);
-  gpu_copy_bytes(cmd, 3, &rbp, sizeof rbp);
-  gpu_run_kernel(cmd, (uint32_t)INK2_HEADS, (uint32_t)rows, 1, ROW_THREADS, 1,
-                 1);
+  if (fuse_kv_prep_m1) {
+    gpu_select_kernel(cmd, K_sconv_qkvr_m1);
+    gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
+    gpu_bind_buffer(cmd, 1, &work.k_raw, 0);
+    gpu_bind_buffer(cmd, 2, &work.v_raw, 0);
+    gpu_bind_buffer(cmd, 3, &work.r_raw, 0);
+    gpu_bind_buffer(cmd, 4, &s->conv_ring, conv_ring_off(v, CONV_K_OFF));
+    gpu_bind_buffer(cmd, 5, &pl->k_sconv_w, 0);
+    gpu_bind_buffer(cmd, 6, &s->conv_ring, conv_ring_off(v, CONV_V_OFF));
+    gpu_bind_buffer(cmd, 7, &pl->v_sconv_w, 0);
+    gpu_bind_buffer(cmd, 8, &pl->q_clip_scale, 0);
+    gpu_bind_buffer(cmd, 9, &pl->rel_clip_scale, 0);
+    gpu_bind_buffer(cmd, 10, &work.q_hm, 0);
+    gpu_bind_buffer(cmd, 11, k_buf, k_off);
+    gpu_bind_buffer(cmd, 12, v_buf, v_off);
+    gpu_bind_buffer(cmd, 13, &work.r_out, 0);
+    gpu_copy_bytes(cmd, 14, &qp, sizeof qp);
+    gpu_run_kernel(cmd, QKVR_HEADS, 1, 1, QKVR_THREADS, 1, 1);
+  } else {
+    gpu_select_kernel(cmd, K_qkvr_prep);
+    gpu_bind_buffer(cmd, 0, &work.q_raw, 0);
+    gpu_bind_buffer(cmd, 1, &work.k_conv, 0);
+    gpu_bind_buffer(cmd, 2, &work.v_conv, 0);
+    gpu_bind_buffer(cmd, 3, &work.r_raw, 0);
+    gpu_bind_buffer(cmd, 4, &pl->q_clip_scale, 0);
+    gpu_bind_buffer(cmd, 5, &pl->rel_clip_scale, 0);
+    gpu_bind_buffer(cmd, 6, &work.q_hm, 0);
+    gpu_bind_buffer(cmd, 7, k_buf, k_off);
+    gpu_bind_buffer(cmd, 8, v_buf, v_off);
+    gpu_bind_buffer(cmd, 9, &work.r_out, 0);
+    gpu_bind_buffer(cmd, 10, &work.kv_tgt, kv_tgt_off);
+    gpu_copy_bytes(cmd, 11, &qp, sizeof qp);
+    gpu_run_kernel(cmd, QKVR_HEADS, (uint32_t)rows, 1, QKVR_THREADS, 1, 1);
+  }
 
   // Attention: tiled MPP FlashAttention for prefill, FlashDecoding otherwise.
   uint32_t window = pl->is_global ? 0u : (uint32_t)INK2_WINDOW;
   if (is_prefill) {
+    uint32_t q_tiles =
+        ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
     AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
                               (uint32_t)pos0, ring_rows, window};
-    gpu_select_kernel(cmd, K_attend_prefill);
+    gpu_select_kernel(cmd, K_attend_prefill_rel);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
     gpu_bind_buffer(cmd, 1, k_buf, k_off);
     gpu_bind_buffer(cmd, 2, v_buf, v_off);
-    gpu_bind_buffer(cmd, 3, &work.rel_bias, 0);
-    gpu_bind_buffer(cmd, 4, &work.sink, 0);
-    gpu_bind_buffer(cmd, 5, &work.gate, 0);
-    gpu_bind_buffer(cmd, 6, &work.attn_out, 0);
-    gpu_copy_bytes(cmd, 7, &app, sizeof app);
-    uint32_t q_tiles =
-        ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
+    gpu_bind_buffer(cmd, 3, &work.r_out, 0);
+    gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
+    gpu_bind_buffer(cmd, 5, &work.sink, 0);
+    gpu_bind_buffer(cmd, 6, &work.gate, 0);
+    gpu_bind_buffer(cmd, 7, &work.attn_out, 0);
+    gpu_copy_bytes(cmd, 8, &app, sizeof app);
     gpu_run_kernel(cmd, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
                    1, 1);
   } else {
-    int total_k = max_pos + 1;
-    if (window && total_k > (int)window) total_k = (int)window;
-    int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
+    int max_len = pl->is_global ? max_pos + 1 : INK2_WINDOW;
+    if (max_len > max_pos + 1) max_len = max_pos + 1;
+    int nparts = (max_len + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
     if (nparts < 1) nparts = 1;
     if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
     AttendDecodeParam adp = {(uint32_t)rows,
@@ -2633,17 +2666,17 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                              (uint32_t)nparts,
                              (uint32_t)MAX_DECODE_PARTS,
                              (uint32_t)batched};
-    gpu_select_kernel(cmd, K_attend_part);
+    gpu_select_kernel(cmd, K_attend_part_rel);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
     gpu_bind_buffer(cmd, 1, k_buf, k_off);
     gpu_bind_buffer(cmd, 2, v_buf, v_off);
-    gpu_bind_buffer(cmd, 3, &work.rel_bias, 0);
-    gpu_bind_buffer(cmd, 4, &work.kv_tgt, kv_tgt_off);
-    gpu_bind_buffer(cmd, 5, &work.part, 0);
-    gpu_copy_bytes(cmd, 6, &adp, sizeof adp);
+    gpu_bind_buffer(cmd, 3, &work.r_out, 0);
+    gpu_bind_buffer(cmd, 4, &pl->rel_proj_t, 0);
+    gpu_bind_buffer(cmd, 5, &work.kv_tgt, kv_tgt_off);
+    gpu_bind_buffer(cmd, 6, &work.part, 0);
+    gpu_copy_bytes(cmd, 7, &adp, sizeof adp);
     gpu_run_kernel(cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
                    (uint32_t)rows, DECODE_THREADS, 1, 1);
-
     gpu_select_kernel(cmd, K_attend_combine);
     gpu_bind_buffer(cmd, 0, &work.part, 0);
     gpu_bind_buffer(cmd, 1, &work.sink, 0);
@@ -3102,10 +3135,10 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     K(K_sconv_dynamic_batched, "ink2_sconv_dynamic_batched");
     K(K_sconv_ring_save, "ink2_sconv_ring_save");
     K(K_qkvr_prep, "ink2_qkvr_prep");
-    K(K_rel_bias, "ink2_rel_bias");
-    K(K_attend_part, "ink2_attend_part");
+    K(K_sconv_qkvr_m1, "ink2_sconv_qkvr_prep_m1");
+    K(K_attend_part_rel, "ink2_attend_part_rel");
     K(K_attend_combine, "ink2_attend_combine");
-    K(K_attend_prefill, "ink2_attend_prefill");
+    K(K_attend_prefill_rel, "ink2_attend_prefill_rel");
     K(K_route_topk, "ink2_route_topk");
     K(K_route_topk_m1, "ink2_route_topk_m1");
     K(K_moe_group, "ink2_moe_group");

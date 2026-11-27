@@ -11,6 +11,7 @@ constant constexpr uint INK2_HEADS = 24, INK2_KV_HEADS = 8,
                         INK2_KV_DIM = INK2_KV_HEADS * INK2_HEAD_DIM,
                         INK2_D_REL = 16, INK2_REL_EXTENT = 1024,
                         INK2_WINDOW = 1024, INK2_SCONV_K = 4,
+                        INK2_SCONV_RING = 19,  // 3 history + 16 rewind margin (model.h)
                         INK2_EXPERTS = 128, INK2_TOPK = 8,
                         INK2_INTER = 1152, INK2_DIM = 2304;
 // Block sizes of quantized expert weights (hf_quant_config.json).
@@ -109,12 +110,6 @@ struct Ink2QkvrParam {
   uint is_global;
   // Nonzero to read per-row KV targets instead of single-state K/V buffers.
   uint batched;
-};
-
-// Parameters for relative position bias projection (r @ proj).
-struct Ink2RelBiasParam {
-  // Active token count, head count (24), relative dim (16), extent (1024).
-  uint rows, heads, d_rel, extent;
 };
 
 // Parameters for FlashDecoding attention over sliding or global KV.
@@ -1198,6 +1193,86 @@ kernel void ink2_sconv_static_post_batched(device const float *x [[buffer(0)]],
   }
 }
 
+// Fused m = 1 static K/V short convolution, Q/K/V/R head prep, and BF16 KV
+// cache store for sliding layers.
+// Grid: x = 64 heads, y = 1. Threadgroup: 128 threads.
+kernel void ink2_sconv_qkvr_prep_m1(device const float *q_in [[buffer(0)]],
+                                    device const float *k_raw [[buffer(1)]],
+                                    device const float *v_raw [[buffer(2)]],
+                                    device const float *r_in [[buffer(3)]],
+                                    device float *k_ring [[buffer(4)]],
+                                    device const float *k_sconv_w [[buffer(5)]],
+                                    device float *v_ring [[buffer(6)]],
+                                    device const float *v_sconv_w [[buffer(7)]],
+                                    device const float *q_scale [[buffer(8)]],
+                                    device const float *r_scale [[buffer(9)]],
+                                    device bfloat *q_out [[buffer(10)]],
+                                    device bfloat *k_cache [[buffer(11)]],
+                                    device bfloat *v_cache [[buffer(12)]],
+                                    device float *r_out [[buffer(13)]],
+                                    constant Ink2QkvrParam &p [[buffer(14)]],
+                                    uint head [[threadgroup_position_in_grid]],
+                                    uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float tmp[INK2_SIMD];
+  uint pos = p.pos0;
+  uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+
+  if (head < INK2_HEADS) {
+    uint h = head;
+    float v = q_in[h * INK2_HEAD_DIM + t] * q_scale[h * INK2_HEAD_DIM + t];
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = bf(v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f));
+    q_out[(ulong)h * p.q_stride * INK2_HEAD_DIM + t] = bfloat(clipped);
+    return;
+  }
+
+  if (head < INK2_HEADS + INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS;
+    uint c = h * INK2_HEAD_DIM + t;
+    device const float *wc = k_sconv_w + (ulong)c * INK2_SCONV_K;
+    float xt = k_raw[c];
+    float csum = wc[INK2_SCONV_K - 1u] * xt;
+#pragma unroll
+    for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+      if (pos >= lag)
+        csum += wc[INK2_SCONV_K - 1u - lag] *
+                k_ring[(ulong)((pos - lag) % INK2_SCONV_RING) * INK2_KV_DIM + c];
+    }
+    k_ring[(ulong)(pos % INK2_SCONV_RING) * INK2_KV_DIM + c] = xt;
+    float v = bf((csum + xt) * INK2_SCONV_STATIC_SCALE);
+    float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
+    float clipped = v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f);
+    k_cache[(ulong)slot * INK2_KV_DIM + c] = bfloat(bf(clipped));
+    return;
+  }
+
+  if (head < INK2_HEADS + 2u * INK2_KV_HEADS) {
+    uint h = head - INK2_HEADS - INK2_KV_HEADS;
+    uint c = h * INK2_HEAD_DIM + t;
+    device const float *wc = v_sconv_w + (ulong)c * INK2_SCONV_K;
+    float xt = v_raw[c];
+    float csum = wc[INK2_SCONV_K - 1u] * xt;
+#pragma unroll
+    for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+      if (pos >= lag)
+        csum += wc[INK2_SCONV_K - 1u - lag] *
+                v_ring[(ulong)((pos - lag) % INK2_SCONV_RING) * INK2_KV_DIM + c];
+    }
+    v_ring[(ulong)(pos % INK2_SCONV_RING) * INK2_KV_DIM + c] = xt;
+    float v = bf((csum + xt) * INK2_SCONV_STATIC_SCALE);
+    float inv = rsqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM) / float(INK2_HEAD_DIM) + INK2_RMS_EPS);
+    v_cache[(ulong)slot * INK2_KV_DIM + c] = bfloat(bf(v * inv));
+    return;
+  }
+
+  uint h = head - INK2_HEADS - 2u * INK2_KV_HEADS;
+  if (t >= INK2_D_REL) return;
+  float v = r_in[h * INK2_D_REL + t] * r_scale[h * INK2_D_REL + t];
+  float sq = v * v;
+  for (uint off = INK2_D_REL / 2u; off > 0u; off >>= 1u) sq += simd_shuffle_xor(sq, off);
+  r_out[h * INK2_D_REL + t] = bf(v * min(INK2_REL_CLIP / (sqrt(sq) + INK2_CLIP_EPS), 1.0f));
+}
+
 // Writes the last `min(rows, ring_rows)` rows of a contiguous chunk into the
 // short-convolution ring buffer after the convolution kernel completes.
 kernel void ink2_sconv_ring_save(device const float *x [[buffer(0)]],
@@ -1288,124 +1363,8 @@ kernel void ink2_qkvr_prep(device const float *q_in [[buffer(0)]],
   r_out[((ulong)row * INK2_HEADS + h) * INK2_D_REL + t] = final_v;
 }
 
-// Relative position bias projection (modeling_inkling2.py Inkling2RelativeLogits):
-// rel_bias[row, h, dist] = sum_j r[row, h, j] * proj[j, dist].
-// Grid: x = heads (24), y = rows. Threadgroup: 256 threads (4 distances each).
-kernel void ink2_rel_bias(device const float *r [[buffer(0)]],
-                          device const ushort *proj [[buffer(1)]],
-                          device float *out [[buffer(2)]],
-                          constant Ink2RelBiasParam &p [[buffer(3)]],
-                          uint2 tg [[threadgroup_position_in_grid]],
-                          uint t [[thread_index_in_threadgroup]],
-                          uint2 nt [[threads_per_threadgroup]]) {
-  uint h = tg.x, row = tg.y;
-  if (h >= p.heads || row >= p.rows) return;
-  device const float *rv = r + ((ulong)row * p.heads + h) * p.d_rel;
-  float reg[INK2_D_REL];
-  for (uint j = 0; j < p.d_rel; j++) reg[j] = rv[j];
-  device float *dst = out + ((ulong)row * p.heads + h) * p.extent;
-  for (uint d = t; d < p.extent; d += nt.x) {
-    float acc = 0.0f;
-    for (uint j = 0; j < p.d_rel; j++) acc += reg[j] * bf16f(proj[(ulong)j * p.extent + d]);
-    dst[d] = acc;
-  }
-}
-
-// Phase 1 of FlashDecoding attention: one threadgroup (4 simdgroups, 128 threads)
-// handles one (row, kv_head, partition), computing online softmax over its key
-// slice for all 3 GQA query heads simultaneously. Each lane holds 4 head dims
-// (32 * 4 = 128).
-// Output layout in `part`: [row][head][part] of (m, l, acc[128]) = 130 floats.
+// Floats per (row, head, partition) in FlashDecoding partials: m, l, acc[128].
 constant constexpr uint INK2_PART_FLOATS = INK2_HEAD_DIM + 2;
-
-kernel void ink2_attend_part(device const bfloat *q [[buffer(0)]],
-                             device const bfloat *k_cache [[buffer(1)]],
-                             device const bfloat *v_cache [[buffer(2)]],
-                             device const float *rel_bias [[buffer(3)]],
-                             device const Ink2KvTarget *targets [[buffer(4)]],
-                             device float *part [[buffer(5)]],
-                             constant Ink2AttendDecodeParam &p [[buffer(6)]],
-                             uint3 tg [[threadgroup_position_in_grid]],
-                             uint sg [[simdgroup_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float sg_m[INK2_GQA][INK2_DECODE_SGS];
-  threadgroup float sg_l[INK2_GQA][INK2_DECODE_SGS];
-  threadgroup float4 sg_o[INK2_GQA][INK2_DECODE_SGS][INK2_SIMD];
-
-  uint kv_h = tg.x, part_idx = tg.y, row = tg.z;
-  if (row >= p.rows || kv_h >= INK2_KV_HEADS || part_idx >= p.nparts) return;
-
-  uint q_pos = p.batched ? targets[row].pos : p.pos0 + row;
-  uint ring_rows = p.batched ? targets[row].ring_rows : p.ring_rows;
-  device const bfloat *k_base = p.batched ? targets[row].k : k_cache;
-  device const bfloat *v_base = p.batched ? targets[row].v : v_cache;
-
-  uint kv_lo = (p.window && q_pos + 1u > p.window) ? (q_pos + 1u - p.window) : 0u;
-  uint kv_hi = q_pos + 1u;
-  uint total_k = kv_hi - kv_lo;
-  uint per_part = (total_k + p.nparts - 1u) / p.nparts;
-  uint k_start = kv_lo + part_idx * per_part;
-  uint k_end = min(kv_hi, k_start + per_part);
-
-  float scale = rsqrt(float(INK2_HEAD_DIM));
-  float4 qv[INK2_GQA];
-  for (uint g = 0; g < INK2_GQA; g++) {
-    uint h = kv_h * INK2_GQA + g;
-    device const bfloat4 *qp =
-        (device const bfloat4 *)(q + ((ulong)h * p.q_stride + row) * INK2_HEAD_DIM);
-    qv[g] = float4(qp[lane]);
-  }
-
-  float m_run[INK2_GQA] = {-INFINITY, -INFINITY, -INFINITY};
-  float l_run[INK2_GQA] = {0.0f, 0.0f, 0.0f};
-  float4 o_run[INK2_GQA] = {float4(0.0f), float4(0.0f), float4(0.0f)};
-
-  for (uint j = k_start + sg; j < k_end; j += INK2_DECODE_SGS) {
-    uint slot = ring_rows ? (j % ring_rows) : j;
-    ulong kv_off = (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM;
-    float4 kv = float4(((device const bfloat4 *)(k_base + kv_off))[lane]);
-    float4 vv = float4(((device const bfloat4 *)(v_base + kv_off))[lane]);
-    uint dist = q_pos - j;
-    for (uint g = 0; g < INK2_GQA; g++) {
-      uint h = kv_h * INK2_GQA + g;
-      float s = simd_sum(dot(qv[g], kv)) * scale;
-      if (dist < INK2_REL_EXTENT)
-        s += rel_bias[((ulong)row * INK2_HEADS + h) * INK2_REL_EXTENT + dist];
-      float mn = max(m_run[g], s);
-      float a = m_run[g] == -INFINITY ? 0.0f : exp(m_run[g] - mn);
-      float b = exp(s - mn);
-      o_run[g] = o_run[g] * a + vv * b;
-      l_run[g] = l_run[g] * a + b;
-      m_run[g] = mn;
-    }
-  }
-
-  for (uint g = 0; g < INK2_GQA; g++) {
-    if (lane == 0) sg_m[g][sg] = m_run[g], sg_l[g][sg] = l_run[g];
-    sg_o[g][sg][lane] = o_run[g];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Merge the 4 simdgroups for each of the 3 query heads; simdgroup g writes head g.
-  if (sg < INK2_GQA) {
-    uint g = sg, h = kv_h * INK2_GQA + g;
-    float m_all = max(max(sg_m[g][0], sg_m[g][1]), max(sg_m[g][2], sg_m[g][3]));
-    float l_all = 0.0f;
-    float4 o_all = float4(0.0f);
-    if (m_all > -INFINITY) {
-      for (uint s = 0; s < INK2_DECODE_SGS; s++) {
-        if (sg_m[g][s] == -INFINITY) continue;
-        float w = exp(sg_m[g][s] - m_all);
-        l_all += sg_l[g][s] * w;
-        o_all += sg_o[g][s][lane] * w;
-      }
-    }
-    device float *dst =
-        part + (((ulong)row * INK2_HEADS + h) * p.part_stride + part_idx) * INK2_PART_FLOATS;
-    if (lane == 0) dst[0] = m_all, dst[1] = l_all;
-    ((device float4 *)(dst + 2))[lane] = o_all;
-  }
-}
 
 // Phase 2 of FlashDecoding attention: merges partitions, adds per-token sink
 // logit to the softmax denominator, multiplies by sigmoid(gate), and rounds to
@@ -1446,23 +1405,115 @@ kernel void ink2_attend_combine(device const float *part [[buffer(0)]],
   *(device float4 *)(out + off) = res;
 }
 
-// Tiled MPP FlashAttention prefill over a contiguous chunk of queries.
-// Dispatched as a 1D head-coherent grid (ceil(rows / 64) * 24) with 128
-// threads (4 simdgroups) cooperating on one 64x64 tile in exact 16 KiB
-// threadgroup memory. Reads K/V directly from strided device-memory slices of
-// the token-major KV cache without threadgroup KV staging, splitting once at
-// the wrap boundary for sliding-window ring caches.
-kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
-                                device const bfloat *k_cache [[buffer(1)]],
-                                device const bfloat *v_cache [[buffer(2)]],
-                                device const float *rel_bias [[buffer(3)]],
-                                device const float *sink [[buffer(4)]],
-                                device const float *gate [[buffer(5)]],
-                                device float *out [[buffer(6)]],
-                                constant Ink2AttendPrefillParam &p [[buffer(7)]],
-                                uint tg [[threadgroup_position_in_grid]],
-                                uint sg [[simdgroup_index_in_threadgroup]],
-                                uint lane [[thread_index_in_simdgroup]]) {
+// Phase 1 of FlashDecoding attention with on-the-fly relative position bias
+// from r_out ([rows, 24, 16] FP32) and transposed rel_proj_t ([1024, 16] BF16).
+kernel void ink2_attend_part_rel(device const bfloat *q [[buffer(0)]],
+                                 device const bfloat *k_cache [[buffer(1)]],
+                                 device const bfloat *v_cache [[buffer(2)]],
+                                 device const float *r_out [[buffer(3)]],
+                                 device const ushort *rel_proj_t [[buffer(4)]],
+                                 device const Ink2KvTarget *targets [[buffer(5)]],
+                                 device float *part [[buffer(6)]],
+                                 constant Ink2AttendDecodeParam &p [[buffer(7)]],
+                                 uint3 tg [[threadgroup_position_in_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sg_m[INK2_GQA][INK2_DECODE_SGS];
+  threadgroup float sg_l[INK2_GQA][INK2_DECODE_SGS];
+  threadgroup float4 sg_o[INK2_GQA][INK2_DECODE_SGS][INK2_SIMD];
+
+  uint kv_h = tg.x, part_idx = tg.y, row = tg.z;
+  if (row >= p.rows || kv_h >= INK2_KV_HEADS || part_idx >= p.nparts) return;
+
+  uint q_pos = p.batched ? targets[row].pos : p.pos0 + row;
+  uint ring_rows = p.batched ? targets[row].ring_rows : p.ring_rows;
+  device const bfloat *k_base = p.batched ? targets[row].k : k_cache;
+  device const bfloat *v_base = p.batched ? targets[row].v : v_cache;
+
+  uint kv_lo = (p.window && q_pos + 1u > p.window) ? (q_pos + 1u - p.window) : 0u;
+  uint kv_hi = q_pos + 1u;
+  uint total_k = kv_hi - kv_lo;
+  uint per_part = (total_k + p.nparts - 1u) / p.nparts;
+  uint k_start = kv_lo + part_idx * per_part;
+  uint k_end = min(kv_hi, k_start + per_part);
+
+  float scale = rsqrt(float(INK2_HEAD_DIM));
+  float4 qv[INK2_GQA];
+  float r_rel[INK2_GQA] = {0.0f, 0.0f, 0.0f};
+  for (uint g = 0u; g < INK2_GQA; g++) {
+    uint h = kv_h * INK2_GQA + g;
+    device const bfloat4 *qp =
+        (device const bfloat4 *)(q + ((ulong)h * p.q_stride + row) * INK2_HEAD_DIM);
+    qv[g] = float4(qp[lane]) * scale;
+    if (lane < INK2_D_REL)
+      r_rel[g] = r_out[((ulong)row * INK2_HEADS + h) * INK2_D_REL + lane];
+  }
+
+  float m_run[INK2_GQA] = {-INFINITY, -INFINITY, -INFINITY};
+  float l_run[INK2_GQA] = {0.0f, 0.0f, 0.0f};
+  float4 o_run[INK2_GQA] = {float4(0.0f), float4(0.0f), float4(0.0f)};
+
+  for (uint j = k_start + sg; j < k_end; j += INK2_DECODE_SGS) {
+    uint slot = ring_rows ? (j % ring_rows) : j;
+    ulong kv_off = (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM;
+    float4 kv = float4(((device const bfloat4 *)(k_base + kv_off))[lane]);
+    float4 vv = float4(((device const bfloat4 *)(v_base + kv_off))[lane]);
+    uint dist = q_pos - j;
+    float pw = (dist < INK2_REL_EXTENT && lane < INK2_D_REL)
+                   ? bf16f(rel_proj_t[(ulong)dist * INK2_D_REL + lane])
+                   : 0.0f;
+#pragma unroll
+    for (uint g = 0u; g < INK2_GQA; g++) {
+      float s = simd_sum(dot(qv[g], kv) + r_rel[g] * pw);
+      float mn = max(m_run[g], s);
+      float a = m_run[g] == -INFINITY ? 0.0f : exp(m_run[g] - mn);
+      float b = exp(s - mn);
+      o_run[g] = o_run[g] * a + vv * b;
+      l_run[g] = l_run[g] * a + b;
+      m_run[g] = mn;
+    }
+  }
+
+  for (uint g = 0u; g < INK2_GQA; g++) {
+    if (lane == 0u) sg_m[g][sg] = m_run[g], sg_l[g][sg] = l_run[g];
+    sg_o[g][sg][lane] = o_run[g];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg < INK2_GQA) {
+    uint g = sg, h = kv_h * INK2_GQA + g;
+    float m_all = max(max(sg_m[g][0], sg_m[g][1]), max(sg_m[g][2], sg_m[g][3]));
+    float l_all = 0.0f;
+    float4 o_all = float4(0.0f);
+    if (m_all > -INFINITY) {
+      for (uint s = 0u; s < INK2_DECODE_SGS; s++) {
+        if (sg_m[g][s] == -INFINITY) continue;
+        float w = exp(sg_m[g][s] - m_all);
+        l_all += sg_l[g][s] * w;
+        o_all += sg_o[g][s][lane] * w;
+      }
+    }
+    device float *dst =
+        part + (((ulong)row * INK2_HEADS + h) * p.part_stride + part_idx) * INK2_PART_FLOATS;
+    if (lane == 0u) dst[0] = m_all, dst[1] = l_all;
+    ((device float4 *)(dst + 2))[lane] = o_all;
+  }
+}
+
+// Tiled MPP FlashAttention prefill with on-the-fly relative position bias
+// from r_out ([rows, 24, 16] FP32) and rel_proj_t ([1024, 16] BF16).
+kernel void ink2_attend_prefill_rel(device const bfloat *q [[buffer(0)]],
+                                    device const bfloat *k_cache [[buffer(1)]],
+                                    device const bfloat *v_cache [[buffer(2)]],
+                                    device const float *r_out [[buffer(3)]],
+                                    device const ushort *rel_proj_t [[buffer(4)]],
+                                    device const float *sink [[buffer(5)]],
+                                    device const float *gate [[buffer(6)]],
+                                    device float *out [[buffer(7)]],
+                                    constant Ink2AttendPrefillParam &p [[buffer(8)]],
+                                    uint tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint BQ = FLASH_ATTN_64_TILE, BK = FLASH_ATTN_64_TILE;
   threadgroup FlashAttn64Smem<bfloat> smem;
 
@@ -1524,6 +1575,8 @@ kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
           smem.scores[at[1] * BK + at[0]] = sc[i] * scale_log2;
         }
     } else if (all_visible) {
+      uint cached_qr = 0xFFFFFFFFu;
+      float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
       for (uint16_t i = 0; i < sc.get_capacity(); i++)
         if (sc.is_valid_element(i)) {
           auto at = sc.get_multidimensional_index(i);
@@ -1531,12 +1584,26 @@ kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
           uint q_local = q0 + qr;
           uint dist = (p.pos0 + q_local) - (k0 + kr);
           float val = sc[i] * scale_log2;
-          if (dist < INK2_REL_EXTENT)
-            val += rel_bias[((ulong)q_local * INK2_HEADS + h) * INK2_REL_EXTENT + dist] *
-                   M_LOG2E_F;
+          if (dist < INK2_REL_EXTENT) {
+            if (qr != cached_qr) {
+              cached_qr = qr;
+              device const float4 *rp =
+                  (device const float4 *)(r_out + ((ulong)q_local * INK2_HEADS + h) * INK2_D_REL);
+              r0 = rp[0] * M_LOG2E_F;
+              r1 = rp[1] * M_LOG2E_F;
+              r2 = rp[2] * M_LOG2E_F;
+              r3 = rp[3] * M_LOG2E_F;
+            }
+            device const uint4 *pt = (device const uint4 *)(rel_proj_t + (ulong)dist * INK2_D_REL);
+            uint4 q0p = pt[0], q1p = pt[1];
+            val += dot(r0, bf16x4(q0p.xy)) + dot(r1, bf16x4(q0p.zw)) +
+                   dot(r2, bf16x4(q1p.xy)) + dot(r3, bf16x4(q1p.zw));
+          }
           smem.scores[qr * BK + kr] = val;
         }
     } else {
+      uint cached_qr = 0xFFFFFFFFu;
+      float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
       for (uint16_t i = 0; i < sc.get_capacity(); i++)
         if (sc.is_valid_element(i)) {
           auto at = sc.get_multidimensional_index(i);
@@ -1548,9 +1615,22 @@ kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
             if (kpos <= qpos && (!p.window || kpos + p.window > qpos)) {
               val = sc[i] * scale_log2;
               uint dist = qpos - kpos;
-              if (dist < INK2_REL_EXTENT)
-                val += rel_bias[((ulong)q_local * INK2_HEADS + h) * INK2_REL_EXTENT + dist] *
-                       M_LOG2E_F;
+              if (dist < INK2_REL_EXTENT) {
+                if (qr != cached_qr) {
+                  cached_qr = qr;
+                  device const float4 *rp =
+                      (device const float4 *)(r_out + ((ulong)q_local * INK2_HEADS + h) * INK2_D_REL);
+                  r0 = rp[0] * M_LOG2E_F;
+                  r1 = rp[1] * M_LOG2E_F;
+                  r2 = rp[2] * M_LOG2E_F;
+                  r3 = rp[3] * M_LOG2E_F;
+                }
+                device const uint4 *pt =
+                    (device const uint4 *)(rel_proj_t + (ulong)dist * INK2_D_REL);
+                uint4 q0p = pt[0], q1p = pt[1];
+                val += dot(r0, bf16x4(q0p.xy)) + dot(r1, bf16x4(q0p.zw)) +
+                       dot(r2, bf16x4(q1p.xy)) + dot(r3, bf16x4(q1p.zw));
+              }
             }
           }
           smem.scores[qr * BK + kr] = val;
@@ -1568,7 +1648,6 @@ kernel void ink2_attend_prefill(device const bfloat *q [[buffer(0)]],
     k0 += chunk;
   }
 
-  // Fold per-token sink logit (converted to base-2 log scale) into denominator.
   uint row = sg * FLASH_ATTN_64_ROWS_PER_SG + (lane >> 1u);
   if ((lane & 1u) == 0u) {
     uint q_local = q0 + row;

@@ -100,11 +100,6 @@ typedef struct {
 } QkvrParam;
 
 typedef struct {
-  // Active rows, heads, relative dim, relative extent.
-  uint32_t rows, heads, d_rel, extent;
-} RelBiasParam;
-
-typedef struct {
   // Active rows, Q stride, row-0 pos, ring capacity, window, partitions, flag.
   uint32_t rows, q_stride, pos0, ring_rows, window, nparts, part_stride,
       batched;
@@ -680,15 +675,14 @@ static void test_short_convs(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&yb);
 }
 
-// Tests ink2_qkvr_prep, ink2_rel_bias, ink2_attend_part + ink2_attend_combine,
-// and ink2_attend_prefill on both global (with log scaling tau) and sliding
+// Tests ink2_qkvr_prep, ink2_attend_part_rel + ink2_attend_combine, and
+// ink2_attend_prefill_rel on both global (with log scaling tau) and sliding
 // window (with ring wrap-around) attention.
 static void test_attention(Gpu *gpu, MemorySlot *slot) {
   int k_prep = gpu_find_kernel(gpu, "ink2_qkvr_prep");
-  int k_rel = gpu_find_kernel(gpu, "ink2_rel_bias");
-  int k_part = gpu_find_kernel(gpu, "ink2_attend_part");
+  int k_part = gpu_find_kernel(gpu, "ink2_attend_part_rel");
   int k_comb = gpu_find_kernel(gpu, "ink2_attend_combine");
-  int k_pref = gpu_find_kernel(gpu, "ink2_attend_prefill");
+  int k_pref = gpu_find_kernel(gpu, "ink2_attend_prefill_rel");
 
   uint32_t rng = 0x55aa55aau;
   uint32_t past = 70, qrows = 73, total = past + qrows;
@@ -702,16 +696,14 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
       gpu_alloc(gpu, slot, (size_t)qrows * HEADS * D_REL * sizeof(float));
   Buf q_sc = gpu_alloc(gpu, slot, (size_t)Q_DIM * sizeof(float));
   Buf r_sc = gpu_alloc(gpu, slot, (size_t)HEADS * D_REL * sizeof(float));
-  Buf rel_proj =
-      gpu_alloc(gpu, slot, (size_t)D_REL * REL_EXTENT * sizeof(uint16_t));
+  Buf rel_proj_t =
+      gpu_alloc(gpu, slot, (size_t)REL_EXTENT * D_REL * sizeof(uint16_t));
   Buf q_hm = gpu_alloc(gpu, slot,
                        (size_t)HEADS * q_stride * HEAD_DIM * sizeof(uint16_t));
   Buf k_cache = gpu_alloc(gpu, slot, (size_t)total * KV_DIM * sizeof(uint16_t));
   Buf v_cache = gpu_alloc(gpu, slot, (size_t)total * KV_DIM * sizeof(uint16_t));
   Buf r_out =
       gpu_alloc(gpu, slot, (size_t)qrows * HEADS * D_REL * sizeof(float));
-  Buf rel_bias =
-      gpu_alloc(gpu, slot, (size_t)qrows * HEADS * REL_EXTENT * sizeof(float));
   Buf sink = gpu_alloc(gpu, slot, (size_t)qrows * HEADS * sizeof(float));
   Buf gate = gpu_alloc(gpu, slot, (size_t)qrows * Q_DIM * sizeof(float));
   Buf part = gpu_alloc(
@@ -724,7 +716,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
         *vip = (float *)v_in.ptr, *rip = (float *)r_in.ptr;
   float *qsp = (float *)q_sc.ptr, *rsp = (float *)r_sc.ptr,
         *skp = (float *)sink.ptr, *gtp = (float *)gate.ptr;
-  uint16_t *rpp = (uint16_t *)rel_proj.ptr, *kcp = (uint16_t *)k_cache.ptr,
+  uint16_t *rpp = (uint16_t *)rel_proj_t.ptr, *kcp = (uint16_t *)k_cache.ptr,
            *vcp = (uint16_t *)v_cache.ptr;
 
   // Fill large values to exercise both L2 clip saturation and non-saturation.
@@ -738,8 +730,9 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   for (uint32_t i = 0; i < Q_DIM; i++) qsp[i] = 0.5f + rng_f32(&rng) * 0.5f;
   for (uint32_t i = 0; i < HEADS * D_REL; i++)
     rsp[i] = 0.5f + rng_f32(&rng) * 0.5f;
-  for (uint32_t i = 0; i < D_REL * REL_EXTENT; i++)
-    rpp[i] = f32_to_bf16(rng_f32(&rng) * 0.2f);
+  for (uint32_t k = 0; k < D_REL; k++)
+    for (uint32_t d = 0; d < REL_EXTENT; d++)
+      rpp[d * D_REL + k] = f32_to_bf16(rng_f32(&rng) * 0.2f);
   for (uint32_t i = 0; i < past * KV_DIM; i++) {
     kcp[i] = f32_to_bf16(rng_f32(&rng) * 1.2f);
     vcp[i] = f32_to_bf16(rng_f32(&rng) * 1.2f);
@@ -754,8 +747,6 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
                   .ring_rows = 0,
                   .is_global = 1,
                   .batched = 0};
-  RelBiasParam rbp = {
-      .rows = qrows, .heads = HEADS, .d_rel = D_REL, .extent = REL_EXTENT};
   AttendDecodeParam adp = {.rows = qrows,
                            .q_stride = q_stride,
                            .pos0 = past,
@@ -775,18 +766,17 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
          (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, k_cache, v_cache,
                  r_out, dummy_tgt},
          11, &qp, sizeof qp, QKVR_HEADS, qrows, 1, QKVR_THREADS, 1, 1);
-  run_op(&cmd, k_rel, (Buf[]){r_out, rel_proj, rel_bias}, 3, &rbp, sizeof rbp,
-         HEADS, qrows, 1, ROW_THREADS, 1, 1);
   run_op(&cmd, k_part,
-         (Buf[]){q_hm, k_cache, v_cache, rel_bias, dummy_tgt, part}, 6, &adp,
-         sizeof adp, KV_HEADS, nparts, qrows, DECODE_THREADS, 1, 1);
+         (Buf[]){q_hm, k_cache, v_cache, r_out, rel_proj_t, dummy_tgt, part}, 7,
+         &adp, sizeof adp, KV_HEADS, nparts, qrows, DECODE_THREADS, 1, 1);
   run_op(&cmd, k_comb, (Buf[]){part, sink, gate, out_dec}, 4, &adp, sizeof adp,
          HEADS, qrows, 1, COMBINE_THREADS, 1, 1);
-  run_op(&cmd, k_pref,
-         (Buf[]){q_hm, k_cache, v_cache, rel_bias, sink, gate, out_pref}, 7,
-         &app, sizeof app,
-         ((qrows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
-         PREFILL_THREADS, 1, 1);
+  run_op(
+      &cmd, k_pref,
+      (Buf[]){q_hm, k_cache, v_cache, r_out, rel_proj_t, sink, gate, out_pref},
+      8, &app, sizeof app,
+      ((qrows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
+      PREFILL_THREADS, 1, 1);
   gpu_commit(&cmd);
   gpu_sync(gpu);
 
@@ -848,7 +838,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
           float rb = 0.0f;
           for (uint32_t k = 0; k < D_REL; k++)
             rb += rop[(r * HEADS + h) * D_REL + k] *
-                  bf16_to_f32(rpp[k * REL_EXTENT + dist]);
+                  bf16_to_f32(rpp[dist * D_REL + k]);
           val += rb;
         }
         sc[j] = val;
@@ -903,8 +893,6 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
                      .ring_rows = ring_rows,
                      .is_global = 0,
                      .batched = 0};
-  RelBiasParam sw_rbp = {
-      .rows = sw_rows, .heads = HEADS, .d_rel = D_REL, .extent = REL_EXTENT};
   AttendDecodeParam sw_adp = {.rows = sw_rows,
                               .q_stride = sw_qstride,
                               .pos0 = sw_pos0,
@@ -924,16 +912,15 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
          (Buf[]){q_in, k_in, v_in, r_in, q_sc, r_sc, q_hm, sw_k, sw_v, r_out,
                  dummy_tgt},
          11, &sw_qp, sizeof sw_qp, QKVR_HEADS, sw_rows, 1, QKVR_THREADS, 1, 1);
-  run_op(&cmd, k_rel, (Buf[]){r_out, rel_proj, rel_bias}, 3, &sw_rbp,
-         sizeof sw_rbp, HEADS, sw_rows, 1, ROW_THREADS, 1, 1);
-  run_op(&cmd, k_part, (Buf[]){q_hm, sw_k, sw_v, rel_bias, dummy_tgt, part}, 6,
+  run_op(&cmd, k_part,
+         (Buf[]){q_hm, sw_k, sw_v, r_out, rel_proj_t, dummy_tgt, part}, 7,
          &sw_adp, sizeof sw_adp, KV_HEADS, nparts, sw_rows, DECODE_THREADS, 1,
          1);
   run_op(&cmd, k_comb, (Buf[]){part, sink, gate, out_dec}, 4, &sw_adp,
          sizeof sw_adp, HEADS, sw_rows, 1, COMBINE_THREADS, 1, 1);
   run_op(&cmd, k_pref,
-         (Buf[]){q_hm, sw_k, sw_v, rel_bias, sink, gate, out_pref}, 7, &sw_app,
-         sizeof sw_app,
+         (Buf[]){q_hm, sw_k, sw_v, r_out, rel_proj_t, sink, gate, out_pref}, 8,
+         &sw_app, sizeof sw_app,
          ((sw_rows + PREFILL_Q_GROUP - 1) / PREFILL_Q_GROUP) * HEADS, 1, 1,
          PREFILL_THREADS, 1, 1);
   gpu_commit(&cmd);
@@ -960,7 +947,7 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
     uint32_t dist = cqpos - j;
     for (uint32_t k = 0; k < D_REL; k++)
       val += rop[(cr * HEADS + ch) * D_REL + k] *
-             bf16_to_f32(rpp[k * REL_EXTENT + dist]);
+             bf16_to_f32(rpp[dist * D_REL + k]);
     sw_sc[j - klo] = val;
     sw_mx = fmaxf(sw_mx, val);
   }
@@ -1021,12 +1008,11 @@ static void test_attention(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&r_in);
   gpu_free(&q_sc);
   gpu_free(&r_sc);
-  gpu_free(&rel_proj);
+  gpu_free(&rel_proj_t);
   gpu_free(&q_hm);
   gpu_free(&k_cache);
   gpu_free(&v_cache);
   gpu_free(&r_out);
-  gpu_free(&rel_bias);
   gpu_free(&sink);
   gpu_free(&gate);
   gpu_free(&part);
