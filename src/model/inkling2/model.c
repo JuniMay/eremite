@@ -3433,6 +3433,647 @@ static int ink2_max_verify(void) { return INK2_MAX_VERIFY; }
 // Returns the active MTP draft count per pass, or 0 when MTP is disabled.
 static int ink2_drafts_per_pass(void) { return inkling2_mtp_active_drafts(); }
 
+// ---- kernel benchmark (--bench) ----
+
+// Timing rounds and batch sizes for ink2_run_bench.
+static constexpr int BENCH_ROUNDS = 4;
+static constexpr int BENCH_VERIFY_ROWS = 8;
+static constexpr int BENCH_PREFILL_ROWS = 512;
+static constexpr int BENCH_KV_POS = 1536;
+static constexpr int BENCH_EXPERT_REPS = 16;
+static constexpr int BENCH_HEAD_REPS = 4;
+static constexpr int BENCH_SMALL_REPS = 48;
+static constexpr int BENCH_NVFP4_LAYERS = 20;
+static constexpr int BENCH_MXFP8_LAYERS = 4;
+static constexpr int BENCH_MSG_VISITS = 24;
+static constexpr int BENCH_SLIDE_VISITS = 40;
+static constexpr int BENCH_GLOBAL_VISITS = 8;
+static constexpr int BENCH_VERIFY_EXPERTS = 36;
+
+// State shared by ink2_run_bench's timed callbacks.
+static struct {
+  // Byte offset of a Bf16Lin inside PhysLayer.
+  size_t lin_off;
+  // Input and output buffers for linear benchmarks.
+  const Buf *in, *out;
+  // Batch rows, prefill flag, and active physical layer range.
+  int rows, is_prefill, layer_base, layer_count;
+  // Number of grouped MoE tiles and mv/mm dispatch flags.
+  int ntiles, run_mv, run_mm;
+  // Temporary state used by attention and short-convolution benchmarks.
+  Ink2State *state;
+  // Whether the attention benchmark targets a global layer.
+  int is_global;
+} bench_ctx;
+
+// Times `reps` calls to `fn` inside one command buffer, returning the best GPU
+// seconds per call across BENCH_ROUNDS - 1 measured rounds after one warm-up.
+static double bench_timed(void (*fn)(GpuCommandBuffer *c, int r), int reps) {
+  double best = 1e9;
+  for (int round = 0; round < BENCH_ROUNDS; round++) {
+    double g0 = gpu_times(gpu).busy_seconds;
+    GpuCommandBuffer cmd = gpu_begin(gpu);
+    for (int r = 0; r < reps; r++) fn(&cmd, r);
+    model_commit(&cmd);
+    model_sync();
+    double dt = gpu_times(gpu).busy_seconds - g0;
+    if (round > 0 && dt < best) best = dt;
+  }
+  return best / reps;
+}
+
+// Dispatches one dense BF16 projection across cycling physical layers.
+static void bench_cb_lin(GpuCommandBuffer *c, int r) {
+  int l = bench_ctx.layer_base + (r % bench_ctx.layer_count);
+  const Bf16Lin *w =
+      (const Bf16Lin *)((const char *)&layers[l] + bench_ctx.lin_off);
+  run_bf16_linear(c, &w->w, bench_ctx.in, bench_ctx.out, bench_ctx.rows, w->n,
+                  w->k, w->n, 1, bench_ctx.is_prefill);
+}
+
+// Dispatches fused wq + gate_attn + wr across cycling physical layers.
+static void bench_cb_qgr3(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  run_bf16_linear3(c, &pl->wq, &work.q_raw, &pl->gate_attn, &work.gate, &pl->wr,
+                   &work.r_raw, &work.q_in, bench_ctx.rows, 1,
+                   bench_ctx.is_prefill);
+}
+
+// Dispatches fused wk + wv + sink_proj across cycling physical layers.
+static void bench_cb_kvs3(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  run_bf16_linear3(c, &pl->wk, &work.k_raw, &pl->wv, &work.v_raw,
+                   &pl->sink_proj, &work.sink, &work.q_in, bench_ctx.rows, 1,
+                   bench_ctx.is_prefill);
+}
+
+// Dispatches fused unembed_w + logit_softcap.
+static void bench_cb_unembed(GpuCommandBuffer *c, int r) {
+  (void)r;
+  run_unembed_softcap(c, &work.q_in, 0, &work.logits, bench_ctx.rows,
+                      bench_ctx.is_prefill);
+}
+
+// Dispatches logit_softcap alone.
+static void bench_cb_softcap(GpuCommandBuffer *c, int r) {
+  (void)r;
+  SoftcapParam sp = {(uint32_t)bench_ctx.rows, (uint32_t)INK2_VOCAB,
+                     (uint32_t)LOGITS_STRIDE, LOGIT_SOFTCAP};
+  gpu_select_kernel(c, K_logit_softcap);
+  gpu_bind_buffer(c, 0, &work.logits, 0);
+  gpu_copy_bytes(c, 1, &sp, sizeof sp);
+  gpu_run_kernel(c, ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
+                 (uint32_t)bench_ctx.rows, 1, ELEM_THREADS, 1, 1);
+}
+
+// Dispatches routed MoE experts across cycling layers in layer_base..count.
+static void bench_cb_moe(GpuCommandBuffer *c, int r) {
+  int l = bench_ctx.layer_base + (r % bench_ctx.layer_count);
+  if (bench_ctx.rows == 1 && !bench_ctx.run_mm) {
+    encode_moe_m1_fused(c, &layers[l], &layer_table[l], bench_ctx.state,
+                        r % INK2_TOTAL_LAYERS, BENCH_KV_POS, 0);
+    return;
+  }
+  encode_moe_experts(c, &layers[l], &layer_table[l], bench_ctx.rows,
+                     bench_ctx.ntiles, bench_ctx.run_mv, bench_ctx.run_mm);
+}
+
+// Dispatches one loop message gate across cycling core layers (6..17).
+static void bench_cb_msg_gate(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[INK2_CORE_START + (r % INK2_CORE_LAYERS)];
+  run_msg_gate(c, &work.attn_in, 0, &work.msg, 0, &pl->ctrl_q, &work.msg_gated,
+               bench_ctx.rows, bench_ctx.is_prefill);
+}
+
+// Dispatches AttnRes (1 query, 3 blocks).
+static void bench_cb_attn_res(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[1 + (r % (INK2_PHYS_LAYERS - 1))];
+  run_attn_res(c, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
+               bench_ctx.rows, work.cap_rows, 3, 1, work.cap_rows);
+}
+
+// Dispatches weighted RMSNorm.
+static void bench_cb_rmsnorm(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  run_rmsnorm(c, &work.attn_in, 0, &pl->mlp_norm, &work.q_in, bench_ctx.rows,
+              1);
+}
+
+// Dispatches static short convolution on dim = 2304.
+static void bench_cb_sconv(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  run_sconv_static(c, &work.cur2, &pl->mlp_sconv_w, &work.cur, bench_ctx.state,
+                   r % INK2_TOTAL_LAYERS, CONV_MLP_OFF, 3, bench_ctx.rows,
+                   INK2_DIM, BENCH_KV_POS, 0);
+}
+
+// Dispatches qkvr_prep (fused with K/V sconv on m = 1).
+static void bench_cb_qkvr_rel(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  const Ink2State *s = bench_ctx.state;
+  QkvrParam qp = {(uint32_t)bench_ctx.rows,
+                  (uint32_t)work.q_stride,
+                  (uint32_t)BENCH_KV_POS,
+                  (uint32_t)INK2_SLIDE_RING,
+                  0u,
+                  0u};
+  if (bench_ctx.rows == 1) {
+    gpu_select_kernel(c, opt.inkling2.fp8_kv ? K_sconv_qkvr_fp8_m1
+                                             : K_sconv_qkvr_m1);
+    gpu_bind_buffer(c, 0, &work.q_raw, 0);
+    gpu_bind_buffer(c, 1, &work.k_raw, 0);
+    gpu_bind_buffer(c, 2, &work.v_raw, 0);
+    gpu_bind_buffer(c, 3, &work.r_raw, 0);
+    gpu_bind_buffer(c, 4, &s->conv_ring, conv_ring_off(0, CONV_K_OFF));
+    gpu_bind_buffer(c, 5, &pl->k_sconv_w, 0);
+    gpu_bind_buffer(c, 6, &s->conv_ring, conv_ring_off(0, CONV_V_OFF));
+    gpu_bind_buffer(c, 7, &pl->v_sconv_w, 0);
+    gpu_bind_buffer(c, 8, &pl->q_clip_scale, 0);
+    gpu_bind_buffer(c, 9, &pl->rel_clip_scale, 0);
+    gpu_bind_buffer(c, 10, &work.q_hm, 0);
+    gpu_bind_buffer(c, 11, &s->slide_kv, 0);
+    gpu_bind_buffer(c, 12, &s->slide_kv, slide_ring_off(0, 1));
+    gpu_bind_buffer(c, 13, &work.r_out, 0);
+    gpu_copy_bytes(c, 14, &qp, sizeof qp);
+    gpu_run_kernel(c, QKVR_HEADS, 1, 1, QKVR_THREADS, 1, 1);
+    return;
+  }
+  gpu_select_kernel(c, opt.inkling2.fp8_kv ? K_qkvr_prep_fp8 : K_qkvr_prep);
+  gpu_bind_buffer(c, 0, &work.q_raw, 0);
+  gpu_bind_buffer(c, 1, &work.k_conv, 0);
+  gpu_bind_buffer(c, 2, &work.v_conv, 0);
+  gpu_bind_buffer(c, 3, &work.r_raw, 0);
+  gpu_bind_buffer(c, 4, &pl->q_clip_scale, 0);
+  gpu_bind_buffer(c, 5, &pl->rel_clip_scale, 0);
+  gpu_bind_buffer(c, 6, &work.q_hm, 0);
+  gpu_bind_buffer(c, 7, &s->slide_kv, 0);
+  gpu_bind_buffer(c, 8, &s->slide_kv, slide_ring_off(0, 1));
+  gpu_bind_buffer(c, 9, &work.r_out, 0);
+  gpu_bind_buffer(c, 10, &work.kv_tgt, 0);
+  gpu_copy_bytes(c, 11, &qp, sizeof qp);
+  gpu_run_kernel(c, QKVR_HEADS, (uint32_t)bench_ctx.rows, 1, QKVR_THREADS, 1,
+                 1);
+}
+
+// Dispatches decode or prefill attention on global (pos = BENCH_KV_POS) or
+// sliding KV with on-the-fly relative position bias.
+static void bench_cb_attend(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  const Ink2State *s = bench_ctx.state;
+  int slot =
+      bench_ctx.is_global ? (r % INK2_GLOBAL_COUNT) : (r % INK2_SLIDE_COUNT);
+  const Buf *k_buf = bench_ctx.is_global ? &s->gk[slot] : &s->slide_kv;
+  const Buf *v_buf = bench_ctx.is_global ? &s->gv[slot] : &s->slide_kv;
+  size_t k_off = bench_ctx.is_global ? 0 : slide_ring_off(slot, 0);
+  size_t v_off = bench_ctx.is_global ? 0 : slide_ring_off(slot, 1);
+  uint32_t ring_rows = bench_ctx.is_global ? 0u : (uint32_t)INK2_SLIDE_RING;
+  uint32_t window = bench_ctx.is_global ? 0u : (uint32_t)INK2_WINDOW;
+  if (bench_ctx.is_prefill) {
+    uint32_t q_tiles =
+        ((uint32_t)bench_ctx.rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
+    if (!opt.inkling2.fp8_kv) {
+      AttendPrefillParam app = {(uint32_t)bench_ctx.rows,
+                                (uint32_t)work.q_stride, (uint32_t)BENCH_KV_POS,
+                                ring_rows, window};
+      gpu_select_kernel(c, K_attend_prefill_rel);
+      gpu_bind_buffer(c, 0, &work.q_hm, 0);
+      gpu_bind_buffer(c, 1, k_buf, k_off);
+      gpu_bind_buffer(c, 2, v_buf, v_off);
+      gpu_bind_buffer(c, 3, &work.r_out, 0);
+      gpu_bind_buffer(c, 4, &pl->rel_proj_t, 0);
+      gpu_bind_buffer(c, 5, &work.sink, 0);
+      gpu_bind_buffer(c, 6, &work.gate, 0);
+      gpu_bind_buffer(c, 7, &work.attn_out, 0);
+      gpu_copy_bytes(c, 8, &app, sizeof app);
+      gpu_run_kernel(c, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                     1, 1);
+    } else if (!bench_ctx.is_global) {
+      Fp8DequantParam dp = {0u, (uint32_t)INK2_SLIDE_RING};
+      gpu_select_kernel(c, K_fp8_dequant_kv);
+      gpu_bind_buffer(c, 0, k_buf, k_off);
+      gpu_bind_buffer(c, 1, v_buf, v_off);
+      gpu_bind_buffer(c, 2, &work.deq_k, 0);
+      gpu_bind_buffer(c, 3, &work.deq_v, 0);
+      gpu_copy_bytes(c, 4, &dp, sizeof dp);
+      gpu_run_kernel(c, (uint32_t)INK2_SLIDE_RING, 1, 1, ROW_THREADS, 1, 1);
+      AttendPrefillParam app = {(uint32_t)bench_ctx.rows,
+                                (uint32_t)work.q_stride, (uint32_t)BENCH_KV_POS,
+                                ring_rows, window};
+      gpu_select_kernel(c, K_attend_prefill_rel);
+      gpu_bind_buffer(c, 0, &work.q_hm, 0);
+      gpu_bind_buffer(c, 1, &work.deq_k, 0);
+      gpu_bind_buffer(c, 2, &work.deq_v, 0);
+      gpu_bind_buffer(c, 3, &work.r_out, 0);
+      gpu_bind_buffer(c, 4, &pl->rel_proj_t, 0);
+      gpu_bind_buffer(c, 5, &work.sink, 0);
+      gpu_bind_buffer(c, 6, &work.gate, 0);
+      gpu_bind_buffer(c, 7, &work.attn_out, 0);
+      gpu_copy_bytes(c, 8, &app, sizeof app);
+      gpu_run_kernel(c, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                     1, 1);
+    } else {
+      uint32_t total_k = (uint32_t)(BENCH_KV_POS + bench_ctx.rows);
+      for (uint32_t ks = 0; ks < total_k;
+           ks += (uint32_t)FP8_PREFILL_SLAB_ROWS) {
+        uint32_t kc = total_k - ks;
+        if (kc > (uint32_t)FP8_PREFILL_SLAB_ROWS)
+          kc = (uint32_t)FP8_PREFILL_SLAB_ROWS;
+        Fp8DequantParam dp = {ks, kc};
+        gpu_select_kernel(c, K_fp8_dequant_kv);
+        gpu_bind_buffer(c, 0, k_buf, k_off);
+        gpu_bind_buffer(c, 1, v_buf, v_off);
+        gpu_bind_buffer(c, 2, &work.deq_k, 0);
+        gpu_bind_buffer(c, 3, &work.deq_v, 0);
+        gpu_copy_bytes(c, 4, &dp, sizeof dp);
+        gpu_run_kernel(c, kc, 1, 1, ROW_THREADS, 1, 1);
+        AttendSlabParam sp = {(uint32_t)bench_ctx.rows,
+                              (uint32_t)work.q_stride,
+                              (uint32_t)BENCH_KV_POS,
+                              ks,
+                              kc,
+                              ks == 0u ? 1u : 0u,
+                              ks + kc == total_k ? 1u : 0u};
+        gpu_select_kernel(c, K_attend_prefill_slab_rel);
+        gpu_bind_buffer(c, 0, &work.q_hm, 0);
+        gpu_bind_buffer(c, 1, &work.deq_k, 0);
+        gpu_bind_buffer(c, 2, &work.deq_v, 0);
+        gpu_bind_buffer(c, 3, &work.r_out, 0);
+        gpu_bind_buffer(c, 4, &pl->rel_proj_t, 0);
+        gpu_bind_buffer(c, 5, &work.sink, 0);
+        gpu_bind_buffer(c, 6, &work.gate, 0);
+        gpu_bind_buffer(c, 7, &work.attn_out, 0);
+        gpu_bind_buffer(c, 8, &work.slab_ml, 0);
+        gpu_copy_bytes(c, 9, &sp, sizeof sp);
+        gpu_run_kernel(c, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
+                       1, 1);
+      }
+    }
+    return;
+  }
+  int total_k =
+      bench_ctx.is_global ? (BENCH_KV_POS + bench_ctx.rows) : (int)INK2_WINDOW;
+  int nparts = (total_k + DECODE_PART_TARGET - 1) / DECODE_PART_TARGET;
+  if (nparts < 1) nparts = 1;
+  if (nparts > MAX_DECODE_PARTS) nparts = MAX_DECODE_PARTS;
+  AttendDecodeParam adp = {(uint32_t)bench_ctx.rows,
+                           (uint32_t)work.q_stride,
+                           (uint32_t)BENCH_KV_POS,
+                           ring_rows,
+                           window,
+                           (uint32_t)nparts,
+                           (uint32_t)MAX_DECODE_PARTS,
+                           0u};
+  gpu_select_kernel(c, opt.inkling2.fp8_kv ? K_attend_part_fp8_rel
+                                           : K_attend_part_rel);
+  gpu_bind_buffer(c, 0, &work.q_hm, 0);
+  gpu_bind_buffer(c, 1, k_buf, k_off);
+  gpu_bind_buffer(c, 2, v_buf, v_off);
+  gpu_bind_buffer(c, 3, &work.r_out, 0);
+  gpu_bind_buffer(c, 4, &pl->rel_proj_t, 0);
+  gpu_bind_buffer(c, 5, &work.kv_tgt, 0);
+  gpu_bind_buffer(c, 6, &work.part, 0);
+  gpu_copy_bytes(c, 7, &adp, sizeof adp);
+  gpu_run_kernel(c, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)bench_ctx.rows, DECODE_THREADS, 1, 1);
+  gpu_select_kernel(c, K_attend_combine);
+  gpu_bind_buffer(c, 0, &work.part, 0);
+  gpu_bind_buffer(c, 1, &work.sink, 0);
+  gpu_bind_buffer(c, 2, &work.gate, 0);
+  gpu_bind_buffer(c, 3, &work.attn_out, 0);
+  gpu_copy_bytes(c, 4, &adp, sizeof adp);
+  gpu_run_kernel(c, (uint32_t)INK2_HEADS, (uint32_t)bench_ctx.rows, 1,
+                 COMBINE_THREADS, 1, 1);
+}
+
+// Dispatches route_topk + moe_group on GPU.
+static void bench_cb_route_group(GpuCommandBuffer *c, int r) {
+  const PhysLayer *pl = &layers[r % INK2_PHYS_LAYERS];
+  RouteParam rp = {(uint32_t)bench_ctx.rows, (uint32_t)INK2_EXPERTS,
+                   (uint32_t)INK2_TOPK, ROUTE_SCALE};
+  gpu_select_kernel(c, K_route_topk);
+  gpu_bind_buffer(c, 0, &work.route_logits, 0);
+  gpu_bind_buffer(c, 1, &pl->router_bias, 0);
+  gpu_bind_buffer(c, 2, &work.route_ids, 0);
+  gpu_bind_buffer(c, 3, &work.route_w, 0);
+  gpu_copy_bytes(c, 4, &rp, sizeof rp);
+  gpu_run_kernel(c, (uint32_t)bench_ctx.rows, 1, 1, ROUTE_THREADS, 1, 1);
+  if (!bench_ctx.is_prefill) {
+    uint32_t m_topk[2] = {(uint32_t)bench_ctx.rows, (uint32_t)INK2_TOPK};
+    gpu_select_kernel(c, K_moe_group);
+    gpu_bind_buffer(c, 0, &work.route_ids, 0);
+    gpu_bind_buffer(c, 1, &work.route_w, 0);
+    gpu_bind_buffer(c, 2, &work.ptok, 0);
+    gpu_bind_buffer(c, 3, &work.pw, 0);
+    gpu_bind_buffer(c, 4, &work.tp, 0);
+    gpu_bind_buffer(c, 5, &work.tiles, 0);
+    gpu_copy_bytes(c, 6, m_topk, sizeof m_topk);
+    gpu_run_kernel(c, 1, 1, 1, ROUTE_THREADS, 1, 1);
+  }
+}
+
+// Populates work.tiles/ptok/pw/tp for synthetic MoE benchmarking across `rows`.
+static int bench_setup_moe_tiles(int rows, int unique_experts) {
+  int npairs = rows * INK2_TOPK;
+  uint32_t *rids = (uint32_t *)work.route_ids.ptr;
+  float *rw = (float *)work.route_w.ptr;
+  for (int r = 0; r < rows; r++) {
+    for (int k = 0; k < INK2_TOPK; k++) {
+      uint32_t e = (uint32_t)((r * INK2_TOPK + k) % unique_experts);
+      rids[(size_t)r * INK2_TOPK + (size_t)k] = e;
+      rw[(size_t)r * INK2_TOPK + (size_t)k] = 1.0f;
+    }
+  }
+  int ntiles = inkling2_group_expert_tiles(
+      rids, rw, rows, MOE_MM_TILE, (int *)work.ptok.ptr, (float *)work.pw.ptr,
+      (int *)work.tp.ptr, (Ink2MoeTile *)work.tiles.ptr);
+  (void)npairs;
+  return ntiles;
+}
+
+// Benchmarks Inkling-2-Mini kernels on real model weights and prints per-stage
+// timings, bandwidth, TFLOPS, and full-pass roofline comparisons.
+static void ink2_run_bench(void) {
+  ensure_work(BENCH_PREFILL_ROWS, BENCH_VERIFY_ROWS);
+  Ink2State *s = (Ink2State *)ink2_state_new();
+  state_ensure_cap(s, BENCH_KV_POS + BENCH_PREFILL_ROWS);
+  bench_ctx.state = s;
+
+  // Ensure all layer expert tables are populated and resident.
+  for (int l = 0; l < INK2_PHYS_LAYERS; l++) {
+    uint64_t gen = 0;
+    if (!expert_store_layer_is_reachable(experts_store, l, &gen))
+      die("--bench requires all Inkling-2-Mini experts to fit in memory");
+    hold_layer_if_needed(l);
+    refresh_layer_table(l, gen);
+  }
+
+  fprintf(stderr, "\n=== Inkling-2-Mini Dense BF16 Linears ===\n");
+
+  struct {
+    const char *name;
+    size_t off;
+    const Buf *in, *out;
+    int l0, lc;
+  } lins[] = {
+      {"wq         3072x2304", offsetof(PhysLayer, wq), &work.q_in, &work.q_raw,
+       0, INK2_PHYS_LAYERS},
+      {"wk         1024x2304", offsetof(PhysLayer, wk), &work.q_in, &work.k_raw,
+       0, INK2_PHYS_LAYERS},
+      {"wo         2304x3072", offsetof(PhysLayer, wo), &work.attn_out,
+       &work.cur2, 0, INK2_PHYS_LAYERS},
+      {"router      128x2304", offsetof(PhysLayer, router_w), &work.q_in,
+       &work.route_logits, 0, INK2_PHYS_LAYERS},
+      {"ctrl_q.dn    64x4608", offsetof(PhysLayer, ctrl_q.down), &work.msg_cat,
+       &work.msg_g, INK2_CORE_START, INK2_CORE_LAYERS},
+  };
+
+  for (size_t i = 0; i < sizeof lins / sizeof *lins; i++) {
+    const Bf16Lin *w =
+        (const Bf16Lin *)((const char *)&layers[lins[i].l0] + lins[i].off);
+    double bytes = (double)w->n * w->k * 2.0;
+    bench_ctx.lin_off = lins[i].off;
+    bench_ctx.in = lins[i].in;
+    bench_ctx.out = lins[i].out;
+    bench_ctx.layer_base = lins[i].l0;
+    bench_ctx.layer_count = lins[i].lc;
+
+    bench_ctx.rows = BENCH_PREFILL_ROWS;
+    bench_ctx.is_prefill = 1;
+    double t512 = bench_timed(bench_cb_lin, lins[i].lc);
+
+    bench_ctx.rows = 1;
+    bench_ctx.is_prefill = 0;
+    double t1 = bench_timed(bench_cb_lin, lins[i].lc);
+
+    bench_ctx.rows = BENCH_VERIFY_ROWS;
+    bench_ctx.is_prefill = 0;
+    double t8 = bench_timed(bench_cb_lin, lins[i].lc);
+
+    fprintf(stderr,
+            "%-20s m=1: %6.1f us (%5.1f GB/s) | m=8: %6.1f us (%.2fx) | "
+            "m=512: %6.1f us (%5.1f TFLOPS)\n",
+            lins[i].name, t1 * 1e6, bytes / t1 / 1e9, t8 * 1e6, t8 / t1,
+            t512 * 1e6, 2.0 * BENCH_PREFILL_ROWS * w->n * w->k / t512 / 1e12);
+  }
+
+  // Fused 3-way linear dispatches (m=1 and m=8).
+  double qgr_bytes =
+      (double)(INK2_Q_DIM + INK2_Q_DIM + INK2_HEADS * INK2_D_REL) * INK2_DIM *
+      2.0;
+  double kvs_bytes =
+      (double)(INK2_KV_DIM + INK2_KV_DIM + INK2_HEADS) * INK2_DIM * 2.0;
+  bench_ctx.is_prefill = 0;
+  bench_ctx.rows = 1;
+  double t_qgr1 = bench_timed(bench_cb_qgr3, INK2_PHYS_LAYERS);
+  double t_kvs1 = bench_timed(bench_cb_kvs3, INK2_PHYS_LAYERS);
+  bench_ctx.rows = BENCH_VERIFY_ROWS;
+  double t_qgr8 = bench_timed(bench_cb_qgr3, INK2_PHYS_LAYERS);
+  double t_kvs8 = bench_timed(bench_cb_kvs3, INK2_PHYS_LAYERS);
+  fprintf(stderr, "%-20s m=1: %6.1f us (%5.1f GB/s) | m=8: %6.1f us (%.2fx)\n",
+          "wq+gate+wr (3-way)", t_qgr1 * 1e6, qgr_bytes / t_qgr1 / 1e9,
+          t_qgr8 * 1e6, t_qgr8 / t_qgr1);
+  fprintf(stderr, "%-20s m=1: %6.1f us (%5.1f GB/s) | m=8: %6.1f us (%.2fx)\n",
+          "wk+wv+sink (3-way)", t_kvs1 * 1e6, kvs_bytes / t_kvs1 / 1e9,
+          t_kvs8 * 1e6, t_kvs8 / t_kvs1);
+
+  // Unembed (200058 x 2304 BF16 = 921.9 MB) + softcap.
+  double unembed_bytes = (double)INK2_VOCAB * INK2_DIM * 2.0;
+  bench_ctx.is_prefill = 0;
+  bench_ctx.rows = 1;
+  double t_un1 = bench_timed(bench_cb_unembed, BENCH_HEAD_REPS);
+  double t_sc1 = bench_timed(bench_cb_softcap, BENCH_HEAD_REPS);
+  bench_ctx.rows = BENCH_VERIFY_ROWS;
+  double t_un8 = bench_timed(bench_cb_unembed, BENCH_HEAD_REPS);
+  double t_sc8 = bench_timed(bench_cb_softcap, BENCH_HEAD_REPS);
+  fprintf(stderr, "%-20s m=1: %6.1f us (%5.1f GB/s) | m=8: %6.1f us (%.2fx)\n",
+          "unembed 200058x2304", t_un1 * 1e6, unembed_bytes / t_un1 / 1e9,
+          t_un8 * 1e6, t_un8 / t_un1);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=8: %6.1f us\n", "logit_softcap",
+          t_sc1 * 1e6, t_sc8 * 1e6);
+
+  fprintf(stderr, "\n=== Inkling-2-Mini Routed MoE ===\n");
+  double nv_exp_bytes = (double)INK2_W13_ROWS * INK2_DIM / 2.0 +
+                        (double)INK2_W13_ROWS * (INK2_DIM / INK2_NVFP4_BLOCK) +
+                        (double)INK2_DIM * INK2_INTER / 2.0 +
+                        (double)INK2_DIM * (INK2_INTER / INK2_NVFP4_BLOCK);
+  double mx_exp_bytes = (double)INK2_W13_ROWS * INK2_DIM +
+                        (double)INK2_W13_ROWS * (INK2_DIM / INK2_MXFP8_BLOCK) +
+                        (double)INK2_DIM * INK2_INTER +
+                        (double)INK2_DIM * (INK2_INTER / INK2_MXFP8_BLOCK);
+  double moe_flops_per_tok =
+      2.0 * INK2_TOPK *
+      ((double)INK2_W13_ROWS * INK2_DIM + (double)INK2_DIM * INK2_INTER);
+
+  // m=1 (8 distinct experts), m=8 (36 unique experts, 64 pairs), m=512 (128
+  // experts, 32 pairs each -> 128 tiles of 32).
+  int nt1 = bench_setup_moe_tiles(1, INK2_TOPK);
+  bench_ctx.rows = 1;
+  bench_ctx.ntiles = nt1;
+  bench_ctx.run_mv = 1;
+  bench_ctx.run_mm = 0;
+  bench_ctx.layer_base = 0;
+  bench_ctx.layer_count = BENCH_NVFP4_LAYERS;
+  double t_nv1 = bench_timed(bench_cb_moe, BENCH_NVFP4_LAYERS);
+  bench_ctx.layer_base = BENCH_NVFP4_LAYERS;
+  bench_ctx.layer_count = BENCH_MXFP8_LAYERS;
+  double t_mx1 = bench_timed(bench_cb_moe, BENCH_EXPERT_REPS);
+
+  int nt8 = bench_setup_moe_tiles(BENCH_VERIFY_ROWS, BENCH_VERIFY_EXPERTS);
+  bench_ctx.rows = BENCH_VERIFY_ROWS;
+  bench_ctx.ntiles = nt8;
+  bench_ctx.run_mv = 1;
+  bench_ctx.run_mm = 0;
+  bench_ctx.layer_base = 0;
+  bench_ctx.layer_count = BENCH_NVFP4_LAYERS;
+  double t_nv8 = bench_timed(bench_cb_moe, BENCH_NVFP4_LAYERS);
+  bench_ctx.layer_base = BENCH_NVFP4_LAYERS;
+  bench_ctx.layer_count = BENCH_MXFP8_LAYERS;
+  double t_mx8 = bench_timed(bench_cb_moe, BENCH_EXPERT_REPS);
+
+  // Also measure m=8 with full 64-tile padded grid (what K_moe_group launches).
+  Ink2MoeTile *tl = (Ink2MoeTile *)work.tiles.ptr;
+  for (int i = nt8; i < BENCH_VERIFY_ROWS * INK2_TOPK; i++)
+    tl[i] = (Ink2MoeTile){0, 0, 0, 0};
+  bench_ctx.ntiles = BENCH_VERIFY_ROWS * INK2_TOPK;
+  bench_ctx.layer_base = 0;
+  bench_ctx.layer_count = BENCH_NVFP4_LAYERS;
+  double t_nv8_pad = bench_timed(bench_cb_moe, BENCH_NVFP4_LAYERS);
+
+  int nt512 = bench_setup_moe_tiles(BENCH_PREFILL_ROWS, INK2_EXPERTS);
+  bench_ctx.rows = BENCH_PREFILL_ROWS;
+  bench_ctx.ntiles = nt512;
+  bench_ctx.run_mv = 0;
+  bench_ctx.run_mm = 1;
+  bench_ctx.layer_base = 0;
+  bench_ctx.layer_count = BENCH_NVFP4_LAYERS;
+  double t_nv512 = bench_timed(bench_cb_moe, BENCH_NVFP4_LAYERS);
+  bench_ctx.layer_base = BENCH_NVFP4_LAYERS;
+  bench_ctx.layer_count = BENCH_MXFP8_LAYERS;
+  double t_mx512 = bench_timed(bench_cb_moe, BENCH_EXPERT_REPS);
+
+  fprintf(stderr,
+          "NVFP4 MoE  m=1: %6.1f us (%5.1f GB/s) | m=8(36/64t): %6.1f / %6.1f "
+          "us | m=512: %6.1f us (%5.1f TFLOPS)\n",
+          t_nv1 * 1e6, (INK2_TOPK * nv_exp_bytes) / t_nv1 / 1e9, t_nv8 * 1e6,
+          t_nv8_pad * 1e6, t_nv512 * 1e6,
+          BENCH_PREFILL_ROWS * moe_flops_per_tok / t_nv512 / 1e12);
+  fprintf(stderr,
+          "MXFP8 MoE  m=1: %6.1f us (%5.1f GB/s) | m=8(36t):    %6.1f us | "
+          "m=512: %6.1f us (%5.1f TFLOPS)\n",
+          t_mx1 * 1e6, (INK2_TOPK * mx_exp_bytes) / t_mx1 / 1e9, t_mx8 * 1e6,
+          t_mx512 * 1e6,
+          BENCH_PREFILL_ROWS * moe_flops_per_tok / t_mx512 / 1e12);
+
+  fprintf(stderr, "\n=== Inkling-2-Mini Overhead & Attention (fp8_kv=%d) ===\n",
+          opt.inkling2.fp8_kv);
+  bench_ctx.is_prefill = 0;
+  bench_ctx.rows = 1;
+  double t_ar1 = bench_timed(bench_cb_attn_res, BENCH_SMALL_REPS);
+  double t_rn1 = bench_timed(bench_cb_rmsnorm, BENCH_SMALL_REPS);
+  double t_mg1 = bench_timed(bench_cb_msg_gate, BENCH_MSG_VISITS);
+  double t_scv1 = bench_timed(bench_cb_sconv, BENCH_SMALL_REPS);
+  double t_qr1 = bench_timed(bench_cb_qkvr_rel, BENCH_SMALL_REPS);
+  double t_rg1 = bench_timed(bench_cb_route_group, BENCH_SMALL_REPS);
+  bench_ctx.is_global = 0;
+  double t_as1 = bench_timed(bench_cb_attend, BENCH_SLIDE_VISITS);
+  bench_ctx.is_global = 1;
+  double t_ag1 = bench_timed(bench_cb_attend, BENCH_GLOBAL_VISITS);
+
+  bench_ctx.is_prefill = 1;
+  bench_ctx.rows = BENCH_PREFILL_ROWS;
+  double t_ar512 = bench_timed(bench_cb_attn_res, BENCH_SMALL_REPS);
+  double t_rn512 = bench_timed(bench_cb_rmsnorm, BENCH_SMALL_REPS);
+  double t_mg512 = bench_timed(bench_cb_msg_gate, BENCH_MSG_VISITS);
+  double t_scv512 = bench_timed(bench_cb_sconv, BENCH_SMALL_REPS);
+  double t_qr512 = bench_timed(bench_cb_qkvr_rel, BENCH_SMALL_REPS);
+  double t_rg512 = bench_timed(bench_cb_route_group, BENCH_SMALL_REPS);
+  bench_ctx.is_global = 0;
+  double t_as512 = bench_timed(bench_cb_attend, BENCH_SLIDE_VISITS);
+  bench_ctx.is_global = 1;
+  double t_ag512 = bench_timed(bench_cb_attend, BENCH_GLOBAL_VISITS);
+
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n", "attn_res(1q)",
+          t_ar1 * 1e6, t_ar512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n", "rmsnorm",
+          t_rn1 * 1e6, t_rn512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n", "msg_gate(1 ctrl)",
+          t_mg1 * 1e6, t_mg512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n",
+          "sconv_static 2304", t_scv1 * 1e6, t_scv512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n",
+          "qkvr_prep+rel_bias", t_qr1 * 1e6, t_qr512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n", "route_topk+group",
+          t_rg1 * 1e6, t_rg512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n",
+          "attend slide@1024", t_as1 * 1e6, t_as512 * 1e6);
+  fprintf(stderr, "%-20s m=1: %6.1f us | m=512: %6.1f us\n",
+          "attend global@1536", t_ag1 * 1e6, t_ag512 * 1e6);
+
+  // End-to-end forward pass measurements (m=1, m=8, m=512) at pos = 512.
+  fprintf(stderr, "\n=== Inkling-2-Mini Full Forward (pos=512) ===\n");
+  int toks[BENCH_PREFILL_ROWS];
+  for (int i = 0; i < BENCH_PREFILL_ROWS; i++) toks[i] = 100 + (i % 1000);
+  int pos0 = 0;
+  run_forward(&s, toks, &pos0, BENCH_PREFILL_ROWS, 0, 1, 1, NULL);
+
+  int pos1 = BENCH_PREFILL_ROWS;
+  double g0 = gpu_times(gpu).busy_seconds;
+  double w0 = now();
+  for (int i = 0; i < 8; i++) {
+    int p = pos1 + i;
+    run_forward(&s, toks + i, &p, 1, 0, 0, 1, NULL);
+  }
+  double w1 = (now() - w0) / 8.0;
+  double g1 = (gpu_times(gpu).busy_seconds - g0) / 8.0;
+
+  g0 = gpu_times(gpu).busy_seconds;
+  w0 = now();
+  for (int i = 0; i < 4; i++) {
+    int p = pos1;
+    run_forward(&s, toks, &p, BENCH_VERIFY_ROWS, 0, 0, 2, NULL);
+  }
+  double w8 = (now() - w0) / 4.0;
+  double g8 = (gpu_times(gpu).busy_seconds - g0) / 4.0;
+
+  g0 = gpu_times(gpu).busy_seconds;
+  w0 = now();
+  int p512 = BENCH_PREFILL_ROWS;
+  run_forward(&s, toks, &p512, BENCH_PREFILL_ROWS, 0, 1, 1, NULL);
+  double w512 = now() - w0;
+  double g512 = gpu_times(gpu).busy_seconds - g0;
+
+  fprintf(stderr, "m=1   wall %6.2f ms (gpu %6.2f ms) -> %6.1f tok/s\n",
+          w1 * 1e3, g1 * 1e3, 1.0 / w1);
+  fprintf(stderr, "m=8   wall %6.2f ms (gpu %6.2f ms) -> %.2fx m=1\n", w8 * 1e3,
+          g8 * 1e3, w8 / w1);
+  fprintf(stderr,
+          "m=512 wall %6.2f ms (gpu %6.2f ms, sync gap %5.2f ms) -> "
+          "%6.1f tok/s\n",
+          w512 * 1e3, g512 * 1e3, (w512 - g512) * 1e3,
+          BENCH_PREFILL_ROWS / w512);
+
+  if (inkling2_mtp_active_drafts() > 0) {
+    int drafts[INK2_MTP_MAX_DRAFTS];
+    int n_d = inkling2_mtp_active_drafts();
+    inkling2_mtp_propose(gpu, work_slot, &work.mtp, &s->mtp, &embed_w,
+                         &embed_norm, &unembed_w, toks[0], pos1, drafts, n_d,
+                         &last_committed, model_sync);
+    g0 = gpu_times(gpu).busy_seconds;
+    w0 = now();
+    for (int i = 0; i < 4; i++)
+      inkling2_mtp_propose(gpu, work_slot, &work.mtp, &s->mtp, &embed_w,
+                           &embed_norm, &unembed_w, toks[i], pos1, drafts, n_d,
+                           &last_committed, model_sync);
+    double wm = (now() - w0) / 4.0;
+    double gm = (gpu_times(gpu).busy_seconds - g0) / 4.0;
+    fprintf(stderr, "mtp propose(%d) wall %6.2f ms (gpu %6.2f ms)\n", n_d,
+            wm * 1e3, gm * 1e3);
+  }
+
+  held_release_all();
+  ink2_state_free((ModelState *)s);
+}
+
 // Returns how many positions a state can rewind safely without overwriting its
 // sliding KV or short-convolution rings.
 static int ink2_rewind_margin(void) { return INK2_REWIND_MARGIN; }
@@ -3721,4 +4362,5 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .pass_new = ink2_pass_new,
                                .pass_begin = ink2_pass_begin,
                                .pass_end = ink2_pass_end,
-                               .set_other_passes = ink2_set_other_passes};
+                               .set_other_passes = ink2_set_other_passes,
+                               .run_bench = ink2_run_bench};
