@@ -112,7 +112,10 @@ used idle state goes. It is saved on the SSD first when `state_disk` is on and
 it holds `state_disk_tokens` tokens of its own. Saved branches that share at
 least `state_disk_tokens` prefix tokens with an existing saved state reference
 the parent's prefix part files on disk and write only their divergent suffix,
-counting each shared part file once toward `state_disk`.
+counting each shared part file once toward `state_disk`. When loading a saved
+state back into memory while another live state of the same model holds a
+matching prefix, the server shares that prefix in RAM via copy-on-write and
+reads only the remaining suffix from the SSD.
 
 In the terminal UI, 4 Models: States deletes the chosen session's state from
 memory when `d` is pressed twice. The state is not saved on the SSD. A session

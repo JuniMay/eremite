@@ -559,10 +559,11 @@ typedef struct {
   int state_version;
   // Writes s's regions for `positions` positions, at most STATE_REGIONS_MAX:
   // the arrays that state_copy copies. Returns their count. With fill, s is
-  // first made to hold them: it holds `positions` positions and continues as
-  // after a state_copy of that many. A snapshot restored into it, or a replay,
-  // then rebuilds the rest.
-  int (*write_state_regions)(ModelState *s, int positions, int fill,
+  // first made to hold them: when keep is 0, s is sized from position 0 as a
+  // fresh writable state; when keep > 0, rows before keep (including shared
+  // copy-on-write prefix pages) stay untouched and [keep, positions) is made
+  // writable. A snapshot restored into it, or a replay, then rebuilds the rest.
+  int (*write_state_regions)(ModelState *s, int keep, int positions, int fill,
                              StateRegion *out);
   // Writes the parts of snapshot x, or for a null x, of s's rolling rows as
   // they are at pos, at most SNAPSHOT_PARTS_MAX and always in one order. A

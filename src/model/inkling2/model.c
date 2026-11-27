@@ -1661,18 +1661,32 @@ static size_t ink2_state_copy_bytes(const ModelState *src_ms, int positions,
 }
 
 // Writes the paged global KV regions of s (16 base, plus 2 for MTP when
-// active). When fill is nonzero, resets s to hold privately owned pages for
-// `positions` tokens first.
-static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
-                                    StateRegion *out) {
+// active). When fill is nonzero and keep is 0, resets s to hold privately owned
+// pages for `positions` tokens; when keep > 0, preserves prefix rows and shared
+// copy-on-write pages before `keep` and makes [keep, positions) writable.
+static int ink2_write_state_regions(ModelState *ms, int keep, int positions,
+                                    int fill, StateRegion *out) {
   Ink2State *s = (Ink2State *)ms;
   int cap_tokens = s->global_kv.npages * INK2_GLOBAL_PAGE_TOKENS;
-  if (positions < 0 || (!fill && positions > cap_tokens))
-    die("invalid Inkling-2-Mini state regions for %d positions", positions);
+  if (positions < 0 || keep < 0 || keep > positions ||
+      (!fill && positions > cap_tokens))
+    die("invalid Inkling-2-Mini state regions for %d..%d positions", keep,
+        positions);
   model_sync();
   if (fill) {
-    if (!kv_page_table_reset_writable(&s->global_kv, positions))
-      die("out of memory sizing Inkling-2-Mini state to %d tokens", positions);
+    if (keep == 0) {
+      if (!kv_page_table_reset_writable(&s->global_kv, positions))
+        die("out of memory sizing Inkling-2-Mini state to %d tokens",
+            positions);
+    } else {
+      if (keep > cap_tokens)
+        die("Inkling-2-Mini kept prefix %d exceeds state pages %d", keep,
+            cap_tokens);
+      if (positions > keep &&
+          !kv_page_table_prepare_write(&s->global_kv, keep, positions - keep))
+        die("out of memory extending Inkling-2-Mini state from %d to %d tokens",
+            keep, positions);
+    }
   }
   uint32_t row_bytes = (uint32_t)kv_row_bytes();
   size_t slice_bytes = s->global_kv.layout.slice_bytes;

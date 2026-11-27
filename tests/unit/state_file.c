@@ -1,5 +1,6 @@
 #include "check.h"
 #include "base/shutdown.h"
+#include "engine/kv_pages.h"
 #include "engine/state_file.h"
 #include <dirent.h>
 #include <fcntl.h>
@@ -91,8 +92,9 @@ static void reserve(Fake *s, int positions) {
   s->cap = positions;
 }
 
-static int fake_regions(ModelState *state, int positions, int fill,
+static int fake_regions(ModelState *state, int keep, int positions, int fill,
                         StateRegion *out) {
+  (void)keep;
   Fake *s = (Fake *)state;
   if (fill) reserve(s, positions), s->pos = positions;
   for (int i = 0; i < REGIONS; i++)
@@ -313,8 +315,9 @@ static void paged_free(PagedState *s) {
   free(s);
 }
 
-static int paged_regions(ModelState *state, int positions, int fill,
+static int paged_regions(ModelState *state, int keep, int positions, int fill,
                          StateRegion *out) {
+  (void)keep;
   PagedState *s = (PagedState *)state;
   if (fill) paged_reserve(s, positions);
   size_t slice_bytes = (size_t)PAGED_ROWS * PAGED_UNIT;
@@ -383,6 +386,171 @@ static void paged_checks(void) {
   paged_free(src);
 }
 
+// ---- copy-on-write paged load sharing ----
+
+static Buf cow_test_alloc(void *ctx, MemorySlot *slot, size_t bytes) {
+  (void)ctx;
+  (void)slot;
+  void *ptr = malloc(bytes ? bytes : 1);
+  if (!ptr) return (Buf){0};
+  memset(ptr, 0xA5, bytes);
+  return (Buf){
+      .ptr = ptr, .size = bytes, .allocated = bytes, .address = (uint64_t)ptr};
+}
+
+static void cow_test_release(void *ctx, Buf *buf) {
+  (void)ctx;
+  free(buf->ptr);
+  *buf = (Buf){0};
+}
+
+static size_t cow_test_round(size_t bytes) { return bytes; }
+
+static int cow_regions(ModelState *state, int keep, int positions, int fill,
+                       StateRegion *out) {
+  KvPageTable *t = (KvPageTable *)state;
+  if (fill) {
+    if (keep == 0) {
+      if (!kv_page_table_reset_writable(t, positions)) return 0;
+    } else if (positions > keep) {
+      if (!kv_page_table_prepare_write(t, keep, positions - keep)) return 0;
+    }
+  }
+  size_t slice_bytes = t->layout.slice_bytes;
+  for (int i = 0; i < PAGED_SLICES; i++) {
+    out[i] = (StateRegion){
+        .data = t->host_ptrs,
+        .unit = PAGED_UNIT,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = PAGED_ROWS,
+        .page_offset = (size_t)i * slice_bytes,
+    };
+  }
+  return PAGED_SLICES;
+}
+
+static const ModelOps cow_ops = {
+    .family = "cow", .state_version = 1, .write_state_regions = cow_regions};
+
+static uint8_t *cow_row(const KvPageTable *t, int slice, int pos) {
+  int p = pos / PAGED_ROWS, in_p = pos % PAGED_ROWS;
+  return (uint8_t *)t->host_ptrs[p] + (size_t)slice * t->layout.slice_bytes +
+         (size_t)in_p * PAGED_UNIT;
+}
+
+static void cow_shared_load_checks(void) {
+  KvPageBackend backend = {.alloc = cow_test_alloc,
+                           .release = cow_test_release,
+                           .round_bytes = cow_test_round};
+  StateGrowthPolicy tg = {
+      .start_cap = 8, .factor = 2, .max_step = 16, .align = 8, .max_cap = 256};
+  KvPageLayout layout = kv_page_layout_init(
+      PAGED_ROWS, (size_t)PAGED_ROWS * PAGED_UNIT, PAGED_SLICES, tg);
+
+  KvPageTable parent, branch, loaded, loaded_mid, loaded_exact;
+  kv_page_table_init(&parent, backend, &layout);
+  kv_page_table_init(&branch, backend, &layout);
+  kv_page_table_init(&loaded, backend, &layout);
+  kv_page_table_init(&loaded_mid, backend, &layout);
+  kv_page_table_init(&loaded_exact, backend, &layout);
+
+  check(kv_page_table_prepare_write(&parent, 0, 5000),
+        "CoW parent allocates 5000 rows");
+  for (int pos = 0; pos < 5000; pos++) {
+    for (int sl = 0; sl < PAGED_SLICES; sl++) {
+      uint8_t *dst = cow_row(&parent, sl, pos);
+      for (int k = 0; k < PAGED_UNIT; k++)
+        dst[k] = byte_of(sl + 20, pos, 1, (size_t)k);
+    }
+  }
+  int pfd[2] = {open_new("cow-0"), open_new("cow-1")};
+  check(state_file_write(&cow_ops, (ModelState *)&parent, 0, 5000, pfd[0]) > 0,
+        "CoW parent writes part 0..5000");
+
+  // Branch forks at 3000 (11 full pages 0..10 shared + partial page 11), then
+  // generates 3000..4600 and saves only its suffix part 3000..4600.
+  check(kv_page_table_fork(&branch, &parent, 3000),
+        "CoW branch forks parent at 3000");
+  check(kv_page_table_prepare_write(&branch, 3000, 1600),
+        "CoW branch allocates suffix 3000..4600");
+  for (int pos = 3000; pos < 4600; pos++) {
+    for (int sl = 0; sl < PAGED_SLICES; sl++) {
+      uint8_t *dst = cow_row(&branch, sl, pos);
+      for (int k = 0; k < PAGED_UNIT; k++)
+        dst[k] = byte_of(sl + 20, pos, 2, (size_t)k);
+    }
+  }
+  check(state_file_write(&cow_ops, (ModelState *)&branch, 3000, 4600, pfd[1]) >
+            0,
+        "CoW branch writes suffix part 3000..4600");
+
+  // 1) Reload branch from disk while parent is in RAM: full prefix pages 0..10
+  // stay pointer-shared with parent, page 11 stays private, rows match branch.
+  check(kv_page_table_fork(&loaded, &parent, 3000),
+        "reload forks prefix 0..3000 from live parent");
+  check(!state_file_read_from(&cow_ops, (ModelState *)&loaded, 3000, 4600, pfd,
+                              2),
+        "state_file_read_from reads suffix 3000..4600 without resetting pages");
+  int full_shared = 1;
+  for (int p = 0; p < 3000 / PAGED_ROWS; p++) {
+    if (loaded.pages[p] != parent.pages[p] || parent.pages[p]->refs != 3)
+      full_shared = 0;
+  }
+  check(full_shared, "reloaded branch shares full prefix pages 0..10 in RAM");
+  check(loaded.pages[3000 / PAGED_ROWS] != parent.pages[3000 / PAGED_ROWS] &&
+            loaded.pages[3000 / PAGED_ROWS]->refs == 1,
+        "reloaded branch keeps partial boundary page 11 private");
+  int match = 1;
+  for (int pos = 0; match && pos < 4600; pos++) {
+    for (int sl = 0; match && sl < PAGED_SLICES; sl++) {
+      if (memcmp(cow_row(&loaded, sl, pos), cow_row(&branch, sl, pos),
+                 PAGED_UNIT))
+        match = 0;
+    }
+  }
+  check(match, "reloaded branch matches original branch byte for byte");
+
+  // 2) Mid-part keep crossing a 4 MiB block boundary (4200 * 1024 B > 4 MiB).
+  check(kv_page_table_fork(&loaded_mid, &parent, 4200),
+        "mid-part reload forks prefix 0..4200 from live parent");
+  check(!state_file_read_from(&cow_ops, (ModelState *)&loaded_mid, 4200, 5000,
+                              pfd, 1),
+        "state_file_read_from reads suffix across 4 MiB block boundary");
+  int mid_shared = 1;
+  for (int p = 0; p < 4200 / PAGED_ROWS; p++) {
+    if (loaded_mid.pages[p] != parent.pages[p]) mid_shared = 0;
+  }
+  check(mid_shared, "mid-part reload shares full prefix pages 0..15 in RAM");
+  int mid_match = 1;
+  for (int pos = 0; mid_match && pos < 5000; pos++) {
+    for (int sl = 0; mid_match && sl < PAGED_SLICES; sl++) {
+      if (memcmp(cow_row(&loaded_mid, sl, pos), cow_row(&parent, sl, pos),
+                 PAGED_UNIT))
+        mid_match = 0;
+    }
+  }
+  check(mid_match, "mid-part reload matches parent byte for byte");
+
+  // 3) Exact prefix match (keep == positions): reads zero row blocks and keeps
+  // all full prefix pages shared.
+  check(kv_page_table_fork(&loaded_exact, &parent, 3000),
+        "exact-prefix reload forks 3000 positions");
+  check(!state_file_read_from(&cow_ops, (ModelState *)&loaded_exact, 3000, 3000,
+                              pfd, 2),
+        "state_file_read_from succeeds with zero data reads when keep == pos");
+  check(loaded_exact.pages[0] == parent.pages[0],
+        "exact-prefix reload preserves shared prefix pages");
+
+  close(pfd[0]), close(pfd[1]);
+  kv_page_table_free(&loaded_exact);
+  kv_page_table_free(&loaded_mid);
+  kv_page_table_free(&loaded);
+  kv_page_table_free(&branch);
+  kv_page_table_free(&parent);
+}
+
 int main(void) {
   const char *base = getenv("TMPDIR");
   if (!base || !*base) base = "/tmp";
@@ -429,6 +597,27 @@ int main(void) {
   check(all, "a part from an earlier position replaces the rows after it");
   check(!prefix_ok(fds, 3, 11004, s),
         "a prefix past the latest part is refused");
+
+  // Partial read with odd keep on ratio-2 guard-1 and lag-1 flat regions:
+  // keeps stable rows before keep and refreshes guard/lag rows from disk.
+  Fake *partial = calloc(1, sizeof *partial);
+  run(partial, 0, 8999);
+  // Corrupt rows past region_stable(8999) to prove disk overwrites guard/lag.
+  for (int i = 0; i < REGIONS; i++) {
+    StateRegion r = {partial->rows[i], unit_of[i], RATIO[i], GUARD[i],
+                     LAG[i],           0,          0};
+    int64_t stable = region_stable(&r, 8999);
+    int64_t total = region_rows(&r, 8999);
+    if (total > stable)
+      memset(partial->rows[i] + (size_t)stable * unit_of[i], 0xFF,
+             (size_t)(total - stable) * unit_of[i]);
+  }
+  check(!state_file_read_from(&fake, (ModelState *)partial, 8999, 11003, fds,
+                              3) &&
+            same_rows(partial, s, 11003),
+        "flat partial read preserves stable prefix and refreshes guard/lag "
+        "rows");
+  fake_release(partial);
   int reordered[3] = {fds[1], fds[0], fds[2]};
   check(!prefix_ok(reordered, 3, 100, s), "parts out of order are refused");
 
@@ -489,6 +678,7 @@ int main(void) {
         "CRC32C continues across pieces");
 
   paged_checks();
+  cow_shared_load_checks();
 
   // a second stop request ends a write
   shutdown_request(), shutdown_request();

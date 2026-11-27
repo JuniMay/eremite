@@ -791,6 +791,12 @@ int eremite_state_read(eremite_model *m, eremite_state *s, int positions,
   return state_file_read(m->ops, s, positions, fds, count);
 }
 
+int eremite_state_read_from(eremite_model *m, eremite_state *s, int keep,
+                            int positions, const int *fds, int count) {
+  require_states(m);
+  return state_file_read_from(m->ops, s, keep, positions, fds, count);
+}
+
 int64_t eremite_snapshot_write(eremite_model *m, const eremite_snapshot *x,
                                eremite_state *s, int pos, int fd) {
   require_states(m);

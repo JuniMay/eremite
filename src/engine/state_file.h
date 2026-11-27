@@ -21,6 +21,11 @@ int64_t state_file_write(const ModelOps *ops, ModelState *s, int from, int to,
 // another shape, or if the parts leave rows out. After -1, s is of no use.
 int state_file_read(const ModelOps *ops, ModelState *s, int positions,
                     const int *fds, int count);
+// Like state_file_read, except rows strictly before region_stable(keep) are
+// already present in s (for example via state_copy from an in-RAM prefix) and
+// are preserved untouched while only [keep, positions) is read from disk.
+int state_file_read_from(const ModelOps *ops, ModelState *s, int keep,
+                         int positions, const int *fds, int count);
 // Writes snapshot x without its logits, or for a null x, s's rolling rows as
 // they are at pos. Returns the file's bytes, or -1.
 int64_t snapshot_file_write(const ModelOps *ops, ModelSnapshot *x,

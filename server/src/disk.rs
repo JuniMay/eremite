@@ -109,10 +109,12 @@ pub trait StateIo {
     /// Reads the model's identity: what its saved states depend on.
     fn read_model_identity(&self) -> [u8; IDENTITY_BYTES];
 
-    /// Reads the rows before `positions` into the state from the part files
-    /// `fds`, in the order the parts were written. Returns false when a part is
-    /// short, damaged or of another shape.
-    fn read_rows(&self, positions: usize, fds: &[c_int]) -> bool;
+    /// Reads the rows in `keep..positions` into the state from the part files
+    /// `fds`, in the order the parts were written. Rows before `keep` are
+    /// already present in the state (for example via `state_copy` from an
+    /// in-RAM prefix) and remain untouched. Returns false when a part is short,
+    /// damaged or of another shape.
+    fn read_rows(&self, keep: usize, positions: usize, fds: &[c_int]) -> bool;
 
     /// Reads a snapshot from `fd`. Returns None when the file is short, damaged
     /// or of another shape.
@@ -147,8 +149,8 @@ impl StateIo for EngineState<'_> {
         self.model.state_identity()
     }
 
-    fn read_rows(&self, positions: usize, fds: &[c_int]) -> bool {
-        self.model.state_read(self.state, positions, fds)
+    fn read_rows(&self, keep: usize, positions: usize, fds: &[c_int]) -> bool {
+        self.model.state_read_from(self.state, keep, positions, fds)
     }
 
     fn read_snapshot(&self, fd: c_int) -> Option<engine::SnapshotHandle> {
@@ -919,16 +921,19 @@ impl Store {
         ))
     }
 
-    /// Loads saved state `id` into a new state through `io`. It reads the saved
-    /// rows before `from`. With `snapshot_pos`, it also reads the snapshot at
-    /// that position. It returns the snapshot without restoring it, or None
-    /// without one. Marks the saved state used now.
+    /// Loads saved state `id` into a state through `io`. It reads the saved
+    /// rows in `keep..from`, preserving rows before `keep` that were already
+    /// populated in RAM (for example via `state_copy`). With `snapshot_pos`, it
+    /// also reads the snapshot at that position. It returns the snapshot
+    /// without restoring it, or None without one. Marks the saved state used
+    /// now.
     pub fn load_saved_state<S: StateIo>(
         &mut self,
         cache: &mut Cache,
         io: &S,
         id: SavedStateId,
         snapshot_pos: Option<usize>,
+        keep: usize,
         from: usize,
     ) -> Result<Option<S::SnapshotHandle>, LoadError> {
         let damage = |message: String| LoadError::Damaged(message);
@@ -950,7 +955,7 @@ impl Store {
             .map(|part| open_file(format_part_file_name(part)))
             .collect::<Result<Vec<File>, LoadError>>()?;
         let fds: Vec<c_int> = files.iter().map(|file| file.as_raw_fd()).collect();
-        if !io.read_rows(from, &fds) {
+        if !io.read_rows(keep, from, &fds) {
             return Err(damage("its rows are damaged or of another shape".into()));
         }
         let mut snapshot = None;
@@ -1146,7 +1151,7 @@ mod tests {
             [3; IDENTITY_BYTES]
         }
 
-        fn read_rows(&self, _positions: usize, _fds: &[c_int]) -> bool {
+        fn read_rows(&self, _keep: usize, _positions: usize, _fds: &[c_int]) -> bool {
             true
         }
 
@@ -1296,6 +1301,8 @@ mod tests {
             bytes_per_token: u64,
             /// Bytes written per snapshot.
             snapshot_bytes: u64,
+            /// Last `(keep, positions)` passed to `read_rows`.
+            last_read: std::cell::Cell<Option<(usize, usize)>>,
         }
 
         impl StateIo for ProportionalState {
@@ -1330,8 +1337,9 @@ mod tests {
                 [5; IDENTITY_BYTES]
             }
 
-            fn read_rows(&self, _positions: usize, fds: &[c_int]) -> bool {
-                !fds.is_empty()
+            fn read_rows(&self, keep: usize, positions: usize, fds: &[c_int]) -> bool {
+                self.last_read.set(Some((keep, positions)));
+                !fds.is_empty() && keep <= positions
             }
 
             fn read_snapshot(&self, _fd: c_int) -> Option<()> {
@@ -1343,6 +1351,7 @@ mod tests {
         let io = ProportionalState {
             bytes_per_token: 4,
             snapshot_bytes: 50,
+            last_read: std::cell::Cell::new(None),
         };
         // branch A: 1000 shared prefix tokens + 200 branch-A tokens
         let mut branch_a: Vec<i32> = (0..1000).collect();
@@ -1413,9 +1422,10 @@ mod tests {
         cache2.add_saved_state(found[0].id, found[0].saved_state.clone());
         assert!(
             store
-                .load_saved_state(&mut cache2, &io, 2, Some(1300), 1300)
+                .load_saved_state(&mut cache2, &io, 2, Some(1300), 1000, 1300)
                 .is_ok()
         );
+        assert_eq!(io.last_read.get(), Some((1000, 1300)));
 
         // deleting branch B now removes both 1-0.rows and 2-0.rows
         store.delete_saved_state(&mut cache2, 2);
@@ -1561,16 +1571,16 @@ mod tests {
         };
         let part = dir.join("4-0.rows");
         fs::set_permissions(&part, fs::Permissions::from_mode(0o000)).unwrap();
-        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 1000);
+        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 0, 1000);
         fs::set_permissions(&part, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         assert!(matches!(read, Err(LoadError::Unavailable(_))), "{read:?}");
         assert!(
             store
-                .load_saved_state(&mut cache, &io, 4, Some(1000), 1000)
+                .load_saved_state(&mut cache, &io, 4, Some(1000), 0, 1000)
                 .is_ok()
         );
         fs::remove_file(&part).unwrap();
-        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 1000);
+        let read = store.load_saved_state(&mut cache, &io, 4, Some(1000), 0, 1000);
         assert!(
             matches!(read, Err(LoadError::Damaged(_))),
             "a missing part: {read:?}"

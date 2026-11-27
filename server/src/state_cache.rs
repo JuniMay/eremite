@@ -1305,6 +1305,31 @@ impl Cache {
         }
     }
 
+    /// Finds the in-memory state of `model` sharing the longest prefix with
+    /// `tokens[..limit]` (returning `(state_id, shared_tokens)` when at least
+    /// one token matches). Used by `Plan::Load` to share prefix pages in RAM
+    /// via copy-on-write and read only the remaining suffix from SSD.
+    pub fn find_prefix_source(
+        &self,
+        model: usize,
+        tokens: &[i32],
+        limit: usize,
+    ) -> Option<(StateId, usize)> {
+        let prefix = &tokens[..limit.min(tokens.len())];
+        if prefix.is_empty() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.model == model)
+            .filter_map(|(&id, entry)| {
+                let shared = count_shared_prefix(&entry.tokens, prefix);
+                (shared > 0).then_some((id, shared, entry.busy, entry.last_used))
+            })
+            .max_by_key(|&(id, shared, busy, last_used)| (shared, busy, last_used, id))
+            .map(|(id, shared, _, _)| (id, shared))
+    }
+
     /// Copies the saved link of state `source` to state `id`. State `id` copied
     /// the source's rows before `copied_positions`. The copy covers at most
     /// those positions.
@@ -3055,6 +3080,50 @@ mod tests {
         let kept = prefix_parts(&parts, 920);
         assert_eq!(kept, vec![parts[0], parts[2]]);
         assert_eq!(count_unused_prefix_positions(&kept, 920), 100 + 580);
+    }
+
+    #[test]
+    fn find_prefix_source_picks_the_longest_matching_same_model_live_state() {
+        let mut cache = Cache::new(vec![
+            ModelLimits {
+                bytes: 1 << 30,
+                states: 16,
+            },
+            ModelLimits {
+                bytes: 1 << 30,
+                states: 16,
+            },
+        ]);
+        let mut short_tokens = collect_tokens(0..500);
+        short_tokens.extend(10_000..10_100);
+        let short = add_idle_state(&mut cache, &short_tokens, &[]);
+
+        let mut long_tokens = collect_tokens(0..1200);
+        long_tokens.extend(20_000..20_200);
+        let long = add_idle_state(&mut cache, &long_tokens, &[]);
+
+        // Another model with an even longer match must be ignored.
+        let other_model = cache.add_state(1, STATE_BYTES);
+        cache.entries.get_mut(&other_model).unwrap().tokens = collect_tokens(0..2000);
+
+        let target = collect_tokens(0..1500);
+        assert_eq!(
+            cache.find_prefix_source(0, &target, 1500),
+            Some((long, 1200))
+        );
+        assert_eq!(cache.find_prefix_source(0, &target, 800), Some((long, 800)));
+        assert_eq!(cache.find_prefix_source(0, &target, 400), Some((long, 400)));
+        assert_eq!(
+            cache.find_prefix_source(0, &collect_tokens(50_000..50_500), 500),
+            None
+        );
+        assert_eq!(cache.find_prefix_source(0, &target, 0), None);
+        // Removing `long` falls back to `short`.
+        cache.remove_state(long);
+        assert_eq!(
+            cache.find_prefix_source(0, &target, 1500),
+            Some((short, 500))
+        );
     }
 
     #[test]

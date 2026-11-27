@@ -3992,13 +3992,19 @@ const float *deepseek_snapshot_logits(const Snapshot *x) { return x->logits; }
 // position before `positions` shares with a later one (a compressed pair,
 // the guard row) is computed again by the prefill that continues there. With
 // fill, s first takes that many positions (s not the state in use).
-static int state_regions(State *s, int positions, int fill, StateRegion *out) {
-  if (positions < 0 || (!fill && positions > s->cap))
-    die("invalid rows of %d positions", positions);
+static int state_regions(State *s, int keep, int positions, int fill,
+                         StateRegion *out) {
+  if (positions < 0 || keep < 0 || keep > positions ||
+      (!fill && positions > s->cap))
+    die("invalid rows of %d..%d positions", keep, positions);
   model_sync();
   if (fill) {
-    int cap = grown(start_cap(), positions);
-    if (s->cap != cap) resize(s, cap, 0);
+    if (keep == 0) {
+      int cap = grown(start_cap(), positions);
+      if (s->cap != cap) resize(s, cap, 0);
+    } else if (positions > s->cap) {
+      resize(s, grown(s->cap, positions), keep);
+    }
     memory_host_free(&state_slot, s->saved),
         s->saved = NULL;  // its rewind point belonged to its old rows
   }
@@ -4029,8 +4035,8 @@ void deepseek_state_copy(State *dst, const State *src, int positions) {
   if (positions < 0 || positions > src->cap)
     die("invalid state copy of %d positions", positions);
   StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
-  int n = state_regions(dst, positions, 1, to);
-  state_regions((State *)src, positions, 0, from);
+  int n = state_regions(dst, 0, positions, 1, to);
+  state_regions((State *)src, 0, positions, 0, from);
   regions_copy(to, from, n, positions);
 }
 
@@ -4161,10 +4167,10 @@ static const float *ds_snapshot_logits(const ModelSnapshot *x) {
   return deepseek_snapshot_logits((const Snapshot *)x);
 }
 
-static int ds_state_regions(ModelState *s, int positions, int fill,
+static int ds_state_regions(ModelState *s, int keep, int positions, int fill,
                             StateRegion *out) {
   if (fill) park(s);
-  return state_regions((State *)s, positions, fill, out);
+  return state_regions((State *)s, keep, positions, fill, out);
 }
 
 static int ds_snapshot_parts(ModelSnapshot *x, ModelState *s, int pos,

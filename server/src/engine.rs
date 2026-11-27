@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 15;
+const ABI: c_int = 16;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -647,6 +647,14 @@ unsafe extern "C" {
     fn eremite_state_read(
         m: *mut RawModel,
         s: *mut RawState,
+        positions: c_int,
+        fds: *const c_int,
+        count: c_int,
+    ) -> c_int;
+    fn eremite_state_read_from(
+        m: *mut RawModel,
+        s: *mut RawState,
+        keep: c_int,
         positions: c_int,
         fds: *const c_int,
         count: c_int,
@@ -1929,6 +1937,28 @@ impl Model {
             eremite_state_read(
                 self.raw,
                 s.0.as_ptr(),
+                positions as c_int,
+                fds.as_ptr(),
+                fds.len() as c_int,
+            ) == 0
+        }
+    }
+
+    /// Like `state_read`, except rows before `keep` are already populated in `s`
+    /// (for example via `state_copy` from an in-RAM prefix) and remain untouched
+    /// while only `keep..positions` is read from `fds`.
+    pub fn state_read_from(
+        &self,
+        s: StateHandle,
+        keep: usize,
+        positions: usize,
+        fds: &[c_int],
+    ) -> bool {
+        unsafe {
+            eremite_state_read_from(
+                self.raw,
+                s.0.as_ptr(),
+                keep as c_int,
                 positions as c_int,
                 fds.as_ptr(),
                 fds.len() as c_int,

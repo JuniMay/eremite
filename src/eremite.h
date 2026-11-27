@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 15
+#define EREMITE_ABI 16
 
 // ---- the process ----
 
@@ -678,6 +678,12 @@ int64_t eremite_state_write(eremite_model *m, eremite_state *s, int from,
 // another shape, or if the parts leave rows out. After -1, s is of no use.
 int eremite_state_read(eremite_model *m, eremite_state *s, int positions,
                        const int *fds, int count);
+// Like eremite_state_read, except rows before `keep` were already populated in
+// s (for example via eremite_state_copy from a live in-RAM prefix) and remain
+// untouched (preserving shared copy-on-write pages) while only [keep,
+// positions) is read from the part files.
+int eremite_state_read_from(eremite_model *m, eremite_state *s, int keep,
+                            int positions, const int *fds, int count);
 // Writes snapshot x without its logits, or for a null x, s's rolling rows as
 // they are at pos, its end. Returns the bytes written, or -1.
 int64_t eremite_snapshot_write(eremite_model *m, const eremite_snapshot *x,

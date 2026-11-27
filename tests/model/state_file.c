@@ -24,7 +24,7 @@
 // of the logits it compares.
 //
 // usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] [--lookup N]
-//        [--experts GGUF] [--image] [--unload] [--packed-state-rows]
+//        [--experts GGUF] [--image] [--long] [--unload] [--packed-state-rows]
 //        [--fp8-kv]
 
 #define CHECK(x)                                                               \
@@ -79,7 +79,7 @@ static int argmax(const float *logits) {
 // capacity.
 static uint8_t *rows_of(ModelState *s, int positions, size_t *bytes) {
   StateRegion r[STATE_REGIONS_MAX];
-  int n = ops->write_state_regions(s, positions, 0, r);
+  int n = ops->write_state_regions(s, 0, positions, 0, r);
   *bytes = 0;
   for (int i = 0; i < n; i++)
     *bytes += (size_t)region_rows(&r[i], positions) * r[i].unit;
@@ -113,7 +113,7 @@ static int same_rows(ModelState *a, ModelState *b, int positions) {
 static ModelState *read_rows(const int *fds, int count, int positions) {
   ModelState *s = ops->state_new();
   StateRegion r[STATE_REGIONS_MAX];
-  ops->write_state_regions(s, 3 * MAX_PROMPT / 2, 1,
+  ops->write_state_regions(s, 0, 3 * MAX_PROMPT / 2, 1,
                            r);  // a larger capacity first
   if (state_file_read(ops, s, positions, fds, count)) {
     ops->state_free(s);
@@ -179,7 +179,8 @@ static void flip(int fd, off_t at) {
 
 int main(int argc, char **argv) {
   double memory = 32;
-  int draft = 0, lookup = 0, unload = 0, image = 0, packed = 0, fp8_kv = 0;
+  int draft = 0, lookup = 0, unload = 0, image = 0, long_prompt = 0, packed = 0,
+      fp8_kv = 0;
   const char *experts = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--memory") && i + 1 < argc)
@@ -192,6 +193,8 @@ int main(int argc, char **argv) {
       experts = argv[++i];
     else if (!strcmp(argv[i], "--image"))
       image = 1;
+    else if (!strcmp(argv[i], "--long"))
+      long_prompt = 1;
     else if (!strcmp(argv[i], "--unload"))
       unload = 1;
     else if (!strcmp(argv[i], "--packed-state-rows"))
@@ -203,7 +206,7 @@ int main(int argc, char **argv) {
   }
   if (argc < 2 || (fp8_kv && (packed || experts)))
     die("usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] "
-        "[--lookup N] [--experts GGUF] [--image] [--unload] "
+        "[--lookup N] [--experts GGUF] [--image] [--long] [--unload] "
         "[--packed-state-rows] [--fp8-kv]  (--image: a test image in the "
         "prompt)");
   const char *base = getenv("TMPDIR");
@@ -236,14 +239,23 @@ int main(int argc, char **argv) {
   CHECK(ops->write_state_regions && ops->write_snapshot_parts &&
         ops->snapshot_new_empty);
 
-  // the prompt, with an image when one is given
+  // the prompt, with an image or multi-page repetition when requested
   Tokenizer *tk = tokenizer_open(argv[1], ops->media_token);
-  char text[4096];
-  ops->render_chat_turn(
-      text, sizeof text,
-      "Tell a short story about a lighthouse keeper who finds a letter "
-      "in a bottle.",
-      image ? 1 : 0, 0);
+  char prompt_body[4096], text[8192];
+  const char *base_sentence =
+      "Tell a short story about a lighthouse keeper who finds a letter in a "
+      "bottle. ";
+  if (long_prompt) {
+    size_t pos = 0, step = strlen(base_sentence);
+    for (int k = 0; k < 48 && pos + step < sizeof prompt_body; k++) {
+      memcpy(prompt_body + pos, base_sentence, step);
+      pos += step;
+    }
+    prompt_body[pos] = '\0';
+  } else {
+    snprintf(prompt_body, sizeof prompt_body, "%s", base_sentence);
+  }
+  ops->render_chat_turn(text, sizeof text, prompt_body, image ? 1 : 0, 0);
   int *tokens = xmalloc((MAX_PROMPT + ROWS + 1) * sizeof *tokens),
       n = tokenizer_encode_prompt(tk, text, tokens, MAX_PROMPT);
   Media im = {0};
@@ -403,6 +415,32 @@ int main(int argc, char **argv) {
          "%d of 4 rows identical\n",
          n + 12, n + 9, same);
   CHECK(same == 4);
+  // Loading a saved branch while a live state in RAM holds the shared prefix
+  // keeps shared prefix pages in RAM and reads only the remaining suffix.
+  ModelState *shared_load = ops->state_new();
+  CHECK(shared_load);
+  ops->state_copy(shared_load, live, n);
+  CHECK(!state_file_read_from(ops, shared_load, n, n + 12, chain, 3));
+  CHECK(same_rows(shared_load, other_copy, n + 12));
+  if (ops->state_copy_bytes &&
+      ops->state_copy_bytes(live, n, n + 12) < ops->state_bytes(NULL, n + 12)) {
+    size_t full_bytes = ops->state_bytes(NULL, n + 12);
+    size_t shared_bytes = ops->state_bytes(shared_load, n + 12);
+    CHECK(shared_bytes < full_bytes);
+    printf("shared-prefix load RAM: %.2f MiB vs %.2f MiB unshared\n",
+           shared_bytes / 1048576.0, full_bytes / 1048576.0);
+  }
+  int *rewound_shared =
+      xmalloc((size_t)(n + ROWS + 1) * sizeof *rewound_shared);
+  memcpy(rewound_shared, tokens, (size_t)n * sizeof *rewound_shared);
+  memcpy(rewound_shared + n, u, sizeof u);
+  restore(shared_load, end2, rewound_shared, n + 12, NULL);
+  free(rewound_shared);
+  int same_shared = decodes_as(shared_load, u, n, 12, 16, other_expected);
+  printf("shared-prefix load from %d to %d: %d of 4 rows identical\n", n,
+         n + 12, same_shared);
+  CHECK(same_shared == 4);
+  ops->state_free(shared_load);
   ops->state_free(s), ops->state_free(early), ops->state_free(other_copy),
       ops->state_free(other_early);
 

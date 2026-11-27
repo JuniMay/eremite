@@ -1759,17 +1759,26 @@ static size_t nemo_state_bytes(const ModelState *ms, int positions) {
 }
 
 // Writes the growing KV regions of s (24 backbone + 4 lag-1 MTP when drafting).
-// When fill is nonzero, resizes s to hold `positions` tokens first.
-static int nemo_write_state_regions(ModelState *ms, int positions, int fill,
-                                    StateRegion *out) {
+// When fill is nonzero and keep is 0, sizes s from 0; when keep > 0, preserves
+// rows before keep while growing to `positions` if needed.
+static int nemo_write_state_regions(ModelState *ms, int keep, int positions,
+                                    int fill, StateRegion *out) {
   NemoState *s = (NemoState *)ms;
-  if (positions < 0 || (!fill && positions > s->cap))
-    die("nemotron: invalid state regions for %d positions", positions);
+  if (positions < 0 || keep < 0 || keep > positions ||
+      (!fill && positions > s->cap))
+    die("nemotron: invalid state regions for %d..%d positions", keep,
+        positions);
   model_sync();
   if (fill) {
-    int cap = grown_cap(positions > 0 ? positions : 1);
-    if (s->cap != cap && !state_resize_kv(s, cap, 0))
-      die("nemotron: out of memory sizing state to %d tokens", cap);
+    if (keep == 0) {
+      int cap = grown_cap(positions > 0 ? positions : 1);
+      if (s->cap != cap && !state_resize_kv(s, cap, 0))
+        die("nemotron: out of memory sizing state to %d tokens", cap);
+    } else if (positions > s->cap) {
+      int cap = grown_cap_from(s->cap, positions);
+      if (!state_resize_kv(s, cap, keep))
+        die("nemotron: out of memory sizing state to %d tokens", cap);
+    }
   }
   int n = 0;
   for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
@@ -1796,8 +1805,8 @@ static void nemo_state_copy(ModelState *dst_ms, const ModelState *src_ms,
                             int positions) {
   if (dst_ms == src_ms) die("nemotron: cannot copy a state onto itself");
   StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
-  int n = nemo_write_state_regions(dst_ms, positions, 1, to);
-  nemo_write_state_regions((ModelState *)src_ms, positions, 0, from);
+  int n = nemo_write_state_regions(dst_ms, 0, positions, 1, to);
+  nemo_write_state_regions((ModelState *)src_ms, 0, positions, 0, from);
   regions_copy(to, from, n, positions);
 }
 

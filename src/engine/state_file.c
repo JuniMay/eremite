@@ -261,7 +261,7 @@ int64_t state_file_write(const ModelOps *ops, ModelState *s, int from, int to,
                          int fd) {
   if (!ops->write_state_regions || from < 0 || to < from) return -1;
   StateRegion r[STATE_REGIONS_MAX];
-  int n = ops->write_state_regions(s, to, 0, r);
+  int n = ops->write_state_regions(s, 0, to, 0, r);
   int64_t first[STATE_REGIONS_MAX], rows[STATE_REGIONS_MAX];
   uint32_t first_block[STATE_REGIONS_MAX];
   uint64_t blocks = 0;
@@ -332,10 +332,10 @@ static const uint8_t *part_region(const Part *p, int i) {
   return p->h + ROWS_FIXED + (size_t)ROWS_REGION * i;
 }
 
-int state_file_read(const ModelOps *ops, ModelState *s, int positions,
-                    const int *fds, int count) {
+int state_file_read_from(const ModelOps *ops, ModelState *s, int keep,
+                         int positions, const int *fds, int count) {
   if (!ops->write_state_regions || count < 1 || count > PARTS_MAX ||
-      positions < 0)
+      positions < 0 || keep < 0 || keep > positions)
     return -1;
   Part *p = xmalloc((size_t)count * sizeof *p);
   Block *b = NULL;
@@ -358,9 +358,12 @@ int state_file_read(const ModelOps *ops, ModelState *s, int positions,
   }
   if (positions > p[count - 1].to) goto done;
   StateRegion r[STATE_REGIONS_MAX];
-  int n = ops->write_state_regions(s, positions, 1, r);
-  int64_t covered[STATE_REGIONS_MAX];
-  for (int i = 0; i < n; i++) covered[i] = region_rows(&r[i], positions);
+  int n = ops->write_state_regions(s, keep, positions, 1, r);
+  int64_t covered[STATE_REGIONS_MAX], need_from[STATE_REGIONS_MAX];
+  for (int i = 0; i < n; i++) {
+    need_from[i] = keep > 0 ? region_stable(&r[i], keep) : 0;
+    covered[i] = region_rows(&r[i], positions);
+  }
   // the parts' shapes and their rows' places
   for (int j = 0; j < count; j++) {
     if (p[j].regions != n) goto done;
@@ -375,40 +378,45 @@ int state_file_read(const ModelOps *ops, ModelState *s, int positions,
     }
   }
   // the latest part holding a row gives it: from the last part back, each
-  // gives the rows from its first up to those later parts gave
+  // gives the rows from its first (or need_from[i], whichever is later) up to
+  // those later parts gave, skipping blocks strictly before need_from[i]
   for (int j = count - 1; j >= 0; j--)
     for (int i = 0; i < n; i++) {
       const uint8_t *e = part_region(&p[j], i);
       int64_t first = (int64_t)get64(e + 24), rows = (int64_t)get64(e + 32);
-      if (covered[i] <= first)
-        continue;  // later parts gave every row from here
+      if (covered[i] <= need_from[i] || covered[i] <= first) continue;
       if (first + rows < covered[i])
         goto done;  // rows between this part's and the later ones'
-      uint64_t hi_byte = (uint64_t)(covered[i] - first) * r[i].unit,
-               bytes = (uint64_t)rows * r[i].unit;
+      int64_t row_lo = first > need_from[i] ? first : need_from[i];
+      uint64_t lo_byte = (uint64_t)(row_lo - first) * r[i].unit;
+      uint64_t hi_byte = (uint64_t)(covered[i] - first) * r[i].unit;
+      uint64_t bytes = (uint64_t)rows * r[i].unit;
       uint64_t at = get64(e + 40);
       uint32_t block = get32(e + 16);
       if (block + (bytes + BLOCK - 1) / BLOCK > p[j].blocks) goto done;
-      for (uint64_t o = 0; o < hi_byte; o += BLOCK) {
+      uint64_t first_off = (lo_byte / BLOCK) * BLOCK;
+      for (uint64_t o = first_off; o < hi_byte; o += BLOCK) {
         if (nb == cap)
           b = realloc(b, (size_t)(cap = cap ? 2 * cap : 256) * sizeof *b);
         if (!b) die("out of memory for a saved state's blocks");
         uint32_t len = (uint32_t)(bytes - o < BLOCK ? bytes - o : BLOCK);
+        uint32_t lo = (uint32_t)(o < lo_byte ? lo_byte - o : 0);
+        uint32_t hi = (uint32_t)(hi_byte - o < len ? hi_byte - o : len);
         b[nb++] =
             (Block){.fd = p[j].fd,
                     .at = (off_t)(at + o),
                     .len = len,
                     .crc = get32(p[j].h + ROWS_FIXED + (size_t)ROWS_REGION * n +
                                  4 * (size_t)(block + o / BLOCK)),
-                    .lo = 0,
-                    .hi = (uint32_t)(hi_byte - o < len ? hi_byte - o : len),
+                    .lo = lo,
+                    .hi = hi,
                     .region = &r[i],
                     .region_off = (uint64_t)first * r[i].unit + o};
       }
-      covered[i] = first;
+      covered[i] = row_lo;
     }
   for (int i = 0; i < n; i++)
-    if (covered[i] > 0) goto done;  // rows no part holds
+    if (covered[i] > need_from[i]) goto done;  // rows no part holds
   Job job = {.blocks = b, .n = nb};
   ok = !run(&job);
 done:
@@ -416,6 +424,11 @@ done:
   free(p);
   free(b);
   return ok ? 0 : -1;
+}
+
+int state_file_read(const ModelOps *ops, ModelState *s, int positions,
+                    const int *fds, int count) {
+  return state_file_read_from(ops, s, 0, positions, fds, count);
 }
 
 // ---- snapshots ----

@@ -3241,7 +3241,13 @@ impl WorkerModel {
     /// its first token. It counts the snapshot that a load reads. It counts
     /// that snapshot with logits. For the same prompt again, the snapshot holds
     /// them. It also counts the snapshots that the plan takes.
-    fn count_plan_bytes(&self, plan: &Plan, prompt_tokens: usize, states: &States) -> u64 {
+    fn count_plan_bytes(
+        &self,
+        plan: &Plan,
+        load_prefix: Option<(state_cache::StateId, usize)>,
+        prompt_tokens: usize,
+        states: &States,
+    ) -> u64 {
         let growth = match *plan {
             Plan::InPlace { state, .. } => self
                 .model
@@ -3254,7 +3260,15 @@ impl WorkerModel {
                     prompt_tokens + 1,
                 )
             }
-            _ => self.model.state_bytes(None, prompt_tokens + 1),
+            Plan::Load { .. } => match load_prefix {
+                Some((source, shared)) => self.model.state_copy_bytes(
+                    states.handles[&source].engine_state,
+                    shared,
+                    prompt_tokens + 1,
+                ),
+                None => self.model.state_bytes(None, prompt_tokens + 1),
+            },
+            Plan::Cold => self.model.state_bytes(None, prompt_tokens + 1),
         };
         let loaded_snapshot = match plan {
             Plan::Load {
@@ -3634,7 +3648,28 @@ impl WorkerModel {
         let mut need = 0;
         let mut chosen = None;
         for plan in self.list_resume_plans(&prompt, states) {
-            need = self.count_plan_bytes(&plan, prompt_tokens, states);
+            if let Plan::Load { saved_id, from, .. } = plan
+                && let Some(prefix_source) =
+                    states.cache.saved_states.get(&saved_id).and_then(|saved| {
+                        states
+                            .cache
+                            .find_prefix_source(self.model_index, &saved.tokens, from)
+                    })
+            {
+                let shared_need =
+                    self.count_plan_bytes(&plan, Some(prefix_source), prompt_tokens, states);
+                if let Some(eviction) = states.cache.find_eviction(
+                    self.model_index,
+                    shared_need,
+                    true,
+                    &[prefix_source.0],
+                ) {
+                    need = shared_need;
+                    chosen = Some((plan, eviction, Some(prefix_source)));
+                    break;
+                }
+            }
+            need = self.count_plan_bytes(&plan, None, prompt_tokens, states);
             let keep: Vec<state_cache::StateId> = plan.find_source_state().into_iter().collect();
             if let Some(eviction) = states.cache.find_eviction(
                 self.model_index,
@@ -3642,11 +3677,11 @@ impl WorkerModel {
                 !matches!(plan, Plan::InPlace { .. }),
                 &keep,
             ) {
-                chosen = Some((plan, eviction));
+                chosen = Some((plan, eviction, None));
                 break;
             }
         }
-        let Some((plan, eviction)) = chosen else {
+        let Some((plan, eviction, load_prefix)) = chosen else {
             let busy: u64 = states
                 .cache
                 .entries
@@ -3744,6 +3779,19 @@ impl WorkerModel {
                 let state_id = planned_state;
                 let engine_state = states.handles[&state_id].engine_state;
                 let load_started_at = Instant::now();
+                let keep = if let Some((source, shared)) = load_prefix {
+                    self.model.state_copy(
+                        engine_state,
+                        states.handles[&source].engine_state,
+                        shared,
+                    );
+                    states.refresh_idle_state_bytes(Some(self.model_index));
+                    states.cache.record_reuse(source);
+                    states.handles.get_mut(&source).expect("state").last_used_at = Instant::now();
+                    shared
+                } else {
+                    0
+                };
                 let store = states
                     .store
                     .as_mut()
@@ -3757,6 +3805,7 @@ impl WorkerModel {
                     },
                     saved,
                     snapshot_pos,
+                    keep,
                     at,
                 );
                 drop(long);
@@ -3775,8 +3824,13 @@ impl WorkerModel {
                             }
                         }
                         self.log_line(&format!(
-                            "req {}: {at} positions of saved state {saved} read in {:.2} s",
+                            "req {}: {at} positions of saved state {saved} read{} in {:.2} s",
                             job.id,
+                            if keep > 0 {
+                                format!(" ({keep} shared in RAM)")
+                            } else {
+                                String::new()
+                            },
                             load_started_at.elapsed().as_secs_f64()
                         ));
                         state_id
