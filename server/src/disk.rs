@@ -2,12 +2,14 @@
 //! them back. Their files lie in one folder, set by state_dir.
 //!
 //! A saved state `ID` has an index file, `ID.state`, and the files that the
-//! index names. Its parts are `ID-N.rows`, numbered from 0. Its snapshots are
-//! `ID-V-POS.snap`. V is the save that wrote the snapshot. POS is its position.
+//! index names. Each part file is `OWNER-N.rows`, numbered from 0 within its
+//! creating saved state `OWNER`; branches may reference prefix part files owned
+//! by an earlier saved state. Its snapshots are `ID-V-POS.snap`. V is the save
+//! that wrote the snapshot. POS is its position.
 //! The index holds the model's identity and the tokens. For each part it holds
-//! the positions and the bytes. For each snapshot it holds the position, the
-//! kind, the stale rows and the bytes. A SHA-256 sum in the index covers every
-//! byte after it.
+//! the positions, bytes, owner and file number. For each snapshot it holds the
+//! position, the kind, the stale rows and the bytes. A SHA-256 sum in the index
+//! covers every byte after it.
 //!
 //! Each file is written under a temporary name that ends in `.tmp`. Then it is
 //! synced and renamed. The index is written last. So after a crash, each saved
@@ -22,7 +24,7 @@
 use crate::engine::{self, Model};
 use crate::state_cache::{
     Cache, Entry, Part, SaveDecision, SavedSnapshot, SavedState, SavedStateId, Snapshot,
-    SnapshotKind,
+    SnapshotKind, count_unused_prefix_positions, prefix_parts,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -37,7 +39,7 @@ use std::time::{Instant, SystemTime};
 const INDEX_MAGIC: &[u8; 8] = b"EREMITEI";
 /// The index format's version. A server loads only indexes of its own format
 /// version.
-const INDEX_FORMAT_VERSION: u32 = 1;
+const INDEX_FORMAT_VERSION: u32 = 2;
 /// The bytes of an index's head, before its parts. The head holds the magic,
 /// the format version, a reserved word, the SHA-256 sum, the identity, the
 /// save's version, the replaced positions, and the counts of tokens, parts and
@@ -60,8 +62,8 @@ const SNAPSHOT_COUNT_AT: usize = 108;
 const IDENTITY_BYTES: usize = 32;
 /// The bytes of the index's SHA-256 sum.
 const SUM_BYTES: usize = 32;
-/// A part's record: from, to, bytes, file number and a reserved word.
-const PART_RECORD_BYTES: usize = 24;
+/// A part's record: from, to, bytes, owner, file number and a reserved word.
+const PART_RECORD_BYTES: usize = 32;
 /// A snapshot's record: position, kind, 3 reserved bytes, stale rows, a
 /// reserved word, bytes and version.
 const SNAPSHOT_RECORD_BYTES: usize = 32;
@@ -241,9 +243,9 @@ fn format_index_file_name(id: SavedStateId) -> String {
     format!("{id}.state")
 }
 
-/// Formats the file name of part `part` of saved state `id`: `ID-N.rows`.
-fn format_part_file_name(id: SavedStateId, part: &Part) -> String {
-    format!("{id}-{}.rows", part.file_number)
+/// Formats the file name of part `part`: `OWNER-N.rows`.
+fn format_part_file_name(part: &Part) -> String {
+    format!("{}-{}.rows", part.owner, part.file_number)
 }
 
 /// Formats the file name of snapshot `snapshot` of saved state `id`:
@@ -293,6 +295,7 @@ pub fn encode_index(identity: &[u8; IDENTITY_BYTES], saved_state: &SavedState) -
         index.extend_from_slice(&(part.from as u32).to_le_bytes());
         index.extend_from_slice(&(part.to as u32).to_le_bytes());
         index.extend_from_slice(&part.bytes.to_le_bytes());
+        index.extend_from_slice(&part.owner.to_le_bytes());
         index.extend_from_slice(&part.file_number.to_le_bytes());
         index.extend_from_slice(&0u32.to_le_bytes()); // a reserved word, 0
     }
@@ -368,14 +371,15 @@ pub fn decode_index(index: &[u8]) -> Option<([u8; IDENTITY_BYTES], SavedState)> 
         last_used: 0,
         version,
     };
-    // a part's record: from at 0, to at 4, bytes at 8, file number at 16, a
-    // reserved word at 20
+    // a part's record: from at 0, to at 4, bytes at 8, owner at 16, file
+    // number at 24, a reserved word at 28
     for _ in 0..part_count {
         saved_state.parts.push(Part {
             from: read_u32_at(at)? as usize,
             to: read_u32_at(at + 4)? as usize,
             bytes: read_u64_at(at + 8)?,
-            file_number: read_u32_at(at + 16)?,
+            owner: read_u64_at(at + 16)?,
+            file_number: read_u32_at(at + 24)?,
         });
         at += PART_RECORD_BYTES;
     }
@@ -485,7 +489,7 @@ impl Store {
                 saved_state
                     .parts
                     .iter()
-                    .all(|part| file_size(format_part_file_name(id, part)) == Some(part.bytes))
+                    .all(|part| file_size(format_part_file_name(part)) == Some(part.bytes))
                     && saved_state.snapshots.iter().all(|saved_snapshot| {
                         file_size(format_snapshot_file_name(id, saved_snapshot))
                             == Some(saved_snapshot.snapshot.bytes)
@@ -493,12 +497,7 @@ impl Store {
             };
             match decode_index(&index) {
                 Some((identity, saved_state)) if has_whole_files(&saved_state) => {
-                    named.extend(
-                        saved_state
-                            .parts
-                            .iter()
-                            .map(|part| format_part_file_name(id, part)),
-                    );
+                    named.extend(saved_state.parts.iter().map(format_part_file_name));
                     named.extend(
                         saved_state
                             .snapshots
@@ -652,19 +651,30 @@ impl Store {
     /// state `id`.
     fn delete_files(&self, id: SavedStateId, parts: &[Part], snapshots: &[SavedSnapshot]) {
         for part in parts {
-            let _ = fs::remove_file(self.folder.join(format_part_file_name(id, part)));
+            let _ = fs::remove_file(self.folder.join(format_part_file_name(part)));
         }
         for snapshot in snapshots {
             let _ = fs::remove_file(self.folder.join(format_snapshot_file_name(id, snapshot)));
         }
     }
 
-    /// Deletes saved state `id`: its index first, then its other files. Removes
-    /// it from `cache`.
+    /// Deletes saved state `id`: its index first, then its snapshots and the
+    /// part files that no remaining saved state references. Removes it from
+    /// `cache`.
     pub fn delete_saved_state(&mut self, cache: &mut Cache, id: SavedStateId) {
         if let Some(saved_state) = cache.saved_states.remove(&id) {
             let _ = fs::remove_file(self.folder.join(format_index_file_name(id)));
-            self.delete_files(id, &saved_state.parts, &saved_state.snapshots);
+            let referenced: HashSet<(SavedStateId, u32)> = cache
+                .saved_states
+                .values()
+                .flat_map(|other| other.parts.iter().map(Part::file_key))
+                .collect();
+            let unshared_parts: Vec<Part> = saved_state
+                .parts
+                .into_iter()
+                .filter(|part| !referenced.contains(&part.file_key()))
+                .collect();
+            self.delete_files(id, &unshared_parts, &saved_state.snapshots);
         }
     }
 
@@ -711,6 +721,13 @@ impl Store {
                     replaced_positions,
                     saved_state.snapshots.clone(),
                 )
+            }
+            SaveDecision::Branch { parent, from } => {
+                let id = self.next_id;
+                self.next_id += 1;
+                let kept = prefix_parts(&cache.saved_states[&parent].parts, from);
+                let replaced_positions = count_unused_prefix_positions(&kept, from);
+                (id, from, 1, kept, replaced_positions, Vec::new())
             }
             SaveDecision::New { .. } => {
                 let id = self.next_id;
@@ -766,10 +783,7 @@ impl Store {
         let replaced_bytes = match decision {
             SaveDecision::New {
                 replaces: Some(replaced_id),
-            } => cache
-                .saved_states
-                .get(&replaced_id)
-                .map_or(0, SavedState::count_bytes),
+            } => cache.count_reclaimable_bytes(replaced_id),
             _ => old_snapshots
                 .iter()
                 .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
@@ -779,6 +793,7 @@ impl Store {
             SaveDecision::New {
                 replaces: Some(replaced_id),
             } => Some(replaced_id),
+            SaveDecision::Branch { parent, .. } => Some(parent),
             _ => Some(target),
         };
         let Some(to_delete) = cache.find_saved_states_to_delete(
@@ -800,15 +815,21 @@ impl Store {
             ));
         }
         let started = Instant::now();
+        let next_file_number = parts
+            .iter()
+            .filter(|part| part.owner == target)
+            .map(|part| part.file_number + 1)
+            .max()
+            .unwrap_or(0);
         let mut part = Part {
             from,
             to: len,
             // the write gives its bytes
             bytes: 0,
-            // a new saved state's first part is file 0
-            file_number: parts.last().map_or(0, |last| last.file_number + 1),
+            owner: target,
+            file_number: next_file_number,
         };
-        let written = self.write_file(&format_part_file_name(target, &part), |fd| {
+        let written = self.write_file(&format_part_file_name(&part), |fd| {
             io.write_rows(from, len, fd)
         });
         match written {
@@ -926,7 +947,7 @@ impl Store {
         let files = saved_state
             .parts
             .iter()
-            .map(|part| open_file(format_part_file_name(id, part)))
+            .map(|part| open_file(format_part_file_name(part)))
             .collect::<Result<Vec<File>, LoadError>>()?;
         let fds: Vec<c_int> = files.iter().map(|file| file.as_raw_fd()).collect();
         if !io.read_rows(from, &fds) {
@@ -971,12 +992,14 @@ mod tests {
                     from: 0,
                     to: tokens / 2,
                     bytes: 1000,
+                    owner: 5,
                     file_number: 0,
                 },
                 Part {
                     from: tokens / 2 - 1,
                     to: tokens,
                     bytes: 500,
+                    owner: 5,
                     file_number: 1,
                 },
             ],
@@ -1166,6 +1189,7 @@ mod tests {
                 from: 0,
                 to: len,
                 bytes: row_bytes,
+                owner: id,
                 file_number: 0,
             }],
             snapshots: vec![SavedSnapshot {
@@ -1187,7 +1211,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            dir.join(format_part_file_name(id, &saved_state.parts[0])),
+            dir.join(format_part_file_name(&saved_state.parts[0])),
             vec![0u8; row_bytes as usize],
         )
         .unwrap();
@@ -1227,15 +1251,21 @@ mod tests {
         let entry = make_idle_entry(0..500, 100);
         let line = store.save_state(&mut cache, &io, &|_| None, &entry, SystemTime::now(), false);
         assert!(line.unwrap_or_default().contains("saved to the SSD as 1:"));
-        // the same tokens and 300 more: it covers saved state 1
+        // the same tokens and 300 more: it branches from saved state 1's part
+        // file and covers saved state 1
         let entry = make_idle_entry(0..800, 200);
         // whole seconds, so that the file system keeps the time exactly
         let last_used_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
         let line = store.save_state(&mut cache, &io, &|_| None, &entry, last_used_time, false);
-        assert!(line.unwrap_or_default().contains("saved to the SSD as 2:"));
         assert!(
-            !dir.join("1.state").exists() && !dir.join("1-0.rows").exists(),
-            "the saved state it covers is deleted"
+            line.unwrap_or_default()
+                .contains("saved to the SSD as 2: 800 tokens (from position 500)")
+        );
+        assert!(
+            !dir.join("1.state").exists()
+                && !dir.join("1-1-500.snap").exists()
+                && dir.join("1-0.rows").exists(),
+            "the covered state's index and snapshot are deleted while the shared prefix part stays"
         );
         assert_eq!(
             (store.save_count, store.bytes_written),
@@ -1249,11 +1279,148 @@ mod tests {
                 found[0].id,
                 found[0].identity,
                 found[0].saved_state.tokens.len(),
+                found[0].saved_state.parts.len(),
                 found[0].saved_state.count_bytes(),
                 found[0].last_used_time
             ),
-            (2, [3; IDENTITY_BYTES], 800, 300 + 500, last_used_time)
+            (2, [3; IDENTITY_BYTES], 800, 2, 600 + 500, last_used_time)
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sibling_branches_share_prefix_part_files_across_deletions_and_restarts() {
+        /// A test state whose written row bytes scale with `(to - from)`.
+        struct ProportionalState {
+            /// Bytes written per token.
+            bytes_per_token: u64,
+            /// Bytes written per snapshot.
+            snapshot_bytes: u64,
+        }
+
+        impl StateIo for ProportionalState {
+            type SnapshotHandle = ();
+
+            fn write_rows(&self, from: usize, to: usize, fd: c_int) -> Option<u64> {
+                let bytes = (to - from) as u64 * self.bytes_per_token;
+                if fd < 0 {
+                    return Some(bytes);
+                }
+                let mut file = std::mem::ManuallyDrop::new(unsafe {
+                    <File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                });
+                std::io::Write::write_all(&mut *file, &vec![0u8; bytes as usize])
+                    .ok()
+                    .map(|_| bytes)
+            }
+
+            fn write_snapshot(&self, _snapshot: Option<()>, _pos: usize, fd: c_int) -> Option<u64> {
+                if fd < 0 {
+                    return Some(self.snapshot_bytes);
+                }
+                let mut file = std::mem::ManuallyDrop::new(unsafe {
+                    <File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                });
+                std::io::Write::write_all(&mut *file, &vec![0u8; self.snapshot_bytes as usize])
+                    .ok()
+                    .map(|_| self.snapshot_bytes)
+            }
+
+            fn read_model_identity(&self) -> [u8; IDENTITY_BYTES] {
+                [5; IDENTITY_BYTES]
+            }
+
+            fn read_rows(&self, _positions: usize, fds: &[c_int]) -> bool {
+                !fds.is_empty()
+            }
+
+            fn read_snapshot(&self, _fd: c_int) -> Option<()> {
+                Some(())
+            }
+        }
+
+        let (dir, mut store, mut cache) = open_test_store("branch-share");
+        let io = ProportionalState {
+            bytes_per_token: 4,
+            snapshot_bytes: 50,
+        };
+        // branch A: 1000 shared prefix tokens + 200 branch-A tokens
+        let mut branch_a: Vec<i32> = (0..1000).collect();
+        branch_a.extend(10_000..10_200);
+        let entry_a = Entry {
+            tokens: branch_a,
+            ..make_idle_entry(0..0, 100)
+        };
+        let line_a = store.save_state(
+            &mut cache,
+            &io,
+            &|_| None,
+            &entry_a,
+            SystemTime::now(),
+            false,
+        );
+        assert!(
+            line_a
+                .unwrap_or_default()
+                .contains("saved to the SSD as 1:")
+        );
+        assert_eq!(store.bytes_written, 1200 * 4 + 50);
+
+        // branch B: same 1000 prefix tokens + 300 branch-B tokens
+        let mut branch_b: Vec<i32> = (0..1000).collect();
+        branch_b.extend(20_000..20_300);
+        let entry_b = Entry {
+            tokens: branch_b,
+            ..make_idle_entry(0..0, 200)
+        };
+        let line_b = store.save_state(
+            &mut cache,
+            &io,
+            &|_| None,
+            &entry_b,
+            SystemTime::now(),
+            false,
+        );
+        assert!(
+            line_b
+                .unwrap_or_default()
+                .contains("saved to the SSD as 2: 1300 tokens (from position 1000)")
+        );
+        // branch B wrote only its 300-token suffix and its snapshot
+        assert_eq!(store.bytes_written, (1200 * 4 + 50) + (300 * 4 + 50));
+        // deduplicated total counts 1-0.rows once
+        assert_eq!(cache.count_saved_bytes(), 1200 * 4 + 300 * 4 + 2 * 50);
+        assert!(dir.join("1-0.rows").exists() && dir.join("2-0.rows").exists());
+
+        // deleting branch A keeps 1-0.rows alive because branch B still uses it
+        store.delete_saved_state(&mut cache, 1);
+        assert!(!dir.join("1.state").exists());
+        assert!(dir.join("1-0.rows").exists());
+        assert_eq!(cache.count_saved_bytes(), 1200 * 4 + 300 * 4 + 50);
+
+        // restarting keeps 1-0.rows and reloads branch B cleanly
+        drop(store);
+        let (mut store, found) = Store::open(&dir).expect("the store");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 2);
+        assert_eq!(found[0].saved_state.parts.len(), 2);
+        assert_eq!(found[0].saved_state.parts[0].owner, 1);
+        assert_eq!(found[0].saved_state.parts[1].owner, 2);
+        let mut cache2 = Cache::new(vec![crate::state_cache::ModelLimits {
+            bytes: 1 << 30,
+            states: 16,
+        }]);
+        cache2.add_saved_state(found[0].id, found[0].saved_state.clone());
+        assert!(
+            store
+                .load_saved_state(&mut cache2, &io, 2, Some(1300), 1300)
+                .is_ok()
+        );
+
+        // deleting branch B now removes both 1-0.rows and 2-0.rows
+        store.delete_saved_state(&mut cache2, 2);
+        assert!(!dir.join("1-0.rows").exists() && !dir.join("2-0.rows").exists());
+        drop(store);
         fs::remove_dir_all(&dir).unwrap();
     }
 

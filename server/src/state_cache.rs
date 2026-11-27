@@ -76,9 +76,11 @@
 //! link: its rows before some position equal a saved state's rows. Then the
 //! state was loaded from that saved state, or copied from a state that was.
 //! Saving such a state writes only its rows from that position. They become one
-//! more part of the saved state.
+//! more part of the saved state. When a state shares a long prefix with a saved
+//! state that must stay intact, saving writes a new saved state that references
+//! the parent's prefix part files and writes only the new suffix.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// How many tokens one slice comparison takes. Slices compare faster than
 /// single tokens.
@@ -191,8 +193,46 @@ pub struct Part {
     pub to: usize,
     /// The bytes of the part's file.
     pub bytes: u64,
+    /// The saved state that created the part's file: the ID in `ID-N.rows`.
+    pub owner: SavedStateId,
     /// The N in the part's file name, `ID-N.rows`.
     pub file_number: u32,
+}
+
+impl Part {
+    /// Returns the owner and file number that identify the part's file.
+    pub fn file_key(&self) -> (SavedStateId, u32) {
+        (self.owner, self.file_number)
+    }
+}
+
+/// Picks the parts from `parts` that supply rows before `limit`. Keeps parts in
+/// their original order and drops parts starting at or after a later kept part.
+pub fn prefix_parts(parts: &[Part], limit: usize) -> Vec<Part> {
+    let mut need = limit;
+    let mut kept = Vec::new();
+    for &part in parts.iter().rev() {
+        if part.from < need {
+            kept.push(part);
+            need = part.from;
+            if need == 0 {
+                break;
+            }
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+/// Counts the positions stored in `parts` that are overridden or lie past
+/// `limit`.
+pub fn count_unused_prefix_positions(parts: &[Part], limit: usize) -> usize {
+    let mut unused = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let next_from = parts.get(index + 1).map_or(limit, |next| next.from);
+        unused += part.to.saturating_sub(next_from);
+    }
+    unused
 }
 
 /// A snapshot of a saved state, in its own file.
@@ -230,14 +270,17 @@ pub struct SavedState {
 }
 
 impl SavedState {
+    /// Counts the bytes of the saved state's snapshot files.
+    pub fn count_snapshot_bytes(&self) -> u64 {
+        self.snapshots
+            .iter()
+            .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
+            .sum()
+    }
+
     /// Counts the bytes of the saved state's files.
     pub fn count_bytes(&self) -> u64 {
-        self.parts.iter().map(|part| part.bytes).sum::<u64>()
-            + self
-                .snapshots
-                .iter()
-                .map(|saved_snapshot| saved_snapshot.snapshot.bytes)
-                .sum::<u64>()
+        self.parts.iter().map(|part| part.bytes).sum::<u64>() + self.count_snapshot_bytes()
     }
 }
 
@@ -249,6 +292,9 @@ pub enum SaveDecision {
     /// Writes one more part of saved state `saved_id`: the state's rows from
     /// position `from` to its end.
     Append { saved_id: SavedStateId, from: usize },
+    /// Writes a new saved state that shares the prefix parts of `parent` before
+    /// position `from` and writes only the rows from `from` to its end.
+    Branch { parent: SavedStateId, from: usize },
     /// Writes a new saved state. Once it is written, saved state `replaces` is
     /// deleted.
     New { replaces: Option<SavedStateId> },
@@ -1182,12 +1228,42 @@ impl Cache {
 // ---- saved states ----
 
 impl Cache {
-    /// Counts the bytes that saved states take on the SSD.
+    /// Counts the bytes that saved states take on the SSD. Counts each shared
+    /// part file once.
     pub fn count_saved_bytes(&self) -> u64 {
-        self.saved_states
-            .values()
-            .map(SavedState::count_bytes)
-            .sum()
+        let mut seen_parts = HashSet::new();
+        let mut total = 0;
+        for saved_state in self.saved_states.values() {
+            for part in &saved_state.parts {
+                if seen_parts.insert(part.file_key()) {
+                    total += part.bytes;
+                }
+            }
+            total += saved_state.count_snapshot_bytes();
+        }
+        total
+    }
+
+    /// Counts the bytes freed if saved state `id` is deleted. Excludes parts
+    /// that another saved state still references.
+    pub fn count_reclaimable_bytes(&self, id: SavedStateId) -> u64 {
+        let Some(target) = self.saved_states.get(&id) else {
+            return 0;
+        };
+        let other_parts: HashSet<(SavedStateId, u32)> = self
+            .saved_states
+            .iter()
+            .filter(|&(&other_id, _)| other_id != id)
+            .flat_map(|(_, other)| other.parts.iter().map(Part::file_key))
+            .collect();
+        let mut seen = HashSet::new();
+        let unshared_part_bytes: u64 = target
+            .parts
+            .iter()
+            .filter(|part| !other_parts.contains(&part.file_key()) && seen.insert(part.file_key()))
+            .map(|part| part.bytes)
+            .sum();
+        unshared_part_bytes + target.count_snapshot_bytes()
     }
 
     /// Adds saved state `saved_state` with id `id`, and marks it used now. At
@@ -1258,8 +1334,11 @@ impl Cache {
     /// saved state's tail: its tokens after the prefix it shares with the
     /// state. So neither happens when that tail has `min_unshared_tokens`
     /// tokens or more. Neither happens while an admitted request loads the
-    /// linked saved state next. In every other case, saving writes a new saved
-    /// state.
+    /// linked saved state next. Otherwise, if a saved state of the same model
+    /// shares at least `min_unshared_tokens` prefix tokens without exceeding
+    /// `MAX_PARTS` or the replaced-position limit, saving creates a branch that
+    /// reuses that parent's prefix part files. In every other case, saving
+    /// writes a new saved state.
     pub fn decide_save(&self, entry: &Entry, others_stay: bool) -> SaveDecision {
         let len = entry.tokens.len();
         if self.saved_byte_limit == 0 || len == 0 {
@@ -1287,34 +1366,56 @@ impl Cache {
             saved_state.tokens.len()
                 < count_shared_prefix(&entry.tokens, &saved_state.tokens) + self.min_unshared_tokens
         };
-        match entry.saved_link {
-            Some(link)
-                if Some(link.saved_id) != self.pinned
-                    && self
-                        .saved_states
-                        .get(&link.saved_id)
-                        .is_some_and(|saved_state| {
-                            saved_state.version == link.version && has_short_tail(saved_state)
-                        }) =>
-            {
-                let saved_state = &self.saved_states[&link.saved_id];
-                let replaced_positions = saved_state.replaced_positions
-                    + saved_state
-                        .tokens
-                        .len()
-                        .saturating_sub(link.shared_positions);
-                if replaced_positions > len || saved_state.parts.len() >= MAX_PARTS {
-                    SaveDecision::New {
-                        replaces: Some(link.saved_id),
-                    }
-                } else {
-                    SaveDecision::Append {
-                        saved_id: link.saved_id,
-                        from: link.shared_positions,
-                    }
+        if let Some(link) = entry.saved_link
+            && Some(link.saved_id) != self.pinned
+            && self
+                .saved_states
+                .get(&link.saved_id)
+                .is_some_and(|saved_state| {
+                    saved_state.version == link.version && has_short_tail(saved_state)
+                })
+        {
+            let saved_state = &self.saved_states[&link.saved_id];
+            let replaced_positions = saved_state.replaced_positions
+                + saved_state
+                    .tokens
+                    .len()
+                    .saturating_sub(link.shared_positions);
+            return if replaced_positions > len || saved_state.parts.len() >= MAX_PARTS {
+                SaveDecision::New {
+                    replaces: Some(link.saved_id),
                 }
-            }
-            _ => SaveDecision::New { replaces: None },
+            } else {
+                SaveDecision::Append {
+                    saved_id: link.saved_id,
+                    from: link.shared_positions,
+                }
+            };
+        }
+        let best_branch = self
+            .saved_states
+            .iter()
+            .filter(|(_, saved_state)| saved_state.model == Some(entry.model))
+            .filter_map(|(&id, saved_state)| {
+                let prefix = count_shared_prefix(&entry.tokens, &saved_state.tokens);
+                if prefix < self.min_unshared_tokens {
+                    return None;
+                }
+                let kept = prefix_parts(&saved_state.parts, prefix);
+                let unused = count_unused_prefix_positions(&kept, prefix);
+                if kept.is_empty() || kept.len() >= MAX_PARTS || unused > len {
+                    return None;
+                }
+                Some((
+                    (prefix, usize::MAX - unused, usize::MAX - kept.len(), id),
+                    (id, prefix),
+                ))
+            })
+            .max_by_key(|&(score, _)| score)
+            .map(|(_, branch)| branch);
+        match best_branch {
+            Some((parent, from)) => SaveDecision::Branch { parent, from },
+            None => SaveDecision::New { replaces: None },
         }
     }
 
@@ -1354,6 +1455,15 @@ impl Cache {
         used_before: Option<u64>,
     ) -> Option<Vec<SavedStateId>> {
         let mut total = self.count_saved_bytes() + need;
+        let mut part_refs: HashMap<(SavedStateId, u32), usize> = HashMap::new();
+        for saved_state in self.saved_states.values() {
+            let mut seen = HashSet::new();
+            for part in &saved_state.parts {
+                if seen.insert(part.file_key()) {
+                    *part_refs.entry(part.file_key()).or_insert(0) += 1;
+                }
+            }
+        }
         let mut order: Vec<(&SavedStateId, &SavedState)> = self
             .saved_states
             .iter()
@@ -1370,7 +1480,20 @@ impl Cache {
             if total <= self.saved_byte_limit {
                 break;
             }
-            total -= saved_state.count_bytes();
+            let mut freed = saved_state.count_snapshot_bytes();
+            let mut seen = HashSet::new();
+            for part in &saved_state.parts {
+                let key = part.file_key();
+                if seen.insert(key)
+                    && let Some(count) = part_refs.get_mut(&key)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        freed += part.bytes;
+                    }
+                }
+            }
+            total -= freed;
             to_delete.push(id);
         }
         (total <= self.saved_byte_limit).then_some(to_delete)
@@ -2453,6 +2576,7 @@ mod tests {
                     from: 0,
                     to: tokens.len(),
                     bytes: 100 * tokens.len() as u64,
+                    owner: id,
                     file_number: 0,
                 }],
                 snapshots: snapshots.to_vec(),
@@ -2706,11 +2830,15 @@ mod tests {
                 from: 1000
             }
         );
-        // a save into the saved state since: its link is old, a new saved state
+        // a save into the saved state since: its link is old, so it branches
+        // from the shared prefix without modifying the saved state
         cache.saved_states.get_mut(&4).unwrap().version = 2;
         assert_eq!(
             cache.decide_save(&entry, true),
-            SaveDecision::New { replaces: None }
+            SaveDecision::Branch {
+                parent: 4,
+                from: 1000
+            }
         );
         cache.saved_states.get_mut(&4).unwrap().version = 1;
         // its replaced positions would outnumber the state's tokens: a new
@@ -2789,13 +2917,19 @@ mod tests {
         cache.pinned = Some(4);
         assert_eq!(
             cache.decide_save(&entry, false),
-            SaveDecision::New { replaces: None },
-            "not appended to"
+            SaveDecision::Branch {
+                parent: 4,
+                from: 990
+            },
+            "not appended to; branches read-only from the pinned state"
         );
         cache.saved_states.get_mut(&4).unwrap().replaced_positions = 5000;
         assert_eq!(
             cache.decide_save(&entry, false),
-            SaveDecision::New { replaces: None },
+            SaveDecision::Branch {
+                parent: 4,
+                from: 990
+            },
             "nor replaced"
         );
     }
@@ -2805,7 +2939,8 @@ mod tests {
         let mut cache = make_saving_cache();
         add_saved_state_in_one_part(&mut cache, 4, &collect_tokens(0..1000), &[]);
         // a state loaded from it that differs at 500, with 200 unshared tokens.
-        // The saved state's 500 tokens after position 500 stay.
+        // The saved state's 500 tokens after position 500 stay, and the new
+        // saved state shares the prefix before 500.
         let mut prompt = collect_tokens(0..500);
         prompt.extend(collect_tokens(9000..9200));
         let id = add_idle_state(&mut cache, &prompt, &[]);
@@ -2813,15 +2948,113 @@ mod tests {
         let entry = cache.entries.remove(&id).unwrap();
         assert_eq!(
             cache.decide_save(&entry, false),
-            SaveDecision::New { replaces: None },
-            "not appended to"
+            SaveDecision::Branch {
+                parent: 4,
+                from: 500
+            },
+            "branches without modifying the parent"
         );
-        cache.saved_states.get_mut(&4).unwrap().replaced_positions = 5000;
+        // when the shared prefix is too short or leaves too much unused parent
+        // tail, it writes a standalone saved state instead
+        let mut far = collect_tokens(0..100);
+        far.extend(collect_tokens(9000..9300));
+        let far_id = add_idle_state(&mut cache, &far, &[]);
+        let far_entry = cache.entries.remove(&far_id).unwrap();
         assert_eq!(
-            cache.decide_save(&entry, false),
+            cache.decide_save(&far_entry, false),
             SaveDecision::New { replaces: None },
-            "nor replaced"
+            "unused parent tail exceeds the new state's length"
         );
+    }
+
+    #[test]
+    fn shared_prefix_parts_are_counted_once_and_freed_when_the_last_owner_is_deleted() {
+        let mut cache = make_saving_cache();
+        let parent_part = Part {
+            from: 0,
+            to: 1000,
+            bytes: 100_000,
+            owner: 1,
+            file_number: 0,
+        };
+        cache.add_saved_state(
+            1,
+            SavedState {
+                model: Some(0),
+                tokens: collect_tokens(0..1000),
+                parts: vec![parent_part],
+                snapshots: vec![make_saved_snapshot(1000, SnapshotKind::GenerationEnd)],
+                replaced_positions: 0,
+                last_used: 0,
+                version: 1,
+            },
+        );
+        let mut branch_tokens = collect_tokens(0..800);
+        branch_tokens.extend(collect_tokens(5000..5300));
+        let branch_part = Part {
+            from: 800,
+            to: 1100,
+            bytes: 30_000,
+            owner: 2,
+            file_number: 0,
+        };
+        cache.add_saved_state(
+            2,
+            SavedState {
+                model: Some(0),
+                tokens: branch_tokens,
+                parts: vec![parent_part, branch_part],
+                snapshots: vec![make_saved_snapshot(1100, SnapshotKind::GenerationEnd)],
+                replaced_positions: 200,
+                last_used: 0,
+                version: 1,
+            },
+        );
+        // the shared part is counted once across both saved states
+        let expected_total = 100_000 + 30_000 + 2 * SNAPSHOT_BYTES;
+        assert_eq!(cache.count_saved_bytes(), expected_total);
+        // deleting 1 alone frees only its snapshot, not the shared part
+        assert_eq!(cache.count_reclaimable_bytes(1), SNAPSHOT_BYTES);
+        // deleting 2 alone frees its unique suffix part and its snapshot
+        assert_eq!(cache.count_reclaimable_bytes(2), 30_000 + SNAPSHOT_BYTES);
+        cache.saved_byte_limit = expected_total;
+        // freeing SNAPSHOT_BYTES deletes only 1
+        assert_eq!(
+            cache.find_saved_states_to_delete(SNAPSHOT_BYTES, None, None),
+            Some(vec![1])
+        );
+        // freeing more than SNAPSHOT_BYTES must also delete 2 to free the shared part
+        assert_eq!(
+            cache.find_saved_states_to_delete(SNAPSHOT_BYTES + 1, None, None),
+            Some(vec![1, 2])
+        );
+        // pruning shadowed prefix parts keeps only the parts that supply 0..limit
+        let parts = vec![
+            Part {
+                from: 0,
+                to: 1000,
+                bytes: 10,
+                owner: 1,
+                file_number: 0,
+            },
+            Part {
+                from: 950,
+                to: 1400,
+                bytes: 10,
+                owner: 1,
+                file_number: 1,
+            },
+            Part {
+                from: 900,
+                to: 1500,
+                bytes: 10,
+                owner: 1,
+                file_number: 2,
+            },
+        ];
+        let kept = prefix_parts(&parts, 920);
+        assert_eq!(kept, vec![parts[0], parts[2]]);
+        assert_eq!(count_unused_prefix_positions(&kept, 920), 100 + 580);
     }
 
     #[test]

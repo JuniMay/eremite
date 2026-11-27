@@ -108,7 +108,10 @@ a full-speed prompt pass leave of its own `memory`, or else of the root
 the states leave. A new state takes room from the expert cache first, down to
 the smallest cache that a prompt pass needs. Then the model's least recently
 used idle state goes. It is saved on the SSD first when `state_disk` is on and
-it holds `state_disk_tokens` tokens of its own.
+it holds `state_disk_tokens` tokens of its own. Saved branches that share at
+least `state_disk_tokens` prefix tokens with an existing saved state reference
+the parent's prefix part files on disk and write only their divergent suffix,
+counting each shared part file once toward `state_disk`.
 
 In the terminal UI, 4 Models: States deletes the chosen session's state from
 memory when `d` is pressed twice. The state is not saved on the SSD. A session
