@@ -80,9 +80,13 @@ static constexpr uint32_t MM_THREADS = 128;
 static constexpr uint32_t ELEM_THREADS = 256;
 static constexpr uint32_t SCONV_THREADS = 64;
 static constexpr uint32_t VEC4_WIDTH = 4;
+static constexpr uint32_t BF16_MV_SPLIT_TINY_N = 128;
 static constexpr uint32_t BF16_MV_SPLIT_SMALL_N = 256;
+static constexpr uint32_t BF16_MV_SPLIT_MID_N = 1024;
 static constexpr uint32_t BF16_MV_SPLIT_MIN_K = 2048;
-static constexpr uint32_t BF16_MV_SPLIT_FACTOR = 4;
+static constexpr uint32_t BF16_MV_SPLIT_TINY = 8;
+static constexpr uint32_t BF16_MV_SPLIT_SMALL = 4;
+static constexpr uint32_t BF16_MV_SPLIT_MID = 2;
 static constexpr uint32_t BF16_MV_ROWS_PER_SG = 4;
 static constexpr uint32_t BF16_MV_SGS = 8;
 static constexpr uint32_t ATTNRES_GLOBAL_QUERIES = 3;
@@ -163,6 +167,13 @@ typedef struct {
 } AttnResParam;
 
 typedef struct {
+  // Active rows, hidden width, gate rank and row strides for 3-way Q/K/V gate.
+  uint32_t rows, dim, rank, h_stride_rows, m_stride_rows, distinct_h;
+  // Unweighted RMSNorm epsilon.
+  float eps;
+} Msg3Param;
+
+typedef struct {
   // Active rows, hidden width and bottleneck gate rank.
   uint32_t rows, dim, rank;
   // Unweighted RMSNorm epsilon.
@@ -235,6 +246,13 @@ typedef struct {
   // Active rows, hidden width and top-k count.
   uint32_t rows, dim, topk;
 } MoeCombineParam;
+
+typedef struct {
+  // Batch rows (1..8), unpadded vocab size, input width and output stride.
+  uint32_t m, vocab, k, ldy;
+  // Logit softcap bound and its reciprocal.
+  float cap, inv_cap;
+} UnembedParam;
 
 typedef struct {
   // Active rows, unpadded vocab size and row stride in floats.
@@ -419,11 +437,14 @@ static HeldExperts held;
 static uint32_t held_layers;
 
 // Compiled Metal kernel handles.
-static int K_mv_bf16, K_mv_bf16_3, K_mvm_bf16, K_mvm_bf16_3, K_mm_bf16;
-static int K_embed_norm, K_rmsnorm, K_attn_res, K_msg_cat_norm,
-    K_msg_gate_apply;
-static int K_sconv_static, K_sconv_static_batched, K_sconv_dynamic,
-    K_sconv_dynamic_batched, K_sconv_ring_save;
+static int K_mv_bf16, K_mv_bf16_2, K_mv_bf16_3, K_mvm_bf16, K_mvm_bf16_2,
+    K_mvm_bf16_3, K_mm_bf16;
+static int K_embed_norm, K_rmsnorm, K_rmsnorm_3, K_attn_res, K_attn_res_rmsnorm,
+    K_msg_cat_norm, K_msg_cat_norm_3, K_msg_down_3, K_msg_gate_apply,
+    K_msg_gate_apply_3;
+static int K_sconv_static, K_sconv_static_batched, K_sconv_static_post,
+    K_sconv_static_post_batched, K_sconv_dynamic, K_sconv_dynamic_batched,
+    K_sconv_ring_save;
 static int K_qkvr_prep, K_rel_bias, K_attend_part, K_attend_combine,
     K_attend_prefill;
 static int K_route_topk, K_route_topk_m1, K_moe_group, K_moe_gather_bf16;
@@ -431,7 +452,8 @@ static int K_nv_up_m1, K_nv_up_mv, K_nv_dn_mv, K_nv_dn_comb_m1, K_nv_up_mm,
     K_nv_dn_mm;
 static int K_mx_up_m1, K_mx_up_mv, K_mx_dn_mv, K_mx_dn_comb_m1, K_mx_up_mm,
     K_mx_dn_mm;
-static int K_moe_combine, K_copy, K_add, K_logit_softcap;
+static int K_moe_combine, K_copy, K_add, K_unembed_softcap_m1,
+    K_unembed_softcap, K_logit_softcap;
 
 // ---- schedule and tile grouping ----
 
@@ -1000,9 +1022,12 @@ static uint64_t estimate_work_bytes(int rows) {
   bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * cap *
                                  INK2_DIM * sizeof(float));
   bytes += 3 * gpu_round_up_to_pages((size_t)cap * INK2_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)cap * 2 * INK2_DIM * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)cap * INK2_GATE_RANK * sizeof(float));
-  bytes += gpu_round_up_to_pages((size_t)cap * INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * cap * 2 *
+                                 INK2_DIM * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * cap *
+                                 INK2_GATE_RANK * sizeof(float));
+  bytes += gpu_round_up_to_pages((size_t)ATTNRES_GLOBAL_QUERIES * cap *
+                                 INK2_DIM * sizeof(float));
   bytes += 3 * gpu_round_up_to_pages((size_t)cap * INK2_Q_DIM * sizeof(float));
   bytes += 4 * gpu_round_up_to_pages((size_t)cap * INK2_KV_DIM * sizeof(float));
   bytes +=
@@ -1175,9 +1200,12 @@ static void ensure_work(int rows, int logits_rows) {
     work.q_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
     work.k_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
     work.v_in = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
-    work.msg_cat = work_alloc((size_t)new_cap * 2 * INK2_DIM * sizeof(float));
-    work.msg_g = work_alloc((size_t)new_cap * INK2_GATE_RANK * sizeof(float));
-    work.msg_gated = work_alloc((size_t)new_cap * INK2_DIM * sizeof(float));
+    work.msg_cat = work_alloc((size_t)ATTNRES_GLOBAL_QUERIES * new_cap * 2 *
+                              INK2_DIM * sizeof(float));
+    work.msg_g = work_alloc((size_t)ATTNRES_GLOBAL_QUERIES * new_cap *
+                            INK2_GATE_RANK * sizeof(float));
+    work.msg_gated = work_alloc((size_t)ATTNRES_GLOBAL_QUERIES * new_cap *
+                                INK2_DIM * sizeof(float));
     work.q_raw = work_alloc((size_t)new_cap * INK2_Q_DIM * sizeof(float));
     work.k_raw = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
     work.k_conv = work_alloc((size_t)new_cap * INK2_KV_DIM * sizeof(float));
@@ -1712,11 +1740,13 @@ static ModelSnapshot *ink2_snapshot_new_empty(const int32_t *meta, int nmeta,
 // ---- GPU kernel dispatch helpers ----
 
 // Chooses split-K for mv_bf16 / mvm_bf16 to saturate the GPU on narrow output
-// projections.
+// projections while keeping m = 1 and m = 2..8 identical in reduction order.
 static uint32_t pick_mv_split(int n, int k) {
-  return (n < (int)BF16_MV_SPLIT_SMALL_N && k >= (int)BF16_MV_SPLIT_MIN_K)
-             ? BF16_MV_SPLIT_FACTOR
-             : 1u;
+  if (k < (int)BF16_MV_SPLIT_MIN_K) return 1u;
+  if (n <= (int)BF16_MV_SPLIT_TINY_N) return BF16_MV_SPLIT_TINY;
+  if (n <= (int)BF16_MV_SPLIT_SMALL_N) return BF16_MV_SPLIT_SMALL;
+  if (n <= (int)BF16_MV_SPLIT_MID_N) return BF16_MV_SPLIT_MID;
+  return 1u;
 }
 
 // Dispatches a single BF16 linear projection y = x @ w^T starting at byte
@@ -1771,6 +1801,83 @@ static void run_bf16_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
                             const Buf *y, int m, int n, int k, int ldy,
                             int round, int is_prefill) {
   run_bf16_linear_off(c, w, x, 0, y, m, n, k, ldy, round, is_prefill);
+}
+
+// Dispatches fused unembed + softcap for 1..8 rows, or mm_bf16 + softcap for
+// larger batches (e.g. --perplexity with every-row prefill logits).
+static void run_unembed_softcap(GpuCommandBuffer *c, const Buf *x, size_t x_off,
+                                const Buf *y, int m, int is_prefill) {
+  if (!is_prefill && m <= INK2_MAX_BATCH_ROWS) {
+    uint32_t rows_per_tg = BF16_MV_SGS * BF16_MV_ROWS_PER_SG;
+    UnembedParam up = {(uint32_t)m,        (uint32_t)INK2_VOCAB,
+                       (uint32_t)INK2_DIM, (uint32_t)LOGITS_STRIDE,
+                       LOGIT_SOFTCAP,      1.0f / LOGIT_SOFTCAP};
+    gpu_select_kernel(c, m == 1 ? K_unembed_softcap_m1 : K_unembed_softcap);
+    gpu_bind_buffer(c, 0, &unembed_w, 0);
+    gpu_bind_buffer(c, 1, x, x_off);
+    gpu_bind_buffer(c, 2, y, 0);
+    gpu_copy_bytes(c, 3, &up, sizeof up);
+    gpu_run_kernel(c, ((uint32_t)INK2_VOCAB + rows_per_tg - 1u) / rows_per_tg,
+                   1, 1, MV_THREADS, 1, 1);
+    return;
+  }
+  run_bf16_linear_off(c, &unembed_w, x, x_off, y, m, INK2_VOCAB, INK2_DIM,
+                      LOGITS_STRIDE, 0, is_prefill);
+  SoftcapParam sp = {(uint32_t)m, (uint32_t)INK2_VOCAB, (uint32_t)LOGITS_STRIDE,
+                     LOGIT_SOFTCAP};
+  gpu_select_kernel(c, K_logit_softcap);
+  gpu_bind_buffer(c, 0, y, 0);
+  gpu_copy_bytes(c, 1, &sp, sizeof sp);
+  gpu_run_kernel(c, ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
+                 (uint32_t)m, 1, ELEM_THREADS, 1, 1);
+}
+
+// Dispatches 2 BF16 linear projections sharing the same input x and width k in
+// one fused dispatch during decode/verify (mv_bf16_2 / mvm_bf16_2), or 2
+// mm_bf16 calls during prefill.
+static void run_bf16_linear2(GpuCommandBuffer *c, const Bf16Lin *a,
+                             const Buf *ya, const Bf16Lin *b, const Buf *yb,
+                             const Buf *x, int m, int round, int is_prefill) {
+  if (!is_prefill && m <= INK2_MAX_BATCH_ROWS) {
+    int max_n = a->n > b->n ? a->n : b->n;
+    uint32_t split = pick_mv_split(max_n, a->k);
+    uint32_t rows_per_tg = (BF16_MV_SGS / split) * BF16_MV_ROWS_PER_SG;
+    uint32_t dims[2][2] = {{(uint32_t)a->n, (uint32_t)a->n},
+                           {(uint32_t)b->n, (uint32_t)b->n}};
+    if (m == 1) {
+      MvParam p = {(uint32_t)max_n, (uint32_t)a->k, (uint32_t)max_n, 0,
+                   (uint32_t)round, split};
+      gpu_select_kernel(c, K_mv_bf16_2);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, ((uint32_t)max_n + rows_per_tg - 1u) / rows_per_tg, 2,
+                     1, MV_THREADS, 1, 1);
+    } else {
+      MvmParam p = {{(uint32_t)max_n, (uint32_t)a->k, (uint32_t)max_n, 0,
+                     (uint32_t)round, split},
+                    (uint32_t)m,
+                    (uint32_t)a->k,
+                    (uint32_t)max_n};
+      gpu_select_kernel(c, K_mvm_bf16_2);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, ((uint32_t)max_n + rows_per_tg - 1u) / rows_per_tg, 2,
+                     1, MV_THREADS, 1, 1);
+    }
+    return;
+  }
+  run_bf16_linear(c, &a->w, x, ya, m, a->n, a->k, a->n, round, is_prefill);
+  run_bf16_linear(c, &b->w, x, yb, m, b->n, b->k, b->n, round, is_prefill);
 }
 
 // Dispatches 3 BF16 linear projections sharing the same input x and width k in
@@ -1862,6 +1969,176 @@ static void run_attn_res(GpuCommandBuffer *c, const Buf *blocks,
   gpu_bind_buffer(c, 3, out, 0);
   gpu_copy_bytes(c, 4, &p, sizeof p);
   gpu_run_kernel(c, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches fused Block Attention Residuals + weighted BF16-rounded RMSNorm
+// for 1 query (out0, w0) or 3 queries (out0/1/2, w0/1/2).
+static void run_attn_res_rmsnorm(GpuCommandBuffer *c, const Buf *blocks,
+                                 size_t blk_off, const Buf *partial,
+                                 size_t part_off, const Buf *queries,
+                                 size_t q_off, const Buf *w0, const Buf *w1,
+                                 const Buf *w2, const Buf *out0,
+                                 const Buf *out1, const Buf *out2, int rows,
+                                 int block_stride, int nblocks, int nqueries) {
+  AttnResParam p = {(uint32_t)rows,
+                    (uint32_t)block_stride,
+                    (uint32_t)INK2_DIM,
+                    (uint32_t)nblocks,
+                    (uint32_t)nqueries,
+                    (uint32_t)rows,
+                    RMS_EPS};
+  gpu_select_kernel(c, K_attn_res_rmsnorm);
+  gpu_bind_buffer(c, 0, blocks, blk_off);
+  gpu_bind_buffer(c, 1, partial, part_off);
+  gpu_bind_buffer(c, 2, queries, q_off);
+  gpu_bind_buffer(c, 3, w0, 0);
+  gpu_bind_buffer(c, 4, w1 ? w1 : w0, 0);
+  gpu_bind_buffer(c, 5, w2 ? w2 : w0, 0);
+  gpu_bind_buffer(c, 6, out0, 0);
+  gpu_bind_buffer(c, 7, out1 ? out1 : out0, 0);
+  gpu_bind_buffer(c, 8, out2 ? out2 : out0, 0);
+  gpu_copy_bytes(c, 9, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)rows, 1, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches 3-way Q/K/V loop message gates followed by 3-way weighted
+// BF16-rounded RMSNorm.
+static void run_msg_gate_3_rmsnorm(GpuCommandBuffer *c, const Buf *h,
+                                   const Buf *m, const MsgController *cq,
+                                   const MsgController *ck,
+                                   const MsgController *cv, const Buf *nw0,
+                                   const Buf *nw1, const Buf *nw2, int rows,
+                                   int distinct_h, int is_prefill) {
+  Msg3Param p = {(uint32_t)rows,
+                 (uint32_t)INK2_DIM,
+                 (uint32_t)INK2_GATE_RANK,
+                 (uint32_t)work.cap_rows,
+                 (uint32_t)work.cap_rows,
+                 (uint32_t)distinct_h,
+                 RMS_EPS};
+  gpu_select_kernel(c, K_msg_cat_norm_3);
+  gpu_bind_buffer(c, 0, h, 0);
+  gpu_bind_buffer(c, 1, m, 0);
+  gpu_bind_buffer(c, 2, &work.msg_cat, 0);
+  gpu_copy_bytes(c, 3, &p, sizeof p);
+  gpu_run_kernel(c, (uint32_t)rows, 3, 1, ROW_THREADS, 1, 1);
+
+  if (!is_prefill && rows <= INK2_MAX_BATCH_ROWS) {
+    uint32_t split = pick_mv_split(cq->down.n, cq->down.k);
+    uint32_t rows_per_tg = (BF16_MV_SGS / split) * BF16_MV_ROWS_PER_SG;
+    MvmParam mp = {{(uint32_t)cq->down.n, (uint32_t)cq->down.k,
+                    (uint32_t)cq->down.n, 0, 1u, split},
+                   (uint32_t)rows,
+                   (uint32_t)cq->down.k,
+                   (uint32_t)cq->down.n};
+    gpu_select_kernel(c, K_msg_down_3);
+    gpu_bind_buffer(c, 0, &cq->down.w, 0);
+    gpu_bind_buffer(c, 1, &ck->down.w, 0);
+    gpu_bind_buffer(c, 2, &cv->down.w, 0);
+    gpu_bind_buffer(c, 3, &work.msg_cat, 0);
+    gpu_bind_buffer(c, 4, &work.msg_g, 0);
+    gpu_copy_bytes(c, 5, &mp, sizeof mp);
+    gpu_run_kernel(c, ((uint32_t)cq->down.n + rows_per_tg - 1u) / rows_per_tg,
+                   3, 1, MV_THREADS, 1, 1);
+  } else {
+    size_t cat_bytes = (size_t)rows * 2 * INK2_DIM * sizeof(float);
+    size_t g_bytes = (size_t)rows * INK2_GATE_RANK * sizeof(float);
+    const MsgController *ctrls[3] = {cq, ck, cv};
+    for (int s = 0; s < 3; s++) {
+      MmParam mp = {(uint32_t)rows,
+                    (uint32_t)ctrls[s]->down.n,
+                    (uint32_t)ctrls[s]->down.k,
+                    1u,
+                    (uint32_t)ctrls[s]->down.k,
+                    (uint32_t)ctrls[s]->down.n};
+      gpu_select_kernel(c, K_mm_bf16);
+      gpu_bind_buffer(c, 0, &ctrls[s]->down.w, 0);
+      gpu_bind_buffer(c, 2, &work.msg_cat, (size_t)s * cat_bytes);
+      gpu_bind_buffer(c, 3, &work.msg_g, (size_t)s * g_bytes);
+      gpu_copy_bytes(c, 4, &mp, sizeof mp);
+      uint32_t tn = ((uint32_t)ctrls[s]->down.n + MM_TILE_N - 1u) / MM_TILE_N;
+      uint32_t tm = ((uint32_t)rows + MM_TILE_M - 1u) / MM_TILE_M;
+      gpu_run_kernel(c, tn * tm, 1, 1, MM_THREADS, 1, 1);
+    }
+  }
+
+  gpu_select_kernel(c, K_msg_gate_apply_3);
+  gpu_bind_buffer(c, 0, h, 0);
+  gpu_bind_buffer(c, 1, m, 0);
+  gpu_bind_buffer(c, 2, &work.msg_g, 0);
+  gpu_bind_buffer(c, 3, &cq->forget_w, 0);
+  gpu_bind_buffer(c, 4, &cq->gain_w, 0);
+  gpu_bind_buffer(c, 5, &ck->forget_w, 0);
+  gpu_bind_buffer(c, 6, &ck->gain_w, 0);
+  gpu_bind_buffer(c, 7, &cv->forget_w, 0);
+  gpu_bind_buffer(c, 8, &cv->gain_w, 0);
+  gpu_bind_buffer(c, 9, &work.msg_gated, 0);
+  gpu_copy_bytes(c, 10, &p, sizeof p);
+  gpu_run_kernel(
+      c, ((uint32_t)INK2_DIM + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG,
+      ((uint32_t)rows + MOE_MV_MAX_M - 1u) / MOE_MV_MAX_M, 3, ROW_THREADS, 1,
+      1);
+
+  size_t mg_bytes = (size_t)rows * INK2_DIM * sizeof(float);
+  NormParam np = {(uint32_t)INK2_DIM, 1u, RMS_EPS};
+  gpu_select_kernel(c, K_rmsnorm_3);
+  gpu_bind_buffer(c, 0, &work.msg_gated, 0);
+  gpu_bind_buffer(c, 1, nw0, 0);
+  gpu_bind_buffer(c, 2, &work.q_in, 0);
+  gpu_bind_buffer(c, 3, &work.msg_gated, mg_bytes);
+  gpu_bind_buffer(c, 4, nw1, 0);
+  gpu_bind_buffer(c, 5, &work.k_in, 0);
+  gpu_bind_buffer(c, 6, &work.msg_gated, 2 * mg_bytes);
+  gpu_bind_buffer(c, 7, nw2, 0);
+  gpu_bind_buffer(c, 8, &work.v_in, 0);
+  gpu_copy_bytes(c, 9, &np, sizeof np);
+  gpu_run_kernel(c, (uint32_t)rows, 3, 1, ROW_THREADS, 1, 1);
+}
+
+// Dispatches post-attention static short convolution fused with residual add
+// (is_boundary == 0) or block boundary copy to blk (is_boundary == 1).
+static void run_sconv_static_post(GpuCommandBuffer *c, const Buf *x,
+                                  const Buf *w, const Buf *cur, const Buf *out,
+                                  const Buf *blk, size_t blk_off,
+                                  const Ink2State *s, int visit,
+                                  size_t ring_sub_off, int ring_kind, int rows,
+                                  int pos0, int batched, int is_boundary) {
+  SconvParam p = {(uint32_t)rows, (uint32_t)INK2_DIM, (uint32_t)INK2_SCONV_RING,
+                  (uint32_t)pos0, (uint32_t)is_boundary};
+  uint32_t gx = ((uint32_t)INK2_DIM + SCONV_THREADS - 1u) / SCONV_THREADS;
+  if (batched) {
+    size_t tgt_off =
+        ((size_t)visit * SCONV_RINGS_PER_LAYER + (size_t)ring_kind) *
+        INK2_MAX_BATCH_ROWS * sizeof(SconvTarget);
+    gpu_select_kernel(c, K_sconv_static_post_batched);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &work.sconv_tgt, tgt_off);
+    gpu_bind_buffer(c, 2, w, 0);
+    gpu_bind_buffer(c, 3, cur, 0);
+    gpu_bind_buffer(c, 4, out, 0);
+    gpu_bind_buffer(c, 5, blk, blk_off);
+    gpu_copy_bytes(c, 6, &p, sizeof p);
+    gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+    return;
+  }
+  size_t roff = conv_ring_off(visit, ring_sub_off);
+  gpu_select_kernel(c, K_sconv_static_post);
+  gpu_bind_buffer(c, 0, x, 0);
+  gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+  gpu_bind_buffer(c, 2, w, 0);
+  gpu_bind_buffer(c, 3, cur, 0);
+  gpu_bind_buffer(c, 4, out, 0);
+  gpu_bind_buffer(c, 5, blk, blk_off);
+  gpu_copy_bytes(c, 6, &p, sizeof p);
+  gpu_run_kernel(c, gx, (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
+  if (rows > 1) {
+    uint32_t keep = (uint32_t)(rows < INK2_SCONV_RING ? rows : INK2_SCONV_RING);
+    gpu_select_kernel(c, K_sconv_ring_save);
+    gpu_bind_buffer(c, 0, x, 0);
+    gpu_bind_buffer(c, 1, &s->conv_ring, roff);
+    gpu_copy_bytes(c, 2, &p, sizeof p);
+    gpu_run_kernel(c, gx, keep, 1, SCONV_THREADS, 1, 1);
+  }
 }
 
 // Dispatches one loop message gate (h, m) -> out (FP32) using `ctrl`.
@@ -2222,50 +2499,34 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   if (vis->phys == 0) {
     run_rmsnorm(cmd, &work.cur, 0, &pl->attn_norm, &work.q_in, rows, 1);
   } else if (pl->is_global) {
-    run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
-                 rows, work.cap_rows, *nblocks, ATTNRES_GLOBAL_QUERIES,
-                 work.cap_rows);
     if (use_msg) {
-      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 0, &pl->ctrl_q,
-                   &work.msg_gated, rows, is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->q_norm, &work.q_in, rows, 1);
-
-      run_msg_gate(cmd, &work.attn_in, stride_bytes, &work.msg, stride_bytes,
-                   &pl->ctrl_k, &work.msg_gated, rows, is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->k_norm, &work.k_in, rows, 1);
-
-      run_msg_gate(cmd, &work.attn_in, 2 * stride_bytes, &work.msg,
-                   2 * stride_bytes, &pl->ctrl_v, &work.msg_gated, rows,
-                   is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->v_norm, &work.v_in, rows, 1);
+      run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
+                   rows, work.cap_rows, *nblocks, ATTNRES_GLOBAL_QUERIES,
+                   work.cap_rows);
+      run_msg_gate_3_rmsnorm(cmd, &work.attn_in, &work.msg, &pl->ctrl_q,
+                             &pl->ctrl_k, &pl->ctrl_v, &pl->q_norm, &pl->k_norm,
+                             &pl->v_norm, rows, 1, is_prefill);
     } else {
-      run_rmsnorm(cmd, &work.attn_in, 0, &pl->q_norm, &work.q_in, rows, 1);
-      run_rmsnorm(cmd, &work.attn_in, stride_bytes, &pl->k_norm, &work.k_in,
-                  rows, 1);
-      run_rmsnorm(cmd, &work.attn_in, 2 * stride_bytes, &pl->v_norm, &work.v_in,
-                  rows, 1);
+      run_attn_res_rmsnorm(cmd, &work.blk, 0, &work.cur, 0, &pl->attn_query, 0,
+                           &pl->q_norm, &pl->k_norm, &pl->v_norm, &work.q_in,
+                           &work.k_in, &work.v_in, rows, work.cap_rows,
+                           *nblocks, ATTNRES_GLOBAL_QUERIES);
     }
     k_src = &work.k_in;
     v_src = &work.v_in;
   } else {
-    run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
-                 rows, work.cap_rows, *nblocks, 1, work.cap_rows);
     if (use_msg) {
-      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 0, &pl->ctrl_q,
-                   &work.msg_gated, rows, is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.q_in, rows, 1);
-
-      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, stride_bytes, &pl->ctrl_k,
-                   &work.msg_gated, rows, is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.k_in, rows, 1);
-
-      run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 2 * stride_bytes,
-                   &pl->ctrl_v, &work.msg_gated, rows, is_prefill);
-      run_rmsnorm(cmd, &work.msg_gated, 0, &pl->attn_norm, &work.v_in, rows, 1);
+      run_attn_res(cmd, &work.blk, &work.cur, &pl->attn_query, 0, &work.attn_in,
+                   rows, work.cap_rows, *nblocks, 1, work.cap_rows);
+      run_msg_gate_3_rmsnorm(
+          cmd, &work.attn_in, &work.msg, &pl->ctrl_q, &pl->ctrl_k, &pl->ctrl_v,
+          &pl->attn_norm, &pl->attn_norm, &pl->attn_norm, rows, 0, is_prefill);
       k_src = &work.k_in;
       v_src = &work.v_in;
     } else {
-      run_rmsnorm(cmd, &work.attn_in, 0, &pl->attn_norm, &work.q_in, rows, 1);
+      run_attn_res_rmsnorm(cmd, &work.blk, 0, &work.cur, 0, &pl->attn_query, 0,
+                           &pl->attn_norm, NULL, NULL, &work.q_in, NULL, NULL,
+                           rows, work.cap_rows, *nblocks, 1);
     }
   }
 
@@ -2284,19 +2545,13 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                     pl->sink_proj.n, pl->sink_proj.k, pl->sink_proj.n, 1,
                     is_prefill);
     if (pl->is_global) {
-      run_bf16_linear(cmd, &pl->wk.w, k_src, &work.k_raw, rows, pl->wk.n,
-                      pl->wk.k, pl->wk.n, 1, is_prefill);
-      run_bf16_linear(cmd, &pl->k_sconv_proj.w, k_src, &work.dyn_w, rows,
-                      pl->k_sconv_proj.n, pl->k_sconv_proj.k,
-                      pl->k_sconv_proj.n, 1, is_prefill);
+      run_bf16_linear2(cmd, &pl->wk, &work.k_raw, &pl->k_sconv_proj,
+                       &work.dyn_w, k_src, rows, 1, is_prefill);
       run_sconv_dynamic(cmd, &work.k_raw, &pl->k_sconv_w, &work.dyn_w,
                         &work.k_conv, s, v, CONV_K_OFF, 0, rows, pos0, batched);
 
-      run_bf16_linear(cmd, &pl->wv.w, v_src, &work.v_raw, rows, pl->wv.n,
-                      pl->wv.k, pl->wv.n, 1, is_prefill);
-      run_bf16_linear(cmd, &pl->v_sconv_proj.w, v_src, &work.dyn_w, rows,
-                      pl->v_sconv_proj.n, pl->v_sconv_proj.k,
-                      pl->v_sconv_proj.n, 1, is_prefill);
+      run_bf16_linear2(cmd, &pl->wv, &work.v_raw, &pl->v_sconv_proj,
+                       &work.dyn_w, v_src, rows, 1, is_prefill);
       run_sconv_dynamic(cmd, &work.v_raw, &pl->v_sconv_w, &work.dyn_w,
                         &work.v_conv, s, v, CONV_V_OFF, 1, rows, pos0, batched);
     } else {
@@ -2399,31 +2654,28 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                    COMBINE_THREADS, 1, 1);
   }
 
-  // Output projection and post-attention static short convolution.
+  // Output projection and fused post-attention static short convolution +
+  // residual update (or block boundary push into blk).
   run_bf16_linear(cmd, &pl->wo.w, &work.attn_out, &work.cur2, rows, pl->wo.n,
                   pl->wo.k, pl->wo.n, 1, is_prefill);
-  run_sconv_static(cmd, &work.cur2, &pl->attn_sconv_w, &work.residual, s, v,
-                   CONV_ATTN_OFF, 2, rows, INK2_DIM, pos0, batched);
-
-  // Block boundary pushes previous block_residual to blk and resets residual.
-  if (vis->is_boundary) {
-    run_copy(cmd, &work.cur, 0, &work.blk, (size_t)(*nblocks) * stride_bytes,
-             (uint32_t)row_floats);
-    (*nblocks)++;
-  } else {
-    run_add(cmd, &work.cur, &work.residual, &work.residual,
-            (uint32_t)row_floats, 0);
-  }
+  size_t blk_off = vis->is_boundary ? (size_t)(*nblocks) * stride_bytes : 0;
+  run_sconv_static_post(cmd, &work.cur2, &pl->attn_sconv_w, &work.cur,
+                        &work.residual, &work.blk, blk_off, s, v, CONV_ATTN_OFF,
+                        2, rows, pos0, batched, vis->is_boundary);
+  if (vis->is_boundary) (*nblocks)++;
 
   // MLP input via AttnRes, optional loop message gate, and mlp_norm.
-  run_attn_res(cmd, &work.blk, &work.residual, &pl->mlp_query, 0, &work.attn_in,
-               rows, work.cap_rows, *nblocks, 1, work.cap_rows);
   if (use_msg) {
+    run_attn_res(cmd, &work.blk, &work.residual, &pl->mlp_query, 0,
+                 &work.attn_in, rows, work.cap_rows, *nblocks, 1,
+                 work.cap_rows);
     run_msg_gate(cmd, &work.attn_in, 0, &work.msg, 3 * stride_bytes,
                  &pl->ctrl_mlp, &work.msg_gated, rows, is_prefill);
     run_rmsnorm(cmd, &work.msg_gated, 0, &pl->mlp_norm, &work.q_in, rows, 1);
   } else {
-    run_rmsnorm(cmd, &work.attn_in, 0, &pl->mlp_norm, &work.q_in, rows, 1);
+    run_attn_res_rmsnorm(cmd, &work.blk, 0, &work.residual, 0, &pl->mlp_query,
+                         0, &pl->mlp_norm, NULL, NULL, &work.q_in, NULL, NULL,
+                         rows, work.cap_rows, *nblocks, 1);
   }
 
   // Router logits (FP32, unrounded) and biased top-8 selection.
@@ -2750,10 +3002,10 @@ static int run_forward(Ink2State *const *states, const int *tokens,
 
   int mtp_on = inkling2_mtp_active_drafts() > 0;
   if (!stopped && (logits_mode > 0 || mtp_on)) {
-    run_attn_res(&cmd, &work.blk, &work.cur, &output_query, 0, &work.attn_in,
-                 rows, work.cap_rows, nblocks, 1, work.cap_rows);
     if (mtp_on) {
-      run_rmsnorm(&cmd, &work.attn_in, 0, &final_norm, &work.q_in, rows, 1);
+      run_attn_res_rmsnorm(&cmd, &work.blk, 0, &work.cur, 0, &output_query, 0,
+                           &final_norm, NULL, NULL, &work.q_in, NULL, NULL,
+                           rows, work.cap_rows, nblocks, 1);
       inkling2_mtp_capture_tap(&cmd, &work.q_in, &work.mtp, 3, rows);
       Ink2MtpState *mtp_states[INK2_MAX_BATCH_ROWS];
       int mcount = batched ? rows : 1;
@@ -2762,32 +3014,23 @@ static int run_forward(Ink2State *const *states, const int *tokens,
                           is_prefill);
       if (logits_mode == 1) {
         size_t last_off = (size_t)(rows - 1) * INK2_DIM * sizeof(float);
-        run_bf16_linear_off(&cmd, &unembed_w, &work.q_in, last_off,
-                            &work.logits, 1, INK2_VOCAB, INK2_DIM,
-                            LOGITS_STRIDE, 0, 0);
+        run_unembed_softcap(&cmd, &work.q_in, last_off, &work.logits, 1, 0);
       } else if (logits_mode == 2) {
-        run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, rows,
-                        INK2_VOCAB, INK2_DIM, LOGITS_STRIDE, 0, is_prefill);
+        run_unembed_softcap(&cmd, &work.q_in, 0, &work.logits, rows,
+                            is_prefill);
       }
     } else if (logits_mode == 1) {
       size_t last_off = (size_t)(rows - 1) * INK2_DIM * sizeof(float);
-      run_rmsnorm(&cmd, &work.attn_in, last_off, &final_norm, &work.q_in, 1, 1);
-      run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, 1, INK2_VOCAB,
-                      INK2_DIM, LOGITS_STRIDE, 0, 0);
+      run_attn_res_rmsnorm(&cmd, &work.blk, last_off, &work.cur, last_off,
+                           &output_query, 0, &final_norm, NULL, NULL,
+                           &work.q_in, NULL, NULL, 1, work.cap_rows, nblocks,
+                           1);
+      run_unembed_softcap(&cmd, &work.q_in, 0, &work.logits, 1, 0);
     } else {
-      run_rmsnorm(&cmd, &work.attn_in, 0, &final_norm, &work.q_in, rows, 1);
-      run_bf16_linear(&cmd, &unembed_w, &work.q_in, &work.logits, rows,
-                      INK2_VOCAB, INK2_DIM, LOGITS_STRIDE, 0, is_prefill);
-    }
-    if (logits_mode > 0) {
-      SoftcapParam sp = {(uint32_t)need_logits, (uint32_t)INK2_VOCAB,
-                         (uint32_t)LOGITS_STRIDE, LOGIT_SOFTCAP};
-      gpu_select_kernel(&cmd, K_logit_softcap);
-      gpu_bind_buffer(&cmd, 0, &work.logits, 0);
-      gpu_copy_bytes(&cmd, 1, &sp, sizeof sp);
-      gpu_run_kernel(&cmd,
-                     ((uint32_t)INK2_VOCAB + ELEM_THREADS - 1u) / ELEM_THREADS,
-                     (uint32_t)need_logits, 1, ELEM_THREADS, 1, 1);
+      run_attn_res_rmsnorm(&cmd, &work.blk, 0, &work.cur, 0, &output_query, 0,
+                           &final_norm, NULL, NULL, &work.q_in, NULL, NULL,
+                           rows, work.cap_rows, nblocks, 1);
+      run_unembed_softcap(&cmd, &work.q_in, 0, &work.logits, rows, is_prefill);
     }
   }
 
@@ -2835,17 +3078,26 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
 
 #define K(field, name) field = gpu_find_kernel(gpu, name)
     K(K_mv_bf16, "mv_bf16");
+    K(K_mv_bf16_2, "mv_bf16_2");
     K(K_mv_bf16_3, "mv_bf16_3");
     K(K_mvm_bf16, "mvm_bf16");
+    K(K_mvm_bf16_2, "mvm_bf16_2");
     K(K_mvm_bf16_3, "mvm_bf16_3");
     K(K_mm_bf16, "mm_bf16");
     K(K_embed_norm, "ink2_embed_norm");
     K(K_rmsnorm, "ink2_rmsnorm");
+    K(K_rmsnorm_3, "ink2_rmsnorm_3");
     K(K_attn_res, "ink2_attn_res");
+    K(K_attn_res_rmsnorm, "ink2_attn_res_rmsnorm");
     K(K_msg_cat_norm, "ink2_msg_cat_norm");
+    K(K_msg_cat_norm_3, "ink2_msg_cat_norm_3");
+    K(K_msg_down_3, "ink2_msg_down_3");
     K(K_msg_gate_apply, "ink2_msg_gate_apply");
+    K(K_msg_gate_apply_3, "ink2_msg_gate_apply_3");
     K(K_sconv_static, "ink2_sconv_static");
     K(K_sconv_static_batched, "ink2_sconv_static_batched");
+    K(K_sconv_static_post, "ink2_sconv_static_post");
+    K(K_sconv_static_post_batched, "ink2_sconv_static_post_batched");
     K(K_sconv_dynamic, "ink2_sconv_dynamic");
     K(K_sconv_dynamic_batched, "ink2_sconv_dynamic_batched");
     K(K_sconv_ring_save, "ink2_sconv_ring_save");
@@ -2873,6 +3125,8 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     K(K_moe_combine, "ink2_moe_combine");
     K(K_copy, "ink2_copy");
     K(K_add, "ink2_add");
+    K(K_unembed_softcap_m1, "ink2_unembed_softcap_m1");
+    K(K_unembed_softcap, "ink2_unembed_softcap");
     K(K_logit_softcap, "ink2_logit_softcap");
 #undef K
 

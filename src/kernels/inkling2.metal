@@ -15,8 +15,9 @@ constant constexpr uint INK2_HEADS = 24, INK2_KV_HEADS = 8,
                         INK2_INTER = 1152, INK2_DIM = 2304;
 // Block sizes of quantized expert weights (hf_quant_config.json).
 constant constexpr uint INK2_NVFP4_BLOCK = 16, INK2_MXFP8_BLOCK = 32;
-// Maximum number of rows (completed blocks + partial) in an AttnRes stack.
-constant constexpr uint INK2_MAX_RES_BLOCKS = 5;
+// Maximum queries in AttnRes and simdgroups in 256-thread row kernels.
+constant constexpr uint INK2_MAX_RES_BLOCKS = 5, INK2_MAX_RES_QUERIES = 4,
+                        INK2_ROW_SGS = 8, INK2_ROW_MAX_V4 = 3;
 // Bit-exact combined factor (2^14 * 2^8) folded out of NVFP4 inner loops.
 constant constexpr float INK2_NVFP4_UNSCALE = 4194304.0f;  // 16384.0f * 256.0f
 // Hardware SIMD width and tile sizes for Metal matrix kernels.
@@ -240,16 +241,49 @@ inline void ink2_fp4x8_raw(uint u, thread float4 &a, thread float4 &b) {
 }
 
 // Weighted RMSNorm over rows of `dim` floats. One threadgroup per row.
+// Caches float4 inputs in registers so each row is read from memory once.
 kernel void ink2_rmsnorm(device const float *x [[buffer(0)]],
                          device const float *weight [[buffer(1)]],
                          device float *y [[buffer(2)]],
                          constant Ink2NormParam &p [[buffer(3)]],
                          uint row [[threadgroup_position_in_grid]],
                          uint t [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
                          uint nt [[threads_per_threadgroup]]) {
   threadgroup float tmp[INK2_SIMD];
   x += (ulong)row * p.dim;
   y += (ulong)row * p.dim;
+  uint dim4 = p.dim / 4u;
+  if ((p.dim & 3u) == 0u && dim4 <= INK2_ROW_MAX_V4 * nt) {
+    device const float4 *x4 = (device const float4 *)x;
+    device const float4 *w4 = (device const float4 *)weight;
+    device float4 *y4 = (device float4 *)y;
+    float4 v0 = t < dim4 ? x4[t] : float4(0.0f);
+    float4 v1 = t + nt < dim4 ? x4[t + nt] : float4(0.0f);
+    float4 v2 = t + 2u * nt < dim4 ? x4[t + 2u * nt] : float4(0.0f);
+    float sq = dot(v0, v0) + dot(v1, v1) + dot(v2, v2);
+    sq = simd_sum(sq);
+    if (lane == 0u) tmp[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    uint nsgs = (nt + INK2_SIMD - 1u) / INK2_SIMD;
+    for (uint s = 0u; s < nsgs; s++) tot += tmp[s];
+    float inv = rsqrt(tot / float(p.dim) + p.eps);
+    if (t < dim4) {
+      float4 o = w4[t] * (v0 * inv);
+      y4[t] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+    }
+    if (t + nt < dim4) {
+      float4 o = w4[t + nt] * (v1 * inv);
+      y4[t + nt] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+    }
+    if (t + 2u * nt < dim4) {
+      float4 o = w4[t + 2u * nt] * (v2 * inv);
+      y4[t + 2u * nt] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+    }
+    return;
+  }
   float sq = 0.0f;
   for (uint i = t; i < p.dim; i += nt) sq += x[i] * x[i];
   float inv = rsqrt(tg_sum(sq, tmp, t, nt) / float(p.dim) + p.eps);
@@ -261,9 +295,9 @@ kernel void ink2_rmsnorm(device const float *x [[buffer(0)]],
 
 // Block Attention Residuals (modeling_inkling2.py Inkling2BlockAttentionResidual
 // and modular_inkling2_loop.py Inkling2LoopMessageAttentionResidual).
-// Stacks `nblocks` completed blocks and `partial`, applies unweighted RMSNorm,
-// and attends with `nqueries` FP32 queries scaled by 1 / sqrt(dim).
-// One threadgroup per row.
+// Stacks `nblocks` completed blocks and `partial`, computes all block RMS norms
+// and query dot products in a single pass with blocks cached in registers, and
+// writes all `nqueries` outputs in two barriers total. One threadgroup per row.
 kernel void ink2_attn_res(device const float *blocks [[buffer(0)]],
                           device const float *partial [[buffer(1)]],
                           device const float *queries [[buffer(2)]],
@@ -271,58 +305,600 @@ kernel void ink2_attn_res(device const float *blocks [[buffer(0)]],
                           constant Ink2AttnResParam &p [[buffer(4)]],
                           uint row [[threadgroup_position_in_grid]],
                           uint t [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
                           uint nt [[threads_per_threadgroup]]) {
-  threadgroup float tmp[INK2_SIMD];
-  threadgroup float inv_rms[INK2_MAX_RES_BLOCKS];
-  threadgroup float weights[INK2_MAX_RES_BLOCKS];
-  uint total = p.nblocks + 1;
-  float scale = rsqrt(float(p.dim));
-  // Compute unweighted RMSNorm inverse root-mean-square for each stacked block.
-  for (uint b = 0; b < total; b++) {
-    device const float *src = b < p.nblocks
-                                  ? blocks + ((ulong)b * p.block_stride + row) * p.dim
-                                  : partial + (ulong)row * p.dim;
-    float sq = 0.0f;
-    for (uint i = t; i < p.dim; i += nt) sq += src[i] * src[i];
-    float inv = rsqrt(tg_sum(sq, tmp, t, nt) / float(p.dim) + p.eps);
-    if (t == 0) inv_rms[b] = inv;
+  threadgroup float sm_sq[INK2_MAX_RES_BLOCKS][INK2_ROW_SGS];
+  threadgroup float sm_dot[INK2_MAX_RES_QUERIES][INK2_MAX_RES_BLOCKS][INK2_ROW_SGS];
+  threadgroup float eff_w[INK2_MAX_RES_QUERIES][INK2_MAX_RES_BLOCKS];
+
+  uint total = p.nblocks + 1u;
+  uint dim4 = p.dim / 4u;
+  uint nsgs = (nt + INK2_SIMD - 1u) / INK2_SIMD;
+  uint i0 = t, i1 = t + nt, i2 = t + 2u * nt;
+
+  // Load up to 5 stacked blocks once into registers (at most 3 float4s/thread).
+  float4 b0_0 = 0, b0_1 = 0, b0_2 = 0;
+  float4 b1_0 = 0, b1_1 = 0, b1_2 = 0;
+  float4 b2_0 = 0, b2_1 = 0, b2_2 = 0;
+  float4 b3_0 = 0, b3_1 = 0, b3_2 = 0;
+  float4 b4_0 = 0, b4_1 = 0, b4_2 = 0;
+
+#define INK2_AR_LOAD_BLK(B, V0, V1, V2)                                                \
+  if ((B) < total) {                                                                   \
+    device const float4 *src = (device const float4 *)(                                \
+        (B) < p.nblocks ? blocks + ((ulong)(B) * p.block_stride + row) * p.dim         \
+                        : partial + (ulong)row * p.dim);                               \
+    if (i0 < dim4) V0 = src[i0];                                                       \
+    if (i1 < dim4) V1 = src[i1];                                                       \
+    if (i2 < dim4) V2 = src[i2];                                                       \
+    float sq = simd_sum(dot(V0, V0) + dot(V1, V1) + dot(V2, V2));                      \
+    if (lane == 0u) sm_sq[B][sg] = sq;                                                 \
+  }
+  INK2_AR_LOAD_BLK(0u, b0_0, b0_1, b0_2);
+  INK2_AR_LOAD_BLK(1u, b1_0, b1_1, b1_2);
+  INK2_AR_LOAD_BLK(2u, b2_0, b2_1, b2_2);
+  INK2_AR_LOAD_BLK(3u, b3_0, b3_1, b3_2);
+  INK2_AR_LOAD_BLK(4u, b4_0, b4_1, b4_2);
+#undef INK2_AR_LOAD_BLK
+
+  // Compute raw query-block dot products in the same pass before the first barrier.
+#define INK2_AR_DOT_Q(Q)                                                               \
+  if ((Q) < p.nqueries) {                                                              \
+    device const float4 *qv = (device const float4 *)(queries + (ulong)(Q) * p.dim);   \
+    float4 q0 = i0 < dim4 ? qv[i0] : float4(0.0f);                                     \
+    float4 q1 = i1 < dim4 ? qv[i1] : float4(0.0f);                                     \
+    float4 q2 = i2 < dim4 ? qv[i2] : float4(0.0f);                                     \
+    if (0u < total) { float d = simd_sum(dot(q0, b0_0) + dot(q1, b0_1) + dot(q2, b0_2)); if (lane == 0u) sm_dot[Q][0][sg] = d; } \
+    if (1u < total) { float d = simd_sum(dot(q0, b1_0) + dot(q1, b1_1) + dot(q2, b1_2)); if (lane == 0u) sm_dot[Q][1][sg] = d; } \
+    if (2u < total) { float d = simd_sum(dot(q0, b2_0) + dot(q1, b2_1) + dot(q2, b2_2)); if (lane == 0u) sm_dot[Q][2][sg] = d; } \
+    if (3u < total) { float d = simd_sum(dot(q0, b3_0) + dot(q1, b3_1) + dot(q2, b3_2)); if (lane == 0u) sm_dot[Q][3][sg] = d; } \
+    if (4u < total) { float d = simd_sum(dot(q0, b4_0) + dot(q1, b4_1) + dot(q2, b4_2)); if (lane == 0u) sm_dot[Q][4][sg] = d; } \
+  }
+  INK2_AR_DOT_Q(0u);
+  INK2_AR_DOT_Q(1u);
+  INK2_AR_DOT_Q(2u);
+  INK2_AR_DOT_Q(3u);
+#undef INK2_AR_DOT_Q
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (t == 0u) {
+    float inv_rms[INK2_MAX_RES_BLOCKS];
+    float scale = rsqrt(float(p.dim));
+    for (uint b = 0u; b < total; b++) {
+      float tot = 0.0f;
+      for (uint s = 0u; s < nsgs; s++) tot += sm_sq[b][s];
+      inv_rms[b] = rsqrt(tot / float(p.dim) + p.eps);
+    }
+    for (uint q = 0u; q < p.nqueries; q++) {
+      float sc[INK2_MAX_RES_BLOCKS];
+      float mx = -INFINITY;
+      for (uint b = 0u; b < total; b++) {
+        float tot = 0.0f;
+        for (uint s = 0u; s < nsgs; s++) tot += sm_dot[q][b][s];
+        sc[b] = tot * inv_rms[b] * scale;
+        mx = max(mx, sc[b]);
+      }
+      float sum = 0.0f;
+      float w[INK2_MAX_RES_BLOCKS];
+      for (uint b = 0u; b < total; b++) {
+        w[b] = exp(sc[b] - mx);
+        sum += w[b];
+      }
+      float inv_sum = 1.0f / sum;
+      for (uint b = 0u; b < total; b++) eff_w[q][b] = (w[b] * inv_sum) * inv_rms[b];
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint q = 0; q < p.nqueries; q++) {
-    device const float *qv = queries + (ulong)q * p.dim;
-    float sc[INK2_MAX_RES_BLOCKS];
-    for (uint b = 0; b < total; b++) {
-      device const float *src = b < p.nblocks
-                                    ? blocks + ((ulong)b * p.block_stride + row) * p.dim
-                                    : partial + (ulong)row * p.dim;
-      float dotv = 0.0f;
-      for (uint i = t; i < p.dim; i += nt) dotv += qv[i] * (src[i] * inv_rms[b]);
-      sc[b] = tg_sum(dotv, tmp, t, nt) * scale;
-    }
-    if (t == 0) {
-      float mx = sc[0];
-      for (uint b = 1; b < total; b++) mx = max(mx, sc[b]);
-      float sum = 0.0f;
-      for (uint b = 0; b < total; b++) {
-        weights[b] = exp(sc[b] - mx);
-        sum += weights[b];
-      }
-      for (uint b = 0; b < total; b++) weights[b] /= sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    device float *dst = out + ((ulong)q * p.out_row_stride + row) * p.dim;
-    for (uint i = t; i < p.dim; i += nt) {
-      float acc = 0.0f;
-      for (uint b = 0; b < total; b++) {
-        device const float *src = b < p.nblocks
-                                      ? blocks + ((ulong)b * p.block_stride + row) * p.dim
-                                      : partial + (ulong)row * p.dim;
-        acc += weights[b] * (src[i] * inv_rms[b]);
-      }
-      dst[i] = acc;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#define INK2_AR_EMIT_Q(Q)                                                              \
+  if ((Q) < p.nqueries) {                                                              \
+    float w0 = eff_w[Q][0], w1 = eff_w[Q][1];                                          \
+    float4 o0 = w0 * b0_0 + w1 * b1_0;                                                 \
+    float4 o1 = w0 * b0_1 + w1 * b1_1;                                                 \
+    float4 o2 = w0 * b0_2 + w1 * b1_2;                                                 \
+    if (2u < total) { float w2 = eff_w[Q][2]; o0 += w2 * b2_0; o1 += w2 * b2_1; o2 += w2 * b2_2; } \
+    if (3u < total) { float w3 = eff_w[Q][3]; o0 += w3 * b3_0; o1 += w3 * b3_1; o2 += w3 * b3_2; } \
+    if (4u < total) { float w4 = eff_w[Q][4]; o0 += w4 * b4_0; o1 += w4 * b4_1; o2 += w4 * b4_2; } \
+    device float4 *dst =                                                               \
+        (device float4 *)(out + ((ulong)(Q) * p.out_row_stride + row) * p.dim);        \
+    if (i0 < dim4) dst[i0] = o0;                                                       \
+    if (i1 < dim4) dst[i1] = o1;                                                       \
+    if (i2 < dim4) dst[i2] = o2;                                                       \
   }
+  INK2_AR_EMIT_Q(0u);
+  INK2_AR_EMIT_Q(1u);
+  INK2_AR_EMIT_Q(2u);
+  INK2_AR_EMIT_Q(3u);
+#undef INK2_AR_EMIT_Q
+}
+
+// Fused Block Attention Residuals and weighted BF16-rounded RMSNorm for 1 query
+// (out0, norm_w0) or 3 queries (global layers: out0/1/2, norm_w0/1/2).
+// Grid: rows threadgroups of 256 threads.
+kernel void ink2_attn_res_rmsnorm(device const float *blocks [[buffer(0)]],
+                                  device const float *partial [[buffer(1)]],
+                                  device const float *queries [[buffer(2)]],
+                                  device const float *norm_w0 [[buffer(3)]],
+                                  device const float *norm_w1 [[buffer(4)]],
+                                  device const float *norm_w2 [[buffer(5)]],
+                                  device float *out0 [[buffer(6)]],
+                                  device float *out1 [[buffer(7)]],
+                                  device float *out2 [[buffer(8)]],
+                                  constant Ink2AttnResParam &p [[buffer(9)]],
+                                  uint row [[threadgroup_position_in_grid]],
+                                  uint t [[thread_index_in_threadgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint nt [[threads_per_threadgroup]]) {
+  threadgroup float sm_sq[INK2_MAX_RES_BLOCKS][INK2_ROW_SGS];
+  threadgroup float sm_dot[3][INK2_MAX_RES_BLOCKS][INK2_ROW_SGS];
+  threadgroup float eff_w[3][INK2_MAX_RES_BLOCKS];
+  threadgroup float sm_out_sq[3][INK2_ROW_SGS];
+
+  uint total = p.nblocks + 1u;
+  uint dim4 = p.dim / 4u;
+  uint nsgs = (nt + INK2_SIMD - 1u) / INK2_SIMD;
+  uint i0 = t, i1 = t + nt, i2 = t + 2u * nt;
+
+  float4 b0_0 = 0, b0_1 = 0, b0_2 = 0;
+  float4 b1_0 = 0, b1_1 = 0, b1_2 = 0;
+  float4 b2_0 = 0, b2_1 = 0, b2_2 = 0;
+  float4 b3_0 = 0, b3_1 = 0, b3_2 = 0;
+  float4 b4_0 = 0, b4_1 = 0, b4_2 = 0;
+
+#define INK2_ARN_LOAD_BLK(B, V0, V1, V2)                                               \
+  if ((B) < total) {                                                                   \
+    device const float4 *src = (device const float4 *)(                                \
+        (B) < p.nblocks ? blocks + ((ulong)(B) * p.block_stride + row) * p.dim         \
+                        : partial + (ulong)row * p.dim);                               \
+    if (i0 < dim4) V0 = src[i0];                                                       \
+    if (i1 < dim4) V1 = src[i1];                                                       \
+    if (i2 < dim4) V2 = src[i2];                                                       \
+    float sq = simd_sum(dot(V0, V0) + dot(V1, V1) + dot(V2, V2));                      \
+    if (lane == 0u) sm_sq[B][sg] = sq;                                                 \
+  }
+  INK2_ARN_LOAD_BLK(0u, b0_0, b0_1, b0_2);
+  INK2_ARN_LOAD_BLK(1u, b1_0, b1_1, b1_2);
+  INK2_ARN_LOAD_BLK(2u, b2_0, b2_1, b2_2);
+  INK2_ARN_LOAD_BLK(3u, b3_0, b3_1, b3_2);
+  INK2_ARN_LOAD_BLK(4u, b4_0, b4_1, b4_2);
+#undef INK2_ARN_LOAD_BLK
+
+#define INK2_ARN_DOT_Q(Q)                                                              \
+  if ((Q) < p.nqueries) {                                                              \
+    device const float4 *qv = (device const float4 *)(queries + (ulong)(Q) * p.dim);   \
+    float4 q0 = i0 < dim4 ? qv[i0] : float4(0.0f);                                     \
+    float4 q1 = i1 < dim4 ? qv[i1] : float4(0.0f);                                     \
+    float4 q2 = i2 < dim4 ? qv[i2] : float4(0.0f);                                     \
+    if (0u < total) { float d = simd_sum(dot(q0, b0_0) + dot(q1, b0_1) + dot(q2, b0_2)); if (lane == 0u) sm_dot[Q][0][sg] = d; } \
+    if (1u < total) { float d = simd_sum(dot(q0, b1_0) + dot(q1, b1_1) + dot(q2, b1_2)); if (lane == 0u) sm_dot[Q][1][sg] = d; } \
+    if (2u < total) { float d = simd_sum(dot(q0, b2_0) + dot(q1, b2_1) + dot(q2, b2_2)); if (lane == 0u) sm_dot[Q][2][sg] = d; } \
+    if (3u < total) { float d = simd_sum(dot(q0, b3_0) + dot(q1, b3_1) + dot(q2, b3_2)); if (lane == 0u) sm_dot[Q][3][sg] = d; } \
+    if (4u < total) { float d = simd_sum(dot(q0, b4_0) + dot(q1, b4_1) + dot(q2, b4_2)); if (lane == 0u) sm_dot[Q][4][sg] = d; } \
+  }
+  INK2_ARN_DOT_Q(0u);
+  INK2_ARN_DOT_Q(1u);
+  INK2_ARN_DOT_Q(2u);
+#undef INK2_ARN_DOT_Q
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (t == 0u) {
+    float inv_rms[INK2_MAX_RES_BLOCKS];
+    float scale = rsqrt(float(p.dim));
+    for (uint b = 0u; b < total; b++) {
+      float tot = 0.0f;
+      for (uint s = 0u; s < nsgs; s++) tot += sm_sq[b][s];
+      inv_rms[b] = rsqrt(tot / float(p.dim) + p.eps);
+    }
+    for (uint q = 0u; q < p.nqueries; q++) {
+      float sc[INK2_MAX_RES_BLOCKS];
+      float mx = -INFINITY;
+      for (uint b = 0u; b < total; b++) {
+        float tot = 0.0f;
+        for (uint s = 0u; s < nsgs; s++) tot += sm_dot[q][b][s];
+        sc[b] = tot * inv_rms[b] * scale;
+        mx = max(mx, sc[b]);
+      }
+      float sum = 0.0f;
+      float w[INK2_MAX_RES_BLOCKS];
+      for (uint b = 0u; b < total; b++) {
+        w[b] = exp(sc[b] - mx);
+        sum += w[b];
+      }
+      float inv_sum = 1.0f / sum;
+      for (uint b = 0u; b < total; b++) eff_w[q][b] = (w[b] * inv_sum) * inv_rms[b];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Combine in registers and compute RMSNorm square sums for all queries before one barrier.
+#define INK2_ARN_COMB(Q, O0, O1, O2)                                                   \
+  {                                                                                    \
+    float w0 = eff_w[Q][0], w1 = eff_w[Q][1];                                          \
+    O0 = w0 * b0_0 + w1 * b1_0;                                                        \
+    O1 = w0 * b0_1 + w1 * b1_1;                                                        \
+    O2 = w0 * b0_2 + w1 * b1_2;                                                        \
+    if (2u < total) { float w2 = eff_w[Q][2]; O0 += w2 * b2_0; O1 += w2 * b2_1; O2 += w2 * b2_2; } \
+    if (3u < total) { float w3 = eff_w[Q][3]; O0 += w3 * b3_0; O1 += w3 * b3_1; O2 += w3 * b3_2; } \
+    if (4u < total) { float w4 = eff_w[Q][4]; O0 += w4 * b4_0; O1 += w4 * b4_1; O2 += w4 * b4_2; } \
+    float osq = simd_sum(dot(O0, O0) + dot(O1, O1) + dot(O2, O2));                     \
+    if (lane == 0u) sm_out_sq[Q][sg] = osq;                                            \
+  }
+  float4 y0_0 = 0, y0_1 = 0, y0_2 = 0;
+  float4 y1_0 = 0, y1_1 = 0, y1_2 = 0;
+  float4 y2_0 = 0, y2_1 = 0, y2_2 = 0;
+  INK2_ARN_COMB(0u, y0_0, y0_1, y0_2);
+  if (p.nqueries > 1u) INK2_ARN_COMB(1u, y1_0, y1_1, y1_2);
+  if (p.nqueries > 2u) INK2_ARN_COMB(2u, y2_0, y2_1, y2_2);
+#undef INK2_ARN_COMB
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#define INK2_ARN_STORE(Q, NW, DST, O0, O1, O2)                                         \
+  {                                                                                    \
+    float tot = 0.0f;                                                                  \
+    for (uint s = 0u; s < nsgs; s++) tot += sm_out_sq[Q][s];                           \
+    float inv = rsqrt(tot / float(p.dim) + p.eps);                                     \
+    device const float4 *nw4 = (device const float4 *)(NW);                            \
+    device float4 *dst4 = (device float4 *)((DST) + (ulong)row * p.dim);               \
+    if (i0 < dim4) { float4 v = nw4[i0] * (O0 * inv); dst4[i0] = float4(bf(v.x), bf(v.y), bf(v.z), bf(v.w)); } \
+    if (i1 < dim4) { float4 v = nw4[i1] * (O1 * inv); dst4[i1] = float4(bf(v.x), bf(v.y), bf(v.z), bf(v.w)); } \
+    if (i2 < dim4) { float4 v = nw4[i2] * (O2 * inv); dst4[i2] = float4(bf(v.x), bf(v.y), bf(v.z), bf(v.w)); } \
+  }
+  INK2_ARN_STORE(0u, norm_w0, out0, y0_0, y0_1, y0_2);
+  if (p.nqueries > 1u) INK2_ARN_STORE(1u, norm_w1, out1, y1_0, y1_1, y1_2);
+  if (p.nqueries > 2u) INK2_ARN_STORE(2u, norm_w2, out2, y2_0, y2_1, y2_2);
+#undef INK2_ARN_STORE
+}
+
+// Parameters for 3-way loop message controller concatenation, down-proj,
+// gate apply and weighted RMSNorm across Q, K and V streams.
+struct Ink2Msg3Param {
+  // Active token count, hidden width, gate rank, row stride of h/m slices.
+  uint rows, dim, rank, h_stride_rows;
+  // Row stride of m slices (in rows), nonzero if h has 3 distinct slices (global).
+  uint m_stride_rows, distinct_h;
+  // Unweighted RMSNorm epsilon.
+  float eps;
+};
+
+// 3-way weighted BF16-rounded RMSNorm across Q, K and V streams (grid.y = 0..2).
+// Grid: (rows, 3, 1). Threadgroup: 256 threads.
+kernel void ink2_rmsnorm_3(device const float *x0 [[buffer(0)]],
+                           device const float *w0 [[buffer(1)]],
+                           device float *y0 [[buffer(2)]],
+                           device const float *x1 [[buffer(3)]],
+                           device const float *w1 [[buffer(4)]],
+                           device float *y1 [[buffer(5)]],
+                           device const float *x2 [[buffer(6)]],
+                           device const float *w2 [[buffer(7)]],
+                           device float *y2 [[buffer(8)]],
+                           constant Ink2NormParam &p [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint t [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint2 nt_v [[threads_per_threadgroup]]) {
+  threadgroup float tmp[INK2_SIMD];
+  uint row = tg.x, idx = tg.y, nt = nt_v.x;
+  device const float *x = idx == 0u ? x0 : (idx == 1u ? x1 : x2);
+  device const float *w = idx == 0u ? w0 : (idx == 1u ? w1 : w2);
+  device float *y = idx == 0u ? y0 : (idx == 1u ? y1 : y2);
+  x += (ulong)row * p.dim;
+  y += (ulong)row * p.dim;
+  uint dim4 = p.dim / 4u;
+  device const float4 *x4 = (device const float4 *)x;
+  device const float4 *w4 = (device const float4 *)w;
+  device float4 *y4 = (device float4 *)y;
+  float4 v0 = t < dim4 ? x4[t] : float4(0.0f);
+  float4 v1 = t + nt < dim4 ? x4[t + nt] : float4(0.0f);
+  float4 v2 = t + 2u * nt < dim4 ? x4[t + 2u * nt] : float4(0.0f);
+  float sq = simd_sum(dot(v0, v0) + dot(v1, v1) + dot(v2, v2));
+  if (lane == 0u) tmp[sg] = sq;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float tot = 0.0f;
+  uint nsgs = (nt + INK2_SIMD - 1u) / INK2_SIMD;
+  for (uint s = 0u; s < nsgs; s++) tot += tmp[s];
+  float inv = rsqrt(tot / float(p.dim) + p.eps);
+  if (t < dim4) {
+    float4 o = w4[t] * (v0 * inv);
+    y4[t] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+  }
+  if (t + nt < dim4) {
+    float4 o = w4[t + nt] * (v1 * inv);
+    y4[t + nt] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+  }
+  if (t + 2u * nt < dim4) {
+    float4 o = w4[t + 2u * nt] * (v2 * inv);
+    y4[t + 2u * nt] = p.round ? float4(bf(o.x), bf(o.y), bf(o.z), bf(o.w)) : o;
+  }
+}
+
+// 3-way loop message input concatenation and normalization for Q, K and V
+// controllers into cat[stream][row][2 * dim]. Grid: (rows, 3, 1), TG: 256.
+kernel void ink2_msg_cat_norm_3(device const float *h [[buffer(0)]],
+                                device const float *m [[buffer(1)]],
+                                device float *cat [[buffer(2)]],
+                                constant Ink2Msg3Param &p [[buffer(3)]],
+                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint t [[thread_index_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint2 nt_v [[threads_per_threadgroup]]) {
+  threadgroup float tmp_h[INK2_ROW_SGS];
+  threadgroup float tmp_m[INK2_ROW_SGS];
+  uint row = tg.x, s = tg.y, nt = nt_v.x;
+  uint h_slice = p.distinct_h ? s : 0u;
+  device const float4 *hr =
+      (device const float4 *)(h + ((ulong)h_slice * p.h_stride_rows + row) * p.dim);
+  device const float4 *mr =
+      (device const float4 *)(m + ((ulong)s * p.m_stride_rows + row) * p.dim);
+  device float4 *dst =
+      (device float4 *)(cat + ((ulong)s * p.rows + row) * (2u * p.dim));
+  uint dim4 = p.dim / 4u;
+  float4 h0 = t < dim4 ? hr[t] : float4(0.0f);
+  float4 h1 = t + nt < dim4 ? hr[t + nt] : float4(0.0f);
+  float4 h2 = t + 2u * nt < dim4 ? hr[t + 2u * nt] : float4(0.0f);
+  float4 m0 = t < dim4 ? mr[t] : float4(0.0f);
+  float4 m1 = t + nt < dim4 ? mr[t + nt] : float4(0.0f);
+  float4 m2 = t + 2u * nt < dim4 ? mr[t + 2u * nt] : float4(0.0f);
+  float sq_h = simd_sum(dot(h0, h0) + dot(h1, h1) + dot(h2, h2));
+  float sq_m = simd_sum(dot(m0, m0) + dot(m1, m1) + dot(m2, m2));
+  if (lane == 0u) tmp_h[sg] = sq_h, tmp_m[sg] = sq_m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float th = 0.0f, tm = 0.0f;
+  uint nsgs = (nt + INK2_SIMD - 1u) / INK2_SIMD;
+  for (uint i = 0u; i < nsgs; i++) th += tmp_h[i], tm += tmp_m[i];
+  float inv_h = rsqrt(th / float(p.dim) + p.eps);
+  float inv_m = rsqrt(tm / float(p.dim) + p.eps);
+  if (t < dim4) {
+    float4 oh = h0 * inv_h, om = m0 * inv_m;
+    dst[t] = float4(bf(oh.x), bf(oh.y), bf(oh.z), bf(oh.w));
+    dst[dim4 + t] = float4(bf(om.x), bf(om.y), bf(om.z), bf(om.w));
+  }
+  if (t + nt < dim4) {
+    float4 oh = h1 * inv_h, om = m1 * inv_m;
+    dst[t + nt] = float4(bf(oh.x), bf(oh.y), bf(oh.z), bf(oh.w));
+    dst[dim4 + t + nt] = float4(bf(om.x), bf(om.y), bf(om.z), bf(om.w));
+  }
+  if (t + 2u * nt < dim4) {
+    float4 oh = h2 * inv_h, om = m2 * inv_m;
+    dst[t + 2u * nt] = float4(bf(oh.x), bf(oh.y), bf(oh.z), bf(oh.w));
+    dst[dim4 + t + 2u * nt] = float4(bf(om.x), bf(om.y), bf(om.z), bf(om.w));
+  }
+}
+
+// 3-way loop message down projection (Q, K, V controllers with separate input
+// slices cat[s][row][2*dim] -> g[s][row][rank]) for m = 1..8 with split = 8.
+// Grid: (ceil(rank / 4), 3, 1), TG: 256.
+kernel void ink2_msg_down_3(device const ushort *w0 [[buffer(0)]],
+                            device const ushort *w1 [[buffer(1)]],
+                            device const ushort *w2 [[buffer(2)]],
+                            device const float *cat [[buffer(3)]],
+                            device float *g_out [[buffer(4)]],
+                            constant MVM &p [[buffer(5)]],
+                            uint2 g [[threadgroup_position_in_grid]],
+                            uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float4 part[8][8];
+  uint s = g.y;
+  device const ushort *w = s == 0u ? w0 : (s == 1u ? w1 : w2);
+  device const float *x = cat + (ulong)s * p.m * p.lda;
+  device float *y = g_out + (ulong)s * p.m * p.ldy;
+  uint row = (g.x * (8u / p.mv.split) + sg / p.mv.split) * 4u;
+  uint chunks = p.mv.k / 8u;
+  uint c_start = (sg % p.mv.split) * 32u + lane;
+  uint c_step = 32u * p.mv.split;
+  device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.mv.k);
+
+  if (p.m == 1u) {
+    float4 a0 = 0;
+    if (row < p.mv.n) {
+      device const float4 *xr = (device const float4 *)x;
+      for (uint c = c_start; c < chunks; c += c_step) {
+        uint4 q[4];
+#pragma unroll
+        for (uint r = 0u; r < 4u; r++) q[r] = wr[r * chunks + c];
+        float4 x0 = xr[2u * c], x1 = xr[2u * c + 1u];
+#pragma unroll
+        for (uint r = 0u; r < 4u; r++) {
+          float4 d = bf16x4(q[r].xy) * x0 + bf16x4(q[r].zw) * x1;
+          a0[r] += d.x + d.y + d.z + d.w;
+        }
+      }
+    }
+    mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+    if (p.mv.split > 1u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg % p.mv.split) return;
+    }
+    mvm_emit_row(a0, 0u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+    return;
+  }
+
+#define INK2_MD3_DOT(j, av)                                                             \
+  {                                                                                     \
+    device const float4 *xr = (device const float4 *)(x + (ulong)(j) * p.lda);          \
+    float4 d = w0v * xr[2u * c] + w1v * xr[2u * c + 1u];                                \
+    av[r] += d.x + d.y + d.z + d.w;                                                     \
+  }
+
+  if (p.m <= 4u) {
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    if (row < p.mv.n) {
+      for (uint c = c_start; c < chunks; c += c_step) {
+        uint4 q[4];
+#pragma unroll
+        for (uint r = 0u; r < 4u; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+        for (uint r = 0u; r < 4u; r++) {
+          float4 w0v = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+          INK2_MD3_DOT(0u, a0);
+          INK2_MD3_DOT(1u, a1);
+          if (p.m > 2u) INK2_MD3_DOT(2u, a2);
+          if (p.m > 3u) INK2_MD3_DOT(3u, a3);
+        }
+      }
+    }
+    mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+    mvm_reduce_row(a1, 1u, part, p.mv.split, sg, lane);
+    if (p.m > 2u) mvm_reduce_row(a2, 2u, part, p.mv.split, sg, lane);
+    if (p.m > 3u) mvm_reduce_row(a3, 3u, part, p.mv.split, sg, lane);
+    if (p.mv.split > 1u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sg % p.mv.split) return;
+    }
+    mvm_emit_row(a0, 0u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+    mvm_emit_row(a1, 1u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+    if (p.m > 2u) mvm_emit_row(a2, 2u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+    if (p.m > 3u) mvm_emit_row(a3, 3u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+    return;
+  }
+
+  float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+  if (row < p.mv.n) {
+    for (uint c = c_start; c < chunks; c += c_step) {
+      uint4 q[4];
+#pragma unroll
+      for (uint r = 0u; r < 4u; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+      for (uint r = 0u; r < 4u; r++) {
+        float4 w0v = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+        INK2_MD3_DOT(0u, a0);
+        INK2_MD3_DOT(1u, a1);
+        INK2_MD3_DOT(2u, a2);
+        INK2_MD3_DOT(3u, a3);
+        INK2_MD3_DOT(4u, a4);
+        if (p.m > 5u) INK2_MD3_DOT(5u, a5);
+        if (p.m > 6u) INK2_MD3_DOT(6u, a6);
+        if (p.m > 7u) INK2_MD3_DOT(7u, a7);
+      }
+    }
+  }
+  mvm_reduce_row(a0, 0u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a1, 1u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a2, 2u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a3, 3u, part, p.mv.split, sg, lane);
+  mvm_reduce_row(a4, 4u, part, p.mv.split, sg, lane);
+  if (p.m > 5u) mvm_reduce_row(a5, 5u, part, p.mv.split, sg, lane);
+  if (p.m > 6u) mvm_reduce_row(a6, 6u, part, p.mv.split, sg, lane);
+  if (p.m > 7u) mvm_reduce_row(a7, 7u, part, p.mv.split, sg, lane);
+  if (p.mv.split > 1u) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg % p.mv.split) return;
+  }
+  mvm_emit_row(a0, 0u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  mvm_emit_row(a1, 1u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  mvm_emit_row(a2, 2u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  mvm_emit_row(a3, 3u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  mvm_emit_row(a4, 4u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  if (p.m > 5u) mvm_emit_row(a5, 5u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  if (p.m > 6u) mvm_emit_row(a6, 6u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+  if (p.m > 7u) mvm_emit_row(a7, 7u, part, y, p, p.mv.n, p.ldy, row, sg, lane);
+#undef INK2_MD3_DOT
+}
+
+// 3-way loop message gate apply for Q, K and V streams (grid.z = 0..2).
+// Grid: (ceil(dim / 32), ceil(rows / 8), 3). Threadgroup: 256 threads.
+kernel void ink2_msg_gate_apply_3(device const float *h_base [[buffer(0)]],
+                                  device const float *m_base [[buffer(1)]],
+                                  device const float *g_base [[buffer(2)]],
+                                  device const ushort *fw0 [[buffer(3)]],
+                                  device const ushort *gw0 [[buffer(4)]],
+                                  device const ushort *fw1 [[buffer(5)]],
+                                  device const ushort *gw1 [[buffer(6)]],
+                                  device const ushort *fw2 [[buffer(7)]],
+                                  device const ushort *gw2 [[buffer(8)]],
+                                  device float *out_base [[buffer(9)]],
+                                  constant Ink2Msg3Param &p [[buffer(10)]],
+                                  uint3 tg [[threadgroup_position_in_grid]],
+                                  uint t [[thread_index_in_threadgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint LANES_PER_CH = 8u, CH_PER_SG = INK2_SIMD / LANES_PER_CH,
+                 CH_PER_TG = INK2_MV_SGS * CH_PER_SG, BF16_PER_UINT4 = 8u,
+                 ROWS_PER_TG = INK2_MV_MAX_M,
+                 TG_THREADS = INK2_MV_SGS * INK2_SIMD;
+  threadgroup float gs[ROWS_PER_TG * INK2_MAX_GATE_RANK];
+  uint s = tg.z;
+  uint row0 = tg.y * ROWS_PER_TG;
+  if (row0 >= p.rows) return;
+  uint nr = min(ROWS_PER_TG, p.rows - row0);
+
+  uint h_slice = p.distinct_h ? s : 0u;
+  device const float *h = h_base + (ulong)h_slice * p.h_stride_rows * p.dim;
+  device const float *m = m_base + (ulong)s * p.m_stride_rows * p.dim;
+  device const float *g = g_base + (ulong)s * p.rows * p.rank;
+  device const ushort *forget_w = s == 0u ? fw0 : (s == 1u ? fw1 : fw2);
+  device const ushort *gain_w = s == 0u ? gw0 : (s == 1u ? gw1 : gw2);
+  device float *out = out_base + (ulong)s * p.rows * p.dim;
+
+  uint total_g = nr * p.rank;
+  for (uint idx = t; idx < total_g; idx += TG_THREADS) {
+    uint r = idx / p.rank;
+    uint c = idx % p.rank;
+    gs[r * INK2_MAX_GATE_RANK + c] = g[(ulong)(row0 + r) * p.rank + c];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint ch = tg.x * CH_PER_TG + sg * CH_PER_SG + lane / LANES_PER_CH;
+  uint chunk = lane & (LANES_PER_CH - 1u);
+  if (ch >= p.dim) return;
+
+  uint chunks = p.rank / BF16_PER_UINT4;
+  device const uint4 *fw = (device const uint4 *)(forget_w + (ulong)ch * p.rank);
+  device const uint4 *gw = (device const uint4 *)(gain_w + (ulong)ch * p.rank);
+  float df0 = 0.0f, df1 = 0.0f, df2 = 0.0f, df3 = 0.0f;
+  float df4 = 0.0f, df5 = 0.0f, df6 = 0.0f, df7 = 0.0f;
+  float dg0 = 0.0f, dg1 = 0.0f, dg2 = 0.0f, dg3 = 0.0f;
+  float dg4 = 0.0f, dg5 = 0.0f, dg6 = 0.0f, dg7 = 0.0f;
+  for (uint c = chunk; c < chunks; c += LANES_PER_CH) {
+    uint4 fq = fw[c], gq = gw[c];
+    float4 fw0v = bf16x4(fq.xy), fw1v = bf16x4(fq.zw);
+    float4 gw0v = bf16x4(gq.xy), gw1v = bf16x4(gq.zw);
+    uint coff = c * BF16_PER_UINT4;
+#define INK2_MG3_STEP(idx, dfv, dgv)                                                    \
+  if (idx < nr) {                                                                       \
+    float4 g0 = *(threadgroup const float4 *)(gs + idx * INK2_MAX_GATE_RANK + coff);    \
+    float4 g1 = *(threadgroup const float4 *)(gs + idx * INK2_MAX_GATE_RANK + coff + 4u); \
+    float4 fd = fw0v * g0 + fw1v * g1;                                                  \
+    float4 gd = gw0v * g0 + gw1v * g1;                                                  \
+    dfv += fd.x + fd.y + fd.z + fd.w;                                                   \
+    dgv += gd.x + gd.y + gd.z + gd.w;                                                   \
+  }
+    INK2_MG3_STEP(0u, df0, dg0);
+    INK2_MG3_STEP(1u, df1, dg1);
+    INK2_MG3_STEP(2u, df2, dg2);
+    INK2_MG3_STEP(3u, df3, dg3);
+    INK2_MG3_STEP(4u, df4, dg4);
+    INK2_MG3_STEP(5u, df5, dg5);
+    INK2_MG3_STEP(6u, df6, dg6);
+    INK2_MG3_STEP(7u, df7, dg7);
+#undef INK2_MG3_STEP
+  }
+#define INK2_MG3_EMIT(idx, dfv, dgv)                                                    \
+  if (idx < nr) {                                                                       \
+    for (uint off = LANES_PER_CH / 2u; off > 0u; off >>= 1u) {                          \
+      dfv += simd_shuffle_xor(dfv, off);                                                \
+      dgv += simd_shuffle_xor(dgv, off);                                                \
+    }                                                                                   \
+    if (chunk == 0u) {                                                                  \
+      ulong oidx = (ulong)(row0 + idx) * p.dim + ch;                                    \
+      out[oidx] = (1.0f - tanh(dfv)) * h[oidx] + tanh(dgv) * m[oidx];                   \
+    }                                                                                   \
+  }
+  INK2_MG3_EMIT(0u, df0, dg0);
+  INK2_MG3_EMIT(1u, df1, dg1);
+  INK2_MG3_EMIT(2u, df2, dg2);
+  INK2_MG3_EMIT(3u, df3, dg3);
+  INK2_MG3_EMIT(4u, df4, dg4);
+  INK2_MG3_EMIT(5u, df5, dg5);
+  INK2_MG3_EMIT(6u, df6, dg6);
+  INK2_MG3_EMIT(7u, df7, dg7);
+#undef INK2_MG3_EMIT
 }
 
 // Prepares loop controller input: concatenates unweighted-RMSNorm(h) and
@@ -552,6 +1128,74 @@ kernel void ink2_sconv_dynamic_batched(device const float *x [[buffer(0)]],
   ring[(ulong)(pos % p.ring_rows) * p.dim + c] = xt;
   float out = (sum + xt) * INK2_SCONV_DYNAMIC_SCALE;
   y[(ulong)r * p.dim + c] = p.round ? bf(out) : out;
+}
+
+// Static causal short convolution fused with residual addition
+// (out = cur + bf((conv + x) / sqrt(5))) or block boundary push
+// (out = bf((conv + x) / sqrt(5)) and blk_dst = cur).
+// mode == 0: out = cur + sconv; mode == 1: out = sconv and blk_dst = cur.
+kernel void ink2_sconv_static_post(device const float *x [[buffer(0)]],
+                                   device float *ring [[buffer(1)]],
+                                   device const float *w [[buffer(2)]],
+                                   device const float *cur [[buffer(3)]],
+                                   device float *out [[buffer(4)]],
+                                   device float *blk_dst [[buffer(5)]],
+                                   constant Ink2SconvParam &p [[buffer(6)]],
+                                   uint2 i [[thread_position_in_grid]]) {
+  uint c = i.x, r = i.y;
+  if (c >= p.dim || r >= p.rows) return;
+  uint pos = p.pos0 + r;
+  device const float *wc = w + (ulong)c * INK2_SCONV_K;
+  ulong idx = (ulong)r * p.dim + c;
+  float xt = x[idx];
+  float sum = wc[INK2_SCONV_K - 1u] * xt;
+  for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+    if (pos < lag) continue;
+    float v = r >= lag ? x[(ulong)(r - lag) * p.dim + c]
+                       : ring[(ulong)((pos - lag) % p.ring_rows) * p.dim + c];
+    sum += wc[INK2_SCONV_K - 1u - lag] * v;
+  }
+  if (p.rows == 1u) ring[(ulong)(pos % p.ring_rows) * p.dim + c] = xt;
+  float sc = bf((sum + xt) * INK2_SCONV_STATIC_SCALE);
+  if (p.round == 0u) {
+    out[idx] = cur[idx] + sc;
+  } else {
+    out[idx] = sc;
+    blk_dst[idx] = cur[idx];
+  }
+}
+
+// Batched multi-state static causal short convolution fused with post-attention
+// residual add (p.round == 0) or block boundary copy (p.round == 1).
+kernel void ink2_sconv_static_post_batched(device const float *x [[buffer(0)]],
+                                           device const Ink2SconvTarget *targets [[buffer(1)]],
+                                           device const float *w [[buffer(2)]],
+                                           device const float *cur [[buffer(3)]],
+                                           device float *out [[buffer(4)]],
+                                           device float *blk_dst [[buffer(5)]],
+                                           constant Ink2SconvParam &p [[buffer(6)]],
+                                           uint2 i [[thread_position_in_grid]]) {
+  uint c = i.x, r = i.y;
+  if (c >= p.dim || r >= p.rows) return;
+  device float *ring = targets[r].ring;
+  uint pos = targets[r].pos;
+  device const float *wc = w + (ulong)c * INK2_SCONV_K;
+  ulong idx = (ulong)r * p.dim + c;
+  float xt = x[idx];
+  float sum = wc[INK2_SCONV_K - 1u] * xt;
+  for (uint lag = 1u; lag < INK2_SCONV_K; lag++) {
+    if (pos < lag) continue;
+    sum += wc[INK2_SCONV_K - 1u - lag] *
+           ring[(ulong)((pos - lag) % p.ring_rows) * p.dim + c];
+  }
+  ring[(ulong)(pos % p.ring_rows) * p.dim + c] = xt;
+  float sc = bf((sum + xt) * INK2_SCONV_STATIC_SCALE);
+  if (p.round == 0u) {
+    out[idx] = cur[idx] + sc;
+  } else {
+    out[idx] = sc;
+    blk_dst[idx] = cur[idx];
+  }
 }
 
 // Writes the last `min(rows, ring_rows)` rows of a contiguous chunk into the
@@ -2213,6 +2857,124 @@ kernel void ink2_moe_group(device const uint *route_ids [[buffer(0)]],
   }
   for (uint idx = total_tiles + t; idx < npairs; idx += INK2_EXPERTS)
     tiles[idx] = Ink2MoeTile{0u, 0u, 0u, 0u};
+}
+
+// Parameters for fused BF16 unembed + softcap (rows 1..8).
+struct Ink2UnembedParam {
+  // Batch rows (1..8), unpadded vocabulary size, input width, output stride.
+  uint m, vocab, k, ldy;
+  // Softcap bound (30.0) and its reciprocal.
+  float cap, inv_cap;
+};
+
+// Single-row fused BF16 unembed and softcap (cap * tanh(x / cap)).
+// Grid: x = ceil(vocab / 32), y = 1, z = 1. Threadgroup: 256 threads (8 sgs).
+kernel void ink2_unembed_softcap_m1(device const ushort *w [[buffer(0)]],
+                                    device const float *x [[buffer(1)]],
+                                    device float *y [[buffer(2)]],
+                                    constant Ink2UnembedParam &p [[buffer(3)]],
+                                    uint tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  uint row = (tg * INK2_MV_SGS + sg) * INK2_MV_ROWS;
+  if (row >= p.vocab) return;
+  uint chunks = p.k / 8u;
+  device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.k);
+  device const float4 *xr = (device const float4 *)x;
+  float4 acc = float4(0.0f);
+  for (uint c = lane; c < chunks; c += INK2_SIMD) {
+    uint4 q[4];
+#pragma unroll
+    for (uint r = 0u; r < 4u; r++) q[r] = wr[r * chunks + c];
+    float4 x0 = xr[2u * c], x1 = xr[2u * c + 1u];
+#pragma unroll
+    for (uint r = 0u; r < 4u; r++) {
+      float4 d = bf16x4(q[r].xy) * x0 + bf16x4(q[r].zw) * x1;
+      acc[r] += d.x + d.y + d.z + d.w;
+    }
+  }
+  acc = float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+  if (lane < 4u && row + lane < p.vocab)
+    y[row + lane] = p.cap * tanh(acc[lane] * p.inv_cap);
+}
+
+// Fused BF16 unembed and softcap (cap * tanh(x / cap)) for 2..8 rows.
+// Grid: x = ceil(vocab / 32), y = 1, z = 1. Threadgroup: 256 threads (8 sgs).
+kernel void ink2_unembed_softcap(device const ushort *w [[buffer(0)]],
+                                 device const float *x [[buffer(1)]],
+                                 device float *y [[buffer(2)]],
+                                 constant Ink2UnembedParam &p [[buffer(3)]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  uint row = (tg * INK2_MV_SGS + sg) * INK2_MV_ROWS;
+  if (row >= p.vocab) return;
+  uint chunks = p.k / 8u;
+  device const uint4 *wr = (device const uint4 *)(w + (ulong)row * p.k);
+
+#define INK2_UN_DOT(j, av)                                                             \
+  {                                                                                    \
+    device const float4 *xr = (device const float4 *)(x + (ulong)(j) * p.k);           \
+    float4 d = w0 * xr[2u * c] + w1v * xr[2u * c + 1u];                                \
+    av[r] += d.x + d.y + d.z + d.w;                                                    \
+  }
+#define INK2_UN_EMIT(j, av)                                                            \
+  {                                                                                    \
+    float4 s = float4(simd_sum(av.x), simd_sum(av.y), simd_sum(av.z), simd_sum(av.w)); \
+    if (lane < 4u && row + lane < p.vocab)                                             \
+      y[(ulong)(j) * p.ldy + row + lane] = p.cap * tanh(s[lane] * p.inv_cap);          \
+  }
+
+  if (p.m <= 4u) {
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint c = lane; c < chunks; c += INK2_SIMD) {
+      uint4 q[4];
+#pragma unroll
+      for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+      for (uint r = 0; r < 4; r++) {
+        float4 w0 = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+        INK2_UN_DOT(0u, a0);
+        INK2_UN_DOT(1u, a1);
+        if (p.m > 2u) INK2_UN_DOT(2u, a2);
+        if (p.m > 3u) INK2_UN_DOT(3u, a3);
+      }
+    }
+    INK2_UN_EMIT(0u, a0);
+    INK2_UN_EMIT(1u, a1);
+    if (p.m > 2u) INK2_UN_EMIT(2u, a2);
+    if (p.m > 3u) INK2_UN_EMIT(3u, a3);
+    return;
+  }
+
+  float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+  for (uint c = lane; c < chunks; c += INK2_SIMD) {
+    uint4 q[4];
+#pragma unroll
+    for (uint r = 0; r < 4; r++) q[r] = wr[r * chunks + c];
+#pragma unroll
+    for (uint r = 0; r < 4; r++) {
+      float4 w0 = bf16x4(q[r].xy), w1v = bf16x4(q[r].zw);
+      INK2_UN_DOT(0u, a0);
+      INK2_UN_DOT(1u, a1);
+      INK2_UN_DOT(2u, a2);
+      INK2_UN_DOT(3u, a3);
+      INK2_UN_DOT(4u, a4);
+      if (p.m > 5u) INK2_UN_DOT(5u, a5);
+      if (p.m > 6u) INK2_UN_DOT(6u, a6);
+      if (p.m > 7u) INK2_UN_DOT(7u, a7);
+    }
+  }
+  INK2_UN_EMIT(0u, a0);
+  INK2_UN_EMIT(1u, a1);
+  INK2_UN_EMIT(2u, a2);
+  INK2_UN_EMIT(3u, a3);
+  INK2_UN_EMIT(4u, a4);
+  if (p.m > 5u) INK2_UN_EMIT(5u, a5);
+  if (p.m > 6u) INK2_UN_EMIT(6u, a6);
+  if (p.m > 7u) INK2_UN_EMIT(7u, a7);
+#undef INK2_UN_DOT
+#undef INK2_UN_EMIT
 }
 
 // Final logit softcap (modeling_inkling2.py Inkling2Softcap):
