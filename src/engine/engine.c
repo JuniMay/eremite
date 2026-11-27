@@ -212,10 +212,12 @@ eremite_model *eremite_open(const eremite_config *c) {
   if (!initialized || !c || c->abi != EREMITE_ABI || !c->model) return NULL;
   const ModelOps *ops = model_find_family(c->model);
   const eremite_deepseek_config *d = &c->deepseek;
+  const eremite_inkling2_config *ik = &c->inkling2;
   const eremite_minimax_h3_config *h3 = &c->minimax_h3;
   const eremite_minimax_h3_video_config *hv = &c->minimax_h3_video;
   int has_deepseek =
       d->experts || d->ced || d->substitute != 0 || d->packed_state_rows;
+  int has_inkling2 = ik->fp8_kv != 0;
   int has_minimax_h3 = h3->text_encoder || h3->dit || h3->vae;
   int has_minimax_h3_video =
       hv->text_encoder || hv->dit || hv->vae || hv->audio_vae || hv->lora ||
@@ -256,6 +258,8 @@ eremite_model *eremite_open(const eremite_config *c) {
                                 .shift_video = hv->shift_video,
                                 .shift_audio = hv->shift_audio,
                                 .variant = (VideoVariant)hv->variant};
+  } else if (ops == &inkling2_ops) {
+    options.inkling2 = (Inkling2Options){.fp8_kv = ik->fp8_kv != 0};
   } else {
     options.deepseek =
         (DeepSeekOptions){.substitute = d->substitute,
@@ -271,13 +275,16 @@ eremite_model *eremite_open(const eremite_config *c) {
       : has_video_limits && options.ctx > vid_limits.max_prompt_tokens
           ? "ctx exceeds this model's prompt token limit"
       : ops->decide && (options.draft || options.lookup || has_deepseek ||
-                        has_minimax_h3 || has_minimax_h3_video)
+                        has_inkling2 || has_minimax_h3 || has_minimax_h3_video)
           ? "a decision model takes no drafts, lookup, experts, "
-            "ced, substitute, packed state rows or media checkpoint paths"
-      : ops->generate_image && (options.draft || options.lookup ||
-                                has_deepseek || has_minimax_h3_video)
+            "ced, substitute, packed state rows, fp8_kv or media checkpoint "
+            "paths"
+      : ops->generate_image &&
+              (options.draft || options.lookup || has_deepseek ||
+               has_inkling2 || has_minimax_h3_video)
           ? "an image model takes no drafts, lookup, experts, "
-            "ced, substitute, packed state rows or video checkpoint paths"
+            "ced, substitute, packed state rows, fp8_kv or video checkpoint "
+            "paths"
       : ops->generate_image &&
               (!h3->text_encoder || !h3->text_encoder[0] || !h3->dit ||
                !h3->dit[0] || !h3->vae || !h3->vae[0])
@@ -285,9 +292,10 @@ eremite_model *eremite_open(const eremite_config *c) {
       : !ops->generate_image && has_minimax_h3
           ? "image text_encoder, dit and vae apply to image models only"
       : ops->generate_video && (options.draft || options.lookup ||
-                                has_deepseek || has_minimax_h3)
+                                has_deepseek || has_inkling2 || has_minimax_h3)
           ? "a video model takes no drafts, lookup, experts, "
-            "ced, substitute, packed state rows or image checkpoint paths"
+            "ced, substitute, packed state rows, fp8_kv or image checkpoint "
+            "paths"
       : ops->generate_video &&
               (!hv->text_encoder || !hv->text_encoder[0] || !hv->dit ||
                !hv->dit[0] || !hv->vae || !hv->vae[0] || !hv->audio_vae ||
@@ -308,6 +316,8 @@ eremite_model *eremite_open(const eremite_config *c) {
           ? "video default_steps is out of range"
       : !ops->generate_video && has_minimax_h3_video
           ? "video checkpoint paths apply to video models only"
+      : ops != &inkling2_ops && has_inkling2
+          ? "fp8_kv applies to Inkling-2-Mini models only"
       : ops != &deepseek_ops && !ops->decide && !ops->generate_image &&
               !ops->generate_video && has_deepseek
           ? "experts, ced, substitute and packed state rows apply to "
@@ -348,7 +358,7 @@ eremite_model *eremite_open(const eremite_config *c) {
     x->opt.minimax_h3_video.audio_vae =
         copy(options.minimax_h3_video.audio_vae);
     x->opt.minimax_h3_video.lora = copy(options.minimax_h3_video.lora);
-  } else {
+  } else if (ops == &deepseek_ops) {
     x->opt.deepseek.experts = copy(options.deepseek.experts);
   }
   x->tk = open_model_tokenizer(c->model, ops->media_token);
@@ -401,7 +411,13 @@ int eremite_load(eremite_model *m) {
   else if (!was_loaded && m->ops->generate_video)
     say("%s: %s video model, prompt limit %d tokens", m->dir, m->ops->family,
         m->opt.ctx);
-  else if (!was_loaded)
+  else if (!was_loaded && m->ops == &inkling2_ops)
+    say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
+        "fp8 kv %s",
+        m->dir, m->ops->family, m->opt.ctx, m->ops->drafts_per_pass(),
+        m->ops->rewind_margin(), m->opt.lookup,
+        m->opt.inkling2.fp8_kv ? "on (approximate)" : "off");
+  else if (!was_loaded && m->ops == &deepseek_ops)
     say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d; "
         "prefill: ced_depth=%d (%s), dependency "
         "pruning=%s; packed state rows %s",
@@ -410,6 +426,10 @@ int eremite_load(eremite_model *m) {
         m->opt.deepseek.ced ? "approximate" : "off",
         m->opt.deepseek.prefill_prune ? "on" : "off",
         m->opt.deepseek.packed_state_rows ? "on" : "off");
+  else if (!was_loaded)
+    say("%s: %s, context %d, drafts %d, rewind margin %d, context lookup %d",
+        m->dir, m->ops->family, m->opt.ctx, m->ops->drafts_per_pass(),
+        m->ops->rewind_margin(), m->opt.lookup);
   return 1;
 }
 
@@ -782,15 +802,19 @@ void eremite_state_identity(eremite_model *m, uint8_t out[32]) {
     identity_add_folder(&h, m->dir);
     identity_number(&h, m->opt.draft);
     identity_number(&h, m->opt.lookup);
-    const DeepSeekOptions *d = &m->opt.deepseek;
-    uint32_t substitute;
-    memcpy(&substitute, &d->substitute, sizeof substitute);
-    identity_number(&h, d->ced);
-    identity_number(&h, d->prefill_prune);
-    identity_number(&h, d->packed_state_rows != 0);
-    identity_number(&h, substitute);
-    identity_number(&h, d->experts != NULL);
-    if (d->experts) identity_add_gguf_set(&h, d->experts);
+    if (m->ops == &inkling2_ops) {
+      identity_number(&h, m->opt.inkling2.fp8_kv != 0);
+    } else if (m->ops == &deepseek_ops) {
+      const DeepSeekOptions *d = &m->opt.deepseek;
+      uint32_t substitute;
+      memcpy(&substitute, &d->substitute, sizeof substitute);
+      identity_number(&h, d->ced);
+      identity_number(&h, d->prefill_prune);
+      identity_number(&h, d->packed_state_rows != 0);
+      identity_number(&h, substitute);
+      identity_number(&h, d->experts != NULL);
+      if (d->experts) identity_add_gguf_set(&h, d->experts);
+    }
     CC_SHA256_Final(m->identity, &h);
     m->identified = 1;
   }

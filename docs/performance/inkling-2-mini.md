@@ -49,3 +49,22 @@ under macOS 27.2.1.
 - Greedy decoding only. Non-zero temperature changes draft acceptance rates.
 - Vision encoding (160 x 160 PNG, 16 visual tokens) was measured separately
   in `build/tests/model-inkling2` at 0.19 s.
+
+## FP8 KV cache (`fp8_kv`)
+
+Measured separately with `build/eremite` on the same Apple M5 Max (128 GiB,
+`ctx` 16,384, `draft` 0, `lookup` 0, `reserve` 2, greedy, raw prompt of
+11,072 tokens from `src/engine/memory.c`):
+
+| KV cache | Prefill of 11,072 tokens | Decode of 128 tokens | Perplexity (572 tokens after 10,500) | State at 4,096 tokens (`draft` 7) |
+|---|---|---|---|---|
+| BF16 (default) | 1,318.8 token/s (8.40 s) | 44.0 token/s (2.91 s) | 1.2572 (535/572 top-1) | 338.06 MiB (snapshot 194.06 MiB) |
+| FP8 E4M3 (`fp8_kv`) | 1,357.3 token/s (8.16 s) | 45.6 token/s (2.81 s) | 1.2479 (534/572 top-1) | 183.23 MiB (snapshot 110.08 MiB) |
+
+- `fp8_kv` is approximate: global, sliding-window and draft-head KV rows use
+  1,040 bytes per token (1,024 FP8 E4M3 codes and 8 FP16 per-head scales)
+  instead of 2,048 bytes in BF16 (50.8% of BF16 KV bytes). Short-convolution
+  and draft-head feature rings remain in FP32.
+- During prefill, `fp8_kv` uses an 8 MiB reusable BF16 dequantization slab
+  (2,048 rows) so FlashAttention runs at full 16 KiB occupancy while reading
+  half the KV cache bytes from memory.

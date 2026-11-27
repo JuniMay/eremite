@@ -81,8 +81,9 @@ again from where an interrupted download stopped.
 Flash or Inkling-2-Mini, whose checkpoint is the directory CHECKPOINT. For
 DeepSeek, `--experts GGUF` reads the routed experts from a GGUF file set
 instead. `--draft N` turns on the model's draft head (up to 5 for DeepSeek, up
-to 7 for Inkling-2-Mini), and `--memory GB` limits the model memory, state
-memory included. `build/eremite` alone lists the options.
+to 7 for Inkling-2-Mini), `--fp8-kv` stores Inkling-2-Mini's KV caches in
+approximate FP8 E4M3 instead of BF16, and `--memory GB` limits the model
+memory, state memory included. `build/eremite` alone lists the options.
 
 ## Serve
 

@@ -50,6 +50,10 @@ static void usage(void) {
       "  --packed-state-rows  keep a state's compressed rows and index keys "
       "packed: the same values\n"
       "                in about 28% of BF16's bytes (default off)\n"
+      "  --fp8-kv      Inkling-2-Mini: approximate state storing KV caches in "
+      "FP8 E4M3 with per-head\n"
+      "                scales instead of BF16, about half the KV bytes "
+      "(default off)\n"
       "  --ced off|N   approximate prefill: replay N decoder tokens, "
       "128-1048576 (default off);\n"
       "                keeps the verification rewind margin; decoding uses all "
@@ -207,7 +211,7 @@ int main(int argc, char **argv) {
   MemorySettings memory_settings = {.reserve_gib = 10};
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
   const char *media_path[16];
-  int nmedia = 0, vision_fd = -1;
+  int nmedia = 0, vision_fd = -1, fp8_kv = 0;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : 0;
     if (!strcmp(a, "--raw")) {
@@ -246,6 +250,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(a, "--packed-state-rows")) {
       o.deepseek.packed_state_rows = 1;
+      continue;
+    }
+    if (!strcmp(a, "--fp8-kv")) {
+      fp8_kv = 1;
       continue;
     }
     if (!v) usage();
@@ -365,6 +373,14 @@ int main(int argc, char **argv) {
     die("--dump-fd and --check-prefill require --ced off; they inspect every "
         "prompt row");
   const ModelOps *ops = model_find_family(dir);
+  if (fp8_kv && ops != &inkling2_ops)
+    die("--fp8-kv applies to Inkling-2-Mini models only");
+  if (ops == &inkling2_ops) {
+    if (o.deepseek.experts || o.deepseek.ced || o.deepseek.substitute != 0 ||
+        o.deepseek.prefill_prune || o.deepseek.packed_state_rows)
+      die("DeepSeek options do not apply to Inkling-2-Mini");
+    o.inkling2 = (Inkling2Options){.fp8_kv = fp8_kv};
+  }
   if (ops->decide)
     die("%s: a decision model generates no text; eremite-server serves its "
         "decisions",

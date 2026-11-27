@@ -24,7 +24,7 @@
 // runs on the engine thread between passes; the caller publishes a copy for its
 // HTTP handlers and terminal.
 
-#define EREMITE_ABI 13
+#define EREMITE_ABI 14
 
 // ---- the process ----
 
@@ -109,6 +109,13 @@ typedef struct {
   int packed_state_rows;
 } eremite_deepseek_config;
 
+// Inkling-2-Mini options.
+typedef struct {
+  // Whether a state stores global, sliding-window and draft-head KV caches as
+  // approximate FP8 E4M3 with per-head scales instead of BF16.
+  int fp8_kv;
+} eremite_inkling2_config;
+
 // MiniMax-H3-Image checkpoint files.
 typedef struct {
   // Safetensors file of the Qwen3-VL text and vision encoder.
@@ -154,6 +161,7 @@ typedef struct {
   // workspaces and states; 0: none of its own.
   double memory_gb;
   eremite_deepseek_config deepseek;
+  eremite_inkling2_config inkling2;
   eremite_minimax_h3_config minimax_h3;
   eremite_minimax_h3_video_config minimax_h3_video;
 } eremite_config;
@@ -664,8 +672,8 @@ eremite_snapshot *eremite_snapshot_read(eremite_model *m, int fd);
 // Writes the identity of m's saved states: what they depend on. It is known
 // before the weights load. It covers the family's state layout, the
 // checkpoint's weights, the experts' GGUF set, and the options that change a
-// state's rows or shapes: draft, lookup, ced, prefill_prune, substitute and
-// packed_state_rows.
+// state's rows or shapes: draft, lookup, ced, prefill_prune, substitute,
+// packed_state_rows and fp8_kv.
 // The weights are the folder's config.json, .safetensors and .gguf files, by
 // name, size, and first and last 64 KiB. A state saved with another identity
 // is not read.

@@ -25,6 +25,7 @@
 //
 // usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] [--lookup N]
 //        [--experts GGUF] [--image] [--unload] [--packed-state-rows]
+//        [--fp8-kv]
 
 #define CHECK(x)                                                               \
   do {                                                                         \
@@ -169,7 +170,7 @@ static void flip(int fd, off_t at) {
 
 int main(int argc, char **argv) {
   double memory = 32;
-  int draft = 0, lookup = 0, unload = 0, image = 0, packed = 0;
+  int draft = 0, lookup = 0, unload = 0, image = 0, packed = 0, fp8_kv = 0;
   const char *experts = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--memory") && i + 1 < argc)
@@ -186,13 +187,16 @@ int main(int argc, char **argv) {
       unload = 1;
     else if (!strcmp(argv[i], "--packed-state-rows"))
       packed = 1;
+    else if (!strcmp(argv[i], "--fp8-kv"))
+      fp8_kv = 1;
     else
       argc = 0;
   }
-  if (argc < 2)
+  if (argc < 2 || (fp8_kv && (packed || experts)))
     die("usage: model-state_file CHECKPOINT [--memory GIB] [--draft N] "
         "[--lookup N] [--experts GGUF] [--image] [--unload] "
-        "[--packed-state-rows]  (--image: a test image in the prompt)");
+        "[--packed-state-rows] [--fp8-kv]  (--image: a test image in the "
+        "prompt)");
   const char *base = getenv("TMPDIR");
   if (!base || !*base) base = "/tmp";
   snprintf(directory, sizeof directory, "%s/eremite-state-file-model.XXXXXX",
@@ -209,8 +213,12 @@ int main(int argc, char **argv) {
                .quiet = 1,
                .draft = draft,
                .lookup = lookup};
-  if (experts) o.deepseek.experts = experts;
-  o.deepseek.packed_state_rows = packed;
+  if (fp8_kv) {
+    o.inkling2.fp8_kv = 1;
+  } else {
+    if (experts) o.deepseek.experts = experts;
+    o.deepseek.packed_state_rows = packed;
+  }
   Model *model =
       model_open(process_memory, open_gpu(process_memory), argv[1], &o);
   CHECK(model);

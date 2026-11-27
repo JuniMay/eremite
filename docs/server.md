@@ -67,6 +67,7 @@ Each entry under `models` holds one model's settings:
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
 | `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; it changes no result, and needs `ced` off | `true` without `ced` |
 | `packed_state_rows` | DeepSeek: a state keeps its compressed rows and index keys packed: the same values in about 28% of BF16's bytes | `false` |
+| `fp8_kv` | Inkling-2-Mini: approximate state storing global, sliding-window and draft-head KV caches in FP8 E4M3 with per-head scales instead of BF16, in about 51% of BF16's KV bytes | `false` |
 | `memory` | GiB of the model's own memory: its weights, expert cache, workspace and states; 0: none of its own | 0 |
 | `max_cached_states` | the most states of the model kept in memory | 256 |
 | `idle_unload` | the model's own `idle_unload` | the server-wide one |
@@ -87,7 +88,8 @@ Inkling-2-Mini checkpoints (`model_type` `inkling2_loop` or
 `inkling2_loop_text`) serve `POST /v1/chat/completions`, `POST /v1/responses`,
 and `GET /v1/codex/models`. Their entry takes `model`, `id`, `ctx` (up to
 1,048,576), `draft` (0 to 7, using `mtp.safetensors` when present), `lookup`
-(`off` or 1 to 15), `memory`, `max_cached_states` and `idle_unload`, and
+(`off` or 1 to 15), `fp8_kv` (approximate FP8 E4M3 KV caches, about 51% of
+BF16's KV bytes), `memory`, `max_cached_states` and `idle_unload`, and
 refuses DeepSeek-only and MiniMax-H3 settings. Its dense backbone stays
 resident in GPU memory (about 3.6 GiB, or about 4.3 GiB with its draft head),
 while its 3,072 routed experts across 24 physical layers live in an SSD-backed

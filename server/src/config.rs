@@ -38,6 +38,8 @@ const MOST_LOOKUP_PROPOSALS: i32 = 15;
 const DEFAULT_NEMOTRON_CONTEXT_TOKENS: i32 = 65_536;
 /// Keys of a model entry that belong only to DeepSeek models.
 const DEEPSEEK_ONLY_KEYS: [&str; 4] = ["experts", "ced", "prefill_prune", "packed_state_rows"];
+/// Keys of a model entry that belong only to Inkling-2-Mini models.
+const INKLING2_ONLY_KEYS: [&str; 1] = ["fp8_kv"];
 
 /// One model's settings.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,11 +61,12 @@ pub struct ModelConfig {
 }
 
 /// The keys of a model's entry that only a model that generates text takes.
-const GENERATING_KEYS: [&str; 7] = [
+const GENERATING_KEYS: [&str; 8] = [
     "experts",
     "ced",
     "prefill_prune",
     "packed_state_rows",
+    "fp8_kv",
     "draft",
     "lookup",
     "max_cached_states",
@@ -198,12 +201,15 @@ impl ModelConfig {
     }
 
     /// Fits the settings to a Nemotron-3.5-Transcribe audio model. Rejects
-    /// DeepSeek-only and image/video-only keys, defaults an omitted `ctx` to
-    /// 65,536 tokens, and disables context lookup unless explicitly set.
+    /// DeepSeek-only, Inkling-2-Mini-only and image/video-only keys, defaults
+    /// an omitted `ctx` to 65,536 tokens, and disables context lookup unless
+    /// explicitly set.
     pub fn fit_nemotron_model(&mut self) -> Result<(), String> {
         let model = &self.engine.model;
         if let Some(key) = self.keys.iter().find(|key| {
-            DEEPSEEK_ONLY_KEYS.contains(&key.as_str()) || MEDIA_MODEL_KEYS.contains(&key.as_str())
+            DEEPSEEK_ONLY_KEYS.contains(&key.as_str())
+                || INKLING2_ONLY_KEYS.contains(&key.as_str())
+                || MEDIA_MODEL_KEYS.contains(&key.as_str())
         }) {
             return Err(format!(
                 "{model}: {key} is not a setting of a Nemotron-3.5-Transcribe model"
@@ -302,6 +308,7 @@ impl ModelConfig {
             }
             "prefill_prune" => options.deepseek_mut()?.prefill_prune = Some(switch()?),
             "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
+            "fp8_kv" => options.inkling2_mut()?.fp8_kv = switch()?,
             "memory" => {
                 options.memory_gb = value
                     .as_f64()
@@ -1190,6 +1197,32 @@ mod tests {
     }
 
     #[test]
+    fn fp8_kv_is_an_inkling2_switch() {
+        let models = parse(&json!({"models": [
+            {"model": "/m/inkling2", "fp8_kv": true}
+        ]}))
+        .unwrap()
+        .models;
+        assert!(models[0].engine.inkling2().unwrap().fp8_kv);
+        let models = parse(&json!({"models": [{"model": "/m/inkling2"}]}))
+            .unwrap()
+            .models;
+        assert!(
+            !models[0]
+                .engine
+                .inkling2()
+                .is_some_and(|inkling2| inkling2.fp8_kv)
+        );
+        assert!(parse(&json!({"models": [{"model": "/m", "fp8_kv": 1}]})).is_err());
+        assert!(
+            parse(&json!({"models": [
+                {"model": "/m", "fp8_kv": true, "packed_state_rows": true}
+            ]}))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn deepseek_options_stay_through_the_family_check() {
         let mut models = parse(&json!({"models": [
             {"model": "/models/deepseek", "ced": 128}, {"model": "/models/plain"}
@@ -1299,7 +1332,7 @@ mod tests {
         for key in GENERATING_KEYS {
             let value = match key {
                 "experts" => json!("/m/experts.gguf"),
-                "prefill_prune" | "packed_state_rows" => json!(false),
+                "prefill_prune" | "packed_state_rows" | "fp8_kv" => json!(false),
                 "ced" | "lookup" => json!("off"),
                 _ => json!(1),
             };
@@ -1498,6 +1531,7 @@ mod tests {
         for bad in [
             json!({"model": "/m/nemotron", "ced": 512}),
             json!({"model": "/m/nemotron", "experts": "/m/e.gguf"}),
+            json!({"model": "/m/nemotron", "fp8_kv": true}),
             json!({"model": "/m/nemotron", "dit": "/m/dit.safetensors"}),
             json!({"model": "/m/nemotron", "audio_vae": "/m/avae.safetensors"}),
         ] {

@@ -13,7 +13,7 @@ use deepseek_recipe::stream::StreamTokenizer;
 
 /// The version of src/eremite.h's interface that these declarations follow
 /// (EREMITE_ABI).
-const ABI: c_int = 13;
+const ABI: c_int = 14;
 
 /// The process's settings and hooks (eremite_process).
 #[repr(C)]
@@ -44,6 +44,15 @@ struct RawDeepSeekConfig {
     ced: c_int,
     prefill_prune: c_int,
     packed_state_rows: c_int,
+}
+
+/// Inkling-2-Mini's settings (eremite_inkling2_config).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawInkling2Config {
+    /// Nonzero stores global, sliding-window and draft-head KV caches as
+    /// approximate FP8 E4M3 with per-head scales instead of BF16.
+    fp8_kv: c_int,
 }
 
 /// MiniMax-H3-Image's checkpoint paths (eremite_minimax_h3_config).
@@ -81,6 +90,7 @@ struct RawConfig {
     lookup: c_int,
     memory_gb: f64,
     deepseek: RawDeepSeekConfig,
+    inkling2: RawInkling2Config,
     minimax_h3: RawMinimaxH3Config,
     minimax_h3_video: RawMinimaxH3VideoConfig,
 }
@@ -988,6 +998,8 @@ pub enum BackendOptions {
     Unspecified,
     /// DeepSeek's settings.
     DeepSeek(DeepSeekOptions),
+    /// Inkling-2-Mini's settings.
+    Inkling2(Inkling2Options),
     /// MiniMax-H3 image or video checkpoint paths and sampling defaults.
     MinimaxH3(MinimaxH3Options),
 }
@@ -1082,6 +1094,14 @@ impl DeepSeekOptions {
     }
 }
 
+/// Inkling-2-Mini's own settings.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Inkling2Options {
+    /// Whether a state stores global, sliding-window and draft-head KV caches
+    /// as approximate FP8 E4M3 with per-head scales instead of BF16.
+    pub fp8_kv: bool,
+}
+
 impl Options {
     /// Sets the family's own settings to the checkpoint's family. Returns an
     /// error if they were set for another family, or if required media paths
@@ -1094,13 +1114,24 @@ impl Options {
             (BackendOptions::DeepSeek(d), Architecture::DeepSeek) => {
                 BackendOptions::DeepSeek(d.clone())
             }
+            (BackendOptions::Inkling2(_), Architecture::DeepSeek) => {
+                return Err(format!(
+                    "{}: Inkling-2-Mini's settings do not apply to DeepSeek",
+                    self.model
+                ));
+            }
             (BackendOptions::MinimaxH3(_), Architecture::DeepSeek) => {
                 return Err(format!(
                     "{}: MiniMax-H3 checkpoint paths do not apply to DeepSeek",
                     self.model
                 ));
             }
-            (BackendOptions::Unspecified, Architecture::Inkling2) => BackendOptions::Unspecified,
+            (BackendOptions::Unspecified, Architecture::Inkling2) => {
+                BackendOptions::Inkling2(Inkling2Options::default())
+            }
+            (BackendOptions::Inkling2(ik), Architecture::Inkling2) => {
+                BackendOptions::Inkling2(ik.clone())
+            }
             (BackendOptions::DeepSeek(_), Architecture::Inkling2) => {
                 return Err(format!(
                     "{}: DeepSeek's settings do not apply to Inkling-2-Mini",
@@ -1125,6 +1156,12 @@ impl Options {
             (BackendOptions::DeepSeek(_), Architecture::D1) => {
                 return Err(format!(
                     "{}: DeepSeek's settings for a decision model",
+                    self.model
+                ));
+            }
+            (BackendOptions::Inkling2(_), Architecture::D1) => {
+                return Err(format!(
+                    "{}: Inkling-2-Mini's settings for a decision model",
                     self.model
                 ));
             }
@@ -1167,6 +1204,12 @@ impl Options {
                     self.model
                 ));
             }
+            (BackendOptions::Inkling2(_), Architecture::MinimaxH3Image) => {
+                return Err(format!(
+                    "{}: Inkling-2-Mini's settings for an image model",
+                    self.model
+                ));
+            }
             (BackendOptions::MinimaxH3(h3), Architecture::MinimaxH3Video) => {
                 if self.draft != 0 || self.lookup != 0 {
                     return Err(format!(
@@ -1198,12 +1241,24 @@ impl Options {
                     self.model
                 ));
             }
+            (BackendOptions::Inkling2(_), Architecture::MinimaxH3Video) => {
+                return Err(format!(
+                    "{}: Inkling-2-Mini's settings for a video model",
+                    self.model
+                ));
+            }
             (BackendOptions::Unspecified, Architecture::NemotronTranscribe) => {
                 BackendOptions::Unspecified
             }
             (BackendOptions::DeepSeek(_), Architecture::NemotronTranscribe) => {
                 return Err(format!(
                     "{}: DeepSeek's settings do not apply to Nemotron-3.5-Transcribe",
+                    self.model
+                ));
+            }
+            (BackendOptions::Inkling2(_), Architecture::NemotronTranscribe) => {
+                return Err(format!(
+                    "{}: Inkling-2-Mini's settings do not apply to Nemotron-3.5-Transcribe",
                     self.model
                 ));
             }
@@ -1221,7 +1276,9 @@ impl Options {
     pub fn deepseek(&self) -> Option<&DeepSeekOptions> {
         match &self.backend {
             BackendOptions::DeepSeek(d) => Some(d),
-            BackendOptions::Unspecified | BackendOptions::MinimaxH3(_) => None,
+            BackendOptions::Unspecified
+            | BackendOptions::Inkling2(_)
+            | BackendOptions::MinimaxH3(_) => None,
         }
     }
 
@@ -1233,8 +1290,39 @@ impl Options {
         }
         match &mut self.backend {
             BackendOptions::DeepSeek(d) => Ok(d),
+            BackendOptions::Inkling2(_) => {
+                Err("DeepSeek's settings cannot be combined with Inkling-2-Mini's settings".into())
+            }
             BackendOptions::MinimaxH3(_) => {
                 Err("DeepSeek's settings cannot be combined with MiniMax-H3 paths".into())
+            }
+            BackendOptions::Unspecified => unreachable!("set above"),
+        }
+    }
+
+    /// Returns Inkling-2-Mini's settings, or None for another family.
+    pub fn inkling2(&self) -> Option<&Inkling2Options> {
+        match &self.backend {
+            BackendOptions::Inkling2(ik) => Some(ik),
+            BackendOptions::Unspecified
+            | BackendOptions::DeepSeek(_)
+            | BackendOptions::MinimaxH3(_) => None,
+        }
+    }
+
+    /// Returns Inkling-2-Mini's settings to change. Settings not set yet become
+    /// Inkling-2-Mini's.
+    pub fn inkling2_mut(&mut self) -> Result<&mut Inkling2Options, String> {
+        if matches!(self.backend, BackendOptions::Unspecified) {
+            self.backend = BackendOptions::Inkling2(Inkling2Options::default());
+        }
+        match &mut self.backend {
+            BackendOptions::Inkling2(ik) => Ok(ik),
+            BackendOptions::DeepSeek(_) => {
+                Err("Inkling-2-Mini's settings cannot be combined with DeepSeek's settings".into())
+            }
+            BackendOptions::MinimaxH3(_) => {
+                Err("Inkling-2-Mini's settings cannot be combined with MiniMax-H3 paths".into())
             }
             BackendOptions::Unspecified => unreachable!("set above"),
         }
@@ -1244,7 +1332,9 @@ impl Options {
     pub fn minimax_h3(&self) -> Option<&MinimaxH3Options> {
         match &self.backend {
             BackendOptions::MinimaxH3(h3) => Some(h3),
-            BackendOptions::Unspecified | BackendOptions::DeepSeek(_) => None,
+            BackendOptions::Unspecified
+            | BackendOptions::DeepSeek(_)
+            | BackendOptions::Inkling2(_) => None,
         }
     }
 
@@ -1258,6 +1348,9 @@ impl Options {
             BackendOptions::MinimaxH3(h3) => Ok(h3),
             BackendOptions::DeepSeek(_) => {
                 Err("MiniMax-H3 paths cannot be combined with DeepSeek's settings".into())
+            }
+            BackendOptions::Inkling2(_) => {
+                Err("MiniMax-H3 paths cannot be combined with Inkling-2-Mini's settings".into())
             }
             BackendOptions::Unspecified => unreachable!("set above"),
         }
@@ -1430,6 +1523,7 @@ impl Model {
             return None;
         }
         let deepseek = o.deepseek().cloned().unwrap_or_default();
+        let inkling2 = o.inkling2().cloned().unwrap_or_default();
         let minimax_h3 = o.minimax_h3().cloned().unwrap_or_default();
         let model = c_string(&o.model);
         let experts = deepseek.experts.as_deref().map(c_string);
@@ -1459,6 +1553,9 @@ impl Model {
                     0
                 },
                 packed_state_rows: deepseek.packed_state_rows.into(),
+            },
+            inkling2: RawInkling2Config {
+                fp8_kv: inkling2.fp8_kv.into(),
             },
             minimax_h3: if is_image {
                 RawMinimaxH3Config {
@@ -3191,14 +3288,35 @@ mod tests {
             ..Default::default()
         };
         options.configure(Architecture::Inkling2).unwrap();
-        assert_eq!(options.backend, BackendOptions::Unspecified);
+        assert_eq!(
+            options.backend,
+            BackendOptions::Inkling2(Inkling2Options::default())
+        );
+
+        let mut fp8 = Options::default();
+        fp8.inkling2_mut().unwrap().fp8_kv = true;
+        fp8.configure(Architecture::Inkling2).unwrap();
+        assert_eq!(fp8.inkling2().map(|ik| ik.fp8_kv), Some(true));
+        for arch in [
+            Architecture::DeepSeek,
+            Architecture::D1,
+            Architecture::MinimaxH3Image,
+            Architecture::MinimaxH3Video,
+            Architecture::NemotronTranscribe,
+        ] {
+            assert!(fp8.clone().configure(arch).is_err(), "{arch:?}");
+        }
+        assert!(fp8.deepseek_mut().is_err());
+        assert!(fp8.minimax_h3_mut().is_err());
 
         let mut ds = Options::default();
         ds.deepseek_mut().unwrap().ced = 512;
+        assert!(ds.inkling2_mut().is_err());
         assert!(ds.configure(Architecture::Inkling2).is_err());
 
         let mut h3 = Options::default();
         h3.minimax_h3_mut().unwrap().dit = Some("/m/dit.safetensors".into());
+        assert!(h3.inkling2_mut().is_err());
         assert!(h3.configure(Architecture::Inkling2).is_err());
     }
 

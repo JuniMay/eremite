@@ -17,10 +17,11 @@
 //    speculative verify/accept equivalence.
 // 3. Reports measured prefill and single-stream decode speeds.
 //
-// usage: model-inkling2 CHECKPOINT
+// usage: model-inkling2 CHECKPOINT [--fp8-kv]
 
 // Context capacity, memory limit, greedy check length and timing steps.
 static constexpr int CONTEXT = 4096;
+static constexpr size_t STATE_IDENTITY_BYTES = 32;
 static constexpr double MEMORY_GB = 32.0;
 static constexpr double RESERVE_GB = 2.0;
 static constexpr int GOLDEN_STEPS = 30;
@@ -92,7 +93,11 @@ static float max_abs_diff(const float *a, const float *b, int n) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) die("usage: model-inkling2 CHECKPOINT");
+  int fp8_kv = 0;
+  if (argc == 3 && !strcmp(argv[2], "--fp8-kv"))
+    fp8_kv = 1;
+  else if (argc != 2)
+    die("usage: model-inkling2 CHECKPOINT [--fp8-kv]");
   check(eremite_init(&(eremite_process){.abi = EREMITE_ABI,
                                         .memory_gb = MEMORY_GB,
                                         .reserve_gb = RESERVE_GB}) == 0,
@@ -101,14 +106,19 @@ int main(int argc, char **argv) {
       eremite_open(&(eremite_config){.abi = EREMITE_ABI,
                                      .model = argv[1],
                                      .ctx = CONTEXT,
-                                     .deepseek = {.draft = MTP_DRAFTS}});
+                                     .deepseek = {.draft = MTP_DRAFTS},
+                                     .inkling2 = {.fp8_kv = fp8_kv}});
   double t_load0 = now();
   int loaded = m && eremite_load(m) && eremite_is_loaded(m);
   double t_load = now() - t_load0;
   check(loaded, "Inkling-2-Mini loads");
   if (!loaded) return 1;
-  printf("loaded Inkling-2-Mini in %.2f s (drafts_per_pass=%d)\n", t_load,
-         eremite_drafts_per_pass(m));
+  uint8_t ident[STATE_IDENTITY_BYTES];
+  eremite_state_identity(m, ident);
+  printf("loaded Inkling-2-Mini in %.2f s (drafts_per_pass=%d, fp8_kv=%d, "
+         "state_id=%02x%02x%02x%02x)\n",
+         t_load, eremite_drafts_per_pass(m), fp8_kv, ident[0], ident[1],
+         ident[2], ident[3]);
   check(eremite_drafts_per_pass(m) == MTP_DRAFTS,
         "MTP draft head loads with 7 drafts per pass");
 
@@ -122,6 +132,15 @@ int main(int argc, char **argv) {
   check(n_prompt > 0, "golden prompt tokenizes");
 
   eremite_state *s = eremite_state_new(m);
+  size_t ctx_bytes = eremite_state_bytes(m, s, CONTEXT);
+  size_t snap_bytes = eremite_snapshot_bytes(m, 0);
+  printf("state@%d: %.2f MiB, snapshot: %.2f MiB\n", CONTEXT,
+         (double)ctx_bytes / (1024.0 * 1024.0),
+         (double)snap_bytes / (1024.0 * 1024.0));
+  if (fp8_kv) {
+    check(ctx_bytes < 200u * 1024u * 1024u && snap_bytes < 120u * 1024u * 1024u,
+          "fp8_kv halves KV cache and snapshot footprint");
+  }
   const float *lg =
       eremite_prefill(m, s, prompt_ids, n_prompt, 0, 0, -1, NULL, NULL, NULL);
   float *first_logits = xmalloc((size_t)vocab * sizeof(float));
@@ -136,10 +155,11 @@ int main(int argc, char **argv) {
   }
   printf("\n");
   char msg[160];
+  float golden_tol = fp8_kv ? 2.5f : GOLDEN_LOGIT_TOL;
   snprintf(msg, sizeof msg,
            "first-step logits[:5] match B200 golden (max diff %.4f < %.4f)",
-           worst_golden, GOLDEN_LOGIT_TOL);
-  check(worst_golden < GOLDEN_LOGIT_TOL, msg);
+           worst_golden, golden_tol);
+  check(worst_golden < golden_tol, msg);
 
   int32_t gen[GOLDEN_STEPS];
   char decoded[2048] = "";
@@ -159,8 +179,13 @@ int main(int argc, char **argv) {
     }
   }
   printf("greedy %d tokens: %s\n", GOLDEN_STEPS, decoded);
-  check(!strcmp(decoded, GOLDEN_COMPLETION),
-        "30-token greedy completion matches B200 golden verbatim");
+  if (!fp8_kv) {
+    check(!strcmp(decoded, GOLDEN_COMPLETION),
+          "30-token greedy completion matches B200 golden verbatim");
+  } else {
+    check(contains_ci(decoded, "sky") && contains_ci(decoded, "blue"),
+          "30-token FP8 KV greedy completion stays coherent on prompt");
+  }
 
   // 2. Stepwise decode vs prefill agreement on the prompt.
   eremite_state *s_step = eremite_state_new(m);
