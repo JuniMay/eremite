@@ -101,6 +101,23 @@ inline float4 comp_values(device const uchar *comp, uint row, uint i, uint packe
   device const uchar *r = comp + row * COMP_ROW_BYTES;
   return fp4x4(((device const ushort *)r)[i]) * e4m3_value(r[COMP_SCALES + i / 4]);
 }
+// Base byte pointer of compressed row `row` in either flat (`page_shift == 0`)
+// or paged (`page_shift > 0`, `comp` holds device ulong page addresses) layout.
+inline device const uchar *comp_row_ptr(device const uchar *comp, uint row, uint packed, ulong slice_off,
+                                        uint page_shift) {
+  ulong row_bytes = packed ? COMP_ROW_BYTES : 1024ul;
+  if (page_shift) {
+    device const ulong *addrs = (device const ulong *)comp;
+    uint slot = row & ((1u << page_shift) - 1u);
+    return (device const uchar *)(addrs[row >> page_shift] + slice_off) + (ulong)slot * row_bytes;
+  }
+  return comp + (ulong)row * row_bytes;
+}
+// Values 4i to 4i + 3 starting from resolved row byte pointer `r`.
+inline float4 comp_row_values(device const uchar *r, uint i, uint packed) {
+  if (!packed) return float4(((device const bfloat4 *)r)[i]);
+  return fp4x4(((device const ushort *)r)[i]) * e4m3_value(r[COMP_SCALES + i / 4]);
+}
 
 // Sum over a threadgroup of up to 1024 threads; every thread gets the result.
 inline float tg_sum(float v, threadgroup float *tmp, uint t, uint n) {
@@ -778,8 +795,13 @@ kernel void kv_window(device const float *kv [[buffer(0)]], device const float *
 // or as BF16. Group g starts at position start + g ratio; its rows of kv and
 // score are row0 + g ratio (and the next, for ratio 2). One threadgroup per
 // group. packed: whether the rows, and index_key's keys, are written packed,
-// not BF16.
-struct Groups { uint ratio, start, row0, packed; };
+// not BF16. When page_shift > 0, `rows`/`keys` holds device page addresses and
+// `slice_off` is this layer's byte offset within each page.
+struct Groups {
+  uint ratio, start, row0, packed;
+  ulong slice_off;
+  uint page_shift, pad;
+};
 kernel void compress(device const float *kv [[buffer(0)]], device const float *score [[buffer(1)]],
                      device const float *w [[buffer(2)]], device const float2 *cs [[buffer(3)]],
                      device float *latent [[buffer(4)]], device uchar *rows [[buffer(5)]],
@@ -801,13 +823,21 @@ kernel void compress(device const float *kv [[buffer(0)]], device const float *s
   float amax = fabs(v);  // blocks of 16: half a simdgroup
   for (uint o = 1; o < 16; o <<= 1) amax = max(amax, simd_shuffle_xor(amax, o));
   float s = e4m3(max(amax, 6.0f * 0x1p-9f) / 6.0f), x = e2m1(clamp(v / s, -6.0f, 6.0f));
+  uint idx = p.y / p.x;
+  device uchar *dst = rows;
+  uint slot = idx;
+  if (g.page_shift) {
+    device const ulong *addrs = (device const ulong *)rows;
+    dst = (device uchar *)(addrs[idx >> g.page_shift] + g.slice_off);
+    slot = idx & ((1u << g.page_shift) - 1u);
+  }
   if (!g.packed) {
-    ((device bfloat *)rows)[(p.y / p.x) * 512 + t] = bfloat(x * s);
+    ((device bfloat *)dst)[(ulong)slot * 512 + t] = bfloat(x * s);
     return;
   }
   uint code = e2m1_code(x);
   uint pair = code | simd_shuffle_down(code, 1) << 4;  // with the next value's
-  device uchar *row = rows + (p.y / p.x) * COMP_ROW_BYTES;
+  device uchar *row = dst + (ulong)slot * COMP_ROW_BYTES;
   if (t % 2 == 0) row[t / 2] = uchar(pair);
   if (t % 16 == 0) row[COMP_SCALES + t / 16] = uchar(e4m3_code(s));
 }
@@ -824,13 +854,21 @@ kernel void index_key(device const float *k [[buffer(0)]], device const float *w
   float r = rsqrt(tg_sum(v * v, tmp, t, 128) / 128 + 1e-20f);
   v = rope1(bf(w[t] * (v * r)), t, 128, cs + pos * 32, false);
   float s = fp4_scale(v), x = e2m1(clamp(v / s, -6.0f, 6.0f));
+  uint idx = pos / ratio;
+  device uchar *dst = keys;
+  uint slot = idx;
+  if (g.page_shift) {
+    device const ulong *addrs = (device const ulong *)keys;
+    dst = (device uchar *)(addrs[idx >> g.page_shift] + g.slice_off);
+    slot = idx & ((1u << g.page_shift) - 1u);
+  }
   if (!g.packed) {
-    ((device bfloat *)keys)[(pos / ratio) * 128 + t] = bfloat(x * s);
+    ((device bfloat *)dst)[(ulong)slot * 128 + t] = bfloat(x * s);
     return;
   }
   uint code = e2m1_code(x);
   uint pair = code | simd_shuffle_down(code, 1) << 4;  // with the next value's
-  device uchar *key = keys + (pos / ratio) * KEY_ROW_BYTES;
+  device uchar *key = dst + (ulong)slot * KEY_ROW_BYTES;
   if (t % 2 == 0) key[t / 2] = uchar(pair);
   if (t % 32 == 0) key[KEY_SCALES + t / 32] = uchar(as_type<uint>(s) >> 23);
 }
@@ -843,8 +881,12 @@ kernel void index_key(device const float *k [[buffer(0)]], device const float *w
 // candidates, since index_topk reads no other score. The candidates take the
 // threadgroup's first threads, so that the simdgroups beyond them do nothing.
 // cand: words of a row's candidate bits, 0: none; packed: whether the index
-// keys are packed, not BF16.
-struct Index { uint pos, ratio, stride, cand, packed; };
+// keys are packed, not BF16. When page_shift > 0, `keys` holds device page
+// addresses and `slice_off` is this layer's byte offset within each page.
+struct Index {
+  uint pos, ratio, stride, cand, packed, page_shift;
+  ulong slice_off;
+};
 inline uint nth_set_bit(uint bits, uint n) {  // the place of the bit that has n set bits below it
   for (uint i = 0; i < n; i++) bits &= bits - 1;
   return ctz(bits);
@@ -870,7 +912,15 @@ kernel void index_score(device const float *q [[buffer(0)]], device const float 
   if (blocks != ~0u) block = nth_set_bit(blocks, block);
   uint gid = (g.x * 32 + block) * 8 + t % 8;
   if (gid >= p.x) return;
-  device const uchar *key = keys + gid * (ix.packed ? KEY_ROW_BYTES : 128 * 2);
+  ulong key_bytes = ix.packed ? KEY_ROW_BYTES : 128ul * 2;
+  device const uchar *key;
+  if (ix.page_shift) {
+    device const ulong *addrs = (device const ulong *)keys;
+    uint slot = gid & ((1u << ix.page_shift) - 1u);
+    key = (device const uchar *)(addrs[gid >> ix.page_shift] + ix.slice_off) + (ulong)slot * key_bytes;
+  } else {
+    key = keys + (ulong)gid * key_bytes;
+  }
   device const uint *kr = (device const uint *)key;
   uint scales = ix.packed ? kr[KEY_SCALES / 4] : 0;
   float acc[32];
@@ -1015,8 +1065,14 @@ kernel void cand_topk(device const float *score [[buffer(0)]], device uint *cand
 // pos + r - 127 .. pos + r (from position `first` on), and to its selected
 // compressed rows if `comp_rows` is set.
 // comp_rows: whether the row attends selected compressed rows; packed: whether
-// those rows are packed, not BF16.
-struct Att { Win win; uint first, comp_rows, packed; };
+// those rows are packed, not BF16. When page_shift > 0, `comp` holds device
+// page addresses and `slice_off` is this layer's byte offset within each page.
+struct Att {
+  Win win;
+  uint first, comp_rows, packed;
+  ulong slice_off;
+  uint page_shift, pad;
+};
 
 // Decoding attention of one row over the rows it sees: the window, then the
 // selected compressed rows, up to 640, in chunks of 64 and three passes: the
@@ -1049,24 +1105,32 @@ kernel void attend_scores(device const float *q [[buffer(0)]], device const bflo
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float4 qs[4][128];
   threadgroup float s[4][2 * ATT_CHUNK], tmp[16];
-  threadgroup uint rows[2 * ATT_CHUNK];
+  threadgroup ulong row_ptrs[2 * ATT_CHUNK];
   uint g = gr.x, pos = at.win.pos, lo, nwin;
   uint n = att_rows(at, sel, lo, nwin), r0 = gr.y * 2 * ATT_CHUNK, r1 = min(n, r0 + 2 * ATT_CHUNK);
   if (r0 >= n) return;
-  if (t < r1 - r0) rows[t] = att_index(r0 + t, lo, nwin, at, sel);
+  if (t < r1 - r0) {
+    uint r = r0 + t;
+    uint idx = att_index(r, lo, nwin, at, sel);
+    row_ptrs[t] = ulong(r < nwin ? ((device const uchar *)(ring + (ulong)idx * 512ul))
+                                 : comp_row_ptr(comp, idx, at.packed, at.slice_off, at.page_shift));
+  }
   for (uint i = t; i < 2048; i += 512) {
     uint h = i / 512, d = i % 512;
     ((threadgroup float *)qs)[i] = rope1(q[(g * 4 + h) * 512 + d], d, 512, cs + pos * 32, false);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = r0 + 2 * sg; r < r1; r += 32) {  // rows r and r + 1 (r again, not stored, past r1)
-    uint r2 = min(r + 1, r1 - 1), row0 = rows[r - r0], row1 = rows[r2 - r0];
-    device const bfloat4 *w0 = (device const bfloat4 *)(ring + row0 * 512), *w1 = (device const bfloat4 *)(ring + row1 * 512);
+    uint r2 = min(r + 1, r1 - 1);
+    device const uchar *p0 = (device const uchar *)row_ptrs[r - r0];
+    device const uchar *p1 = (device const uchar *)row_ptrs[r2 - r0];
+    uint pk0 = r < nwin ? 0u : at.packed;
+    uint pk1 = r2 < nwin ? 0u : at.packed;
     float4 d0 = 0, d1 = 0;
     for (uint i = lane; i < 128; i += 32) {
       float4 q0 = qs[0][i], q1 = qs[1][i], q2 = qs[2][i], q3 = qs[3][i];
-      float4 a = r < nwin ? float4(w0[i]) : comp_values(comp, row0, i, at.packed);
-      float4 b = r2 < nwin ? float4(w1[i]) : comp_values(comp, row1, i, at.packed);
+      float4 a = comp_row_values(p0, i, pk0);
+      float4 b = comp_row_values(p1, i, pk1);
       d0 += float4(dot(q0, a), dot(q1, a), dot(q2, a), dot(q3, a));
       d1 += float4(dot(q0, b), dot(q1, b), dot(q2, b), dot(q3, b));
     }
@@ -1084,22 +1148,22 @@ kernel void attend_scores(device const float *q [[buffer(0)]], device const bflo
     cmax[(gr.y * 2 + t / 4) * 64 + g * 4 + t % 4] = max(tmp[t / 4 * 8 + t % 4 * 2], tmp[t / 4 * 8 + t % 4 * 2 + 1]);
 }
 
-// Adds rows j .. j1 - 1, of one buffer, of the chunk from row r0, times their
-// probabilities p (4 heads per float4), to the sums acc of 4 columns of the
-// heads of hq, row after row, loading 8 rows at a time. The rows are packed
-// compressed rows, or BF16 rows of 512 values.
-inline void att_values(device const uchar *base, uint packed, threadgroup const uint *rows, uint j, uint j1,
+// Adds rows j .. j1 - 1, of resolved row pointers `row_ptrs`, of the chunk from
+// row r0, times their probabilities p (4 heads per float4), to the sums acc of
+// 4 columns of the heads of hq, loading 8 rows at a time.
+inline void att_values(uint packed, threadgroup const ulong *row_ptrs, uint j, uint j1,
                        uint r0, threadgroup const float4 (*p)[4], uint hq, uint col, thread float4 *acc) {
   for (; j + 8 <= j1; j += 8) {
     float4 x[8];
-    for (uint u = 0; u < 8; u++) x[u] = comp_values(base, rows[j + u - r0], col / 4, packed);
+    for (uint u = 0; u < 8; u++)
+      x[u] = comp_row_values((device const uchar *)row_ptrs[j + u - r0], col / 4, packed);
     for (uint u = 0; u < 8; u++) {
       float4 pv = p[j + u - r0][hq];
       acc[0] += pv.x * x[u], acc[1] += pv.y * x[u], acc[2] += pv.z * x[u], acc[3] += pv.w * x[u];
     }
   }
   for (; j < j1; j++) {
-    float4 x = comp_values(base, rows[j - r0], col / 4, packed), pv = p[j - r0][hq];
+    float4 x = comp_row_values((device const uchar *)row_ptrs[j - r0], col / 4, packed), pv = p[j - r0][hq];
     acc[0] += pv.x * x, acc[1] += pv.y * x, acc[2] += pv.z * x, acc[3] += pv.w * x;
   }
 }
@@ -1115,11 +1179,16 @@ kernel void attend_values(device const uchar *ring [[buffer(0)]], device const u
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float4 p[2][ATT_CHUNK][4];  // [chunk][row][head / 4]
   threadgroup float tmp[2][32], mxs[16];
-  threadgroup uint rows[2 * ATT_CHUNK];
+  threadgroup ulong row_ptrs[2 * ATT_CHUNK];
   uint g = gr.x / 2, lo, nwin, n = att_rows(at, sel, lo, nwin), nc = (n + ATT_CHUNK - 1) / ATT_CHUNK;
   uint rc = gr.y * 2 * ATT_CHUNK;  // the first row of the two chunks
   if (rc >= n) return;
-  if (t < min(n - rc, 2u * ATT_CHUNK)) rows[t] = att_index(rc + t, lo, nwin, at, sel);
+  if (t < min(n - rc, 2u * ATT_CHUNK)) {
+    uint r = rc + t;
+    uint idx = att_index(r, lo, nwin, at, sel);
+    row_ptrs[t] = ulong(r < nwin ? (ring + (ulong)idx * 1024ul)
+                                 : comp_row_ptr(comp, idx, at.packed, at.slice_off, at.page_shift));
+  }
   if (t < 16) {  // head g 16 + t's maximum over the chunks
     float m[ATT_ROWS / ATT_CHUNK], mx = -INFINITY;
     for (uint k = 0; k < ATT_ROWS / ATT_CHUNK; k++) m[k] = cmax[min(k, nc - 1) * 64 + g * 16 + t];
@@ -1140,8 +1209,8 @@ kernel void attend_values(device const uchar *ring [[buffer(0)]], device const u
   uint r0 = rc + c * ATT_CHUNK, r1 = min(n, r0 + ATT_CHUNK);
   if (r0 >= n) return;
   float4 acc[4] = {0, 0, 0, 0};
-  att_values(ring, 0, rows + c * ATT_CHUNK, r0, min(r1, nwin), r0, p[c], hq, col, acc);
-  att_values(comp, at.packed, rows + c * ATT_CHUNK, max(r0, nwin), r1, r0, p[c], hq, col, acc);
+  att_values(0, row_ptrs + c * ATT_CHUNK, r0, min(r1, nwin), r0, p[c], hq, col, acc);
+  att_values(at.packed, row_ptrs + c * ATT_CHUNK, max(r0, nwin), r1, r0, p[c], hq, col, acc);
   device float *out = part + ((gr.y * 2 + c) * 64 + g * 16 + hq * 4) * 514 + col;
   for (uint k = 0; k < 4; k++)
     *(device float2 *)(out + k * 514) = acc[k].xy, *(device float2 *)(out + k * 514 + 2) = acc[k].zw;
@@ -1201,6 +1270,18 @@ inline Keys keys_load(device const bfloat *ring, device const uchar *comp, uint 
   }
   return c;
 }
+inline Keys keys_load_ptrs(threadgroup const ulong *row_ptrs, uint nwin, uint packed,
+                           uint r0, uint n, uint ds, uint t) {
+  Keys c;
+  uint col = ds * 32 + t % 32;
+  for (uint i = 0; i < 4; i++) {
+    uint r = r0 + t / 32 + 8 * i;
+    c.v[i] = r >= n ? bfloat4(0)
+             : r < nwin ? ((device const bfloat4 *)row_ptrs[r])[col]
+                        : bfloat4(comp_row_values((device const uchar *)row_ptrs[r], col, packed));
+  }
+  return c;
+}
 inline void keys_store(threadgroup bfloat *kv, Keys c, uint t) {
   for (uint i = 0; i < 4; i++) *(threadgroup bfloat4 *)(kv + (t / 32 + 8 * i) * 128 + (t % 32) * 4) = c.v[i];
 }
@@ -1211,12 +1292,17 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
                      uint t [[thread_index_in_threadgroup]]) {
   threadgroup bfloat kv[2][32 * 128], ps[32 * 32];
   threadgroup float ss[32 * 32], mx[32], sum[32], rescale[32];
-  threadgroup uint rows[640];
+  threadgroup ulong row_ptrs[640];
   uint h0 = gr.x * 32, pos = at.win.pos + gr.y;
   o += gr.y * 32768, sel += gr.y * 513 + 1;
   uint lo = max(pos >= 127 ? pos - 127 : 0u, at.first);
   uint nwin = pos + 1 - lo, ncomp = at.comp_rows ? uint(sel[-1]) : 0, n = nwin + ncomp;
-  for (uint r = t; r < n; r += 256) rows[r] = r < nwin ? win_row(lo + r, at.win) : 0x80000000u | uint(sel[r - nwin]);
+  for (uint r = t; r < n; r += 256) {
+    if (r < nwin)
+      row_ptrs[r] = ulong((device const uchar *)(ring + (ulong)win_row(lo + r, at.win) * 512ul));
+    else
+      row_ptrs[r] = ulong(comp_row_ptr(comp, uint(sel[r - nwin]), at.packed, at.slice_off, at.page_shift));
+  }
   if (t < 32) mx[t] = -1e30f, sum[t] = 0;
   constexpr auto sdesc = matmul2d_descriptor(32, 32, 128, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   constexpr auto odesc = matmul2d_descriptor(32, 128, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -1233,7 +1319,8 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
   for (uint16_t i = 0; i < acc0.get_capacity(); i++)
     if (acc0.is_valid_element(i)) acc0[i] = acc1[i] = acc2[i] = acc3[i] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  Keys ka = keys_load(ring, comp, at.packed, rows, 0, n, 0, t), kb = keys_load(ring, comp, at.packed, rows, 0, n, 1, t);
+  Keys ka = keys_load_ptrs(row_ptrs, nwin, at.packed, 0, n, 0, t),
+       kb = keys_load_ptrs(row_ptrs, nwin, at.packed, 0, n, 1, t);
   for (uint r0 = 0; r0 < n; r0 += 32) {
     auto sc = sop.get_destination_cooperative_tensor<decltype(tq.slice(0, 0)), decltype(tk), float>();
     for (uint16_t i = 0; i < sc.get_capacity(); i++)
@@ -1242,7 +1329,8 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
       keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       // the next pair; after the last, the first again, for the values
-      ka = keys_load(ring, comp, at.packed, rows, r0, n, (ds + 2) % 4, t), kb = keys_load(ring, comp, at.packed, rows, r0, n, (ds + 3) % 4, t);
+      ka = keys_load_ptrs(row_ptrs, nwin, at.packed, r0, n, (ds + 2) % 4, t),
+      kb = keys_load_ptrs(row_ptrs, nwin, at.packed, r0, n, (ds + 3) % 4, t);
       auto q0 = tq.slice(ds * 128, 0), q1 = tq.slice(ds * 128 + 128, 0);
       sop.run(q0, tk, sc);
       sop.run(q1, tk1, sc);
@@ -1277,7 +1365,9 @@ kernel void attend_m(device const bfloat *qb [[buffer(0)]], device const bfloat 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     keys_store(kv[0], ka, t), keys_store(kv[1], kb, t);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (r0 + 32 < n) ka = keys_load(ring, comp, at.packed, rows, r0 + 32, n, 0, t), kb = keys_load(ring, comp, at.packed, rows, r0 + 32, n, 1, t);
+    if (r0 + 32 < n)
+      ka = keys_load_ptrs(row_ptrs, nwin, at.packed, r0 + 32, n, 0, t),
+      kb = keys_load_ptrs(row_ptrs, nwin, at.packed, r0 + 32, n, 1, t);
     oop.run(tp, tk, acc0);
     oop.run(tp, tk1, acc1);
     threadgroup_barrier(mem_flags::mem_threadgroup);

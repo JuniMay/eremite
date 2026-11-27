@@ -149,6 +149,21 @@ static size_t global_values(int l, int keys) {
   return (size_t)(prompt_n / L[l].ratio) * (keys ? IDX_DIM : HEAD_DIM);
 }
 
+// Copies all rows of KV source layer `l`'s compressed rows (`keys == 0`) or
+// index keys (`keys == 1`) from active->kv's pages into contiguous `dst`.
+static void copy_global_rows(int l, int keys, uint8_t *dst) {
+  size_t row_bytes = (size_t)(keys ? key_row_bytes() : comp_row_bytes());
+  size_t off = keys ? L[l].key_off : L[l].comp_off;
+  size_t total_rows = (size_t)(prompt_n / L[l].ratio);
+  size_t page_rows = L[l].kv_page_rows;
+  for (size_t r = 0, p = 0; r < total_rows; p++) {
+    size_t take = total_rows - r < page_rows ? total_rows - r : page_rows;
+    memcpy(dst + r * row_bytes, (const uint8_t *)active->kv.host_ptrs[p] + off,
+           take * row_bytes);
+    r += take;
+  }
+}
+
 static void snapshot(void) {
   gpu_sync(gpu);
   memcpy(reference_routes, observed, sizeof observed);
@@ -158,7 +173,7 @@ static void snapshot(void) {
     for (int k = 0; k < 2; k++) {
       size_t bytes = global_values(l, k) * sizeof(uint16_t);
       reference_global[l][k] = xmalloc(bytes);
-      memcpy(reference_global[l][k], (k ? L[l].keys : L[l].comp).ptr, bytes);
+      copy_global_rows(l, k, (uint8_t *)reference_global[l][k]);
     }
   }
 }
@@ -189,10 +204,12 @@ static uint64_t report_cache(int keep) {
     all_different += local.different;
     if (L[l].kv_source)
       for (int k = 0; k < 2; k++) {
-        const uint16_t *current =
-            (const uint16_t *)(k ? L[l].keys : L[l].comp).ptr;
-        for (size_t i = 0; i < global_values(l, k); i++)
+        size_t nvals = global_values(l, k);
+        uint16_t *current = xmalloc(nvals * sizeof(uint16_t));
+        copy_global_rows(l, k, (uint8_t *)current);
+        for (size_t i = 0; i < nvals; i++)
           global_different += reference_global[l][k][i] != current[i];
+        free(current);
       }
     if (l >= ced_check_layer)
       for (int r = 0; r < prompt_n - first; r++)

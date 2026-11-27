@@ -16,7 +16,8 @@ static Buf fixture_alloc(size_t n) {
   memset(p, 0xD7, n);
   allocated += n;
   if (allocated > peak) peak = allocated;
-  return (Buf){.obj = p, .ptr = p, .size = n};
+  return (Buf){
+      .obj = p, .ptr = p, .size = n, .address = (uint64_t)(uintptr_t)p};
 }
 
 static void fixture_free(Buf *b) {
@@ -38,15 +39,21 @@ static void fixture_sync(Gpu *gpu) {
   pending = 0;
 }
 
+static size_t fixture_round(size_t bytes) { return bytes; }
+
 #include "residency_stand_ins.h"
 #define gpu_alloc fixture_gpu_alloc
 #define gpu_try_alloc_required fixture_gpu_alloc
 #define gpu_free fixture_free
+#define gpu_mark_to_free fixture_free
+#define gpu_round_up_to_pages fixture_round
 #define gpu_sync fixture_sync
 #include "model/deepseek/model.c"
 #undef gpu_alloc
 #undef gpu_try_alloc_required
 #undef gpu_free
+#undef gpu_mark_to_free
+#undef gpu_round_up_to_pages
 #undef gpu_sync
 
 static int filled(const Buf *b, size_t first, unsigned char value) {
@@ -55,28 +62,31 @@ static int filled(const Buf *b, size_t first, unsigned char value) {
   return 1;
 }
 
-static State *make_state(int cap) {
+static State *make_state(int positions) {
   State *s = xmalloc(sizeof *s);
-  memset(s, 0, sizeof *s);
-  s->cap = cap;
+  *s = (State){0};
   for (int l = 0; l < LAYERS; l++) {
     s->ring[l] = fixture_alloc(16);
     if (!L[l].kv_source) continue;
     s->cstate[l] = fixture_alloc(32);
-    s->comp[l] = fixture_alloc(rows_bytes(l, cap, 0));
-    s->keys[l] = fixture_alloc(rows_bytes(l, cap, 1));
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) s->dring[d] = fixture_alloc(16);
+  remember_state_layout();
+  KvPageLayout layout = ds_kv_layout();
+  kv_page_table_init(&s->kv, ds_kv_backend(), &layout);
+  if (!kv_page_table_prepare_write(&s->kv, 0, positions + 1))
+    die("fixture failed allocating KV pages");
   return s;
 }
 
-// The bytes a state's buffers take, and its rewind copy's, if it has one.
+// The proportional bytes a state's buffers take, plus its rewind copy if any.
 static size_t owned(const State *s) {
   size_t n = s->saved ? saved_bytes() : 0;
-  for (int l = 0; l < LAYERS; l++)
-    n +=
-        s->ring[l].size + s->cstate[l].size + s->comp[l].size + s->keys[l].size;
+  for (int l = 0; l < LAYERS; l++) n += s->ring[l].size + s->cstate[l].size;
   for (int d = 0; opt.draft && d < DRAFTS; d++) n += s->dring[d].size;
+  n += s->kv.gpu_addrs.size;
+  for (int p = 0; p < s->kv.npages; p++)
+    n += s->kv.pages[p]->buf.size / s->kv.pages[p]->refs;
   return n;
 }
 
@@ -91,23 +101,24 @@ static void rolling_fill(State *src, unsigned char value) {
 
 // A fork as the server's prefix cache makes it: a snapshot of the source at the
 // fork, the source going on past it, then the source's global rows before the
-// fork copied into another state and the snapshot restored there.
+// fork shared copy-on-write into another state and the snapshot restored there.
 static void run(int ratio, int positions, int large, int draft) {
   memset(L, 0, sizeof L);
   memset(D, 0, sizeof D);
-  opt.ctx = large ? 32768 : 128;
+  opt.ctx = large ? 32768 : 1024;
   opt.draft = draft;
   L[2].kv_source = 1;
   L[2].ratio = ratio;
-  State *src = make_state(opt.ctx), *dst = make_state(start_cap());
+  int src_pos = large ? 2048 : positions + 32;
+  State *src = make_state(src_pos), *dst = make_state(0);
   active = src, history = src->history;
   bind(src);
   remember_state_layout();  // the fixture supplies the model's small
                             // rolling-buffer layout
   // What the server's prefix cache charges for a state.
-  check(deepseek_state_bytes(src, src->cap) == owned(src),
+  check(deepseek_state_bytes(src, src_pos) == owned(src),
         "a state is charged the bytes it owns");
-  State *fresh = make_state(grown(start_cap(), positions));
+  State *fresh = make_state(positions);
   check(deepseek_state_bytes(NULL, positions) == owned(fresh),
         "a new state is charged what it will own");
   deepseek_state_free(fresh);
@@ -119,28 +130,57 @@ static void run(int ratio, int positions, int large, int draft) {
   Snapshot *x = deepseek_snapshot_take(src, positions, 0);
   rolling_fill(src, 0x39);
   for (int i = 0; i < 3; i++) history[i] = src->history[i] = 70 + i;
-  memset(src->comp[2].ptr, 0x31, src->comp[2].size);
-  memset(src->keys[2].ptr, 0x32, src->keys[2].size);
+  for (int p = 0; p < src->kv.npages; p++) {
+    uint8_t *base = (uint8_t *)src->kv.host_ptrs[p];
+    memset(base + L[2].comp_off, (int)(0x31 + p),
+           (size_t)L[2].kv_page_rows * (size_t)comp_row_bytes());
+    memset(base + L[2].key_off, (int)(0x51 + p),
+           (size_t)L[2].kv_page_rows * (size_t)key_row_bytes());
+  }
   size_t saved = saved_bytes();
   dst->saved = xmalloc(saved);  // a rewind point of the destination's old rows
   memset(dst->saved, 0x67, saved);
-  check(deepseek_state_bytes(dst, dst->cap) == owned(dst),
+  check(deepseek_state_bytes(dst, 0) == owned(dst),
         "a state is charged its rewind copy");
   pending = 1;
   deepseek_state_copy(dst, src, positions);
   deepseek_snapshot_restore(dst, x);
-  size_t main_used = rows_bytes(2, positions, 0),
-         keys_used = rows_bytes(2, positions, 1);
-  check(dst->cap == grown(start_cap(), positions),
-        "capacity follows the prefix, not the source allocation");
-  check(!memcmp(src->comp[2].ptr, dst->comp[2].ptr, main_used),
-        "required global KV rows and guard row are copied");
-  check(!memcmp(src->keys[2].ptr, dst->keys[2].ptr, keys_used),
-        "required index rows and guard row are copied");
-  check(filled(&dst->comp[2], main_used, 0xD7),
-        "global KV beyond the prefix is not copied");
-  check(filled(&dst->keys[2], keys_used, 0xD7),
-        "index keys beyond the prefix are not copied");
+  int full_pages = (positions + 1) / DS_KV_PAGE_TOKENS;
+  int need_pages = (positions + 1 + DS_KV_PAGE_TOKENS - 1) / DS_KV_PAGE_TOKENS;
+  check(dst->kv.npages == need_pages,
+        "page count follows the prefix, not the source allocation");
+  int shared_ok = 1;
+  for (int p = 0; p < full_pages; p++)
+    shared_ok &=
+        dst->kv.pages[p] == src->kv.pages[p] && src->kv.pages[p]->refs == 2;
+  if (full_pages < need_pages)
+    shared_ok &= dst->kv.pages[full_pages] != src->kv.pages[full_pages] &&
+                 dst->kv.pages[full_pages]->refs == 1;
+  check(shared_ok,
+        "full prefix pages are shared CoW and trailing page is private");
+  int pages_match = 1;
+  for (int p = 0; p < need_pages; p++)
+    pages_match &=
+        !memcmp(src->kv.host_ptrs[p], dst->kv.host_ptrs[p], kv_page_bytes);
+  check(pages_match, "global KV rows and guard row match across all pages");
+  if (full_pages > 0) {
+    if (positions >= DS_KV_PAGE_TOKENS) {
+      check(deepseek_state_copy_bytes(src, positions, positions) <
+                deepseek_state_bytes(NULL, positions),
+            "fork copy bytes reflect shared prefix pages");
+    }
+    check(deepseek_state_bytes(dst, positions) == owned(dst),
+          "proportional state bytes account for shared prefix pages");
+    // CoW write on dst splits only the written shared page without altering
+    // src.
+    state_prepare_write(dst, 0, 1);
+    check(dst->kv.pages[0] != src->kv.pages[0] && src->kv.pages[0]->refs == 1 &&
+              dst->kv.pages[0]->refs == 1,
+          "CoW prepare_write splits shared page 0 on write");
+    ((uint8_t *)dst->kv.host_ptrs[0])[0] ^= 0xFF;
+    check(((const uint8_t *)src->kv.host_ptrs[0])[0] == 0x31,
+          "CoW write into forked branch leaves source page intact");
+  }
   int local = 1;
   for (int l = 0; l < LAYERS; l++) local &= filled(&dst->ring[l], 0, 0x42);
   local &= filled(&dst->cstate[2], 0, 0x42);
@@ -156,9 +196,10 @@ static void run(int ratio, int positions, int large, int draft) {
   check(!pending && !unsafe_frees,
         "submitted work completes before replacing buffers");
   if (large)
-    printf("prefix copy: %zu required global bytes; %zu bytes in source "
-           "capacity\n",
-           main_used + keys_used, src->comp[2].size + src->keys[2].size);
+    printf("prefix copy: %d/%d shared pages; delta %zu vs full %zu bytes\n",
+           full_pages, need_pages,
+           deepseek_state_copy_bytes(src, positions, positions),
+           deepseek_state_bytes(NULL, positions));
   deepseek_snapshot_free(x);
   active = NULL;
   deepseek_state_free(dst), deepseek_state_free(src);
@@ -168,10 +209,11 @@ static void recreate_after_eviction(void) {
   memset(L, 0, sizeof L), memset(D, 0, sizeof D);
   opt.ctx = 128, opt.draft = 0;
   L[2].kv_source = 1, L[2].ratio = 2;
-  State *seed = make_state(128);
+  State *seed = make_state(0);
   bind(seed);
   base_state();
-  free(seed);  // base_state owns these same fixture buffers now
+  kv_page_table_free(&seed->kv);
+  free(seed);  // base_state owns these same fixture rolling buffers now
   taken = 1;
   State *first = active;
   size_t expected = owned(first), ring = first->ring[0].size,
@@ -202,9 +244,9 @@ int main(void) {
   memory_slot_init(&state_slot, &account, MEMORY_STATE, NULL, "state", NULL,
                    NULL);
   work_slot = &work;
-  run(2, 33, 1, 1);
+  run(2, 545, 1, 1);
   for (int ratio = 1; ratio <= 2; ratio++)
-    for (int positions = 31; positions <= 33; positions++)
+    for (int positions = 255; positions <= 257; positions++)
       run(ratio, positions, 0, positions & 1);
   recreate_after_eviction();
   check(allocated == 0, "all host buffers are released");

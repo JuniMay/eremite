@@ -61,6 +61,8 @@ static const char reference[] = METAL(
 
 typedef struct {
   uint32_t ratio, start, row0, packed;
+  uint64_t slice_off;
+  uint32_t page_shift, pad;
 } Groups;
 
 // The groups of a run, and a packed compressed row and index key: E2M1 codes,
@@ -68,6 +70,8 @@ typedef struct {
 // scale for every 32 codes of a key.
 static constexpr int GROUPS = 64, ROW_BYTES = 288, ROW_SCALES = 256,
                      KEY_BYTES = 68, KEY_SCALES = 64;
+static constexpr int PAGE_ROWS = 16, PAGE_SHIFT = 4,
+                     NPAGES = GROUPS / PAGE_ROWS;
 
 static uint32_t seed = 88172645u;
 
@@ -124,6 +128,17 @@ int main(void) {
       keys_bf16 = gpu_alloc(gpu, slot, (size_t)GROUPS * 128 * 2),
       kernel_rows = gpu_alloc(gpu, slot, (size_t)GROUPS * 512 * 2),
       kernel_keys = gpu_alloc(gpu, slot, (size_t)GROUPS * 128 * 2);
+  size_t page_comp_off = 512,
+         page_key_off = page_comp_off + PAGE_ROWS * 512 * 2;
+  size_t page_bytes = page_key_off + PAGE_ROWS * 128 * 2;
+  Buf pages[NPAGES],
+      page_addrs = gpu_alloc(gpu, slot, NPAGES * sizeof(uint64_t));
+  for (int p = 0; p < NPAGES; p++) {
+    pages[p] = gpu_alloc(gpu, slot, page_bytes);
+    gpu_set_resident(&pages[p], 1);
+    ((uint64_t *)page_addrs.ptr)[p] = pages[p].address + pages[p].off;
+  }
+  gpu_commit_residency(gpu);
   for (int p = 0; p < positions; p++)
     for (int i = 0; i < 32; i++) {
       float a = 6.2831853f * (float)(next() >> 8) / (1 << 24);
@@ -159,7 +174,7 @@ int main(void) {
       // Pass 0: the kernels, packed. Pass 1: the references. Pass 2: the
       // kernels, as BF16.
       for (int pass = 0; pass < 3; pass++) {
-        Groups g = {ratio, 0, 0, pass == 0};
+        Groups g = {ratio, 0, 0, pass == 0, 0, 0, 0};
         const Buf *rows_out = pass == 0   ? &packed
                               : pass == 1 ? &bf16
                                           : &kernel_rows,
@@ -182,6 +197,50 @@ int main(void) {
       }
       gpu_commit(&cmd);
       gpu_sync(gpu);
+      // Verify paged compress and index_key match flat outputs bit-for-bit
+      // across multiple pages for both packed (form=1) and BF16 (form=0).
+      for (uint32_t form = 0; form < 2; form++) {
+        for (int p = 0; p < NPAGES; p++) memset(pages[p].ptr, 0, page_bytes);
+        Groups gc = {ratio, 0, 0, form, page_comp_off, PAGE_SHIFT, 0};
+        Groups gk = {ratio, 0, 0, form, page_key_off, PAGE_SHIFT, 0};
+        cmd = gpu_begin(gpu);
+        gpu_select_kernel(&cmd, compress);
+        gpu_bind_buffer(&cmd, 0, &kv, 0), gpu_bind_buffer(&cmd, 1, &score, 0),
+            gpu_bind_buffer(&cmd, 2, &w, 0), gpu_bind_buffer(&cmd, 3, &cs, 0);
+        gpu_bind_buffer(&cmd, 4, &latent, 0),
+            gpu_bind_buffer(&cmd, 5, &page_addrs, 0),
+            gpu_copy_bytes(&cmd, 6, &gc, sizeof gc);
+        gpu_run_kernel(&cmd, GROUPS, 1, 1, 512, 1, 1);
+        gpu_select_kernel(&cmd, index_key);
+        gpu_bind_buffer(&cmd, 0, &k, 0), gpu_bind_buffer(&cmd, 1, &kw, 0),
+            gpu_bind_buffer(&cmd, 2, &cs, 0),
+            gpu_bind_buffer(&cmd, 3, &page_addrs, 0),
+            gpu_copy_bytes(&cmd, 4, &gk, sizeof gk);
+        gpu_run_kernel(&cmd, GROUPS, 1, 1, 128, 1, 1);
+        gpu_commit(&cmd);
+        gpu_sync(gpu);
+        size_t rb = form ? ROW_BYTES : 512 * 2;
+        size_t kb = form ? KEY_BYTES : 128 * 2;
+        const uint8_t *flat_r =
+            (const uint8_t *)(form ? packed.ptr : kernel_rows.ptr);
+        const uint8_t *flat_k =
+            (const uint8_t *)(form ? keys.ptr : kernel_keys.ptr);
+        int paged_ok = 1;
+        for (int p = 0; p < NPAGES; p++) {
+          const uint8_t *pr = (const uint8_t *)pages[p].ptr + page_comp_off;
+          const uint8_t *pk = (const uint8_t *)pages[p].ptr + page_key_off;
+          paged_ok &= !memcmp(pr, flat_r + (size_t)p * PAGE_ROWS * rb,
+                              (size_t)PAGE_ROWS * rb);
+          paged_ok &= !memcmp(pk, flat_k + (size_t)p * PAGE_ROWS * kb,
+                              (size_t)PAGE_ROWS * kb);
+        }
+        char pwhat[160];
+        snprintf(pwhat, sizeof pwhat,
+                 "ratio %u, norm weights near 2^%d, %s: paged compress and "
+                 "index_key match flat bit-for-bit across %d pages",
+                 ratio, weight_exponents[c], form ? "packed" : "BF16", NPAGES);
+        check(paged_ok, pwhat);
+      }
       int rows_same = 1, keys_same = 1, small_scales = 0, zeros = 1;
       for (int r = 0; r < GROUPS; r++) {
         const uint8_t *row = (const uint8_t *)packed.ptr + r * ROW_BYTES;

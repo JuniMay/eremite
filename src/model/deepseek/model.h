@@ -37,6 +37,9 @@ static constexpr int REWIND = 8;
 // Rows of different sequences that one decode pass takes
 // (deepseek_decode_rows, --batch).
 static constexpr int BATCH_ROWS = 6;
+// Fixed power-of-two token span per shared copy-on-write KV page (128 ratio-2
+// rows and 256 ratio-1 rows per page across all 4 KV sources).
+static constexpr int DS_KV_PAGE_TOKENS = 256;
 // The expert cache's layers: the backbone's, then the stages'.
 static constexpr int CACHE_LAYERS = LAYERS + DRAFTS;
 
@@ -143,6 +146,10 @@ void deepseek_state_free(State *s);
 // Returns the bytes of s, or of a new state for a null s, when it holds that
 // many positions.
 size_t deepseek_state_bytes(const State *s, int positions);
+// Returns the extra bytes allocated when forking `positions` tokens from `src`
+// into a new state that grows to `target_positions`.
+size_t deepseek_state_copy_bytes(const State *src, int positions,
+                                 int target_positions);
 // Makes s the state that the layers work on.
 void deepseek_set_state_in_use(State *s);
 // deepseek_pass_new returns a pass of this model that runs body(argument).

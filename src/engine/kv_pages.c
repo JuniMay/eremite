@@ -86,6 +86,23 @@ KvPageLayout kv_page_layout_init(int page_tokens, size_t slice_bytes,
   };
 }
 
+KvPageLayout kv_page_layout_init_packed(int page_tokens, size_t page_bytes,
+                                        StateGrowthPolicy table_growth) {
+  if (page_tokens <= 0 || (page_tokens & (page_tokens - 1)) != 0)
+    die("KV page_tokens %d must be a positive power of two", page_tokens);
+  if (page_bytes == 0) die("invalid packed KV page size %zu", page_bytes);
+  uint32_t shift = 0;
+  for (int v = page_tokens; v > 1; v >>= 1) shift++;
+  return (KvPageLayout){
+      .page_tokens = page_tokens,
+      .page_shift = shift,
+      .slice_bytes = 0,
+      .slice_count = 1,
+      .page_bytes = page_bytes,
+      .table_growth = table_growth,
+  };
+}
+
 size_t kv_page_alloc_bytes(const KvPageBackend *backend,
                            const KvPageLayout *layout) {
   return round_backend_bytes(backend, layout->page_bytes);
@@ -234,7 +251,7 @@ int kv_page_table_prepare_write(KvPageTable *t, int pos, int count) {
   for (int p = t->npages; p < need_pages; p++) {
     table_set_slot(t, p, staged[si++]);
   }
-  t->npages = need_pages;
+  if (need_pages > t->npages) t->npages = need_pages;
   free(staged);
   commit_backend(&t->backend);
   return 1;
@@ -318,14 +335,18 @@ int kv_page_table_fork(KvPageTable *dst, const KvPageTable *src,
       return 0;
     }
     allocated_any = 1;
-    size_t row_bytes =
-        dst->layout.slice_bytes / (size_t)dst->layout.page_tokens;
-    size_t copy_bytes = (size_t)rem_rows * row_bytes;
     const uint8_t *src_base = src->pages[full_pages]->buf.ptr;
     uint8_t *dst_base = boundary->buf.ptr;
-    for (int s = 0; s < dst->layout.slice_count; s++) {
-      size_t off = (size_t)s * dst->layout.slice_bytes;
-      memcpy(dst_base + off, src_base + off, copy_bytes);
+    if (dst->layout.slice_bytes == 0) {
+      memcpy(dst_base, src_base, dst->layout.page_bytes);
+    } else {
+      size_t row_bytes =
+          dst->layout.slice_bytes / (size_t)dst->layout.page_tokens;
+      size_t copy_bytes = (size_t)rem_rows * row_bytes;
+      for (int s = 0; s < dst->layout.slice_count; s++) {
+        size_t off = (size_t)s * dst->layout.slice_bytes;
+        memcpy(dst_base + off, src_base + off, copy_bytes);
+      }
     }
   }
 

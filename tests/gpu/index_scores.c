@@ -44,7 +44,8 @@ static const char reference[] = METAL(kernel void index_score_reference(
 #undef METAL
 
 typedef struct {
-  uint32_t pos, ratio, stride, cand, packed;
+  uint32_t pos, ratio, stride, cand, packed, page_shift;
+  uint64_t slice_off;
 } Index;
 
 // The forms of the index keys that the kernel reads.
@@ -169,8 +170,13 @@ int main(void) {
   int starts[][2] = {{0, 1}, {300, 1}, {5000, 2}, {20000, 1}, {40001, 2}};
   for (uint32_t form = 0; form < 2; form++)
     for (size_t c = 0; c < sizeof starts / sizeof *starts; c++) {
-      Index ix = {(uint32_t)starts[c][0], (uint32_t)starts[c][1], POSITIONS, 0,
-                  form};
+      Index ix = {(uint32_t)starts[c][0],
+                  (uint32_t)starts[c][1],
+                  POSITIONS,
+                  0,
+                  form,
+                  0,
+                  0};
       int rows = 48;
       clear(&SCORE[0]), clear(&SCORE[1]);
       run(gpu, every, &KEYS, ix, rows, &SCORE[0], 1),
@@ -190,7 +196,7 @@ int main(void) {
   // else.
   for (uint32_t form = 0; form < 2; form++)
     for (int kind = 0; kind < 6; kind++) {
-      Index ix = {20000 - 5 * kind, 1, POSITIONS, WORDS, form};
+      Index ix = {20000 - 5 * kind, 1, POSITIONS, WORDS, form, 0, 0};
       int rows = 48;
       uint64_t kept = 0, skipped = 0;
       for (int r = 0; r < rows; r++)
@@ -228,10 +234,55 @@ int main(void) {
                (unsigned long long)skipped);
       check(same, what);
     }
+  // Paged index_score parity and timing across 256 pages of 256 rows.
+  static constexpr int PAGE_ROWS = 256, PAGE_SHIFT = 8,
+                       NPAGES = POSITIONS / PAGE_ROWS;
+  static constexpr size_t BF16_OFF = 512,
+                          PACKED_OFF = BF16_OFF + PAGE_ROWS * 128 * 2,
+                          PAGE_BYTES = PACKED_OFF + PAGE_ROWS * KEY_BYTES;
+  Buf *pages = xmalloc((size_t)NPAGES * sizeof *pages);
+  Buf page_addrs = gpu_alloc(gpu, slot, (size_t)NPAGES * sizeof(uint64_t));
+  for (int p = 0; p < NPAGES; p++) {
+    pages[p] = gpu_alloc(gpu, slot, PAGE_BYTES);
+    gpu_set_resident(&pages[p], 1);
+    memcpy(pages[p].ptr + BF16_OFF,
+           (const uint8_t *)KEYS.ptr + (size_t)p * PAGE_ROWS * 128 * 2,
+           (size_t)PAGE_ROWS * 128 * 2);
+    memcpy(pages[p].ptr + PACKED_OFF,
+           (const uint8_t *)PACKED.ptr + (size_t)p * PAGE_ROWS * KEY_BYTES,
+           (size_t)PAGE_ROWS * KEY_BYTES);
+    ((uint64_t *)page_addrs.ptr)[p] = pages[p].address + pages[p].off;
+  }
+  gpu_commit_residency(gpu);
+  for (uint32_t form = 0; form < 2; form++) {
+    Index flat = {20000, 1, POSITIONS, WORDS, form, 0, 0};
+    Index paged = {20000,
+                   1,
+                   POSITIONS,
+                   WORDS,
+                   form,
+                   PAGE_SHIFT,
+                   form ? PACKED_OFF : BF16_OFF};
+    int rows = 48;
+    for (int r = 0; r < rows; r++)
+      candidates((uint32_t *)CAND.ptr + (size_t)r * WORDS,
+                 (int)(flat.pos + r + 1 + 7) / 8, 1);
+    clear(&SCORE[0]), clear(&SCORE[1]);
+    run(gpu, scored, form ? &PACKED : &KEYS, flat, rows, &SCORE[0], 1);
+    run(gpu, scored, &page_addrs, paged, rows, &SCORE[1], 1);
+    char what[128];
+    snprintf(what, sizeof what,
+             "paged %s index_score matches flat bit-for-bit across %d pages",
+             FORMS[form], NPAGES);
+    check(!memcmp(a, b, (size_t)ROWS * POSITIONS * 4), what);
+  }
+
   // Time: every position, then 2,048 candidate blocks of 8,190, spread and in
   // runs.
-  Index ix = {POSITIONS - ROWS, 1, POSITIONS, 0, 0}, packed = ix;
+  Index ix = {POSITIONS - ROWS, 1, POSITIONS, 0, 0, 0, 0}, packed = ix;
   packed.packed = 1;
+  Index paged_packed = packed;
+  paged_packed.page_shift = PAGE_SHIFT, paged_packed.slice_off = PACKED_OFF;
   for (int spread = 0; spread < 3; spread++) {
     for (int r = 0; r < ROWS && spread; r++) {
       uint32_t *bits = (uint32_t *)CAND.ptr + (size_t)r * WORDS;
@@ -241,20 +292,24 @@ int main(void) {
         if (spread == 1 ? b % 4 == r % 4 : (b / 64) % 4 == r % 4)
           bits[b / 32] |= 1u << (b % 32);
     }
-    ix.cand = packed.cand = spread ? WORDS : 0;
+    ix.cand = packed.cand = paged_packed.cand = spread ? WORDS : 0;
     run(gpu, scored, &KEYS, ix, ROWS, &SCORE[1], 1);  // raise the GPU's clock
-    Index all = {ix.pos, 1, POSITIONS, 0, 0};
+    Index all = {ix.pos, 1, POSITIONS, 0, 0, 0, 0};
     double before = run(gpu, every, &KEYS, all, ROWS, &SCORE[0], 4);
     double bf16 = run(gpu, scored, &KEYS, ix, ROWS, &SCORE[1], 4);
     double packed_us = run(gpu, scored, &PACKED, packed, ROWS, &SCORE[1], 4);
+    double paged_us =
+        run(gpu, scored, &page_addrs, paged_packed, ROWS, &SCORE[1], 4);
     double after = run(gpu, every, &KEYS, all, ROWS, &SCORE[0], 4);
     printf("index scores of %d rows over %d positions, %s: every position %.0f "
-           "/ %.0f us, scored %.0f us from BF16 keys, %.0f us from packed\n",
+           "/ %.0f us, scored %.0f us BF16, %.0f us packed flat, %.0f us "
+           "packed paged\n",
            ROWS, POSITIONS,
            spread == 0   ? "no candidates"
            : spread == 1 ? "a quarter of the blocks, spread"
                          : "a quarter of the blocks, in runs of 64",
-           before, after, bf16, packed_us);
+           before, after, bf16, packed_us, paged_us);
   }
+  free(pages);
   return failures != 0;
 }

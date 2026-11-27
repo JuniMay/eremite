@@ -100,10 +100,14 @@ int main(int argc, char **argv) {
   for (int l = 0; l < LAYERS; l++)
     if (L[l].kv_source)
       for (int k = 0; k < 2; k++) {
-        Buf *b = k ? &L[l].keys : &L[l].comp;
-        sizes[l][k] = b->size;
-        globals[l][k] = xmalloc(b->size);
-        memcpy(globals[l][k], b->ptr, b->size);
+        size_t rb = (size_t)(k ? key_row_bytes() : comp_row_bytes());
+        size_t off = k ? L[l].key_off : L[l].comp_off;
+        size_t pbytes = (size_t)L[l].kv_page_rows * rb;
+        sizes[l][k] = (size_t)active->kv.npages * pbytes;
+        globals[l][k] = xmalloc(sizes[l][k]);
+        for (int p = 0; p < active->kv.npages; p++)
+          memcpy(globals[l][k] + (size_t)p * pbytes,
+                 (const uint8_t *)active->kv.host_ptrs[p] + off, pbytes);
       }
   int draft_reference[2] = {0}, first = sample_greedy(reference, VOCAB);
   if (o.draft) deepseek_propose_drafts(first, n, draft_reference, 2);
@@ -143,10 +147,16 @@ int main(int argc, char **argv) {
   for (int l = 0; l < LAYERS; l++)
     if (L[l].kv_source)
       for (int k = 0; k < 2; k++) {
-        Buf *b = k ? &L[l].keys : &L[l].comp;
-        if (sizes[l][k] != b->size)
+        size_t rb = (size_t)(k ? key_row_bytes() : comp_row_bytes());
+        size_t off = k ? L[l].key_off : L[l].comp_off;
+        size_t pbytes = (size_t)L[l].kv_page_rows * rb;
+        size_t cur_size = (size_t)active->kv.npages * pbytes;
+        if (sizes[l][k] != cur_size)
           die("global capacity changed between comparisons");
-        global_diff += bytes_differ(globals[l][k], b->ptr, b->size);
+        for (int p = 0; p < active->kv.npages; p++)
+          global_diff += bytes_differ(
+              globals[l][k] + (size_t)p * pbytes,
+              (const uint8_t *)active->kv.host_ptrs[p] + off, pbytes);
       }
   int drafts[2] = {0}, draft_diff = 0;
   if (o.draft)

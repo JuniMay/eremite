@@ -107,13 +107,26 @@ typedef struct {
   float *logits;
 } Tensors;
 
+// Copies all pages of layer `l`'s compressed rows (`keys == 0`) or index keys
+// (`keys == 1`) from active->kv into a contiguous host buffer.
+static uint8_t *host_copy_kv_slice(int l, int keys) {
+  size_t rb = (size_t)(keys ? key_row_bytes() : comp_row_bytes());
+  size_t off = keys ? L[l].key_off : L[l].comp_off;
+  size_t pbytes = (size_t)L[l].kv_page_rows * rb;
+  uint8_t *out = xmalloc((size_t)active->kv.npages * pbytes);
+  for (int p = 0; p < active->kv.npages; p++)
+    memcpy(out + (size_t)p * pbytes,
+           (const uint8_t *)active->kv.host_ptrs[p] + off, pbytes);
+  return out;
+}
+
 static void take(Tensors *c, const float *lg) {
   gpu_sync(gpu);
   for (int l = 0; l < LAYERS; l++) {
     c->ring[l] = host_copy(L[l].ring.ptr, L[l].ring.size);
     if (L[l].kv_source)
-      c->comp[l] = host_copy(L[l].comp.ptr, L[l].comp.size),
-      c->keys[l] = host_copy(L[l].keys.ptr, L[l].keys.size),
+      c->comp[l] = host_copy_kv_slice(l, 0),
+      c->keys[l] = host_copy_kv_slice(l, 1),
       c->cstate[l] = host_copy(L[l].cstate.ptr, L[l].cstate.size);
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++)
@@ -515,8 +528,8 @@ static void keep_source_rows(void) {
   gpu_sync(gpu);
   for (int l = 0; l < LAYERS; l++)
     if (L[l].kv_source)
-      source_comp[l] = host_copy(L[l].comp.ptr, L[l].comp.size),
-      source_keys[l] = host_copy(L[l].keys.ptr, L[l].keys.size);
+      source_comp[l] = host_copy_kv_slice(l, 0),
+      source_keys[l] = host_copy_kv_slice(l, 1);
 }
 
 static void snapshot_source(int pos, int with_logits) {

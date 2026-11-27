@@ -38,11 +38,13 @@ typedef struct {
   int page_tokens;
   // Base-2 logarithm of page_tokens for bit-shift indexing.
   uint32_t page_shift;
-  // Byte size of one slice inside a page (page_tokens * row_bytes).
+  // Byte size of one slice inside a page (page_tokens * row_bytes), or 0 when
+  // heterogeneous slices are packed inside one page and partial boundary forks
+  // copy the full page_bytes.
   size_t slice_bytes;
-  // Number of slices packed sequentially inside each page.
+  // Number of slices packed sequentially inside each page (1 when packed).
   int slice_count;
-  // Total byte size of one page buffer (slice_count * slice_bytes).
+  // Total byte size of one page buffer.
   size_t page_bytes;
   // Growth policy for the page-address table array, measured in pages.
   StateGrowthPolicy table_growth;
@@ -80,6 +82,12 @@ KvPageBackend kv_page_backend_gpu(Gpu *gpu, MemorySlot *slot);
 KvPageLayout kv_page_layout_init(int page_tokens, size_t slice_bytes,
                                  int slice_count,
                                  StateGrowthPolicy table_growth);
+
+// Initializes a packed page layout of `page_bytes` bytes covering power-of-two
+// `page_tokens` positions across heterogeneous slices (such as multi-ratio
+// layers). Partial boundary forks copy the full `page_bytes`.
+KvPageLayout kv_page_layout_init_packed(int page_tokens, size_t page_bytes,
+                                        StateGrowthPolicy table_growth);
 
 // Returns the backend-rounded byte size of one page buffer.
 size_t kv_page_alloc_bytes(const KvPageBackend *backend,

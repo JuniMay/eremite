@@ -127,6 +127,8 @@ static const char reference[] = METAL(kernel void attend_m_reference(
 
 typedef struct {
   uint32_t pos, base, mod, first, comp_rows, packed;
+  uint64_t slice_off;
+  uint32_t page_shift, pad;
 } Att;
 
 // Query rows, and compressed key rows.
@@ -249,7 +251,8 @@ int main(void) {
   for (uint32_t form = 0; form < 2; form++)
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
       uint32_t pos = cases[c].pos, base = pos >= 127 ? pos - 127 : 0;
-      Att at = {pos, base, 1u << 30, cases[c].first, cases[c].comp, form};
+      Att at = {pos, base, 1u << 30, cases[c].first, cases[c].comp, form,
+                0,   0,    0};
       select_rows(cases[c].rows, cases[c].count);
       memset(OUT[0].ptr, 0xa5, OUT[0].size),
           memset(OUT[1].ptr, 0xa5, OUT[1].size);
@@ -273,16 +276,110 @@ int main(void) {
                FORMS[form], cases[c].name, count);
       check(same && finite && nonzero >= count / 2, what);
     }
-  Att at = {20000, 20000 - 127, 1u << 30, 0, 1, 0}, packed = at;
+  // Paged attend_m and paged decode (attend_scores/values/combine) parity
+  // across 32 pages of 256 rows, plus paged attend_m timing.
+  static constexpr int PAGE_ROWS = 256, PAGE_SHIFT = 8,
+                       NPAGES = COMP / PAGE_ROWS;
+  static constexpr size_t BF16_OFF = 512,
+                          PACKED_OFF = BF16_OFF + PAGE_ROWS * 512 * 2,
+                          PAGE_BYTES = PACKED_OFF + PAGE_ROWS * ROW_BYTES;
+  Buf pages[NPAGES],
+      page_addrs = gpu_alloc(gpu, slot, (size_t)NPAGES * sizeof(uint64_t));
+  for (int p = 0; p < NPAGES; p++) {
+    pages[p] = gpu_alloc(gpu, slot, PAGE_BYTES);
+    gpu_set_resident(&pages[p], 1);
+    memcpy(pages[p].ptr + BF16_OFF,
+           (const uint8_t *)KEYS.ptr + (size_t)p * PAGE_ROWS * 512 * 2,
+           (size_t)PAGE_ROWS * 512 * 2);
+    memcpy(pages[p].ptr + PACKED_OFF,
+           (const uint8_t *)PACKED.ptr + (size_t)p * PAGE_ROWS * ROW_BYTES,
+           (size_t)PAGE_ROWS * ROW_BYTES);
+    ((uint64_t *)page_addrs.ptr)[p] = pages[p].address + pages[p].off;
+  }
+  gpu_commit_residency(gpu);
+  int k_scores = gpu_find_kernel(gpu, "attend_scores"),
+      k_values = gpu_find_kernel(gpu, "attend_values"),
+      k_combine = gpu_find_kernel(gpu, "attend_combine");
+  Buf q_f32 = gpu_alloc(gpu, slot, 32768 * 4),
+      cs_buf = gpu_alloc(gpu, slot, 6000 * 32 * 8),
+      asc = gpu_alloc(gpu, slot, 64 * 640 * 4),
+      amax = gpu_alloc(gpu, slot, 10 * 64 * 4),
+      apart = gpu_alloc(gpu, slot, 10 * 64 * 514 * 4);
+  for (size_t i = 0; i < 32768; i++)
+    ((float *)q_f32.ptr)[i] = (float)((int)(next() >> 27) - 16) / 16.0f;
+  for (size_t p = 0; p < 6000; p++)
+    for (int i = 0; i < 32; i++) {
+      float a = (float)p * powf(10000.0f, -(float)i / 32.0f);
+      ((float *)cs_buf.ptr)[(p * 32 + i) * 2] = cosf(a);
+      ((float *)cs_buf.ptr)[(p * 32 + i) * 2 + 1] = sinf(a);
+    }
+  select_rows(96, all);
+  for (uint32_t form = 0; form < 2; form++) {
+    uint32_t pos = 5000, base = pos - 127;
+    Att flat = {pos, base, 1u << 30, 0, 1, form, 0, 0, 0};
+    Att paged = {
+        pos,        base, 1u << 30, 0, 1, form, form ? PACKED_OFF : BF16_OFF,
+        PAGE_SHIFT, 0};
+    memset(OUT[0].ptr, 0xa5, OUT[0].size),
+        memset(OUT[1].ptr, 0xa5, OUT[1].size);
+    run(gpu, now_kernel, form ? &PACKED : &KEYS, flat, 96, &OUT[0], 1);
+    run(gpu, now_kernel, &page_addrs, paged, 96, &OUT[1], 1);
+    char what[160];
+    snprintf(what, sizeof what,
+             "paged %s attend_m matches flat bit-for-bit across %d pages",
+             FORMS[form], NPAGES);
+    check(!memcmp(OUT[0].ptr, OUT[1].ptr, (size_t)96 * 32768 * 4), what);
+
+    // Paged decode attention (attend_scores + attend_values + attend_combine).
+    for (int mode = 0; mode < 2; mode++) {
+      Att da = mode == 0 ? flat : paged;
+      const Buf *cbuf = mode == 0 ? (form ? &PACKED : &KEYS) : &page_addrs;
+      GpuCommandBuffer cmd = gpu_begin(gpu);
+      gpu_select_kernel(&cmd, k_scores);
+      gpu_bind_buffer(&cmd, 0, &q_f32, 0), gpu_bind_buffer(&cmd, 1, &WIN, 0),
+          gpu_bind_buffer(&cmd, 2, cbuf, 0), gpu_bind_buffer(&cmd, 3, &SEL, 0),
+          gpu_bind_buffer(&cmd, 4, &cs_buf, 0),
+          gpu_bind_buffer(&cmd, 5, &asc, 0), gpu_bind_buffer(&cmd, 6, &amax, 0),
+          gpu_copy_bytes(&cmd, 7, &da, sizeof da);
+      gpu_run_kernel(&cmd, 16, 5, 1, 512, 1, 1);
+      gpu_select_kernel(&cmd, k_values);
+      gpu_bind_buffer(&cmd, 0, &WIN, 0), gpu_bind_buffer(&cmd, 1, cbuf, 0),
+          gpu_bind_buffer(&cmd, 2, &SEL, 0), gpu_bind_buffer(&cmd, 3, &asc, 0),
+          gpu_bind_buffer(&cmd, 4, &amax, 0),
+          gpu_bind_buffer(&cmd, 5, &apart, 0),
+          gpu_copy_bytes(&cmd, 6, &da, sizeof da);
+      gpu_run_kernel(&cmd, 8, 5, 1, 512, 1, 1);
+      gpu_select_kernel(&cmd, k_combine);
+      gpu_bind_buffer(&cmd, 0, &apart, 0), gpu_bind_buffer(&cmd, 1, &amax, 0),
+          gpu_bind_buffer(&cmd, 2, &SINK, 0),
+          gpu_bind_buffer(&cmd, 3, &OUT[mode], 0),
+          gpu_bind_buffer(&cmd, 4, &SEL, 0),
+          gpu_copy_bytes(&cmd, 5, &da, sizeof da);
+      gpu_run_kernel(&cmd, 64, 2, 1, 128, 1, 1);
+      gpu_commit(&cmd);
+      gpu_sync(gpu);
+    }
+    snprintf(what, sizeof what,
+             "paged %s decode attention matches flat bit-for-bit across %d "
+             "pages",
+             FORMS[form], NPAGES);
+    check(!memcmp(OUT[0].ptr, OUT[1].ptr, (size_t)32768 * 4), what);
+  }
+
+  Att at = {20000, 20000 - 127, 1u << 30, 0, 1, 0, 0, 0, 0}, packed = at;
   packed.packed = 1;
+  Att paged_packed = packed;
+  paged_packed.slice_off = PACKED_OFF, paged_packed.page_shift = PAGE_SHIFT;
   select_rows(ROWS, all);
   run(gpu, now_kernel, &KEYS, at, ROWS, &OUT[1], 1);  // raise the GPU's clock
   double first = run(gpu, before, &KEYS, at, ROWS, &OUT[0], 4),
          bf16_us = run(gpu, now_kernel, &KEYS, at, ROWS, &OUT[1], 4),
-         packed_us = run(gpu, now_kernel, &PACKED, packed, ROWS, &OUT[1], 4);
+         packed_us = run(gpu, now_kernel, &PACKED, packed, ROWS, &OUT[1], 4),
+         paged_us =
+             run(gpu, now_kernel, &page_addrs, paged_packed, ROWS, &OUT[1], 4);
   double last = run(gpu, before, &KEYS, at, ROWS, &OUT[0], 4);
   printf("prompt attention of %d rows over 640 keys: a slice at a time %.0f / "
-         "%.0f us, the kernel %.0f us from BF16 rows, %.0f us from packed\n",
-         ROWS, first, last, bf16_us, packed_us);
+         "%.0f us, BF16 %.0f us, packed flat %.0f us, packed paged %.0f us\n",
+         ROWS, first, last, bf16_us, packed_us, paged_us);
   return failures != 0;
 }

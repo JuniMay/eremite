@@ -6,6 +6,7 @@
 #include "base/shutdown.h"
 #include "engine/gguf.h"
 #include "engine/io.h"
+#include "engine/kv_pages.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/state_growth.h"
@@ -175,9 +176,12 @@ typedef struct {
   Tensor e_codes, e_scales;
   // Window keys [RING][512] in BF16, row p % RING.
   Buf ring;
-  // KV sources: compressed rows, index keys (BF16), compressor rows
-  // [PENDING][512] x 2 (FP32).
-  Buf comp, keys, cstate;
+  // KV sources: compressor rows [PENDING][512] x 2 (FP32), plus byte offsets
+  // and paging geometry of this layer's compressed-row and index-key slices
+  // inside each shared KvPage.
+  Buf cstate;
+  size_t comp_off, key_off;
+  uint32_t kv_page_shift, kv_page_rows;
 } Layer;
 
 static Layer L[LAYERS];
@@ -214,13 +218,12 @@ static int prefill_prune_active, prefill_prune_end;
 static uint32_t ced_first;
 static int ced_active, ced_compact;
 static DeepSeekForwardInfo forward_info;
-// A bounded replay (deepseek_prefill's replay under --ced, as DeepInfer's
-// encoder SWA bounded replay; approximate): every layer computes again from
-// bounded_first, its windows cut off there, and the copied compressed rows
-// and index keys of the groups completed before bounded_keep (the branch
-// point) stay as they are.
-static int bounded;
-static uint32_t bounded_first, bounded_keep;
+// Replay state (deepseek_prefill's exact or CED bounded replay): replay_keep
+// is the branch point whose already-copied compressed rows and index keys stay
+// untouched so shared CoW prefix pages before it never split. Under bounded
+// replay (CED), every layer's window is also cut off at bounded_first.
+static int bounded, replaying;
+static uint32_t bounded_first, replay_keep;
 
 // The first position a row's window reads: CED's decoder layers from
 // ced_first, every layer of a bounded replay from bounded_first.
@@ -344,14 +347,9 @@ static uint64_t dense_bytes;
 // The least memory that a full prompt pass needs, as the last load noted it.
 static uint64_t required_bytes;
 static void note_required_bytes(void);
-static size_t rows_bytes(int l, int cap, int keys);
 static size_t saved_bytes(void);
-static int start_cap(void);
-static void base_state(void), reserve(int need, int keep), shrink(void);
-// One sequence's attention state (see the state section at the end). A
-// state holds compressed rows and index keys for cap positions: at first
-// CAP (or the context, if less), doubling as positions need them.
-static constexpr int CAP = 16384;
+static void base_state(void);
+static void state_prepare_write(State *s, int pos, int count);
 // With --packed-state-rows, a state keeps its compressed rows and index keys
 // packed, as the reference quantizes them: a row's E2M1 codes, two to a byte,
 // then its scales. A packed compressed row holds 512 codes and an E4M3 scale
@@ -360,6 +358,9 @@ static constexpr int CAP = 16384;
 // those values exactly.
 static constexpr int PACKED_COMP_ROW_BYTES = HEAD_DIM / 2 + HEAD_DIM / 16,
                      PACKED_KEY_ROW_BYTES = IDX_DIM / 2 + IDX_DIM / 32;
+// Page-table growth parameters (in pages of DS_KV_PAGE_TOKENS positions).
+static constexpr int KV_TABLE_START_PAGES = 64, KV_TABLE_MAX_GROW_PAGES = 1024,
+                     KV_TABLE_ALIGN_PAGES = 64;
 
 // The bytes of a state's compressed row, in the form the options set.
 static int comp_row_bytes(void) {
@@ -372,9 +373,9 @@ static int key_row_bytes(void) {
 }
 
 struct State {
-  Buf ring[LAYERS], comp[LAYERS], keys[LAYERS], cstate[LAYERS], dring[DRAFTS];
+  Buf ring[LAYERS], cstate[LAYERS], dring[DRAFTS];
+  KvPageTable kv;
   int32_t history[3];
-  int cap;
   // The rolling rows deepseek_save_rewind_point copied, for
   // deepseek_restore_rewind_point.
   char *saved;
@@ -974,11 +975,7 @@ int deepseek_load(Gpu *model_gpu, MemorySlot *work, const char *dir,
     for (int l = 0; l < LAYERS; l++) {
       Layer *y = &L[l];
       y->ring = kv_zeros(RING * HEAD_DIM * 2);
-      if (y->kv_source) {
-        y->comp = kv_zeros(rows_bytes(l, start_cap(), 0));
-        y->keys = kv_zeros(rows_bytes(l, start_cap(), 1));
-        y->cstate = kv_zeros(2 * PENDING * HEAD_DIM * 4);
-      }
+      if (y->kv_source) y->cstate = kv_zeros(2 * PENDING * HEAD_DIM * 4);
     }
     for (int d = 0; opt.draft && d < DRAFTS; d++)
       D[d].ring = kv_zeros(RING * HEAD_DIM * 2);
@@ -1292,15 +1289,19 @@ typedef struct {
 } Win;
 
 // packed: whether the compressor writes the rows, and index_key the keys,
-// packed, not BF16.
+// packed, not BF16. slice_off and page_shift select paged addressing when
+// page_shift > 0.
 typedef struct {
   uint32_t ratio, start, row0, packed;
+  uint64_t slice_off;
+  uint32_t page_shift, pad;
 } Groups;
 
 // cand: words of a row's candidate bits, 0: none; packed: whether the index
-// keys are packed, not BF16.
+// keys are packed, not BF16; page_shift and slice_off select paged addressing.
 typedef struct {
-  uint32_t pos, ratio, stride, cand, packed;
+  uint32_t pos, ratio, stride, cand, packed, page_shift;
+  uint64_t slice_off;
 } Index;
 
 // inference/config.json: candidate_source_layer, candidate_topk_blocks (of
@@ -1312,6 +1313,10 @@ typedef struct {
   // comp_rows: whether the row attends selected compressed rows; packed:
   // whether those rows are a state's packed ones, not BF16.
   uint32_t first, comp_rows, packed;
+  // Byte offset of this layer's compressed-row slice in a page, and
+  // log2(page_rows) (0: flat).
+  uint64_t slice_off;
+  uint32_t page_shift, pad;
 } Att;
 
 // Of the experts predicted for each of the next two layers, the top 3 are
@@ -1421,6 +1426,7 @@ static void attend_one(GpuCommandBuffer *c, const Buf *q, size_t q_off,
 // at position row_pos[r] of state row_state[r]. 0 rows: one sequence.
 static State *row_state[FEW];
 static int row_pos[FEW], nrows;
+static const State *bound;  // the state the layers' buffers are bound to
 static void bind(const State *s);
 
 // The attention of the batch's rows r0 .. r0 + m - 1, one sequence at
@@ -1437,6 +1443,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
   // The window keys: the ring when decoding; for a prompt batch, rows of WIN
   // from the earliest position any of its rows sees, loaded from the ring.
   const Buf *win = m == 1 ? &y->ring : &WIN;
+  const Buf *kv_addrs = bound ? &bound->kv.gpu_addrs : win;
   uint32_t base = m == 1 ? 0 : (pos >= WINDOW - 1 ? pos - (WINDOW - 1) : 0),
            mod = m == 1 ? RING : 1u << 30;
   size_t x = (size_t)r0 * DIM * 4, q = (size_t)r0 * HEADS * HEAD_DIM * 4;
@@ -1475,30 +1482,37 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       copy_rows(c, &CK, 0, &y->cstate, 0, out, K_copy_rows);
       copy_rows(c, &CS, 0, &y->cstate, half, out, K_copy_rows);
     }
-    if (bounded && groups) {  // the copied rows of groups completed before the
-                              // branch point stay
+    if ((bounded || replaying) && groups) {
+      // The copied rows of groups completed before the branch point stay,
+      // keeping shared CoW prefix pages untouched during replay.
       uint32_t r = (uint32_t)y->ratio,
-               keep = bounded_keep / r *
-                      r;  // the first group ending at or after it
+               keep = replay_keep / r * r;  // first group ending at or after it
       if (keep > g0) {
         uint32_t skip = (keep - g0) / r;
         groups = skip < groups ? groups - skip : 0, g0 = keep;
       }
     }
     if (groups) {
-      Groups g = {(uint32_t)y->ratio, g0, g0 - pos + 2,
-                  opt.deepseek.packed_state_rows != 0};
+      Groups gc = {(uint32_t)y->ratio,
+                   g0,
+                   g0 - pos + 2,
+                   opt.deepseek.packed_state_rows != 0,
+                   y->comp_off,
+                   y->kv_page_shift,
+                   0};
       gpu_select_kernel(c, K_compress);
       gpu_bind_buffer(c, 0, &CK, 0), gpu_bind_buffer(c, 1, &CS, 0),
           gpu_bind_buffer(c, 2, &y->c_norm, 0), gpu_bind_buffer(c, 3, cs, 0);
-      gpu_bind_buffer(c, 4, &LAT, 0), gpu_bind_buffer(c, 5, &y->comp, 0),
-          gpu_copy_bytes(c, 6, &g, sizeof g);
+      gpu_bind_buffer(c, 4, &LAT, 0), gpu_bind_buffer(c, 5, kv_addrs, 0),
+          gpu_copy_bytes(c, 6, &gc, sizeof gc);
       gpu_run_kernel(c, groups, 1, 1, 512, 1, 1);
       linear(c, &y->i_wk, groups, &LAT, 0, HEAD_DIM, &IK, 0, IDX_DIM, 1);
+      Groups gk = gc;
+      gk.slice_off = y->key_off;
       gpu_select_kernel(c, K_index_key);
       gpu_bind_buffer(c, 0, &IK, 0), gpu_bind_buffer(c, 1, &y->i_knorm, 0),
-          gpu_bind_buffer(c, 2, cs, 0), gpu_bind_buffer(c, 3, &y->keys, 0);
-      gpu_copy_bytes(c, 4, &g, sizeof g);
+          gpu_bind_buffer(c, 2, cs, 0), gpu_bind_buffer(c, 3, kv_addrs, 0);
+      gpu_copy_bytes(c, 4, &gk, sizeof gk);
       gpu_run_kernel(c, groups, 1, 1, 128, 1, 1);
     }
   }
@@ -1512,16 +1526,20 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
          t0 += sc_rows) {  // rows in tiles, as many as SC holds
       uint32_t rows = m - t0 < sc_rows ? m - t0 : sc_rows,
                seen = (pos + t0 + rows) / y->ratio;
-      Index ix = {p32 + t0, (uint32_t)y->ratio, (uint32_t)opt.ctx,
+      Index ix = {p32 + t0,
+                  (uint32_t)y->ratio,
+                  (uint32_t)opt.ctx,
                   cand && l > CAND_LAYER ? cand_words : 0,
-                  opt.deepseek.packed_state_rows != 0};
+                  opt.deepseek.packed_state_rows != 0,
+                  src->kv_page_shift,
+                  src->key_off};
       // Layer 20 writes once; later indexers reuse the same prompt row,
       // even when decoder compaction starts partway through a batch.
       size_t cand_off = (size_t)(srow + t0) * cand_words * 4;
       gpu_select_kernel(c, K_index_score);
       gpu_bind_buffer(c, 0, &QI, (size_t)(r0 + t0) * IDX_HEADS * IDX_DIM * 4),
           gpu_bind_buffer(c, 1, &IW, (size_t)(r0 + t0) * IDX_HEADS * 4);
-      gpu_bind_buffer(c, 2, &src->keys, 0), gpu_bind_buffer(c, 3, cs, 0),
+      gpu_bind_buffer(c, 2, kv_addrs, 0), gpu_bind_buffer(c, 3, cs, 0),
           gpu_bind_buffer(c, 4, &SC, 0), gpu_copy_bytes(c, 5, &ix, sizeof ix);
       gpu_bind_buffer(c, 6, &CAND, cand_off);
       gpu_run_kernel(c, (seen + 255) / 256, rows, 1, 256, 1, 1);
@@ -1542,12 +1560,15 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       gpu_run_kernel(c, rows, 1, 1, 1024, 1, 1);
     }
   }
+  uint64_t comp_off = y->ratio ? src->comp_off : 0;
+  uint32_t comp_shift = y->ratio ? src->kv_page_shift : 0;
   if (small_rows(m)) {  // one row or a verify pass, each as decoding runs it
     for (int r = 0; r < m; r++) {
-      Att ar = {{p32 + r, base, mod}, 0, visible > 0, packed};
+      Att ar = {{p32 + r, base, mod}, 0, visible > 0, packed, comp_off,
+                comp_shift,           0};
       ar.first = window_lower(l, p32 + r);
       attend_one(c, &Q, q + (size_t)r * HEADS * HEAD_DIM * 4, win,
-                 y->ratio ? &src->comp : win, &SEL,
+                 y->ratio ? kv_addrs : win, &SEL,
                  sel_off + (size_t)r * (IDX_TOPK + 1) * 4, &y->sink, cs, 0, &O,
                  q + (size_t)r * HEADS * HEAD_DIM * 4, &ar);
     }
@@ -1556,7 +1577,8 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
     for (int r = 0; r < m;) {
       uint32_t rows = m - r < QB_ROWS ? m - r : QB_ROWS, p = p32 + r;
       size_t qr = q + (size_t)r * HEADS * HEAD_DIM * 4;
-      Att ar = {{p, base, mod}, 0, visible > 0, packed};
+      Att ar = {{p, base, mod}, 0, visible > 0, packed, comp_off,
+                comp_shift,     0};
       // Prefix queries stay unchanged. Retained queries cannot read them.
       // Split at the boundary so first never exceeds a dispatched query
       // position.
@@ -1569,7 +1591,7 @@ static void attend_rows(GpuCommandBuffer *c, int l, int m, int pos, int r0,
       gpu_run_kernel(c, HEADS * HEAD_DIM / 256, rows, 1, 256, 1, 1);
       gpu_select_kernel(c, K_attend_m);
       gpu_bind_buffer(c, 0, &XB, 0), gpu_bind_buffer(c, 1, win, 0),
-          gpu_bind_buffer(c, 2, y->ratio ? &src->comp : win, 0);
+          gpu_bind_buffer(c, 2, y->ratio ? kv_addrs : win, 0);
       gpu_bind_buffer(c, 3, &SEL, sel_off + (size_t)r * (IDX_TOPK + 1) * 4),
           gpu_bind_buffer(c, 4, &y->sink, 0), gpu_bind_buffer(c, 5, &O, qr);
       gpu_copy_bytes(c, 6, &ar, sizeof ar);
@@ -2358,7 +2380,7 @@ static void step_rows(GpuCommandBuffer *c, const int *tokens, int m, int pos) {
       die("an image's token outside a prompt's batch (position %d)", pos + i);
   route_steps++;
   if (!nrows && pos + m > opt.ctx) die("context full (%d tokens)", opt.ctx);
-  if (!nrows) reserve(pos + m, pos);
+  if (!nrows) state_prepare_write(active, pos, m + 1);
   request_capacity(m);
   double ts = now();
   int64_t rows[FEW][2][ENGRAM_ROWS];
@@ -2628,7 +2650,7 @@ static void prefix_complete(GpuCommandBuffer *c) {
 // 1's first row, so each layer below starts a window earlier. The rows a layer
 // computes before its outputs are right only give their keys; nothing reads
 // their outputs. A ratio-2 compressor starts on a pair.
-static int replay_first[LAYERS], replaying;
+static int replay_first[LAYERS];
 
 static void replay_starts(int k) {
   int s = k - RING;
@@ -2691,7 +2713,11 @@ static int prefill(GpuCommandBuffer *c, const int *tokens, int n, int pos0,
                          prefill_prune_active ? plan.kept : retained;
   ExpertStoreCounts c0 = *expert_stats();
   prefill_n = n, prefill_layer = 0;
-  reserve(pos0 + n, pos0);
+  int write_pos = pos0;
+  if ((bounded || replaying) && write_pos < (int)replay_keep)
+    write_pos = (int)replay_keep;
+  if (pos0 + n > write_pos)
+    state_prepare_write(active, write_pos, (pos0 + n + 1) - write_pos);
   request_capacity(n);
   for (int i = 0; i < n; i++) ((uint8_t *)IMG.ptr)[i] = tokens[i] < 0;
   int64_t (*rows)[2][ENGRAM_ROWS] =
@@ -2968,9 +2994,10 @@ const float *deepseek_prefill(const int *tokens, int n, int from, int replay,
   if (replay && opt.deepseek.ced) {  // the bounded replay: the ring's positions
                                      // before from, windows cut off there
     start = deepseek_replay_start(from);
-    bounded = 1, bounded_first = (uint32_t)start, bounded_keep = (uint32_t)from;
+    bounded = 1, bounded_first = (uint32_t)start, replay_keep = (uint32_t)from;
   } else if (replay) {
-    replay_starts(from), start = replay_first[0], replaying = 1;
+    replay_starts(from), start = replay_first[0], replaying = 1,
+                         replay_keep = (uint32_t)from;
   }
   if (capture >= 0 && (capture <= start || capture >= n || !captured))
     die("invalid capture at %d in a prefill of positions %d to %d", capture,
@@ -3245,7 +3272,13 @@ static void draft_stage(GpuCommandBuffer *c, int d, int pos) {
       gpu_bind_buffer(c, 2, &cs_base, 0), gpu_bind_buffer(c, 3, &BLK, 0),
       gpu_copy_bytes(c, 4, &bw, sizeof bw);
   gpu_run_kernel(c, BLOCK, 1, 1, 512, 1, 1);
-  Att at = {{(uint32_t)pos - 1, 0, WINDOW}, 0, 1, 0};  // the draft's BF16 rows
+  Att at = {{(uint32_t)pos - 1, 0, WINDOW},
+            0,
+            1,
+            0,
+            0,
+            0,
+            0};  // the draft's BF16 rows
   for (int r = 0; r < m; r++)  // the window up to pos - 1; the angle table from
                                // row r's position pos + r
     attend_one(c, &Q, (size_t)r * HEADS * HEAD_DIM * 4, &y->ring, &BLK, &DSEL,
@@ -3407,19 +3440,17 @@ void deepseek_accept(const int *tokens, int n, int pos) {
 }
 
 // Clears the request's state: window rings, compressed rows, compressor
-// rows and the Engram history. A state that grew shrinks back.
+// rows and the Engram history. A state that grew shrinks back to page 0.
 void deepseek_zero_state(void) {
-  shrink();
   model_sync();
+  if (!kv_page_table_reset_writable(&active->kv, 1))
+    die("out of memory resetting attention state");
+  memset(active->kv.pages[0]->buf.ptr, 0, active->kv.layout.page_bytes);
   for (int d = 0; opt.draft && d < DRAFTS; d++)
     memset(D[d].ring.ptr, 0, D[d].ring.size);
   for (int l = 0; l < LAYERS; l++) {
     memset(L[l].ring.ptr, 0, L[l].ring.size);
-    if (L[l].kv_source) {
-      memset(L[l].comp.ptr, 0, L[l].comp.size);
-      memset(L[l].keys.ptr, 0, L[l].keys.size);
-      memset(L[l].cstate.ptr, 0, L[l].cstate.size);
-    }
+    if (L[l].kv_source) memset(L[l].cstate.ptr, 0, L[l].cstate.size);
   }
   memset(history, 0, sizeof active->history);
 }
@@ -3482,10 +3513,15 @@ static void bench_hc(GpuCommandBuffer *c, int r) {
 
 static void bench_attend(GpuCommandBuffer *c, int r) {
   (void)r;
-  Att at = {{1000, 0, RING}, 0, 1, opt.deepseek.packed_state_rows != 0};
-  ((int *)SEL.ptr)[0] = 512;
-  attend_one(c, &Q, 0, &L[5].ring, &L[2].comp, &SEL, 0, &L[5].sink, &cs_comp, 0,
-             &O, 0, &at);
+  Att at = {{1000, 0, RING},
+            0,
+            1,
+            opt.deepseek.packed_state_rows != 0,
+            L[2].comp_off,
+            L[2].kv_page_shift,
+            0};
+  attend_one(c, &Q, 0, &L[5].ring, &active->kv.gpu_addrs, &SEL, 0, &L[5].sink,
+             &cs_comp, 0, &O, 0, &at);
 }
 
 void deepseek_run_bench(void) {
@@ -3584,7 +3620,7 @@ void deepseek_run_bench(void) {
       for (int i = 0; i < n; i++)
         sc[i] = tied ? (float)((i * 7919) % 13)
                      : (float)((i * 2654435761u) % 100003) - 50000;
-      Index ix = {n - 1, 1, (uint32_t)opt.ctx, 0, 0};
+      Index ix = {n - 1, 1, (uint32_t)opt.ctx, 0, 0, 0, 0};
       cmd = gpu_begin(gpu);
       gpu_select_kernel(&cmd, K_index_topk);
       gpu_bind_buffer(&cmd, 0, &SC, 0), gpu_bind_buffer(&cmd, 1, &SEL, 0),
@@ -3625,7 +3661,7 @@ void deepseek_run_bench(void) {
           *sorted = xmalloc(n * 4);
     for (int i = 0; i < n; i++)
       sc[i] = (float)((i * 2654435761u) % 100003) - 50000;
-    Index ix = {n - 1, 1, n, (nb + 31) / 32, 0};
+    Index ix = {n - 1, 1, n, (nb + 31) / 32, 0, 0, 0};
     cmd = gpu_begin(gpu);
     gpu_select_kernel(&cmd, K_cand_topk);
     gpu_bind_buffer(&cmd, 0, &SC, 0), gpu_bind_buffer(&cmd, 1, &CAND, 0),
@@ -3695,6 +3731,10 @@ void deepseek_run_bench(void) {
             mode == 2 ? "kept busy" : "idle     ", busy / 40 * 1e6);
   }
 
+  state_prepare_write(active, 0, 1025);
+  ((int *)SEL.ptr)[0] = 512;
+  for (int i = 0; i < 512; i++) ((int *)SEL.ptr)[1 + i] = i;
+
   struct {
     const char *name;
     void (*f)(GpuCommandBuffer *c, int r);
@@ -3713,49 +3753,96 @@ static int
     taken;  // deepseek_load's state went to a caller of deepseek_state_new
 static size_t state_rings[LAYERS], state_compressors[LAYERS],
     state_drafts[DRAFTS];
+// Total byte size of one packed 256-token KV page across all KV sources.
+static size_t kv_page_bytes;
+
+// Returns log2(n) for positive power-of-two n.
+static uint32_t log2_pow2(int n) {
+  uint32_t s = 0;
+  for (int v = n; v > 1; v >>= 1) s++;
+  return s;
+}
 
 // Allocation layout belongs to the loaded model, not to whichever state
 // happens to be bound. Eviction can leave the bindings empty.
 static void remember_state_layout(void) {
+  size_t off = 0;
   for (int l = 0; l < LAYERS; l++) {
     state_rings[l] = L[l].ring.size;
     state_compressors[l] = L[l].kv_source ? L[l].cstate.size : 0;
+    if (!L[l].kv_source) continue;
+    int prows = DS_KV_PAGE_TOKENS / L[l].ratio;
+    L[l].kv_page_rows = (uint32_t)prows;
+    L[l].kv_page_shift = log2_pow2(prows);
+    L[l].comp_off = off;
+    off += (size_t)prows * (size_t)comp_row_bytes();
   }
+  for (int l = 0; l < LAYERS; l++) {
+    if (!L[l].kv_source) continue;
+    L[l].key_off = off;
+    off += (size_t)L[l].kv_page_rows * (size_t)key_row_bytes();
+  }
+  kv_page_bytes = off;
   for (int d = 0; d < DRAFTS; d++)
     state_drafts[d] = opt.draft ? D[d].ring.size : 0;
 }
 
-// Maximum bytes added in one linear KV growth step once doubling reaches it.
-static constexpr size_t KV_MAX_GROW_STEP_BYTES = 128ull << 20;
-// Alignment granularity in tokens for capacities above CAP.
-static constexpr int KV_GROW_ALIGN = 1024;
-// Sample span in positions used to compute bytes per token across KV ratios.
-static constexpr int KV_RATE_SAMPLE = 1024;
-
-// Returns the configurable KV growth policy for the active DeepSeek row format.
-static StateGrowthPolicy kv_growth_policy(void) {
-  size_t sample_bytes = 0;
-  for (int l = 0; l < LAYERS; l++)
-    if (L[l].kv_source)
-      sample_bytes += (size_t)(KV_RATE_SAMPLE / L[l].ratio) *
-                      (size_t)(comp_row_bytes() + key_row_bytes());
-  size_t per_pos = sample_bytes / KV_RATE_SAMPLE;
-  return state_growth_policy_for_bytes(CAP, per_pos, KV_MAX_GROW_STEP_BYTES,
-                                       CAP, KV_GROW_ALIGN, opt.ctx);
+// Metal page backend wrappers so host unit tests can intercept GPU calls.
+static Buf ds_kv_alloc(void *ctx, MemorySlot *slot, size_t bytes) {
+  Buf b = gpu_try_alloc_required((Gpu *)ctx, slot, bytes);
+  if (b.obj) gpu_set_resident(&b, 1);
+  return b;
 }
 
-static int start_cap(void) { return opt.ctx < CAP ? opt.ctx : CAP; }
-
-static int grown(int cap, int need) {
-  StateGrowthPolicy policy = kv_growth_policy();
-  int next = state_growth_next(&policy, cap, need);
-  return next >= 0 ? next : opt.ctx;
+static void ds_kv_release(void *ctx, Buf *buf) {
+  (void)ctx;
+  if (buf->obj) gpu_mark_to_free(buf);
 }
 
-// A KV source's compressed rows or index keys for cap positions.
-static size_t rows_bytes(int l, int cap, int keys) {
-  return (size_t)(cap / L[l].ratio + 1) *
-         (size_t)(keys ? key_row_bytes() : comp_row_bytes());
+static void ds_kv_commit(void *ctx) { gpu_commit_residency((Gpu *)ctx); }
+
+static size_t ds_kv_round(size_t bytes) { return gpu_round_up_to_pages(bytes); }
+
+// Returns the KV page allocation backend backed by state_slot.
+static KvPageBackend ds_kv_backend(void) {
+  return (KvPageBackend){
+      .ctx = gpu,
+      .slot = &state_slot,
+      .alloc = ds_kv_alloc,
+      .release = ds_kv_release,
+      .commit = ds_kv_commit,
+      .round_bytes = ds_kv_round,
+  };
+}
+
+// Returns the packed 256-token KV page layout for all KV sources.
+static KvPageLayout ds_kv_layout(void) {
+  int max_pages = (opt.ctx + 1 + DS_KV_PAGE_TOKENS - 1) / DS_KV_PAGE_TOKENS;
+  StateGrowthPolicy table_growth = {
+      .start_cap = KV_TABLE_START_PAGES,
+      .factor = 2,
+      .max_step = KV_TABLE_MAX_GROW_PAGES,
+      .align = KV_TABLE_ALIGN_PAGES,
+      .max_cap = max_pages,
+  };
+  return kv_page_layout_init_packed(DS_KV_PAGE_TOKENS, kv_page_bytes,
+                                    table_growth);
+}
+
+// Ensures KV pages covering `[pos, pos + count)` are allocated and privately
+// owned (copy-on-write on shared pages), zeroing newly appended pages so guard
+// rows are deterministic and syncing the GPU only when needed.
+static void state_prepare_write(State *s, int pos, int count) {
+  if (count <= 0) return;
+  if (pos < 0 || pos + count > opt.ctx + 1)
+    die("context full (%d tokens)", opt.ctx);
+  if (!kv_page_table_needs_sync(&s->kv, pos, count)) return;
+  model_sync();
+  int old_npages = s->kv.npages;
+  if (!kv_page_table_prepare_write(&s->kv, pos, count))
+    die("out of memory growing KV cache to %d tokens", pos + count - 1);
+  for (int p = old_npages; p < s->kv.npages; p++)
+    memset(s->kv.pages[p]->buf.ptr, 0, s->kv.layout.page_bytes);
 }
 
 // The rows later positions overwrite: every window ring, the compressor
@@ -3767,58 +3854,43 @@ static size_t saved_bytes(void) {
   return n;
 }
 
-// The bytes a state owns once it holds `positions` (s null: a new state):
-// its rolling buffers (saved_bytes() less the history, which lives in the
-// State itself), its compressed rows and index keys, and the rewind copy
-// that deepseek_save_rewind_point made, if any.
+// The proportional bytes a state owns once it holds `positions` (s null: a new
+// state): its rolling buffers, its paged compressed rows and index keys
+// (including the guard row at `positions`), and any rewind copy.
 size_t deepseek_state_bytes(const State *s, int positions) {
-  int cap = grown(s ? s->cap : start_cap(), positions);
+  KvPageLayout layout = ds_kv_layout();
+  KvPageBackend backend = ds_kv_backend();
   size_t n = saved_bytes() - sizeof active->history +
              (s && s->saved ? saved_bytes() : 0);
-  for (int l = 0; l < LAYERS; l++)
-    if (L[l].kv_source) n += rows_bytes(l, cap, 0) + rows_bytes(l, cap, 1);
-  return n;
+  return n + kv_page_table_bytes(s ? &s->kv : NULL, &backend, &layout,
+                                 positions + 1);
 }
 
-// s's compressed rows and index keys for cap positions, keeping those of
-// the first `keep` positions.
-static void resize(State *s, int cap, int keep) {
-  model_sync();
-  for (int l = 0; l < LAYERS; l++) {
-    if (!L[l].kv_source) continue;
-    for (int k = 0; k < 2; k++) {
-      Buf *b = k ? &s->keys[l] : &s->comp[l],
-          nb = state_alloc(rows_bytes(l, cap, k));
-      size_t used = rows_bytes(l, keep, k);
-      memcpy(nb.ptr, b->ptr, used < b->size ? used : b->size);
-      gpu_free(b);
-      *b = nb;
-    }
-    if (s == active) L[l].comp = s->comp[l], L[l].keys = s->keys[l];
-  }
-  s->cap = cap;
-}
-
-static void reserve(int need,
-                    int keep) {  // the state in use holds need positions
-  if (need > active->cap) resize(active, grown(active->cap, need), keep);
-}
-
-static void shrink(void) {  // the state in use back to its first capacity
-  if (active->cap > start_cap()) resize(active, start_cap(), 0);
+// Returns the extra bytes allocated when copying `positions` tokens from `src`
+// into a new state that grows to `target_positions`.
+size_t deepseek_state_copy_bytes(const State *src, int positions,
+                                 int target_positions) {
+  size_t rolling = saved_bytes() - sizeof active->history;
+  return rolling + kv_page_table_fork_delta_bytes(&src->kv, positions,
+                                                  target_positions + 1);
 }
 
 static void base_state(void) {  // deepseek_load's buffers as the state in use
   remember_state_layout();
-  active = xmalloc(sizeof *active), history = active->history;
+  active = xmalloc(sizeof *active);
+  *active = (State){0};
+  history = active->history;
   for (int l = 0; l < LAYERS; l++) {
     active->ring[l] = L[l].ring;
-    if (L[l].kv_source)
-      active->comp[l] = L[l].comp, active->keys[l] = L[l].keys,
-      active->cstate[l] = L[l].cstate;
+    if (L[l].kv_source) active->cstate[l] = L[l].cstate;
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) active->dring[d] = D[d].ring;
-  active->cap = start_cap();
+  KvPageLayout layout = ds_kv_layout();
+  kv_page_table_init(&active->kv, ds_kv_backend(), &layout);
+  if (!kv_page_table_prepare_write(&active->kv, 0, 1))
+    die("out of memory allocating initial KV page");
+  memset(active->kv.pages[0]->buf.ptr, 0, active->kv.layout.page_bytes);
+  bound = active;
 }
 
 // Allocates a state's zeroed buffer of bytes. Returns whether it fits.
@@ -3834,14 +3906,15 @@ static int state_buffer(Buf *b, size_t bytes) {
 State *deepseek_state_new(void) {
   if (!taken) return taken = 1, active;
   State *s = xmalloc(sizeof *s);
-  s->cap = start_cap();
-  int fits = 1;
+  *s = (State){0};
+  KvPageLayout layout = ds_kv_layout();
+  kv_page_table_init(&s->kv, ds_kv_backend(), &layout);
+  int fits = kv_page_table_prepare_write(&s->kv, 0, 1);
+  if (fits) memset(s->kv.pages[0]->buf.ptr, 0, s->kv.layout.page_bytes);
   for (int l = 0; fits && l < LAYERS; l++) {
     fits = state_buffer(&s->ring[l], state_rings[l]);
     if (fits && L[l].kv_source)
-      fits = state_buffer(&s->comp[l], rows_bytes(l, s->cap, 0)) &&
-             state_buffer(&s->keys[l], rows_bytes(l, s->cap, 1)) &&
-             state_buffer(&s->cstate[l], state_compressors[l]);
+      fits = state_buffer(&s->cstate[l], state_compressors[l]);
   }
   for (int d = 0; fits && opt.draft && d < DRAFTS; d++)
     fits = state_buffer(&s->dring[d], state_drafts[d]);
@@ -3854,26 +3927,22 @@ State *deepseek_state_new(void) {
 
 void deepseek_state_free(State *s) {
   if (s == active) die("the attention state in use cannot be freed");
+  kv_page_table_free(&s->kv);
   for (int l = 0; l < LAYERS; l++) {
     gpu_free(&s->ring[l]);
-    if (L[l].kv_source)
-      gpu_free(&s->comp[l]), gpu_free(&s->keys[l]), gpu_free(&s->cstate[l]);
+    if (L[l].kv_source) gpu_free(&s->cstate[l]);
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) gpu_free(&s->dring[d]);
   memory_host_free(&state_slot, s->saved);
   free(s);
 }
 
-static const State *bound;  // the state the layers' buffers are bound to
-
 static void bind(const State *s) {  // the layers' state buffers: s's, for the
                                     // dispatches encoded next
   bound = s;
   for (int l = 0; l < LAYERS; l++) {
     L[l].ring = s->ring[l];
-    if (L[l].kv_source)
-      L[l].comp = s->comp[l], L[l].keys = s->keys[l],
-      L[l].cstate = s->cstate[l];
+    if (L[l].kv_source) L[l].cstate = s->cstate[l];
   }
   for (int d = 0; opt.draft && d < DRAFTS; d++) D[d].ring = s->dring[d];
 }
@@ -3892,8 +3961,7 @@ const float *deepseek_decode_rows(State **st, const int *tokens, const int *pos,
     die("%d rows of sequences at once: 1 to %d", m, BATCH_ROWS);
   for (int r = 0; r < m; r++) {
     if (pos[r] >= opt.ctx) die("context full (%d tokens)", opt.ctx);
-    if (pos[r] + 1 > st[r]->cap)
-      resize(st[r], grown(st[r]->cap, pos[r] + 1), pos[r]);
+    state_prepare_write(st[r], pos[r], 2);
     row_state[r] = st[r], row_pos[r] = pos[r];
   }
   nrows = m;
@@ -3987,23 +4055,32 @@ int deepseek_snapshot_extent(const Snapshot *x) { return x->extent; }
 
 const float *deepseek_snapshot_logits(const Snapshot *x) { return x->logits; }
 
-// The rows state_copy copies: the compressed rows and index keys of each KV
-// source. Global rows never change before a state's position. The row that a
-// position before `positions` shares with a later one (a compressed pair,
-// the guard row) is computed again by the prefill that continues there. With
-// fill, s first takes that many positions (s not the state in use).
+// The paged KV regions of each KV source (compressed rows and index keys).
+// Global rows never change before a state's position; the guard row at
+// `positions / ratio` is computed again where a state continues. When fill is
+// nonzero and keep is 0, resets s to hold privately owned pages for `positions`
+// + guard; when keep > 0, preserves shared CoW pages before `keep` and makes
+// `[keep, positions]` writable.
 static int state_regions(State *s, int keep, int positions, int fill,
                          StateRegion *out) {
+  int cap_tokens = s->kv.npages * DS_KV_PAGE_TOKENS;
   if (positions < 0 || keep < 0 || keep > positions ||
-      (!fill && positions > s->cap))
+      (!fill && positions >= cap_tokens))
     die("invalid rows of %d..%d positions", keep, positions);
   model_sync();
   if (fill) {
     if (keep == 0) {
-      int cap = grown(start_cap(), positions);
-      if (s->cap != cap) resize(s, cap, 0);
-    } else if (positions > s->cap) {
-      resize(s, grown(s->cap, positions), keep);
+      if (!kv_page_table_reset_writable(&s->kv, positions + 1))
+        die("out of memory sizing state to %d positions", positions);
+    } else {
+      if (keep >= cap_tokens)
+        die("kept prefix %d exceeds state pages %d", keep, cap_tokens);
+      int old_npages = s->kv.npages;
+      if (!kv_page_table_prepare_write(&s->kv, keep, positions + 1 - keep))
+        die("out of memory extending state from %d to %d positions", keep,
+            positions);
+      for (int p = old_npages; p < s->kv.npages; p++)
+        memset(s->kv.pages[p]->buf.ptr, 0, s->kv.layout.page_bytes);
     }
     memory_host_free(&state_slot, s->saved),
         s->saved = NULL;  // its rewind point belonged to its old rows
@@ -4011,20 +4088,20 @@ static int state_regions(State *s, int keep, int positions, int fill,
   int n = 0;
   for (int l = 0; l < LAYERS; l++) {
     if (!L[l].kv_source) continue;
-    out[n++] = (StateRegion){s->comp[l].ptr,
-                             (uint32_t)comp_row_bytes(),
-                             (uint32_t)L[l].ratio,
-                             1,
-                             0,
-                             0,
-                             0};
-    out[n++] = (StateRegion){s->keys[l].ptr,
-                             (uint32_t)key_row_bytes(),
-                             (uint32_t)L[l].ratio,
-                             1,
-                             0,
-                             0,
-                             0};
+    out[n++] = (StateRegion){.data = s->kv.host_ptrs,
+                             .unit = (uint32_t)comp_row_bytes(),
+                             .ratio = (uint32_t)L[l].ratio,
+                             .guard = 1,
+                             .lag = 0,
+                             .page_rows = L[l].kv_page_rows,
+                             .page_offset = L[l].comp_off};
+    out[n++] = (StateRegion){.data = s->kv.host_ptrs,
+                             .unit = (uint32_t)key_row_bytes(),
+                             .ratio = (uint32_t)L[l].ratio,
+                             .guard = 1,
+                             .lag = 0,
+                             .page_rows = L[l].kv_page_rows,
+                             .page_offset = L[l].key_off};
   }
   return n;
 }
@@ -4032,12 +4109,14 @@ static int state_regions(State *s, int keep, int positions, int fill,
 void deepseek_state_copy(State *dst, const State *src, int positions) {
   if (dst == active || dst == src)
     die("the attention state in use cannot be overwritten");
-  if (positions < 0 || positions > src->cap)
+  int src_cap = src->kv.npages * DS_KV_PAGE_TOKENS;
+  if (positions < 0 || positions >= src_cap)
     die("invalid state copy of %d positions", positions);
-  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
-  int n = state_regions(dst, 0, positions, 1, to);
-  state_regions((State *)src, 0, positions, 0, from);
-  regions_copy(to, from, n, positions);
+  model_sync();
+  if (!kv_page_table_fork(&dst->kv, &src->kv, positions + 1))
+    die("out of memory forking KV cache at %d positions", positions);
+  memory_host_free(&state_slot, dst->saved);
+  dst->saved = NULL;
 }
 
 // A snapshot's rows block and logits, or a state's rolling rows in the
@@ -4138,6 +4217,12 @@ static void ds_state_free(ModelState *s) {
 
 static size_t ds_state_bytes(const ModelState *s, int positions) {
   return deepseek_state_bytes((const State *)s, positions);
+}
+
+static size_t ds_state_copy_bytes(const ModelState *src, int positions,
+                                  int target_positions) {
+  return deepseek_state_copy_bytes((const State *)src, positions,
+                                   target_positions);
 }
 
 static void ds_state_copy(ModelState *dst, const ModelState *src,
@@ -4374,7 +4459,7 @@ static const PassVariable pass_own[] = {
     V(forward_info),
     V(bounded),
     V(bounded_first),
-    V(bounded_keep),
+    V(replay_keep),
     V(request_rows),
     V(pass_work_rows),
     V(active),
@@ -4537,6 +4622,7 @@ const ModelOps deepseek_ops = {.family = "DeepSeek V4.1",
                                .state_new = ds_state_new,
                                .state_free = ds_state_free,
                                .state_bytes = ds_state_bytes,
+                               .state_copy_bytes = ds_state_copy_bytes,
                                .state_copy = ds_state_copy,
                                .snapshot_take = ds_snapshot_take,
                                .snapshot_restore = ds_snapshot_restore,

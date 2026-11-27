@@ -136,7 +136,8 @@ and active guard memory as guard pool.
 
 DeepSeek V4.1 Flash always enables lossless packed state rows (exact FP4 +
 scales in about 28% of BF16's bytes) and dependency-pruned prefills whenever
-`ced` is off.
+`ced` is off, and shares full 256-token compressed KV and index-key pages
+copy-on-write across forked branches in memory.
 
 ## GPU sharing
 

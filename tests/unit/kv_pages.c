@@ -201,6 +201,14 @@ int main(void) {
         "CoW write modifies only the writing branch");
   check(read_row(&b, 0, 16) == 1601,
         "CoW preserves unmodified rows in the duplicated page");
+  // Writing to an earlier shared page (page 1 of a 3-page table) must preserve
+  // npages and all later pages without leaking them.
+  KvPage *c_p0 = c.pages[0], *c_p2 = c.pages[2];
+  check(kv_page_table_prepare_write(&c, 16, 1) == 1,
+        "CoW prepare_write on page 1 of 3-page table succeeds");
+  check(c.npages == 3 && c.pages[0] == c_p0 && c.pages[2] == c_p2 &&
+            c.pages[1] != a.pages[1] && a.pages[1]->refs == 1,
+        "CoW prepare_write on earlier page preserves npages and later pages");
 
   // 6. OOM rollback leaves existing table intact.
   ctx.fail_after = ctx.alloc_count + 1;
@@ -226,6 +234,28 @@ int main(void) {
   kv_page_table_free(&c);
   check(slot.bytes == 0 && account.bytes == 0,
         "freeing all page tables releases all memory slot bytes");
+
+  // 9. Heterogeneous packed page layout copies the full boundary page on fork.
+  KvPageLayout packed =
+      kv_page_layout_init_packed(TEST_PAGE_TOKENS, 320, table_growth);
+  KvPageTable pa, pb;
+  kv_page_table_init(&pa, backend, &packed);
+  kv_page_table_init(&pb, backend, &packed);
+  check(kv_page_table_prepare_write(&pa, 0, 20) == 1,
+        "packed prepare_write allocates 2 pages for 20 positions");
+  memset(pa.host_ptrs[0], 0x3A, packed.page_bytes);
+  memset(pa.host_ptrs[1], 0x5C, packed.page_bytes);
+  check(kv_page_table_fork(&pb, &pa, 20) == 1,
+        "packed fork across page boundary succeeds");
+  check(pb.pages[0] == pa.pages[0] && pa.pages[0]->refs == 2 &&
+            pb.pages[1] != pa.pages[1] && pb.pages[1]->refs == 1,
+        "packed fork shares full prefix page 0 and copies boundary page 1");
+  check(!memcmp(pb.host_ptrs[1], pa.host_ptrs[1], packed.page_bytes),
+        "packed boundary fork preserves all heterogeneous slices in page 1");
+  kv_page_table_free(&pa);
+  kv_page_table_free(&pb);
+  check(slot.bytes == 0 && account.bytes == 0,
+        "freeing packed page tables releases all memory slot bytes");
 
   return failures != 0;
 }
