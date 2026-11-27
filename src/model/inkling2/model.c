@@ -1679,13 +1679,13 @@ static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
   uint32_t row_bytes = (uint32_t)kv_row_bytes();
   int n = 0;
   for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    out[n++] = (StateRegion){s->gk[i].ptr, row_bytes, 1, 0, 0};
-    out[n++] = (StateRegion){s->gv[i].ptr, row_bytes, 1, 0, 0};
+    out[n++] = (StateRegion){s->gk[i].ptr, row_bytes, 1, 0, 0, 0, 0};
+    out[n++] = (StateRegion){s->gv[i].ptr, row_bytes, 1, 0, 0, 0, 0};
   }
   if (inkling2_mtp_active_drafts()) {
     uint32_t mtp_row_bytes = (uint32_t)inkling2_mtp_kv_row_bytes();
-    out[n++] = (StateRegion){s->mtp.gk.ptr, mtp_row_bytes, 1, 0, 0};
-    out[n++] = (StateRegion){s->mtp.gv.ptr, mtp_row_bytes, 1, 0, 0};
+    out[n++] = (StateRegion){s->mtp.gk.ptr, mtp_row_bytes, 1, 0, 0, 0, 0};
+    out[n++] = (StateRegion){s->mtp.gv.ptr, mtp_row_bytes, 1, 0, 0, 0, 0};
   }
   return n;
 }

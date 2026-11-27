@@ -85,8 +85,17 @@ static uint8_t *rows_of(ModelState *s, int positions, size_t *bytes) {
     *bytes += (size_t)region_rows(&r[i], positions) * r[i].unit;
   uint8_t *out = xmalloc(*bytes ? *bytes : 1), *p = out;
   for (int i = 0; i < n; i++) {
-    size_t len = (size_t)region_rows(&r[i], positions) * r[i].unit;
-    memcpy(p, r[i].data, len), p += len;
+    int64_t rows = region_rows(&r[i], positions);
+    int64_t row = 0;
+    while (row < rows) {
+      size_t contig = 0;
+      const uint8_t *sp = region_row_ptr(&r[i], row, &contig);
+      size_t rem = (size_t)(rows - row) * r[i].unit;
+      size_t take = contig < rem ? contig : rem;
+      memcpy(p, sp, take);
+      p += take;
+      row += (int64_t)(take / r[i].unit);
+    }
   }
   return out;
 }

@@ -104,14 +104,16 @@ static uint64_t get64(const uint8_t *p) {
 // ---- blocks, written and read by workers ----
 
 // One block: its file offset and bytes (before padding). Rows move between
-// the file and memory at mem; a snapshot's stream (mem null) between the file
-// and the job's parts, from stream on. A read copies only the block's bytes
-// lo .. hi into memory, after checking all of them.
+// the file and `region` starting at logical byte offset `region_off`; a
+// snapshot's stream (`region` null) moves between the file and the job's parts,
+// from `stream` on. A read copies only the block's bytes lo .. hi into memory,
+// after checking all of them.
 typedef struct {
   int fd;
   off_t at;
   uint32_t len, crc, lo, hi;
-  uint8_t *mem;
+  const StateRegion *region;
+  uint64_t region_off;
   uint64_t stream;
 } Block;
 
@@ -122,6 +124,35 @@ typedef struct {
   int nparts;
   atomic_int failed;
 } Job;
+
+// Copies `len` bytes between flat buffer `buf` and region `r` starting at byte
+// offset `off` from row 0. When `put` is nonzero, writes from `buf` into `r`.
+static void region_copy_bytes(const StateRegion *r, uint64_t off, uint8_t *buf,
+                              size_t len, int put) {
+  if (!r->page_rows) {
+    if (put)
+      memcpy((uint8_t *)r->data + off, buf, len);
+    else
+      memcpy(buf, (const uint8_t *)r->data + off, len);
+    return;
+  }
+  void *const *pages = (void *const *)r->data;
+  uint64_t page_bytes = (uint64_t)r->page_rows * r->unit;
+  while (len) {
+    uint64_t p = off / page_bytes;
+    size_t in_page = (size_t)(off % page_bytes);
+    size_t take = (size_t)(page_bytes - in_page);
+    if (take > len) take = len;
+    uint8_t *ptr = (uint8_t *)pages[p] + r->page_offset + in_page;
+    if (put)
+      memcpy(ptr, buf, take);
+    else
+      memcpy(buf, ptr, take);
+    buf += take;
+    off += take;
+    len -= take;
+  }
+}
 
 // The stream's bytes [at, at + len) from the parts, or (put) into them.
 static void stream_copy(const SnapshotPart *parts, int n, uint64_t at,
@@ -155,8 +186,8 @@ static void worker(void *context, size_t w) {
         atomic_store(&j->failed, 1);
         break;
       }
-      if (b->mem)
-        memcpy(buf, b->mem, b->len);
+      if (b->region)
+        region_copy_bytes(b->region, b->region_off, buf, b->len, 0);
       else
         stream_copy(j->parts, j->nparts, b->stream, buf, b->len, 0);
       memset(buf + b->len, 0, span - b->len);
@@ -168,8 +199,9 @@ static void worker(void *context, size_t w) {
         atomic_store(&j->failed, 1);
         break;
       }
-      if (b->mem)
-        memcpy(b->mem + b->lo, buf + b->lo, b->hi - b->lo);
+      if (b->region)
+        region_copy_bytes(b->region, b->region_off + b->lo, buf + b->lo,
+                          b->hi - b->lo, 1);
       else
         stream_copy(j->parts, j->nparts, b->stream, buf, b->len, 1);
     }
@@ -255,7 +287,7 @@ int64_t state_file_write(const ModelOps *ops, ModelState *s, int from, int to,
   int k = 0;
   for (int i = 0; i < n; i++) {
     uint64_t bytes = (uint64_t)rows[i] * r[i].unit;
-    uint8_t *row = (uint8_t *)r[i].data + (size_t)first[i] * r[i].unit;
+    uint64_t base_off = (uint64_t)first[i] * r[i].unit;
     uint8_t *e = h + ROWS_FIXED + (size_t)ROWS_REGION * i;
     put32(e, r[i].unit), put32(e + 4, r[i].ratio), put32(e + 8, r[i].guard),
         put32(e + 12, r[i].lag);
@@ -266,7 +298,8 @@ int64_t state_file_write(const ModelOps *ops, ModelState *s, int from, int to,
       b[k++] = (Block){.fd = fd,
                        .at = (off_t)(at + o),
                        .len = (uint32_t)(bytes - o < BLOCK ? bytes - o : BLOCK),
-                       .mem = row + o};
+                       .region = &r[i],
+                       .region_off = base_off + o};
     at += aligned(bytes);
   }
   fcntl(fd, F_NOCACHE, 1);
@@ -361,15 +394,16 @@ int state_file_read(const ModelOps *ops, ModelState *s, int positions,
           b = realloc(b, (size_t)(cap = cap ? 2 * cap : 256) * sizeof *b);
         if (!b) die("out of memory for a saved state's blocks");
         uint32_t len = (uint32_t)(bytes - o < BLOCK ? bytes - o : BLOCK);
-        b[nb++] = (Block){
-            .fd = p[j].fd,
-            .at = (off_t)(at + o),
-            .len = len,
-            .crc = get32(p[j].h + ROWS_FIXED + (size_t)ROWS_REGION * n +
-                         4 * (size_t)(block + o / BLOCK)),
-            .lo = 0,
-            .hi = (uint32_t)(hi_byte - o < len ? hi_byte - o : len),
-            .mem = (uint8_t *)r[i].data + (size_t)first * r[i].unit + o};
+        b[nb++] =
+            (Block){.fd = p[j].fd,
+                    .at = (off_t)(at + o),
+                    .len = len,
+                    .crc = get32(p[j].h + ROWS_FIXED + (size_t)ROWS_REGION * n +
+                                 4 * (size_t)(block + o / BLOCK)),
+                    .lo = 0,
+                    .hi = (uint32_t)(hi_byte - o < len ? hi_byte - o : len),
+                    .region = &r[i],
+                    .region_off = (uint64_t)first * r[i].unit + o};
       }
       covered[i] = first;
     }

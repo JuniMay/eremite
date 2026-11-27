@@ -1774,18 +1774,18 @@ static int nemo_write_state_regions(ModelState *ms, int positions, int fill,
   int n = 0;
   for (int a = 0; a < NEMO_ATTN_LAYERS; a++) {
     for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      out[n++] =
-          (StateRegion){s->k[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0};
-      out[n++] =
-          (StateRegion){s->v[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0};
+      out[n++] = (StateRegion){
+          s->k[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0, 0, 0};
+      out[n++] = (StateRegion){
+          s->v[a][h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 0, 0, 0};
     }
   }
   if (active_drafts > 0) {
     for (int h = 0; h < NEMO_KV_HEADS; h++) {
-      out[n++] =
-          (StateRegion){s->mtp_k[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1};
-      out[n++] =
-          (StateRegion){s->mtp_v[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1};
+      out[n++] = (StateRegion){
+          s->mtp_k[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1, 0, 0};
+      out[n++] = (StateRegion){
+          s->mtp_v[h].ptr, (uint32_t)KV_HEAD_ROW_BYTES, 1, 0, 1, 0, 0};
     }
   }
   return n;

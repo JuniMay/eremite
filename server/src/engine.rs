@@ -611,6 +611,12 @@ unsafe extern "C" {
     fn eremite_state_new(m: *mut RawModel) -> *mut RawState;
     fn eremite_state_free(m: *mut RawModel, s: *mut RawState);
     fn eremite_state_bytes(m: *const RawModel, s: *const RawState, positions: c_int) -> usize;
+    fn eremite_state_copy_bytes(
+        m: *const RawModel,
+        src: *const RawState,
+        positions: c_int,
+        target_positions: c_int,
+    ) -> usize;
     fn eremite_state_copy(
         m: *mut RawModel,
         dst: *mut RawState,
@@ -1819,6 +1825,24 @@ impl Model {
     pub fn state_bytes(&self, s: Option<StateHandle>, positions: usize) -> u64 {
         let s = s.map_or(ptr::null_mut(), |s| s.0.as_ptr());
         unsafe { eremite_state_bytes(self.raw, s, positions as c_int) as u64 }
+    }
+
+    /// Returns the extra bytes allocated when copying `positions` tokens from
+    /// `src` into a new state that grows to `target_positions`.
+    pub fn state_copy_bytes(
+        &self,
+        src: StateHandle,
+        positions: usize,
+        target_positions: usize,
+    ) -> u64 {
+        unsafe {
+            eremite_state_copy_bytes(
+                self.raw,
+                src.0.as_ptr(),
+                positions as c_int,
+                target_positions as c_int,
+            ) as u64
+        }
     }
 
     /// Copies the rows of `src` before `positions` that later positions do

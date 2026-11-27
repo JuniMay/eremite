@@ -59,7 +59,7 @@ static uint32_t unit_of[REGIONS] = {
 
 // Region i's shape, its rows nowhere.
 static StateRegion shape(int i) {
-  return (StateRegion){NULL, UNIT[i], RATIO[i], GUARD[i], LAG[i]};
+  return (StateRegion){NULL, UNIT[i], RATIO[i], GUARD[i], LAG[i], 0, 0};
 }
 
 typedef struct {
@@ -96,7 +96,8 @@ static int fake_regions(ModelState *state, int positions, int fill,
   Fake *s = (Fake *)state;
   if (fill) reserve(s, positions), s->pos = positions;
   for (int i = 0; i < REGIONS; i++)
-    out[i] = (StateRegion){s->rows[i], unit_of[i], RATIO[i], GUARD[i], LAG[i]};
+    out[i] =
+        (StateRegion){s->rows[i], unit_of[i], RATIO[i], GUARD[i], LAG[i], 0, 0};
   return REGIONS;
 }
 
@@ -285,6 +286,103 @@ static void identity_checks(void) {
   check(memcmp(base, again, 32), "every file of a GGUF set counts");
 }
 
+// ---- paged regions ----
+
+enum { PAGED_SLICES = 2, PAGED_ROWS = 256, PAGED_UNIT = 1024 };
+
+typedef struct {
+  void **pages;
+  int npages;
+} PagedState;
+
+static void paged_reserve(PagedState *s, int positions) {
+  int need = positions > 0 ? (positions + PAGED_ROWS - 1) / PAGED_ROWS : 0;
+  if (need <= s->npages) return;
+  s->pages = realloc(s->pages, (size_t)need * sizeof *s->pages);
+  size_t page_bytes = (size_t)PAGED_SLICES * PAGED_ROWS * PAGED_UNIT;
+  for (int p = s->npages; p < need; p++) {
+    s->pages[p] = malloc(page_bytes);
+    memset(s->pages[p], 0xCC, page_bytes);
+  }
+  s->npages = need;
+}
+
+static void paged_free(PagedState *s) {
+  for (int p = 0; p < s->npages; p++) free(s->pages[p]);
+  free(s->pages);
+  free(s);
+}
+
+static int paged_regions(ModelState *state, int positions, int fill,
+                         StateRegion *out) {
+  PagedState *s = (PagedState *)state;
+  if (fill) paged_reserve(s, positions);
+  size_t slice_bytes = (size_t)PAGED_ROWS * PAGED_UNIT;
+  for (int i = 0; i < PAGED_SLICES; i++) {
+    out[i] = (StateRegion){
+        .data = s->pages,
+        .unit = PAGED_UNIT,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = PAGED_ROWS,
+        .page_offset = (size_t)i * slice_bytes,
+    };
+  }
+  return PAGED_SLICES;
+}
+
+static const ModelOps paged_ops = {.family = "paged",
+                                   .state_version = 1,
+                                   .write_state_regions = paged_regions};
+
+static uint8_t *paged_row(const PagedState *s, int slice, int pos) {
+  int p = pos / PAGED_ROWS, in_p = pos % PAGED_ROWS;
+  return (uint8_t *)s->pages[p] + (size_t)slice * PAGED_ROWS * PAGED_UNIT +
+         (size_t)in_p * PAGED_UNIT;
+}
+
+static void paged_checks(void) {
+  // 5000 rows x 1024 B = 5.12 MB per slice: crosses 4 MiB block and 256-row
+  // page boundaries across two parts with an overlapping branch/rewind.
+  PagedState *src = calloc(1, sizeof *src);
+  paged_reserve(src, 5000);
+  for (int pos = 0; pos < 5000; pos++) {
+    for (int sl = 0; sl < PAGED_SLICES; sl++) {
+      uint8_t *dst = paged_row(src, sl, pos);
+      for (int k = 0; k < PAGED_UNIT; k++)
+        dst[k] = byte_of(sl + 10, pos, 1, (size_t)k);
+    }
+  }
+  int pfd[2] = {open_new("paged-0"), open_new("paged-1")};
+  check(state_file_write(&paged_ops, (ModelState *)src, 0, 5000, pfd[0]) > 0,
+        "paged state writes first part spanning 4 MiB blocks");
+  // Overwrite suffix from 3000..4600 (mid-page 11 through page 17) as branch.
+  for (int pos = 3000; pos < 4600; pos++) {
+    for (int sl = 0; sl < PAGED_SLICES; sl++) {
+      uint8_t *dst = paged_row(src, sl, pos);
+      for (int k = 0; k < PAGED_UNIT; k++)
+        dst[k] = byte_of(sl + 10, pos, 2, (size_t)k);
+    }
+  }
+  check(state_file_write(&paged_ops, (ModelState *)src, 3000, 4600, pfd[1]) > 0,
+        "paged state writes overlapping branch suffix part");
+
+  PagedState *got = calloc(1, sizeof *got);
+  int read_ok = !state_file_read(&paged_ops, (ModelState *)got, 4600, pfd, 2);
+  int match = read_ok;
+  for (int pos = 0; match && pos < 4600; pos++) {
+    for (int sl = 0; match && sl < PAGED_SLICES; sl++) {
+      if (memcmp(paged_row(got, sl, pos), paged_row(src, sl, pos), PAGED_UNIT))
+        match = 0;
+    }
+  }
+  check(match, "paged state reads back byte for byte across parts and pages");
+  close(pfd[0]), close(pfd[1]);
+  paged_free(got);
+  paged_free(src);
+}
+
 int main(void) {
   const char *base = getenv("TMPDIR");
   if (!base || !*base) base = "/tmp";
@@ -389,6 +487,8 @@ int main(void) {
         "CRC32C gives the standard check value of \"123456789\"");
   check(crc32c(crc32c(0, "1234", 4), "56789", 5) == 0xe3069283,
         "CRC32C continues across pieces");
+
+  paged_checks();
 
   // a second stop request ends a write
   shutdown_request(), shutdown_request();

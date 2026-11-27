@@ -618,6 +618,11 @@ void eremite_state_free(eremite_model *m, eremite_state *s);
 // that many positions.
 size_t eremite_state_bytes(const eremite_model *m, const eremite_state *s,
                            int positions);
+// Returns the additional bytes allocated when copying `positions` tokens from
+// `src` into a new state that grows to `target_positions`.
+size_t eremite_state_copy_bytes(const eremite_model *m,
+                                const eremite_state *src, int positions,
+                                int target_positions);
 // Copies the rows of src before positions that later positions do not change
 // into dst. src may be a running request's state.
 void eremite_state_copy(eremite_model *m, eremite_state *dst,

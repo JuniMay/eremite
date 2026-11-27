@@ -113,15 +113,23 @@ typedef struct ModelState ModelState;
 typedef struct ModelSnapshot ModelSnapshot;
 
 // One array of a state's rows, which only grows. state_copy copies these
-// arrays, and saved states hold them. Row 0 is at data, and each row takes unit
-// bytes. A state of p positions holds its first (p - lag) / ratio + guard rows,
-// and none while p < lag. The rows before (p - lag) / ratio do not change at
-// later positions. A guard row is computed again where the state continues:
-// the last row of a compressed pair, or with lag 1, a row that needs the next
-// position's token.
+// arrays, and saved states hold them. When page_rows is 0, row 0 is at data in
+// one flat array. When page_rows > 0, data is an array of page base pointers
+// (`void *const *`) and each page stores page_rows rows starting at byte offset
+// page_offset. Each row takes unit bytes. A state of p positions holds its
+// first (p - lag) / ratio + guard rows, and none while p < lag. The rows before
+// (p - lag) / ratio do not change at later positions. A guard row is computed
+// again where the state continues: the last row of a compressed pair, or with
+// lag 1, a row that needs the next position's token.
 typedef struct {
+  // Flat row array when page_rows is 0, or page base pointer array otherwise.
   void *data;
+  // Row byte width, positions per row, guard row count and position lag.
   uint32_t unit, ratio, guard, lag;
+  // Rows stored per page for paged regions, or 0 for flat regions.
+  uint32_t page_rows;
+  // Byte offset of this region's slice within each page.
+  size_t page_offset;
 } StateRegion;
 
 // One part of a snapshot's bytes, in its family's order.
@@ -142,13 +150,43 @@ static inline int64_t region_rows(const StateRegion *r, int positions) {
   return positions < (int)r->lag ? 0 : region_stable(r, positions) + r->guard;
 }
 
+// Returns the byte pointer to `row` inside region `r`, and writes the maximum
+// contiguous bytes available from that row to `*contig` when non-null.
+static inline uint8_t *region_row_ptr(const StateRegion *r, int64_t row,
+                                      size_t *contig) {
+  if (!r->page_rows) {
+    if (contig) *contig = SIZE_MAX;
+    return (uint8_t *)r->data + (size_t)row * r->unit;
+  }
+  void *const *pages = (void *const *)r->data;
+  int64_t p = row / r->page_rows;
+  int64_t in_page = row % r->page_rows;
+  if (contig) *contig = (size_t)(r->page_rows - in_page) * r->unit;
+  return (uint8_t *)pages[p] + r->page_offset + (size_t)in_page * r->unit;
+}
+
 // Copies the rows before `positions` of n regions, from src's to dst's. Both
 // lists are for that many positions.
 static inline void regions_copy(const StateRegion *dst, const StateRegion *src,
                                 int n, int positions) {
-  for (int i = 0; i < n; i++)
-    memcpy(dst[i].data, src[i].data,
-           (size_t)region_rows(&src[i], positions) * src[i].unit);
+  for (int i = 0; i < n; i++) {
+    int64_t rows = region_rows(&src[i], positions);
+    if (!dst[i].page_rows && !src[i].page_rows) {
+      memcpy(dst[i].data, src[i].data, (size_t)rows * src[i].unit);
+      continue;
+    }
+    int64_t row = 0;
+    while (row < rows) {
+      size_t dc = 0, sc = 0;
+      uint8_t *dp = region_row_ptr(&dst[i], row, &dc);
+      const uint8_t *sp = region_row_ptr(&src[i], row, &sc);
+      size_t rem = (size_t)(rows - row) * src[i].unit;
+      size_t take = dc < sc ? dc : sc;
+      if (take > rem) take = rem;
+      memcpy(dp, sp, take);
+      row += (int64_t)(take / src[i].unit);
+    }
+  }
 }
 
 // Running stage of an image generation call.
@@ -500,6 +538,11 @@ typedef struct {
   // Returns the bytes of s, or of a new state for a null s, when it holds that
   // many positions.
   size_t (*state_bytes)(const ModelState *s, int positions);
+  // Returns the additional bytes allocated when copying `positions` tokens from
+  // `src` into a new state that grows to `target_positions`. Null when a copy
+  // duplicates every row.
+  size_t (*state_copy_bytes)(const ModelState *src, int positions,
+                             int target_positions);
   // Copies the rows of src before `positions` that later positions do not
   // change into dst. src may be in use by a running pass.
   void (*state_copy)(ModelState *dst, const ModelState *src, int positions);

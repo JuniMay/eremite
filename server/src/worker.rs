@@ -2144,6 +2144,23 @@ impl States {
         )
     }
 
+    /// Refreshes cached byte counts for idle states of `model_index` (or all
+    /// models when `model_index` is None). Sharing copy-on-write KV pages
+    /// across forked states changes each state's proportional memory footprint
+    /// when a branch is created or freed.
+    fn refresh_idle_state_bytes(&mut self, model_index: Option<usize>) {
+        for (&state_id, entry) in &mut self.cache.entries {
+            if model_index.is_none_or(|index| entry.model == index)
+                && !entry.busy
+                && let Some(handle) = self.handles.get(&state_id)
+            {
+                entry.bytes = handle
+                    .owner
+                    .state_bytes(Some(handle.engine_state), entry.tokens.len());
+            }
+        }
+    }
+
     /// Frees the snapshots in `snapshots` and the states in `states`.
     fn free_snapshots_and_states(
         &mut self,
@@ -2153,8 +2170,12 @@ impl States {
         for (state_id, snapshot) in snapshots {
             self.free_snapshot(state_id, snapshot.pos);
         }
+        let freed_any = !states.is_empty();
         for (state_id, _) in states {
             self.handles.remove(&state_id);
+        }
+        if freed_any {
+            self.refresh_idle_state_bytes(None);
         }
     }
 
@@ -3226,6 +3247,13 @@ impl WorkerModel {
                 .model
                 .state_bytes(Some(states.handles[&state].engine_state), prompt_tokens + 1)
                 .saturating_sub(states.cache.entries[&state].bytes),
+            Plan::Snapshot { source, from, .. } | Plan::Replay { source, from } => {
+                self.model.state_copy_bytes(
+                    states.handles[&source].engine_state,
+                    from,
+                    prompt_tokens + 1,
+                )
+            }
             _ => self.model.state_bytes(None, prompt_tokens + 1),
         };
         let loaded_snapshot = match plan {
@@ -3697,6 +3725,7 @@ impl WorkerModel {
                 let engine_state = states.handles[&state_id].engine_state;
                 self.model
                     .state_copy(engine_state, states.handles[&source].engine_state, at);
+                states.refresh_idle_state_bytes(Some(self.model_index));
                 states.cache.record_reuse(source);
                 states.cache.copy_saved_link(state_id, source, at);
                 states.handles.get_mut(&source).expect("state").last_used_at = Instant::now();

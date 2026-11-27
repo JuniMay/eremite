@@ -734,6 +734,15 @@ size_t eremite_state_bytes(const eremite_model *m, const eremite_state *s,
   return m->ops->state_bytes(s, positions);
 }
 
+size_t eremite_state_copy_bytes(const eremite_model *m,
+                                const eremite_state *src, int positions,
+                                int target_positions) {
+  require_states(m);
+  if (m->ops->state_copy_bytes)
+    return m->ops->state_copy_bytes(src, positions, target_positions);
+  return m->ops->state_bytes(NULL, target_positions);
+}
+
 void eremite_state_copy(eremite_model *m, eremite_state *dst,
                         const eremite_state *src, int positions) {
   require_states(m);

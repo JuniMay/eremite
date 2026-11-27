@@ -4005,10 +4005,20 @@ static int state_regions(State *s, int positions, int fill, StateRegion *out) {
   int n = 0;
   for (int l = 0; l < LAYERS; l++) {
     if (!L[l].kv_source) continue;
-    out[n++] = (StateRegion){s->comp[l].ptr, (uint32_t)comp_row_bytes(),
-                             (uint32_t)L[l].ratio, 1, 0};
-    out[n++] = (StateRegion){s->keys[l].ptr, (uint32_t)key_row_bytes(),
-                             (uint32_t)L[l].ratio, 1, 0};
+    out[n++] = (StateRegion){s->comp[l].ptr,
+                             (uint32_t)comp_row_bytes(),
+                             (uint32_t)L[l].ratio,
+                             1,
+                             0,
+                             0,
+                             0};
+    out[n++] = (StateRegion){s->keys[l].ptr,
+                             (uint32_t)key_row_bytes(),
+                             (uint32_t)L[l].ratio,
+                             1,
+                             0,
+                             0,
+                             0};
   }
   return n;
 }
