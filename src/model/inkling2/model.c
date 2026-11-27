@@ -216,6 +216,14 @@ typedef struct {
   float scale;
 } RouteParam;
 
+// Output channels processed per threadgroup in single-token fused MoE down.
+static constexpr uint32_t MOE_MV_DOWN_M1_ROWS = 4;
+
+typedef struct {
+  // Output width, inner width, current token position and ring capacity.
+  uint32_t n, k, pos, ring_rows;
+} MoeDownM1Param;
+
 typedef struct {
   // Matrix output rows, inner columns, active pair count and tile count.
   uint32_t n, k, npairs, ntiles;
@@ -418,9 +426,11 @@ static int K_sconv_static, K_sconv_static_batched, K_sconv_dynamic,
     K_sconv_dynamic_batched, K_sconv_ring_save;
 static int K_qkvr_prep, K_rel_bias, K_attend_part, K_attend_combine,
     K_attend_prefill;
-static int K_route_topk, K_moe_group, K_moe_gather_bf16;
-static int K_nv_up_mv, K_nv_dn_mv, K_nv_up_mm, K_nv_dn_mm;
-static int K_mx_up_mv, K_mx_dn_mv, K_mx_up_mm, K_mx_dn_mm;
+static int K_route_topk, K_route_topk_m1, K_moe_group, K_moe_gather_bf16;
+static int K_nv_up_m1, K_nv_up_mv, K_nv_dn_mv, K_nv_dn_comb_m1, K_nv_up_mm,
+    K_nv_dn_mm;
+static int K_mx_up_m1, K_mx_up_mv, K_mx_dn_mv, K_mx_dn_comb_m1, K_mx_up_mm,
+    K_mx_dn_mm;
 static int K_moe_combine, K_copy, K_add, K_logit_softcap;
 
 // ---- schedule and tile grouping ----
@@ -2118,6 +2128,66 @@ static void encode_moe_experts(GpuCommandBuffer *c, const PhysLayer *pl,
                  (uint32_t)rows, 1, SCONV_THREADS, 1, 1);
 }
 
+// Encodes m = 1 resident MoE experts with fused down + combine + post-MLP
+// static short convolution + residual add.
+static void encode_moe_m1_fused(GpuCommandBuffer *c, const PhysLayer *pl,
+                                const Buf *expert_table, const Ink2State *s,
+                                int visit, int pos0, size_t route_ids_off) {
+  MoeParam mp13 = {
+      (uint32_t)INK2_W13_ROWS, (uint32_t)INK2_DIM, (uint32_t)INK2_TOPK,
+      (uint32_t)INK2_TOPK,     GATE_SOFTCAP,       UP_SOFTCAP};
+  MoeDownM1Param dp = {(uint32_t)INK2_DIM, (uint32_t)INK2_INTER, (uint32_t)pos0,
+                       (uint32_t)INK2_SCONV_RING};
+  uint32_t gx13_mv =
+      ((uint32_t)INK2_W13_ROWS + MOE_MV_ROWS_PER_TG - 1u) / MOE_MV_ROWS_PER_TG;
+  uint32_t gx_dn =
+      ((uint32_t)INK2_DIM + MOE_MV_DOWN_M1_ROWS - 1u) / MOE_MV_DOWN_M1_ROWS;
+  size_t ring_off = conv_ring_off(visit, CONV_MLP_OFF);
+  if (pl->is_nvfp4) {
+    gpu_select_kernel(c, K_nv_up_m1);
+    gpu_bind_buffer(c, 0, expert_table, 0);
+    gpu_bind_buffer(c, 1, &pl->f13, 0);
+    gpu_bind_buffer(c, 2, &work.q_in, 0);
+    gpu_bind_buffer(c, 3, &work.route_ids, route_ids_off);
+    gpu_bind_buffer(c, 4, &work.h_bf16, 0);
+    gpu_copy_bytes(c, 5, &mp13, sizeof mp13);
+    gpu_run_kernel(c, gx13_mv, (uint32_t)INK2_TOPK, 1, MV_THREADS, 1, 1);
+
+    gpu_select_kernel(c, K_nv_dn_comb_m1);
+    gpu_bind_buffer(c, 0, expert_table, 0);
+    gpu_bind_buffer(c, 1, &pl->f2, 0);
+    gpu_bind_buffer(c, 2, &work.h_bf16, 0);
+    gpu_bind_buffer(c, 3, &work.route_ids, route_ids_off);
+    gpu_bind_buffer(c, 4, &work.route_w, 0);
+    gpu_bind_buffer(c, 5, &s->conv_ring, ring_off);
+    gpu_bind_buffer(c, 6, &pl->mlp_sconv_w, 0);
+    gpu_bind_buffer(c, 7, &work.residual, 0);
+    gpu_bind_buffer(c, 8, &work.cur, 0);
+    gpu_copy_bytes(c, 9, &dp, sizeof dp);
+    gpu_run_kernel(c, gx_dn, 1, 1, MV_THREADS, 1, 1);
+  } else {
+    gpu_select_kernel(c, K_mx_up_m1);
+    gpu_bind_buffer(c, 0, expert_table, 0);
+    gpu_bind_buffer(c, 1, &work.q_in, 0);
+    gpu_bind_buffer(c, 2, &work.route_ids, route_ids_off);
+    gpu_bind_buffer(c, 3, &work.h_bf16, 0);
+    gpu_copy_bytes(c, 4, &mp13, sizeof mp13);
+    gpu_run_kernel(c, gx13_mv, (uint32_t)INK2_TOPK, 1, MV_THREADS, 1, 1);
+
+    gpu_select_kernel(c, K_mx_dn_comb_m1);
+    gpu_bind_buffer(c, 0, expert_table, 0);
+    gpu_bind_buffer(c, 1, &work.h_bf16, 0);
+    gpu_bind_buffer(c, 2, &work.route_ids, route_ids_off);
+    gpu_bind_buffer(c, 3, &work.route_w, 0);
+    gpu_bind_buffer(c, 4, &s->conv_ring, ring_off);
+    gpu_bind_buffer(c, 5, &pl->mlp_sconv_w, 0);
+    gpu_bind_buffer(c, 6, &work.residual, 0);
+    gpu_bind_buffer(c, 7, &work.cur, 0);
+    gpu_copy_bytes(c, 8, &dp, sizeof dp);
+    gpu_run_kernel(c, gx_dn, 1, 1, MV_THREADS, 1, 1);
+  }
+}
+
 // ---- forward pass ----
 
 // Runs one logical visit v (0..47) over `rows` tokens. Prefill visits sync
@@ -2364,6 +2434,28 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                   is_prefill);
   RouteParam rp = {(uint32_t)rows, (uint32_t)INK2_EXPERTS, (uint32_t)INK2_TOPK,
                    ROUTE_SCALE};
+  uint64_t fast_gen = 0;
+  int fast_m1 = !is_prefill && rows == 1 && !batched &&
+                expert_store_layer_is_reachable(experts_store, l, &fast_gen);
+  if (fast_m1) {
+    hold_layer_if_needed(l);
+    refresh_layer_table(l, fast_gen);
+    gpu_select_kernel(cmd, K_route_topk_m1);
+    gpu_bind_buffer(cmd, 0, &work.route_logits, 0);
+    gpu_bind_buffer(cmd, 1, &pl->router_bias, 0);
+    gpu_bind_buffer(cmd, 2, &work.route_ids, route_ids_off);
+    gpu_bind_buffer(cmd, 3, &work.route_w, 0);
+    gpu_bind_buffer(cmd, 4, &work.ptok, 0);
+    gpu_bind_buffer(cmd, 5, &work.pw, 0);
+    gpu_bind_buffer(cmd, 6, &work.tp, 0);
+    gpu_bind_buffer(cmd, 7, &work.tiles, 0);
+    gpu_copy_bytes(cmd, 8, &rp, sizeof rp);
+    gpu_run_kernel(cmd, 1, 1, 1, ROUTE_THREADS, 1, 1);
+    encode_moe_m1_fused(cmd, pl, &layer_table[l], s, v, pos0, route_ids_off);
+    fast_visits[v] = 1;
+    return;
+  }
+
   gpu_select_kernel(cmd, K_route_topk);
   gpu_bind_buffer(cmd, 0, &work.route_logits, 0);
   gpu_bind_buffer(cmd, 1, &pl->router_bias, 0);
@@ -2763,14 +2855,19 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
     K(K_attend_combine, "ink2_attend_combine");
     K(K_attend_prefill, "ink2_attend_prefill");
     K(K_route_topk, "ink2_route_topk");
+    K(K_route_topk_m1, "ink2_route_topk_m1");
     K(K_moe_group, "ink2_moe_group");
     K(K_moe_gather_bf16, "ink2_moe_gather_bf16");
+    K(K_nv_up_m1, "ink2_moe_nvfp4_up_m1");
     K(K_nv_up_mv, "ink2_moe_nvfp4_up_mv");
     K(K_nv_dn_mv, "ink2_moe_nvfp4_down_mv");
+    K(K_nv_dn_comb_m1, "ink2_moe_nvfp4_down_combine_m1");
     K(K_nv_up_mm, "ink2_moe_nvfp4_up_mm");
     K(K_nv_dn_mm, "ink2_moe_nvfp4_down_mm");
+    K(K_mx_up_m1, "ink2_moe_mxfp8_up_m1");
     K(K_mx_up_mv, "ink2_moe_mxfp8_up_mv");
     K(K_mx_dn_mv, "ink2_moe_mxfp8_down_mv");
+    K(K_mx_dn_comb_m1, "ink2_moe_mxfp8_down_combine_m1");
     K(K_mx_up_mm, "ink2_moe_mxfp8_up_mm");
     K(K_mx_dn_mm, "ink2_moe_mxfp8_down_mm");
     K(K_moe_combine, "ink2_moe_combine");
