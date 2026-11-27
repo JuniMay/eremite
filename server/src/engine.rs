@@ -43,8 +43,8 @@ struct RawDeepSeekConfig {
     substitute: f32,
     draft: c_int,
     ced: c_int,
-    prefill_prune: c_int,
-    packed_state_rows: c_int,
+    no_prefill_prune: c_int,
+    unpacked_state_rows: c_int,
 }
 
 /// Inkling-2-Mini's settings (eremite_inkling2_config).
@@ -1090,19 +1090,13 @@ pub struct DeepSeekOptions {
     pub experts: Option<String>,
     /// The decoder replay tokens of an approximate prefill, or 0 for none.
     pub ced: i32,
-    /// Whether a prefill skips the decoder batches that no later row needs.
-    /// It changes no result. None: it does whenever ced is 0.
-    pub prefill_prune: Option<bool>,
-    /// Whether a state keeps its compressed rows and index keys packed: the
-    /// same values in about 28% of BF16's bytes.
-    pub packed_state_rows: bool,
 }
 
 impl DeepSeekOptions {
     /// Returns whether a prefill skips the decoder batches that no later row
-    /// needs: as prefill_prune says, or whenever ced is 0.
+    /// needs: always enabled when ced is 0.
     pub fn prunes_prefill(&self) -> bool {
-        self.prefill_prune.unwrap_or(self.ced == 0)
+        self.ced == 0
     }
 }
 
@@ -1559,12 +1553,9 @@ impl Model {
                 substitute: 0.0,
                 draft: o.draft,
                 ced: deepseek.ced,
-                prefill_prune: if architecture == Architecture::DeepSeek {
-                    deepseek.prunes_prefill().into()
-                } else {
-                    0
-                },
-                packed_state_rows: deepseek.packed_state_rows.into(),
+                // Lossless optimizations are always enabled in the server.
+                no_prefill_prune: 0,
+                unpacked_state_rows: 0,
             },
             inkling2: RawInkling2Config {
                 fp8_kv: inkling2.fp8_kv.into(),

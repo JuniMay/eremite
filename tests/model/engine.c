@@ -26,13 +26,14 @@ int main(int argc, char **argv) {
   fflush(stdout);
   pid_t child = fork();
   if (child == 0) {
-    eremite_config packed = {.abi = EREMITE_ABI,
-                             .model = argv[1],
-                             .ctx = 4096,
-                             .lookup = 15,
-                             .deepseek = {.draft = 2, .packed_state_rows = 1}};
+    eremite_config unpacked = {
+        .abi = EREMITE_ABI,
+        .model = argv[1],
+        .ctx = 4096,
+        .lookup = 15,
+        .deepseek = {.draft = 2, .unpacked_state_rows = 1}};
     eremite_model *p = eremite_init(&(eremite_process){.abi = EREMITE_ABI}) == 0
-                           ? eremite_open(&packed)
+                           ? eremite_open(&unpacked)
                            : NULL;
     if (p) eremite_state_identity(p, packed_identity);
     _exit(write(identity_pipe[1], packed_identity, 32) == 32 ? 0 : 1);

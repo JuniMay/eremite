@@ -221,8 +221,8 @@ eremite_model *eremite_open(const eremite_config *c) {
   const eremite_inkling2_config *ik = &c->inkling2;
   const eremite_minimax_h3_config *h3 = &c->minimax_h3;
   const eremite_minimax_h3_video_config *hv = &c->minimax_h3_video;
-  int has_deepseek =
-      d->experts || d->ced || d->substitute != 0 || d->packed_state_rows;
+  int has_deepseek = d->experts || d->ced || d->substitute != 0 ||
+                     d->no_prefill_prune || d->unpacked_state_rows;
   int has_inkling2 = ik->fp8_kv != 0;
   int has_minimax_h3 = h3->text_encoder || h3->dit || h3->vae;
   int has_minimax_h3_video =
@@ -271,8 +271,8 @@ eremite_model *eremite_open(const eremite_config *c) {
         (DeepSeekOptions){.substitute = d->substitute,
                           .experts = d->experts,
                           .ced = d->ced,
-                          .prefill_prune = d->prefill_prune,
-                          .packed_state_rows = d->packed_state_rows};
+                          .prefill_prune = !d->ced && !d->no_prefill_prune,
+                          .packed_state_rows = !d->unpacked_state_rows};
   }
   const char *bad =
       options.ctx < 1 || options.ctx > 1 << 20 ? "ctx takes 1 to 1048576 tokens"

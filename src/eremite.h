@@ -106,10 +106,13 @@ typedef struct {
   // DSpark proposals, 0 to 5.
   int draft;
   int ced;
-  int prefill_prune;
-  // Whether a state keeps its compressed rows and index keys packed, as the
-  // reference rounds them: the same values in about 28% of BF16's bytes.
-  int packed_state_rows;
+  // Experimental benchmark switch: nonzero disables lossless dependency
+  // pruning during prefill (default 0 enables pruning whenever ced is off).
+  int no_prefill_prune;
+  // Experimental benchmark switch: nonzero keeps compressed rows and index
+  // keys unpacked in BF16 instead of lossless packed FP4 + scales (default 0
+  // keeps rows packed in about 28% of BF16's bytes).
+  int unpacked_state_rows;
 } eremite_deepseek_config;
 
 // Inkling-2-Mini options.

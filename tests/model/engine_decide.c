@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
       {.abi = EREMITE_ABI,
        .model = argv[1],
        .ctx = 4096,
-       .deepseek.packed_state_rows = 1}};
+       .deepseek.unpacked_state_rows = 1}};
   int refused = 0;
   for (size_t i = 0; i < sizeof bad / sizeof *bad; i++)
     refused += !eremite_open(&bad[i]);

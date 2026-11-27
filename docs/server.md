@@ -65,8 +65,6 @@ Each entry under `models` holds one model's settings:
 | `draft` | the most proposals of the model's draft head per pass: 0 to 5 for DeepSeek, 0 to 7 for Inkling-2-Mini, 0 to 8 for Nemotron-3.5-Transcribe; each pass runs the count that has given the most tokens per second | 0 |
 | `lookup` | `off`, or the most context-copy proposals per pass, 1 to 15 | 15 |
 | `ced` | DeepSeek: `off`, or an approximate prefill that replays this many decoder tokens, 128 to 1048576, plus the rewind margin: 8, or the most draft or lookup proposals when more (15 with the default lookup) | `off` |
-| `prefill_prune` | DeepSeek: a prefill skips the decoder batches that no later row needs; it changes no result, and needs `ced` off | `true` without `ced` |
-| `packed_state_rows` | DeepSeek: a state keeps its compressed rows and index keys packed: the same values in about 28% of BF16's bytes | `false` |
 | `fp8_kv` | Inkling-2-Mini: approximate state storing global, sliding-window and draft-head KV caches in FP8 E4M3 with per-head scales instead of BF16, in about 51% of BF16's KV bytes | `false` |
 | `memory` | GiB of the model's own memory: its weights, expert cache, workspace and states; 0: none of its own | 0 |
 | `max_cached_states` | the most states of the model kept in memory | 256 |
@@ -128,6 +126,10 @@ immediately when another program pushes available memory below `reserve`, when
 macOS signals memory pressure, or when eremite's own pages compress. The memory
 view shows the pre-existing floor as file cache, the rest as free file cache,
 and active guard memory as guard pool.
+
+DeepSeek V4.1 Flash always enables lossless packed state rows (exact FP4 +
+scales in about 28% of BF16's bytes) and dependency-pruned prefills whenever
+`ced` is off.
 
 ## GPU sharing
 

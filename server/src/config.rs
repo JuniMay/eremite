@@ -37,7 +37,7 @@ const MOST_LOOKUP_PROPOSALS: i32 = 15;
 /// recordings plus transcripts).
 const DEFAULT_NEMOTRON_CONTEXT_TOKENS: i32 = 65_536;
 /// Keys of a model entry that belong only to DeepSeek models.
-const DEEPSEEK_ONLY_KEYS: [&str; 4] = ["experts", "ced", "prefill_prune", "packed_state_rows"];
+const DEEPSEEK_ONLY_KEYS: [&str; 2] = ["experts", "ced"];
 /// Keys of a model entry that belong only to Inkling-2-Mini models.
 const INKLING2_ONLY_KEYS: [&str; 1] = ["fp8_kv"];
 
@@ -61,11 +61,9 @@ pub struct ModelConfig {
 }
 
 /// The keys of a model's entry that only a model that generates text takes.
-const GENERATING_KEYS: [&str; 8] = [
+const GENERATING_KEYS: [&str; 6] = [
     "experts",
     "ced",
-    "prefill_prune",
-    "packed_state_rows",
     "fp8_kv",
     "draft",
     "lookup",
@@ -306,8 +304,6 @@ impl ModelConfig {
                     _ => integer()?,
                 }
             }
-            "prefill_prune" => options.deepseek_mut()?.prefill_prune = Some(switch()?),
-            "packed_state_rows" => options.deepseek_mut()?.packed_state_rows = switch()?,
             "fp8_kv" => options.inkling2_mut()?.fp8_kv = switch()?,
             "memory" => {
                 options.memory_gb = value
@@ -853,12 +849,6 @@ pub fn parse(root: &Value) -> Result<Config, String> {
                 .map_err(|error| format!("models[{i}]: {error}"))?;
             model.keys.push(name.clone());
         }
-        if let Some(deepseek) = model.engine.deepseek()
-            && deepseek.prefill_prune == Some(true)
-            && deepseek.ced != 0
-        {
-            return Err(format!("models[{i}]: prefill_prune needs ced off"));
-        }
         models.push(model);
     }
     Ok(Config {
@@ -1127,9 +1117,7 @@ mod tests {
     fn prefill_prune_is_on_unless_ced_is_on() {
         let models = parse(&json!({"models": [
             {"model": "/m/a", "experts": "/m/a.gguf"},
-            {"model": "/m/b", "ced": 128},
-            {"model": "/m/c", "prefill_prune": false},
-            {"model": "/m/d", "ced": "off", "prefill_prune": true}
+            {"model": "/m/b", "ced": 128}
         ]}))
         .unwrap()
         .models;
@@ -1137,9 +1125,8 @@ mod tests {
             .iter()
             .map(|model| model.engine.deepseek().unwrap().prunes_prefill())
             .collect();
-        assert_eq!(prunes, [true, false, false, true]);
-        let both = parse(&json!({"models": [{"model": "/m", "ced": 128, "prefill_prune": true}]}));
-        assert!(both.unwrap_err().contains("prefill_prune needs ced off"));
+        assert_eq!(prunes, [true, false]);
+        assert!(parse(&json!({"models": [{"model": "/m", "prefill_prune": false}]})).is_err());
     }
 
     #[test]
@@ -1177,23 +1164,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_state_rows_is_a_deepseek_switch() {
-        let models = parse(&json!({"models": [
-            {"model": "/m/deepseek", "packed_state_rows": true}
-        ]}))
-        .unwrap()
-        .models;
-        assert!(models[0].engine.deepseek().unwrap().packed_state_rows);
-        let models = parse(&json!({"models": [{"model": "/m/deepseek"}]}))
-            .unwrap()
-            .models;
-        assert!(
-            !models[0]
-                .engine
-                .deepseek()
-                .is_some_and(|deepseek| deepseek.packed_state_rows)
-        );
-        assert!(parse(&json!({"models": [{"model": "/m", "packed_state_rows": 1}]})).is_err());
+    fn lossless_deepseek_switches_are_not_exposed_in_server_config() {
+        assert!(parse(&json!({"models": [{"model": "/m", "packed_state_rows": true}]})).is_err());
+        assert!(parse(&json!({"models": [{"model": "/m", "packed_state_rows": false}]})).is_err());
+        assert!(parse(&json!({"models": [{"model": "/m", "prefill_prune": true}]})).is_err());
     }
 
     #[test]
@@ -1216,7 +1190,7 @@ mod tests {
         assert!(parse(&json!({"models": [{"model": "/m", "fp8_kv": 1}]})).is_err());
         assert!(
             parse(&json!({"models": [
-                {"model": "/m", "fp8_kv": true, "packed_state_rows": true}
+                {"model": "/m", "fp8_kv": true, "ced": 128}
             ]}))
             .is_err()
         );
@@ -1332,7 +1306,7 @@ mod tests {
         for key in GENERATING_KEYS {
             let value = match key {
                 "experts" => json!("/m/experts.gguf"),
-                "prefill_prune" | "packed_state_rows" | "fp8_kv" => json!(false),
+                "fp8_kv" => json!(false),
                 "ced" | "lookup" => json!("off"),
                 _ => json!(1),
             };

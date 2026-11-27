@@ -44,12 +44,13 @@ static void usage(void) {
       "  --features-fd FD  write encoded BF16 feature rows to FD and exit\n"
       "  --ctx N       context capacity in tokens, at most 1048576 (default "
       "16384)\n"
-      "  --prefill-prune  skip decoder batches outside required history "
-      "(default off); CED and\n"
-      "                substitution must be off\n"
-      "  --packed-state-rows  keep a state's compressed rows and index keys "
-      "packed: the same values\n"
-      "                in about 28% of BF16's bytes (default off)\n"
+      "  --no-prefill-prune  disable dependency-pruned prefills for "
+      "benchmarking (pruning is on by\n"
+      "                default whenever CED and substitution are off)\n"
+      "  --unpacked-state-rows  store state compressed rows and index keys "
+      "unpacked in BF16 for\n"
+      "                benchmarking (lossless FP4 + scales packing is on by "
+      "default, ~28% of BF16)\n"
       "  --fp8-kv      Inkling-2-Mini: approximate state storing KV caches in "
       "FP8 E4M3 with per-head\n"
       "                scales instead of BF16, about half the KV bytes "
@@ -212,6 +213,7 @@ int main(int argc, char **argv) {
   Options o = {.ctx = 16384, .dump_fd = -1, .routes_fd = -1};
   const char *media_path[16];
   int nmedia = 0, vision_fd = -1, fp8_kv = 0;
+  int ds_unpacked = 0, ds_no_prune = 0, ds_flags = 0;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : 0;
     if (!strcmp(a, "--raw")) {
@@ -245,11 +247,19 @@ int main(int argc, char **argv) {
       continue;
     }
     if (!strcmp(a, "--prefill-prune")) {
-      o.deepseek.prefill_prune = 1;
+      ds_no_prune = 0, ds_flags = 1;
+      continue;
+    }
+    if (!strcmp(a, "--no-prefill-prune")) {
+      ds_no_prune = 1, ds_flags = 1;
       continue;
     }
     if (!strcmp(a, "--packed-state-rows")) {
-      o.deepseek.packed_state_rows = 1;
+      ds_unpacked = 0, ds_flags = 1;
+      continue;
+    }
+    if (!strcmp(a, "--unpacked-state-rows")) {
+      ds_unpacked = 1, ds_flags = 1;
       continue;
     }
     if (!strcmp(a, "--fp8-kv")) {
@@ -377,9 +387,12 @@ int main(int argc, char **argv) {
     die("--fp8-kv applies to Inkling-2-Mini models only");
   if (ops == &inkling2_ops) {
     if (o.deepseek.experts || o.deepseek.ced || o.deepseek.substitute != 0 ||
-        o.deepseek.prefill_prune || o.deepseek.packed_state_rows)
+        ds_flags)
       die("DeepSeek options do not apply to Inkling-2-Mini");
     o.inkling2 = (Inkling2Options){.fp8_kv = fp8_kv};
+  } else if (ops == &deepseek_ops) {
+    o.deepseek.packed_state_rows = !ds_unpacked;
+    o.deepseek.prefill_prune = !o.deepseek.ced && !ds_no_prune;
   }
   if (ops->decide)
     die("%s: a decision model generates no text; eremite-server serves its "
