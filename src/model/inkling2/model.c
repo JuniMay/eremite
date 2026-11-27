@@ -7,9 +7,11 @@
 #include "base/json.h"
 #include "base/shutdown.h"
 #include "engine/expert_store.h"
+#include "engine/kv_pages.h"
 #include "engine/memory.h"
 #include "engine/pass.h"
 #include "engine/safetensors.h"
+#include "engine/state_growth.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
 #include <errno.h>
@@ -43,10 +45,14 @@ static constexpr int LOG_SCALING_FLOOR = 8192;
 static constexpr double QK_L2_CLIP = 22.627416997969522;
 static constexpr double REL_L2_CLIP = 8.0;
 
-// Prefill chunk size, KV allocation growth, FlashDecoding split bounds and
+// Prefill chunk size, KV page-table growth, FlashDecoding split bounds and
 // aligned direct-read threshold.
 static constexpr int PREFILL_CHUNK = 512;
-static constexpr int START_CAP = 256;
+// Initial, maximum linear step, and alignment (in pages) for the GPU KV
+// page-address table growth policy.
+static constexpr int KV_TABLE_START_PAGES = 16;
+static constexpr int KV_TABLE_MAX_GROW_PAGES = 64;
+static constexpr int KV_TABLE_ALIGN_PAGES = 16;
 static constexpr int MAX_DECODE_PARTS = 64;
 static constexpr int DECODE_PART_TARGET = 128;
 static constexpr int DECODE_PART_FLOATS = INK2_HEAD_DIM + 2;
@@ -200,24 +206,29 @@ typedef struct {
 } KvTarget;
 
 typedef struct {
-  // Active rows, head-major Q stride, row-0 pos, ring capacity, flags.
-  uint32_t rows, q_stride, pos0, ring_rows, is_global, batched;
+  // Active rows, head-major Q stride, row-0 pos, ring capacity, flags, page
+  // shift and K/V slice byte offsets inside each page.
+  uint32_t rows, q_stride, pos0, ring_rows, is_global, batched, page_shift,
+      k_slice_off, v_slice_off;
 } QkvrParam;
 
 typedef struct {
-  // Active rows, Q stride, row-0 pos, ring capacity, window, partitions, flag.
+  // Active rows, Q stride, row-0 pos, ring capacity, window, partitions, flag,
+  // page shift and K/V slice byte offsets inside each page.
   uint32_t rows, q_stride, pos0, ring_rows, window, nparts, part_stride,
-      batched;
+      batched, page_shift, k_slice_off, v_slice_off;
 } AttendDecodeParam;
 
 typedef struct {
-  // Active rows, Q stride, row-0 pos, ring capacity and sliding window.
-  uint32_t rows, q_stride, pos0, ring_rows, window;
+  // Active rows, Q stride, row-0 pos, ring capacity, sliding window, page shift
+  // and K/V slice byte offsets inside each page.
+  uint32_t rows, q_stride, pos0, ring_rows, window, page_shift, k_slice_off,
+      v_slice_off;
 } AttendPrefillParam;
 
 typedef struct {
-  // First source FP8 KV row and number of rows to unpack to BF16.
-  uint32_t start_row, n_rows;
+  // First source FP8 KV row, row count, page shift and K/V slice byte offsets.
+  uint32_t start_row, n_rows, page_shift, k_slice_off, v_slice_off;
 } Fp8DequantParam;
 
 typedef struct {
@@ -339,10 +350,9 @@ typedef struct {
 
 // Per-sequence attention and short-convolution state.
 typedef struct {
-  // Allocated global KV capacity in tokens.
-  int cap;
-  // Growing global K and V caches (BF16 or packed FP8) for the 8 global visits.
-  Buf gk[INK2_GLOBAL_COUNT], gv[INK2_GLOBAL_COUNT];
+  // Paged global K and V caches (16 backbone slices plus 2 optional MTP slices)
+  // with copy-on-write prefix sharing across forked states.
+  KvPageTable global_kv;
   // Rolling K and V rings (BF16 or packed FP8) for all 40 sliding visits.
   Buf slide_kv;
   // Rolling FP32 short-convolution rings for all 48 logical visits.
@@ -1540,15 +1550,31 @@ static void prefetch_all_layer_experts(int l) {
 
 // ---- state and snapshot management ----
 
-// Returns the next power-of-two capacity holding `positions` tokens, capped at
-// opt.ctx.
-static int grown_cap(int positions) {
-  int cap = START_CAP;
-  while (cap < positions && cap < opt.ctx) cap *= 2;
-  if (cap > opt.ctx) cap = opt.ctx;
-  if (cap < positions)
-    die("sequence length %d exceeds context limit %d", positions, opt.ctx);
-  return cap;
+// Returns the active paged global KV layout and page-table growth policy.
+static KvPageLayout kv_page_layout(void) {
+  int slices =
+      2 * INK2_GLOBAL_COUNT + (inkling2_mtp_active_drafts() > 0 ? 2 : 0);
+  size_t slice_bytes = (size_t)INK2_GLOBAL_PAGE_TOKENS * kv_row_bytes();
+  int max_pages =
+      (opt.ctx + INK2_GLOBAL_PAGE_TOKENS - 1) / INK2_GLOBAL_PAGE_TOKENS;
+  if (max_pages < 1) max_pages = 1;
+  StateGrowthPolicy table_growth = {
+      .start_cap = KV_TABLE_START_PAGES,
+      .factor = 2,
+      .max_step = KV_TABLE_MAX_GROW_PAGES,
+      .align = KV_TABLE_ALIGN_PAGES,
+      .max_cap = max_pages,
+  };
+  return kv_page_layout_init(INK2_GLOBAL_PAGE_TOKENS, slice_bytes, slices,
+                             table_growth);
+}
+
+// Returns the fixed rolling GPU bytes of one Ink2State (sliding KV,
+// short-convolution rings and optional MTP rolling rings).
+static size_t state_rolling_bytes(void) {
+  return gpu_round_up_to_pages(slide_kv_bytes()) +
+         gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
+         inkling2_mtp_state_rolling_bytes();
 }
 
 // Returns the rolling snapshot byte size, including MTP rings when active.
@@ -1564,70 +1590,36 @@ static int32_t snap_flags(void) {
          (opt.inkling2.fp8_kv ? SNAP_FLAG_FP8_KV : 0);
 }
 
-// Resizes the 8 global KV buffer pairs (and MTP global KV when active) of s
-// to hold `new_cap` rows, preserving the first `keep` rows. Returns 1 on
-// success or 0 on memory refusal.
-static int state_resize_global(Ink2State *s, int new_cap, int keep) {
-  size_t row_bytes = kv_row_bytes();
-  size_t new_bytes = (size_t)new_cap * row_bytes;
-  size_t copy_bytes = (size_t)keep * row_bytes;
-  Buf nk[INK2_GLOBAL_COUNT] = {0}, nv[INK2_GLOBAL_COUNT] = {0};
-  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    nk[i] = state_try_alloc(new_bytes);
-    nv[i] = nk[i].obj ? state_try_alloc(new_bytes) : (Buf){0};
-    if (!nv[i].obj) {
-      for (int j = 0; j <= i; j++) {
-        if (nk[j].obj) gpu_free(&nk[j]);
-        if (nv[j].obj) gpu_free(&nv[j]);
-      }
-      return 0;
-    }
-    if (copy_bytes && s->gk[i].obj) {
-      memcpy(nk[i].ptr, s->gk[i].ptr, copy_bytes);
-      memcpy(nv[i].ptr, s->gv[i].ptr, copy_bytes);
-    }
-  }
-  if (!inkling2_mtp_state_resize_global(gpu, &state_slot, &s->mtp, new_cap,
-                                        keep)) {
-    for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-      gpu_free(&nk[i]);
-      gpu_free(&nv[i]);
-    }
-    return 0;
-  }
-  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    if (s->gk[i].obj) gpu_mark_to_free(&s->gk[i]);
-    if (s->gv[i].obj) gpu_mark_to_free(&s->gv[i]);
-    s->gk[i] = nk[i];
-    s->gv[i] = nv[i];
-  }
-  s->cap = new_cap;
-  return 1;
-}
-
-// Ensures s holds at least `need` positions in its global KV caches.
-static void state_ensure_cap(Ink2State *s, int need) {
-  if (need <= s->cap) return;
+// Ensures global KV pages covering `[pos, pos + count)` are allocated and
+// privately owned (copy-on-write on shared pages), syncing the GPU only when
+// allocation or copy-on-write is needed.
+static void state_prepare_write(Ink2State *s, int pos, int count) {
+  if (count <= 0) return;
+  if (pos < 0 || pos + count > opt.ctx)
+    die("sequence length %d exceeds context limit %d", pos + count, opt.ctx);
+  if (!kv_page_table_needs_sync(&s->global_kv, pos, count)) return;
   model_sync();
-  int next = grown_cap(need);
-  if (!state_resize_global(s, next, s->cap))
-    die("out of memory growing Inkling-2-Mini KV cache to %d tokens", next);
+  if (!kv_page_table_prepare_write(&s->global_kv, pos, count))
+    die("out of memory growing Inkling-2-Mini KV cache to %d tokens",
+        pos + count);
 }
 
 // Allocates a new Ink2State, or returns null when memory does not fit.
 static ModelState *ink2_state_new(void) {
   Ink2State *s = xmalloc(sizeof *s);
   *s = (Ink2State){0};
-  int init_cap = grown_cap(1);
+  KvPageLayout layout = kv_page_layout();
+  kv_page_table_init(&s->global_kv, kv_page_backend_gpu(gpu, &state_slot),
+                     &layout);
   size_t slide_bytes = slide_kv_bytes();
   s->slide_kv = state_try_alloc(slide_bytes);
   s->conv_ring = s->slide_kv.obj ? state_try_alloc(CONV_TOTAL_BYTES) : (Buf){0};
   if (!s->conv_ring.obj ||
-      !inkling2_mtp_state_init(gpu, &state_slot, &s->mtp) ||
-      !state_resize_global(s, init_cap, 0)) {
+      !inkling2_mtp_state_init(gpu, &state_slot, &s->mtp, &s->global_kv)) {
     if (s->slide_kv.obj) gpu_free(&s->slide_kv);
     if (s->conv_ring.obj) gpu_free(&s->conv_ring);
     inkling2_mtp_state_free(&s->mtp);
+    kv_page_table_free(&s->global_kv);
     free(s);
     return NULL;
   }
@@ -1640,64 +1632,106 @@ static ModelState *ink2_state_new(void) {
 static void ink2_state_free(ModelState *ms) {
   Ink2State *s = (Ink2State *)ms;
   if (!s) return;
-  for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    if (s->gk[i].obj) gpu_mark_to_free(&s->gk[i]);
-    if (s->gv[i].obj) gpu_mark_to_free(&s->gv[i]);
-  }
+  kv_page_table_free(&s->global_kv);
   if (s->slide_kv.obj) gpu_mark_to_free(&s->slide_kv);
   if (s->conv_ring.obj) gpu_mark_to_free(&s->conv_ring);
   inkling2_mtp_state_free(&s->mtp);
   free(s);
 }
 
-// Returns the byte footprint of state s (or a new state when s is null) at
-// `positions` tokens.
+// Returns the proportional byte footprint of state s (or a new state when s is
+// null) at `positions` tokens.
 static size_t ink2_state_bytes(const ModelState *ms, int positions) {
   const Ink2State *s = (const Ink2State *)ms;
-  int cap = s ? s->cap : grown_cap(positions > 0 ? positions : 1);
-  if (positions > cap) cap = grown_cap(positions);
-  size_t gk_one = gpu_round_up_to_pages((size_t)cap * kv_row_bytes());
-  return (size_t)INK2_GLOBAL_COUNT * 2 * gk_one +
-         gpu_round_up_to_pages(slide_kv_bytes()) +
-         gpu_round_up_to_pages(CONV_TOTAL_BYTES) +
-         inkling2_mtp_state_bytes(cap);
+  KvPageLayout layout = kv_page_layout();
+  KvPageBackend backend = kv_page_backend_gpu(gpu, &state_slot);
+  return kv_page_table_bytes(s ? &s->global_kv : NULL, &backend, &layout,
+                             positions) +
+         state_rolling_bytes();
 }
 
-// Writes the growing global KV regions of s (16 base, plus 2 for MTP when
-// active). When fill is nonzero, grows s to hold `positions` tokens first.
+// Returns the extra bytes allocated when copying `positions` tokens from `src`
+// into a new state that grows to `target_positions`.
+static size_t ink2_state_copy_bytes(const ModelState *src_ms, int positions,
+                                    int target_positions) {
+  const Ink2State *src = (const Ink2State *)src_ms;
+  return kv_page_table_fork_delta_bytes(&src->global_kv, positions,
+                                        target_positions) +
+         state_rolling_bytes();
+}
+
+// Writes the paged global KV regions of s (16 base, plus 2 for MTP when
+// active). When fill is nonzero, resets s to hold privately owned pages for
+// `positions` tokens first.
 static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
                                     StateRegion *out) {
   Ink2State *s = (Ink2State *)ms;
-  if (positions < 0 || (!fill && positions > s->cap))
+  int cap_tokens = s->global_kv.npages * INK2_GLOBAL_PAGE_TOKENS;
+  if (positions < 0 || (!fill && positions > cap_tokens))
     die("invalid Inkling-2-Mini state regions for %d positions", positions);
   model_sync();
   if (fill) {
-    int cap = grown_cap(positions > 0 ? positions : 1);
-    if (s->cap != cap && !state_resize_global(s, cap, 0))
-      die("out of memory sizing Inkling-2-Mini state to %d tokens", cap);
+    if (!kv_page_table_reset_writable(&s->global_kv, positions))
+      die("out of memory sizing Inkling-2-Mini state to %d tokens", positions);
   }
   uint32_t row_bytes = (uint32_t)kv_row_bytes();
+  size_t slice_bytes = s->global_kv.layout.slice_bytes;
   int n = 0;
   for (int i = 0; i < INK2_GLOBAL_COUNT; i++) {
-    out[n++] = (StateRegion){s->gk[i].ptr, row_bytes, 1, 0, 0, 0, 0};
-    out[n++] = (StateRegion){s->gv[i].ptr, row_bytes, 1, 0, 0, 0, 0};
+    out[n++] = (StateRegion){
+        .data = s->global_kv.host_ptrs,
+        .unit = row_bytes,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = INK2_GLOBAL_PAGE_TOKENS,
+        .page_offset = (size_t)(2 * i) * slice_bytes,
+    };
+    out[n++] = (StateRegion){
+        .data = s->global_kv.host_ptrs,
+        .unit = row_bytes,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = INK2_GLOBAL_PAGE_TOKENS,
+        .page_offset = (size_t)(2 * i + 1) * slice_bytes,
+    };
   }
   if (inkling2_mtp_active_drafts()) {
     uint32_t mtp_row_bytes = (uint32_t)inkling2_mtp_kv_row_bytes();
-    out[n++] = (StateRegion){s->mtp.gk.ptr, mtp_row_bytes, 1, 0, 0, 0, 0};
-    out[n++] = (StateRegion){s->mtp.gv.ptr, mtp_row_bytes, 1, 0, 0, 0, 0};
+    out[n++] = (StateRegion){
+        .data = s->global_kv.host_ptrs,
+        .unit = mtp_row_bytes,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = INK2_GLOBAL_PAGE_TOKENS,
+        .page_offset = (size_t)INK2_MTP_GLOBAL_SLICE_K * slice_bytes,
+    };
+    out[n++] = (StateRegion){
+        .data = s->global_kv.host_ptrs,
+        .unit = mtp_row_bytes,
+        .ratio = 1,
+        .guard = 0,
+        .lag = 0,
+        .page_rows = INK2_GLOBAL_PAGE_TOKENS,
+        .page_offset = (size_t)INK2_MTP_GLOBAL_SLICE_V * slice_bytes,
+    };
   }
   return n;
 }
 
-// Copies the growing global KV rows before `positions` from src into dst.
+// Shares complete global KV prefix pages from src into dst via copy-on-write
+// and copies only any partial trailing boundary page before `positions`.
 static void ink2_state_copy(ModelState *dst_ms, const ModelState *src_ms,
                             int positions) {
   if (dst_ms == src_ms) die("cannot copy an Inkling-2-Mini state onto itself");
-  StateRegion to[STATE_REGIONS_MAX], from[STATE_REGIONS_MAX];
-  int n = ink2_write_state_regions(dst_ms, positions, 1, to);
-  ink2_write_state_regions((ModelState *)src_ms, positions, 0, from);
-  regions_copy(to, from, n, positions);
+  Ink2State *dst = (Ink2State *)dst_ms;
+  const Ink2State *src = (const Ink2State *)src_ms;
+  model_sync();
+  if (!kv_page_table_fork(&dst->global_kv, &src->global_kv, positions))
+    die("out of memory forking Inkling-2-Mini KV cache at %d tokens",
+        positions);
 }
 
 // Captures the rolling sliding-window KV, short-convolution and optional MTP
@@ -2644,15 +2678,31 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
   // Q/K/V/R head prep and KV cache store (fused with K/V sconv on m = 1
   // sliding visits; relative position bias is computed on the fly in
   // attention).
-  const Buf *k_buf = pl->is_global ? &s->gk[vis->global_slot] : &s->slide_kv;
-  const Buf *v_buf = pl->is_global ? &s->gv[vis->global_slot] : &s->slide_kv;
+  const Buf *k_buf = pl->is_global ? &s->global_kv.gpu_addrs : &s->slide_kv;
+  const Buf *v_buf = pl->is_global ? &s->global_kv.gpu_addrs : &s->slide_kv;
   size_t k_off = pl->is_global ? 0 : slide_ring_off(vis->slide_slot, 0);
   size_t v_off = pl->is_global ? 0 : slide_ring_off(vis->slide_slot, 1);
   uint32_t ring_rows = pl->is_global ? 0u : (uint32_t)INK2_SLIDE_RING;
+  uint32_t page_shift = pl->is_global ? s->global_kv.layout.page_shift : 0u;
+  uint32_t k_slice_off = pl->is_global
+                             ? (uint32_t)((size_t)(2 * vis->global_slot) *
+                                          s->global_kv.layout.slice_bytes)
+                             : 0u;
+  uint32_t v_slice_off = pl->is_global
+                             ? (uint32_t)((size_t)(2 * vis->global_slot + 1) *
+                                          s->global_kv.layout.slice_bytes)
+                             : 0u;
   size_t kv_tgt_off = (size_t)v * INK2_MAX_BATCH_ROWS * sizeof(KvTarget);
 
-  QkvrParam qp = {(uint32_t)rows, (uint32_t)work.q_stride, (uint32_t)pos0,
-                  ring_rows,      (uint32_t)pl->is_global, (uint32_t)batched};
+  QkvrParam qp = {(uint32_t)rows,
+                  (uint32_t)work.q_stride,
+                  (uint32_t)pos0,
+                  ring_rows,
+                  (uint32_t)pl->is_global,
+                  (uint32_t)batched,
+                  page_shift,
+                  k_slice_off,
+                  v_slice_off};
   if (fuse_kv_prep_m1) {
     gpu_select_kernel(cmd, opt.inkling2.fp8_kv ? K_sconv_qkvr_fp8_m1
                                                : K_sconv_qkvr_m1);
@@ -2696,7 +2746,9 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
         ((uint32_t)rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
     if (!opt.inkling2.fp8_kv) {
       AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
-                                (uint32_t)pos0, ring_rows, window};
+                                (uint32_t)pos0, ring_rows,
+                                window,         page_shift,
+                                k_slice_off,    v_slice_off};
       gpu_select_kernel(cmd, K_attend_prefill_rel);
       gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
       gpu_bind_buffer(cmd, 1, k_buf, k_off);
@@ -2714,7 +2766,7 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
           pl->is_global ? (uint32_t)(pos0 + rows) : (uint32_t)INK2_SLIDE_RING;
       if (!pl->is_global && (uint32_t)(pos0 + rows) < n_deq)
         n_deq = (uint32_t)(pos0 + rows);
-      Fp8DequantParam dp = {0u, n_deq};
+      Fp8DequantParam dp = {0u, n_deq, page_shift, k_slice_off, v_slice_off};
       gpu_select_kernel(cmd, K_fp8_dequant_kv);
       gpu_bind_buffer(cmd, 0, k_buf, k_off);
       gpu_bind_buffer(cmd, 1, v_buf, v_off);
@@ -2723,8 +2775,14 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
       gpu_copy_bytes(cmd, 4, &dp, sizeof dp);
       gpu_run_kernel(cmd, n_deq, 1, 1, ROW_THREADS, 1, 1);
 
-      AttendPrefillParam app = {(uint32_t)rows, (uint32_t)work.q_stride,
-                                (uint32_t)pos0, ring_rows, window};
+      AttendPrefillParam app = {(uint32_t)rows,
+                                (uint32_t)work.q_stride,
+                                (uint32_t)pos0,
+                                ring_rows,
+                                window,
+                                0u,
+                                0u,
+                                0u};
       gpu_select_kernel(cmd, K_attend_prefill_rel);
       gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
       gpu_bind_buffer(cmd, 1, &work.deq_k, 0);
@@ -2744,7 +2802,7 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
         uint32_t kc = total_k - ks;
         if (kc > (uint32_t)FP8_PREFILL_SLAB_ROWS)
           kc = (uint32_t)FP8_PREFILL_SLAB_ROWS;
-        Fp8DequantParam dp = {ks, kc};
+        Fp8DequantParam dp = {ks, kc, page_shift, k_slice_off, v_slice_off};
         gpu_select_kernel(cmd, K_fp8_dequant_kv);
         gpu_bind_buffer(cmd, 0, k_buf, k_off);
         gpu_bind_buffer(cmd, 1, v_buf, v_off);
@@ -2788,7 +2846,10 @@ static void run_visit(GpuCommandBuffer *cmd, int v, int rows, int pos0,
                              window,
                              (uint32_t)nparts,
                              (uint32_t)MAX_DECODE_PARTS,
-                             (uint32_t)batched};
+                             (uint32_t)batched,
+                             page_shift,
+                             k_slice_off,
+                             v_slice_off};
     gpu_select_kernel(cmd, opt.inkling2.fp8_kv ? K_attend_part_fp8_rel
                                                : K_attend_part_rel);
     gpu_bind_buffer(cmd, 0, &work.q_hm, 0);
@@ -3036,7 +3097,7 @@ static int run_forward(Ink2State *const *states, const int *tokens,
   int pos0 = pos[0], max_pos = pos[0];
   if (batched) {
     for (int r = 0; r < rows; r++) {
-      state_ensure_cap(states[r], pos[r] + 1);
+      state_prepare_write(states[r], pos[r], 1);
       if (pos[r] > max_pos) max_pos = pos[r];
     }
     SconvTarget *st = (SconvTarget *)work.sconv_tgt.ptr;
@@ -3058,11 +3119,10 @@ static int run_forward(Ink2State *const *states, const int *tokens,
         st[base_idx + 3 * INK2_MAX_BATCH_ROWS + r] =
             (SconvTarget){conv_base + CONV_MLP_OFF, (uint32_t)pos[r], 0};
         if (vis->is_global) {
-          const Buf *kb = &sr->gk[vis->global_slot];
-          const Buf *vb = &sr->gv[vis->global_slot];
+          uint64_t ga =
+              sr->global_kv.gpu_addrs.address + sr->global_kv.gpu_addrs.off;
           kt[(size_t)v * INK2_MAX_BATCH_ROWS + r] =
-              (KvTarget){kb->address + kb->off, vb->address + vb->off,
-                         (uint32_t)pos[r], 0u};
+              (KvTarget){ga, ga, (uint32_t)pos[r], 0u};
         } else {
           uint64_t sb = sr->slide_kv.address + sr->slide_kv.off;
           kt[(size_t)v * INK2_MAX_BATCH_ROWS + r] =
@@ -3073,7 +3133,7 @@ static int run_forward(Ink2State *const *states, const int *tokens,
       }
     }
   } else {
-    state_ensure_cap(states[0], pos0 + rows);
+    state_prepare_write(states[0], pos0, rows);
     max_pos = pos0 + rows - 1;
     inject_media_rows(tokens, pos0, rows);
   }
@@ -3576,6 +3636,9 @@ static void bench_cb_qkvr_rel(GpuCommandBuffer *c, int r) {
                   (uint32_t)BENCH_KV_POS,
                   (uint32_t)INK2_SLIDE_RING,
                   0u,
+                  0u,
+                  0u,
+                  0u,
                   0u};
   if (bench_ctx.rows == 1) {
     gpu_select_kernel(c, opt.inkling2.fp8_kv ? K_sconv_qkvr_fp8_m1
@@ -3622,19 +3685,36 @@ static void bench_cb_attend(GpuCommandBuffer *c, int r) {
   const Ink2State *s = bench_ctx.state;
   int slot =
       bench_ctx.is_global ? (r % INK2_GLOBAL_COUNT) : (r % INK2_SLIDE_COUNT);
-  const Buf *k_buf = bench_ctx.is_global ? &s->gk[slot] : &s->slide_kv;
-  const Buf *v_buf = bench_ctx.is_global ? &s->gv[slot] : &s->slide_kv;
+  const Buf *k_buf =
+      bench_ctx.is_global ? &s->global_kv.gpu_addrs : &s->slide_kv;
+  const Buf *v_buf =
+      bench_ctx.is_global ? &s->global_kv.gpu_addrs : &s->slide_kv;
   size_t k_off = bench_ctx.is_global ? 0 : slide_ring_off(slot, 0);
   size_t v_off = bench_ctx.is_global ? 0 : slide_ring_off(slot, 1);
   uint32_t ring_rows = bench_ctx.is_global ? 0u : (uint32_t)INK2_SLIDE_RING;
   uint32_t window = bench_ctx.is_global ? 0u : (uint32_t)INK2_WINDOW;
+  uint32_t page_shift =
+      bench_ctx.is_global ? s->global_kv.layout.page_shift : 0u;
+  uint32_t k_slice_off =
+      bench_ctx.is_global
+          ? (uint32_t)((size_t)(2 * slot) * s->global_kv.layout.slice_bytes)
+          : 0u;
+  uint32_t v_slice_off =
+      bench_ctx.is_global
+          ? (uint32_t)((size_t)(2 * slot + 1) * s->global_kv.layout.slice_bytes)
+          : 0u;
   if (bench_ctx.is_prefill) {
     uint32_t q_tiles =
         ((uint32_t)bench_ctx.rows + PREFILL_Q_GROUP - 1u) / PREFILL_Q_GROUP;
     if (!opt.inkling2.fp8_kv) {
       AttendPrefillParam app = {(uint32_t)bench_ctx.rows,
-                                (uint32_t)work.q_stride, (uint32_t)BENCH_KV_POS,
-                                ring_rows, window};
+                                (uint32_t)work.q_stride,
+                                (uint32_t)BENCH_KV_POS,
+                                ring_rows,
+                                window,
+                                page_shift,
+                                k_slice_off,
+                                v_slice_off};
       gpu_select_kernel(c, K_attend_prefill_rel);
       gpu_bind_buffer(c, 0, &work.q_hm, 0);
       gpu_bind_buffer(c, 1, k_buf, k_off);
@@ -3648,7 +3728,7 @@ static void bench_cb_attend(GpuCommandBuffer *c, int r) {
       gpu_run_kernel(c, q_tiles * (uint32_t)INK2_HEADS, 1, 1, PREFILL_THREADS,
                      1, 1);
     } else if (!bench_ctx.is_global) {
-      Fp8DequantParam dp = {0u, (uint32_t)INK2_SLIDE_RING};
+      Fp8DequantParam dp = {0u, (uint32_t)INK2_SLIDE_RING, 0u, 0u, 0u};
       gpu_select_kernel(c, K_fp8_dequant_kv);
       gpu_bind_buffer(c, 0, k_buf, k_off);
       gpu_bind_buffer(c, 1, v_buf, v_off);
@@ -3657,8 +3737,13 @@ static void bench_cb_attend(GpuCommandBuffer *c, int r) {
       gpu_copy_bytes(c, 4, &dp, sizeof dp);
       gpu_run_kernel(c, (uint32_t)INK2_SLIDE_RING, 1, 1, ROW_THREADS, 1, 1);
       AttendPrefillParam app = {(uint32_t)bench_ctx.rows,
-                                (uint32_t)work.q_stride, (uint32_t)BENCH_KV_POS,
-                                ring_rows, window};
+                                (uint32_t)work.q_stride,
+                                (uint32_t)BENCH_KV_POS,
+                                ring_rows,
+                                window,
+                                0u,
+                                0u,
+                                0u};
       gpu_select_kernel(c, K_attend_prefill_rel);
       gpu_bind_buffer(c, 0, &work.q_hm, 0);
       gpu_bind_buffer(c, 1, &work.deq_k, 0);
@@ -3678,7 +3763,7 @@ static void bench_cb_attend(GpuCommandBuffer *c, int r) {
         uint32_t kc = total_k - ks;
         if (kc > (uint32_t)FP8_PREFILL_SLAB_ROWS)
           kc = (uint32_t)FP8_PREFILL_SLAB_ROWS;
-        Fp8DequantParam dp = {ks, kc};
+        Fp8DequantParam dp = {ks, kc, page_shift, k_slice_off, v_slice_off};
         gpu_select_kernel(c, K_fp8_dequant_kv);
         gpu_bind_buffer(c, 0, k_buf, k_off);
         gpu_bind_buffer(c, 1, v_buf, v_off);
@@ -3722,7 +3807,10 @@ static void bench_cb_attend(GpuCommandBuffer *c, int r) {
                            window,
                            (uint32_t)nparts,
                            (uint32_t)MAX_DECODE_PARTS,
-                           0u};
+                           0u,
+                           page_shift,
+                           k_slice_off,
+                           v_slice_off};
   gpu_select_kernel(c, opt.inkling2.fp8_kv ? K_attend_part_fp8_rel
                                            : K_attend_part_rel);
   gpu_bind_buffer(c, 0, &work.q_hm, 0);
@@ -3795,7 +3883,7 @@ static int bench_setup_moe_tiles(int rows, int unique_experts) {
 static void ink2_run_bench(void) {
   ensure_work(BENCH_PREFILL_ROWS, BENCH_VERIFY_ROWS);
   Ink2State *s = (Ink2State *)ink2_state_new();
-  state_ensure_cap(s, BENCH_KV_POS + BENCH_PREFILL_ROWS);
+  state_prepare_write(s, 0, BENCH_KV_POS + BENCH_PREFILL_ROWS);
   bench_ctx.state = s;
 
   // Ensure all layer expert tables are populated and resident.
@@ -4337,6 +4425,7 @@ const ModelOps inkling2_ops = {.family = "Inkling-2-Mini",
                                .state_new = ink2_state_new,
                                .state_free = ink2_state_free,
                                .state_bytes = ink2_state_bytes,
+                               .state_copy_bytes = ink2_state_copy_bytes,
                                .state_copy = ink2_state_copy,
                                .snapshot_take = ink2_snapshot_take,
                                .snapshot_restore = ink2_snapshot_restore,

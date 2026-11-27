@@ -98,6 +98,8 @@ typedef struct {
   uint32_t rows, pos0, ring_rows, batched;
   // NeoX RoPE base frequency and per-head RMSNorm epsilon.
   float rope_theta, eps;
+  // Log2 of tokens per KV page (0 for sliding rings) and K/V slice offsets.
+  uint32_t page_shift, k_slice_off, v_slice_off;
 } MtpCtxKvParam;
 
 typedef struct {
@@ -116,8 +118,9 @@ typedef struct {
 
 typedef struct {
   // Block start position, block length, ring capacity, SWA window, partition
-  // count and partition buffer stride.
-  uint32_t pos0, block, ring_rows, window, nparts, part_stride;
+  // count, partition stride, page shift and K/V slice offsets.
+  uint32_t pos0, block, ring_rows, window, nparts, part_stride, page_shift,
+      k_slice_off, v_slice_off;
 } MtpAttendParam;
 
 typedef struct {
@@ -608,9 +611,9 @@ void inkling2_mtp_ensure_work(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
   }
 }
 
-int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot,
-                            Ink2MtpState *ms) {
-  *ms = (Ink2MtpState){0};
+int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot, Ink2MtpState *ms,
+                            const KvPageTable *global_kv) {
+  *ms = (Ink2MtpState){.global_kv = global_kv};
   if (!active_drafts) return 1;
   size_t slide_bytes = inkling2_mtp_slide_kv_bytes();
   ms->slide_kv = mtp_state_try_alloc(gpu, state_slot, slide_bytes);
@@ -627,42 +630,15 @@ int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot,
   return 1;
 }
 
-int inkling2_mtp_state_resize_global(Gpu *gpu, MemorySlot *state_slot,
-                                     Ink2MtpState *ms, int new_cap, int keep) {
-  if (!active_drafts) return 1;
-  size_t row_bytes = inkling2_mtp_kv_row_bytes();
-  size_t new_bytes = (size_t)new_cap * row_bytes;
-  size_t copy_bytes = (size_t)keep * row_bytes;
-  Buf nk = mtp_state_try_alloc(gpu, state_slot, new_bytes);
-  Buf nv = nk.obj ? mtp_state_try_alloc(gpu, state_slot, new_bytes) : (Buf){0};
-  if (!nv.obj) {
-    if (nk.obj) gpu_free(&nk);
-    return 0;
-  }
-  if (copy_bytes && ms->gk.obj) {
-    memcpy(nk.ptr, ms->gk.ptr, copy_bytes);
-    memcpy(nv.ptr, ms->gv.ptr, copy_bytes);
-  }
-  if (ms->gk.obj) gpu_mark_to_free(&ms->gk);
-  if (ms->gv.obj) gpu_mark_to_free(&ms->gv);
-  ms->gk = nk;
-  ms->gv = nv;
-  return 1;
-}
-
 void inkling2_mtp_state_free(Ink2MtpState *ms) {
-  if (ms->gk.obj) gpu_mark_to_free(&ms->gk);
-  if (ms->gv.obj) gpu_mark_to_free(&ms->gv);
   if (ms->slide_kv.obj) gpu_mark_to_free(&ms->slide_kv);
   if (ms->frnn.obj) gpu_mark_to_free(&ms->frnn);
   *ms = (Ink2MtpState){0};
 }
 
-size_t inkling2_mtp_state_bytes(int cap) {
+size_t inkling2_mtp_state_rolling_bytes(void) {
   if (!active_drafts) return 0;
-  size_t gk_one =
-      gpu_round_up_to_pages((size_t)cap * inkling2_mtp_kv_row_bytes());
-  return 2 * gk_one + gpu_round_up_to_pages(inkling2_mtp_slide_kv_bytes()) +
+  return gpu_round_up_to_pages(inkling2_mtp_slide_kv_bytes()) +
          gpu_round_up_to_pages(INK2_MTP_FRNN_BYTES);
 }
 
@@ -835,9 +811,9 @@ void inkling2_mtp_inject(GpuCommandBuffer *cmd, Ink2MtpWork *w,
         const MtpLayer *ml = &mtp_layers[l];
         size_t idx = (size_t)l * INK2_MAX_BATCH_ROWS + (size_t)r;
         if (ml->is_global) {
-          kt[idx] =
-              (MtpKvTarget){sr->gk.address + sr->gk.off,
-                            sr->gv.address + sr->gv.off, (uint32_t)pos[r], 0u};
+          uint64_t ga =
+              sr->global_kv->gpu_addrs.address + sr->global_kv->gpu_addrs.off;
+          kt[idx] = (MtpKvTarget){ga, ga, (uint32_t)pos[r], 0u};
         } else {
           uint64_t sb = sr->slide_kv.address + sr->slide_kv.off;
           kt[idx] =
@@ -883,15 +859,28 @@ void inkling2_mtp_inject(GpuCommandBuffer *cmd, Ink2MtpWork *w,
     run_linear2(cmd, &ml->wk_ctx, &w->k_ctx_raw, &ml->wv_ctx, &w->v_ctx_raw,
                 &w->ctx, run_rows, is_prefill);
 
-    const Buf *k_dst = ml->is_global ? &s0->gk : &s0->slide_kv;
-    const Buf *v_dst = ml->is_global ? &s0->gv : &s0->slide_kv;
+    const Buf *k_dst =
+        ml->is_global ? &s0->global_kv->gpu_addrs : &s0->slide_kv;
+    const Buf *v_dst =
+        ml->is_global ? &s0->global_kv->gpu_addrs : &s0->slide_kv;
     size_t k_off = ml->is_global ? 0 : mtp_slide_off(ml->local_slot, 0);
     size_t v_off = ml->is_global ? 0 : mtp_slide_off(ml->local_slot, 1);
     uint32_t ring_rows = ml->is_global ? 0u : (uint32_t)INK2_MTP_SLIDE_RING;
+    uint32_t page_shift = ml->is_global ? s0->global_kv->layout.page_shift : 0u;
+    uint32_t k_slice_off = ml->is_global
+                               ? (uint32_t)((size_t)INK2_MTP_GLOBAL_SLICE_K *
+                                            s0->global_kv->layout.slice_bytes)
+                               : 0u;
+    uint32_t v_slice_off = ml->is_global
+                               ? (uint32_t)((size_t)INK2_MTP_GLOBAL_SLICE_V *
+                                            s0->global_kv->layout.slice_bytes)
+                               : 0u;
     size_t kv_tgt_off = (size_t)l * INK2_MAX_BATCH_ROWS * sizeof(MtpKvTarget);
     MtpCtxKvParam kp = {(uint32_t)run_rows, (uint32_t)(pos0 + row_off),
                         ring_rows,          (uint32_t)batched,
-                        MTP_ROPE_THETA,     MTP_RMS_EPS};
+                        MTP_ROPE_THETA,     MTP_RMS_EPS,
+                        page_shift,         k_slice_off,
+                        v_slice_off};
     gpu_select_kernel(cmd, use_fp8_kv ? K_ctx_kv_store_fp8 : K_ctx_kv_store);
     gpu_bind_buffer(cmd, 0, &w->k_ctx_raw, 0);
     gpu_bind_buffer(cmd, 1, &w->v_ctx_raw, 0);
@@ -984,12 +973,23 @@ void inkling2_mtp_propose(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
     gpu_run_kernel(&cmd, (uint32_t)(INK2_HEADS + INK2_KV_HEADS),
                    (uint32_t)INK2_MTP_BLOCK_SIZE, 1, MTP_HEAD_THREADS, 1, 1);
 
-    const Buf *k_ctx = ml->is_global ? &ms->gk : &ms->slide_kv;
-    const Buf *v_ctx = ml->is_global ? &ms->gv : &ms->slide_kv;
+    const Buf *k_ctx =
+        ml->is_global ? &ms->global_kv->gpu_addrs : &ms->slide_kv;
+    const Buf *v_ctx =
+        ml->is_global ? &ms->global_kv->gpu_addrs : &ms->slide_kv;
     size_t k_off = ml->is_global ? 0 : mtp_slide_off(ml->local_slot, 0);
     size_t v_off = ml->is_global ? 0 : mtp_slide_off(ml->local_slot, 1);
     uint32_t ring_rows = ml->is_global ? 0u : (uint32_t)INK2_MTP_SLIDE_RING;
     uint32_t window = ml->is_global ? 0u : (uint32_t)INK2_MTP_WINDOW;
+    uint32_t page_shift = ml->is_global ? ms->global_kv->layout.page_shift : 0u;
+    uint32_t k_slice_off = ml->is_global
+                               ? (uint32_t)((size_t)INK2_MTP_GLOBAL_SLICE_K *
+                                            ms->global_kv->layout.slice_bytes)
+                               : 0u;
+    uint32_t v_slice_off = ml->is_global
+                               ? (uint32_t)((size_t)INK2_MTP_GLOBAL_SLICE_V *
+                                            ms->global_kv->layout.slice_bytes)
+                               : 0u;
     int ctx_len = (window > 0u && pos > (int)window) ? (int)window : pos;
     int total_k = ctx_len + INK2_MTP_BLOCK_SIZE;
     int nparts = (total_k + MTP_PART_TARGET - 1) / MTP_PART_TARGET;
@@ -997,7 +997,9 @@ void inkling2_mtp_propose(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
     if (nparts > MTP_MAX_PARTS) nparts = MTP_MAX_PARTS;
     MtpAttendParam ap = {(uint32_t)pos,    (uint32_t)INK2_MTP_BLOCK_SIZE,
                          ring_rows,        window,
-                         (uint32_t)nparts, (uint32_t)MTP_MAX_PARTS};
+                         (uint32_t)nparts, (uint32_t)MTP_MAX_PARTS,
+                         page_shift,       k_slice_off,
+                         v_slice_off};
 
     gpu_select_kernel(&cmd, use_fp8_kv ? K_attend_part_fp8 : K_attend_part);
     gpu_bind_buffer(&cmd, 0, &w->q_blk, 0);

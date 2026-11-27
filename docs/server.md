@@ -98,7 +98,8 @@ or streamed on demand from SSD on smaller-memory Macs). Thinking effort takes
 are accepted as base64 `data:` URLs in `user` and `tool` messages; audio parts
 return HTTP 400. Inkling-2-Mini resumes cached conversations from saved
 snapshots (including its sliding-window KV rings, short-convolution rings and
-draft-head state).
+draft-head state), and shares full 256-token global KV pages copy-on-write
+across forked branches in memory.
 
 ## Memory
 

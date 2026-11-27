@@ -1,6 +1,7 @@
 #ifndef EREMITE_MODEL_INKLING2_MTP_H
 #define EREMITE_MODEL_INKLING2_MTP_H
 
+#include "engine/kv_pages.h"
 #include "engine/memory.h"
 #include "engine/weights.h"
 #include "gpu/gpu.h"
@@ -35,12 +36,11 @@ static constexpr int INK2_MTP_FRNN_RING = INK2_REWIND_MARGIN + INK2_MAX_VERIFY;
 static constexpr size_t INK2_MTP_FRNN_BYTES =
     (size_t)INK2_MTP_FRNN_RING * INK2_DIM * sizeof(float);
 
-// Per-sequence MTP draft context caches (one global KV pair, two SWA rings and
-// the rolling Markov context feature ring).
+// Per-sequence MTP draft context caches (two SWA rings, the rolling Markov
+// context feature ring, and a pointer to the state's shared paged global KV).
 typedef struct {
-  // Growing global context K and V caches (BF16 or packed FP8) for draft layer
-  // 1.
-  Buf gk, gv;
+  // Parent state's paged global KV table holding MTP global K/V slices 16..17.
+  const KvPageTable *global_kv;
   // Rolling context K and V rings (BF16 or packed FP8) for SWA draft layers 0
   // and 2.
   Buf slide_kv;
@@ -96,21 +96,18 @@ void inkling2_mtp_free_work(Ink2MtpWork *w);
 void inkling2_mtp_ensure_work(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
                               int rows);
 
-// Allocates MTP rolling per-sequence state buffers (slide_kv and frnn). Global
-// draft KV buffers are sized by inkling2_mtp_state_resize_global. Returns 1 on
+// Allocates MTP rolling per-sequence state buffers (slide_kv and frnn) and
+// binds `global_kv` for draft layer 1's global context KV slices. Returns 1 on
 // success or 0 on memory refusal.
-int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot, Ink2MtpState *ms);
-
-// Resizes the global draft layer KV caches of ms to `new_cap` positions,
-// preserving the first `keep` rows. Returns 1 on success or 0 on refusal.
-int inkling2_mtp_state_resize_global(Gpu *gpu, MemorySlot *state_slot,
-                                     Ink2MtpState *ms, int new_cap, int keep);
+int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot, Ink2MtpState *ms,
+                            const KvPageTable *global_kv);
 
 // Frees all GPU buffers owned by ms.
 void inkling2_mtp_state_free(Ink2MtpState *ms);
 
-// Returns the byte footprint of one Ink2MtpState at `cap` global positions.
-size_t inkling2_mtp_state_bytes(int cap);
+// Returns the fixed rolling byte footprint of one Ink2MtpState (excluding
+// global KV slices stored in the parent state's page table).
+size_t inkling2_mtp_state_rolling_bytes(void);
 
 // Copies target hidden state `src` ([rows, INK2_DIM] FP32) into tap slot
 // `tap_idx` (0..3) of w->taps on the GPU.

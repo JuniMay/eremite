@@ -71,6 +71,9 @@ struct Ink2MtpCtxKvParam {
   uint batched;
   float rope_theta;
   float eps;
+  uint page_shift;
+  uint k_slice_off;
+  uint v_slice_off;
 };
 
 // Parameters for ink2_mtp_block_init.
@@ -95,6 +98,9 @@ struct Ink2MtpAttendParam {
   uint window;
   uint nparts;
   uint part_stride;
+  uint page_shift;
+  uint k_slice_off;
+  uint v_slice_off;
 };
 
 // Parameters for ink2_mtp_markov_concat, gru, and add.
@@ -205,7 +211,16 @@ kernel void ink2_mtp_ctx_kv_store(
   uint pos;
   device bfloat *kd;
   device bfloat *vd;
-  if (p.batched) {
+  if (p.page_shift) {
+    pos = p.batched ? tgt[r].pos : (p.pos0 + r);
+    device const ulong *addrs =
+        p.batched ? (device const ulong *)tgt[r].k : (device const ulong *)k_dst;
+    ulong page_base = addrs[pos >> p.page_shift];
+    uint slot = pos & ((1u << p.page_shift) - 1u);
+    ulong kv_off = ulong(slot) * INK2_MTP_KV_DIM + ulong(kh) * INK2_MTP_HEAD_DIM;
+    kd = (device bfloat *)(page_base + p.k_slice_off) + kv_off;
+    vd = (device bfloat *)(page_base + p.v_slice_off) + kv_off;
+  } else if (p.batched) {
     Ink2MtpKvTarget tr = tgt[r];
     pos = tr.pos;
     uint slot = tr.ring_rows ? (pos % tr.ring_rows) : pos;
@@ -270,7 +285,16 @@ kernel void ink2_mtp_ctx_kv_store_fp8(
   uint pos;
   device uchar *krow;
   device uchar *vrow;
-  if (p.batched) {
+  if (p.page_shift) {
+    pos = p.batched ? tgt[r].pos : (p.pos0 + r);
+    device const ulong *addrs =
+        p.batched ? (device const ulong *)tgt[r].k : (device const ulong *)k_dst;
+    ulong page_base = addrs[pos >> p.page_shift];
+    uint slot = pos & ((1u << p.page_shift) - 1u);
+    ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
+    krow = (device uchar *)(page_base + p.k_slice_off) + row_off;
+    vrow = (device uchar *)(page_base + p.v_slice_off) + row_off;
+  } else if (p.batched) {
     Ink2MtpKvTarget tr = tgt[r];
     pos = tr.pos;
     uint slot = tr.ring_rows ? (pos % tr.ring_rows) : pos;
@@ -469,16 +493,33 @@ kernel void ink2_mtp_attend_part(
     ov[g] = float4(0.0f);
   }
 
+  device const ulong *page_addrs = p.page_shift ? (device const ulong *)k_ctx : nullptr;
+  uint page_mask = p.page_shift ? ((1u << p.page_shift) - 1u) : 0u;
+  uint cached_page = 0xFFFFFFFFu;
+  ulong cached_page_base = 0u;
+
   for (uint ki = k_beg + sg; ki < k_end; ki += INK2_MTP_ATTEND_SGS) {
     device const bfloat *kr;
     device const bfloat *vr;
     if (ki < ctx_len) {
       uint pos = ctx_lo + ki;
-      uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
-      ulong kv_off =
-          ulong(slot) * INK2_MTP_KV_DIM + ulong(kh) * INK2_MTP_HEAD_DIM + d_base;
-      kr = k_ctx + kv_off;
-      vr = v_ctx + kv_off;
+      if (p.page_shift) {
+        uint p_idx = pos >> p.page_shift;
+        if (p_idx != cached_page) {
+          cached_page = p_idx;
+          cached_page_base = page_addrs[p_idx];
+        }
+        ulong kv_off = ulong(pos & page_mask) * INK2_MTP_KV_DIM +
+                       ulong(kh) * INK2_MTP_HEAD_DIM + d_base;
+        kr = (device const bfloat *)(cached_page_base + p.k_slice_off) + kv_off;
+        vr = (device const bfloat *)(cached_page_base + p.v_slice_off) + kv_off;
+      } else {
+        uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+        ulong kv_off =
+            ulong(slot) * INK2_MTP_KV_DIM + ulong(kh) * INK2_MTP_HEAD_DIM + d_base;
+        kr = k_ctx + kv_off;
+        vr = v_ctx + kv_off;
+      }
     } else {
       uint bi = ki - ctx_len;
       ulong kv_off =
@@ -582,15 +623,33 @@ kernel void ink2_mtp_attend_part_fp8(
     ov[g] = float4(0.0f);
   }
 
+  device const ulong *page_addrs = p.page_shift ? (device const ulong *)k_ctx : nullptr;
+  uint page_mask = p.page_shift ? ((1u << p.page_shift) - 1u) : 0u;
+  uint cached_page = 0xFFFFFFFFu;
+  ulong cached_page_base = 0u;
+
   for (uint ki = k_beg + sg; ki < k_end; ki += INK2_MTP_ATTEND_SGS) {
     float4 kv;
     float4 vv;
     if (ki < ctx_len) {
       uint pos = ctx_lo + ki;
-      uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
-      ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
-      device const uchar *krow = k_ctx + row_off;
-      device const uchar *vrow = v_ctx + row_off;
+      device const uchar *krow;
+      device const uchar *vrow;
+      if (p.page_shift) {
+        uint p_idx = pos >> p.page_shift;
+        if (p_idx != cached_page) {
+          cached_page = p_idx;
+          cached_page_base = page_addrs[p_idx];
+        }
+        ulong row_off = ulong(pos & page_mask) * INK2_FP8_KV_ROW_BYTES;
+        krow = (device const uchar *)(cached_page_base + p.k_slice_off) + row_off;
+        vrow = (device const uchar *)(cached_page_base + p.v_slice_off) + row_off;
+      } else {
+        uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+        ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
+        krow = k_ctx + row_off;
+        vrow = v_ctx + row_off;
+      }
       float ksc = float(((device const half *)(krow + INK2_FP8_KV_SCALES_OFF))[kh]);
       float vsc = float(((device const half *)(vrow + INK2_FP8_KV_SCALES_OFF))[kh]);
       kv = fp8x4(((device const uint *)(krow + ulong(kh) * INK2_MTP_HEAD_DIM))[lane]) * ksc;

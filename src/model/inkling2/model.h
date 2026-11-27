@@ -65,6 +65,13 @@ static constexpr int INK2_MXFP8_BLOCK = 32;
 // (physical 5, 11x3, 17x3, 23) and 40 sliding-window visits.
 static constexpr int INK2_GLOBAL_COUNT = 8;
 static constexpr int INK2_SLIDE_COUNT = INK2_TOTAL_LAYERS - INK2_GLOBAL_COUNT;
+// Fixed power-of-two token count per shared global KV page (multiple of the
+// 64-row FlashAttention tile so every tile stays contiguous inside one page).
+static constexpr int INK2_GLOBAL_PAGE_TOKENS = 256;
+// Global KV slice indices inside each page: 0..15 hold backbone global K/V,
+// and 16..17 hold MTP global context K/V when MTP drafting is active.
+static constexpr int INK2_MTP_GLOBAL_SLICE_K = 2 * INK2_GLOBAL_COUNT;
+static constexpr int INK2_MTP_GLOBAL_SLICE_V = 2 * INK2_GLOBAL_COUNT + 1;
 
 // Batching, speculative verification and rolling-ring rewind capacities.
 static constexpr int INK2_MAX_BATCH_ROWS = 8;

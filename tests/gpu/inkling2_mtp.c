@@ -50,6 +50,7 @@ typedef struct {
 typedef struct {
   uint32_t rows, pos0, ring_rows, batched;
   float rope_theta, eps;
+  uint32_t page_shift, k_slice_off, v_slice_off;
 } CtxKvParam;
 
 typedef struct {
@@ -63,7 +64,8 @@ typedef struct {
 } BlockQkParam;
 
 typedef struct {
-  uint32_t pos0, block, ring_rows, window, nparts, part_stride;
+  uint32_t pos0, block, ring_rows, window, nparts, part_stride, page_shift,
+      k_slice_off, v_slice_off;
 } AttendParam;
 
 typedef struct {
@@ -349,8 +351,15 @@ static void test_ctx_kv_store(Gpu *gpu, MemorySlot *slot) {
   }
   for (int i = 0; i < INK2_HEAD_DIM; i++) knp[i] = 0.7f + 0.3f * rand_f32(&st);
 
-  CtxKvParam p = {(uint32_t)rows,  (uint32_t)pos0, (uint32_t)ring, 0u,
-                  TEST_ROPE_THETA, TEST_EPS};
+  CtxKvParam p = {(uint32_t)rows,
+                  (uint32_t)pos0,
+                  (uint32_t)ring,
+                  0u,
+                  TEST_ROPE_THETA,
+                  TEST_EPS,
+                  0u,
+                  0u,
+                  0u};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_store);
   gpu_bind_buffer(&cmd, 0, &kr, 0);
@@ -426,8 +435,15 @@ static void test_ctx_kv_store_fp8(Gpu *gpu, MemorySlot *slot) {
   }
   for (int i = 0; i < INK2_HEAD_DIM; i++) knp[i] = 0.7f + 0.3f * rand_f32(&st);
 
-  CtxKvParam p = {(uint32_t)rows,  (uint32_t)pos0, (uint32_t)ring, 0u,
-                  TEST_ROPE_THETA, TEST_EPS};
+  CtxKvParam p = {(uint32_t)rows,
+                  (uint32_t)pos0,
+                  (uint32_t)ring,
+                  0u,
+                  TEST_ROPE_THETA,
+                  TEST_EPS,
+                  0u,
+                  0u,
+                  0u};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_store);
   gpu_bind_buffer(&cmd, 0, &kr, 0);
@@ -716,9 +732,15 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
     ((uint16_t *)vb.ptr)[i] = f32_to_bf16(rand_f32(&st));
   }
 
-  AttendParam ap = {(uint32_t)pos0,   (uint32_t)INK2_MTP_BLOCK_SIZE,
-                    (uint32_t)ring,   (uint32_t)window,
-                    (uint32_t)nparts, (uint32_t)part_stride};
+  AttendParam ap = {(uint32_t)pos0,
+                    (uint32_t)INK2_MTP_BLOCK_SIZE,
+                    (uint32_t)ring,
+                    (uint32_t)window,
+                    (uint32_t)nparts,
+                    (uint32_t)part_stride,
+                    0u,
+                    0u,
+                    0u};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_part);
   gpu_bind_buffer(&cmd, 0, &qb, 0);
@@ -844,9 +866,15 @@ static void test_attend_fp8(Gpu *gpu, MemorySlot *slot) {
     ((uint16_t *)vb.ptr)[i] = f32_to_bf16(rand_f32(&st) * 3.0f);
   }
 
-  AttendParam ap = {(uint32_t)pos0,   (uint32_t)INK2_MTP_BLOCK_SIZE,
-                    (uint32_t)ring,   (uint32_t)window,
-                    (uint32_t)nparts, (uint32_t)part_stride};
+  AttendParam ap = {(uint32_t)pos0,
+                    (uint32_t)INK2_MTP_BLOCK_SIZE,
+                    (uint32_t)ring,
+                    (uint32_t)window,
+                    (uint32_t)nparts,
+                    (uint32_t)part_stride,
+                    0u,
+                    0u,
+                    0u};
   GpuCommandBuffer cmd = gpu_begin(gpu);
   gpu_select_kernel(&cmd, k_part);
   gpu_bind_buffer(&cmd, 0, &qb, 0);
@@ -1187,6 +1215,299 @@ static void test_unembed_argmax(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&out);
 }
 
+// Verifies paged global MTP context store and noncausal attention in both BF16
+// and FP8 across a 256-token page boundary (pos0 = 250, 12 stored context rows
+// spanning pages 0 and 1).
+static void test_paged_global_mtp(Gpu *gpu, MemorySlot *slot) {
+  int k_store = gpu_find_kernel(gpu, "ink2_mtp_ctx_kv_store");
+  int k_store_fp8 = gpu_find_kernel(gpu, "ink2_mtp_ctx_kv_store_fp8");
+  int k_part = gpu_find_kernel(gpu, "ink2_mtp_attend_part");
+  int k_part_fp8 = gpu_find_kernel(gpu, "ink2_mtp_attend_part_fp8");
+  int k_comb = gpu_find_kernel(gpu, "ink2_mtp_attend_combine");
+
+  const int page_tokens = 256, pos0 = 250, add_rows = 12,
+            ctx_end = pos0 + add_rows;
+  const int nparts = 3, part_stride = 4;
+  const int slice_count = 4, k_slice = 2, v_slice = 3;
+  StateGrowthPolicy tg = {
+      .start_cap = 4, .factor = 2, .max_step = 8, .align = 4, .max_cap = 32};
+
+  Buf kr = make_buf(gpu, slot, (size_t)add_rows * INK2_KV_DIM * sizeof(float));
+  Buf vr = make_buf(gpu, slot, (size_t)add_rows * INK2_KV_DIM * sizeof(float));
+  Buf kn = make_buf(gpu, slot, (size_t)INK2_HEAD_DIM * sizeof(float));
+  Buf qb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_Q_DIM * sizeof(uint16_t));
+  Buf kb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_KV_DIM * sizeof(uint16_t));
+  Buf vb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_KV_DIM * sizeof(uint16_t));
+  Buf part = make_buf(gpu, slot,
+                      (size_t)INK2_MTP_BLOCK_SIZE * INK2_HEADS * part_stride *
+                          (INK2_HEAD_DIM + 2) * sizeof(float));
+  Buf out_flat = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_Q_DIM * sizeof(float));
+  Buf out_paged = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_Q_DIM * sizeof(float));
+  Buf tgt = make_buf(gpu, slot, sizeof(KvTarget));
+
+  uint64_t st = 777;
+  for (int i = 0; i < add_rows * INK2_KV_DIM; i++) {
+    ((float *)kr.ptr)[i] = rand_f32(&st);
+    ((float *)vr.ptr)[i] = rand_f32(&st);
+  }
+  for (int i = 0; i < INK2_HEAD_DIM; i++)
+    ((float *)kn.ptr)[i] = 0.7f + 0.3f * rand_f32(&st);
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_Q_DIM; i++)
+    ((uint16_t *)qb.ptr)[i] = f32_to_bf16(rand_f32(&st));
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_KV_DIM; i++) {
+    ((uint16_t *)kb.ptr)[i] = f32_to_bf16(rand_f32(&st));
+    ((uint16_t *)vb.ptr)[i] = f32_to_bf16(rand_f32(&st));
+  }
+
+  // BF16 flat vs paged across pages 0 and 1.
+  size_t bf_row = (size_t)INK2_KV_DIM * sizeof(uint16_t);
+  size_t bf_slice = (size_t)page_tokens * bf_row;
+  KvPageLayout bf_layout =
+      kv_page_layout_init(page_tokens, bf_slice, slice_count, tg);
+  KvPageTable pt_bf;
+  kv_page_table_init(&pt_bf, kv_page_backend_gpu(gpu, slot), &bf_layout);
+  check(kv_page_table_prepare_write(&pt_bf, 0, ctx_end) == 1,
+        "MTP paged BF16 table allocates 2 pages");
+  Buf kc_bf = make_buf(gpu, slot, (size_t)ctx_end * bf_row);
+  Buf vc_bf = make_buf(gpu, slot, (size_t)ctx_end * bf_row);
+  for (int pos = 0; pos < pos0; pos++) {
+    for (int i = 0; i < INK2_KV_DIM; i++) {
+      ((uint16_t *)kc_bf.ptr)[(size_t)pos * INK2_KV_DIM + i] =
+          f32_to_bf16(rand_f32(&st));
+      ((uint16_t *)vc_bf.ptr)[(size_t)pos * INK2_KV_DIM + i] =
+          f32_to_bf16(rand_f32(&st));
+    }
+    int p = pos >> 8, in_p = pos & 255;
+    memcpy((uint8_t *)pt_bf.host_ptrs[p] + (size_t)k_slice * bf_slice +
+               (size_t)in_p * bf_row,
+           (const uint8_t *)kc_bf.ptr + (size_t)pos * bf_row, bf_row);
+    memcpy((uint8_t *)pt_bf.host_ptrs[p] + (size_t)v_slice * bf_slice +
+               (size_t)in_p * bf_row,
+           (const uint8_t *)vc_bf.ptr + (size_t)pos * bf_row, bf_row);
+  }
+
+  uint32_t k_off_bf = (uint32_t)((size_t)k_slice * bf_slice);
+  uint32_t v_off_bf = (uint32_t)((size_t)v_slice * bf_slice);
+  CtxKvParam sp_flat = {(uint32_t)add_rows,
+                        (uint32_t)pos0,
+                        0u,
+                        0u,
+                        TEST_ROPE_THETA,
+                        TEST_EPS,
+                        0u,
+                        0u,
+                        0u};
+  CtxKvParam sp_paged = {
+      (uint32_t)add_rows, (uint32_t)pos0, 0u, 0u, TEST_ROPE_THETA, TEST_EPS, 8u,
+      k_off_bf,           v_off_bf};
+  AttendParam ap_flat = {(uint32_t)ctx_end,
+                         (uint32_t)INK2_MTP_BLOCK_SIZE,
+                         0u,
+                         0u,
+                         (uint32_t)nparts,
+                         (uint32_t)part_stride,
+                         0u,
+                         0u,
+                         0u};
+  AttendParam ap_paged = {
+      (uint32_t)ctx_end, (uint32_t)INK2_MTP_BLOCK_SIZE, 0u, 0u,
+      (uint32_t)nparts,  (uint32_t)part_stride,         8u, k_off_bf,
+      v_off_bf};
+
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_store);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &kc_bf, 0);
+  gpu_bind_buffer(&cmd, 4, &vc_bf, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &sp_flat, sizeof sp_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)add_rows, 1,
+                 HEAD_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_part);
+  gpu_bind_buffer(&cmd, 0, &qb, 0);
+  gpu_bind_buffer(&cmd, 1, &kc_bf, 0);
+  gpu_bind_buffer(&cmd, 2, &vc_bf, 0);
+  gpu_bind_buffer(&cmd, 3, &kb, 0);
+  gpu_bind_buffer(&cmd, 4, &vb, 0);
+  gpu_bind_buffer(&cmd, 5, &part, 0);
+  gpu_copy_bytes(&cmd, 6, &ap_flat, sizeof ap_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)INK2_MTP_BLOCK_SIZE, ATTEND_THREADS, 1, 1);
+  gpu_select_kernel(&cmd, k_comb);
+  gpu_bind_buffer(&cmd, 0, &part, 0);
+  gpu_bind_buffer(&cmd, 1, &out_flat, 0);
+  gpu_copy_bytes(&cmd, 2, &ap_flat, sizeof ap_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_HEADS, (uint32_t)INK2_MTP_BLOCK_SIZE, 1,
+                 COMBINE_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_store);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &pt_bf.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 4, &pt_bf.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &sp_paged, sizeof sp_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)add_rows, 1,
+                 HEAD_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_part);
+  gpu_bind_buffer(&cmd, 0, &qb, 0);
+  gpu_bind_buffer(&cmd, 1, &pt_bf.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 2, &pt_bf.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 3, &kb, 0);
+  gpu_bind_buffer(&cmd, 4, &vb, 0);
+  gpu_bind_buffer(&cmd, 5, &part, 0);
+  gpu_copy_bytes(&cmd, 6, &ap_paged, sizeof ap_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)INK2_MTP_BLOCK_SIZE, ATTEND_THREADS, 1, 1);
+  gpu_select_kernel(&cmd, k_comb);
+  gpu_bind_buffer(&cmd, 0, &part, 0);
+  gpu_bind_buffer(&cmd, 1, &out_paged, 0);
+  gpu_copy_bytes(&cmd, 2, &ap_paged, sizeof ap_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_HEADS, (uint32_t)INK2_MTP_BLOCK_SIZE, 1,
+                 COMBINE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float worst_bf = 0.0f;
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_Q_DIM; i++)
+    worst_bf = fmaxf(worst_bf, fabsf(((float *)out_flat.ptr)[i] -
+                                     ((float *)out_paged.ptr)[i]));
+  printf("ink2_mtp paged global BF16 max diff: %.6f\n", worst_bf);
+  check(worst_bf < 1e-6f, "MTP paged global BF16 store+attend matches flat");
+
+  // FP8 flat vs paged across pages 0 and 1.
+  size_t fp8_slice = (size_t)page_tokens * INK2_FP8_KV_ROW_BYTES;
+  KvPageLayout fp8_layout =
+      kv_page_layout_init(page_tokens, fp8_slice, slice_count, tg);
+  KvPageTable pt_fp8;
+  kv_page_table_init(&pt_fp8, kv_page_backend_gpu(gpu, slot), &fp8_layout);
+  check(kv_page_table_prepare_write(&pt_fp8, 0, ctx_end) == 1,
+        "MTP paged FP8 table allocates 2 pages");
+  Buf kc_fp8 = make_buf(gpu, slot, (size_t)ctx_end * INK2_FP8_KV_ROW_BYTES);
+  Buf vc_fp8 = make_buf(gpu, slot, (size_t)ctx_end * INK2_FP8_KV_ROW_BYTES);
+  for (int pos = 0; pos < pos0; pos++) {
+    for (int kh = 0; kh < INK2_KV_HEADS; kh++) {
+      float khv[INK2_HEAD_DIM], vhv[INK2_HEAD_DIM];
+      for (int d = 0; d < INK2_HEAD_DIM; d++) {
+        khv[d] = bf16_to_f32(((uint16_t *)kc_bf.ptr)[(size_t)pos * INK2_KV_DIM +
+                                                     kh * INK2_HEAD_DIM + d]);
+        vhv[d] = bf16_to_f32(((uint16_t *)vc_bf.ptr)[(size_t)pos * INK2_KV_DIM +
+                                                     kh * INK2_HEAD_DIM + d]);
+      }
+      fp8_kv_pack_head((uint8_t *)kc_fp8.ptr, pos, kh, khv);
+      fp8_kv_pack_head((uint8_t *)vc_fp8.ptr, pos, kh, vhv);
+    }
+    int p = pos >> 8, in_p = pos & 255;
+    memcpy((uint8_t *)pt_fp8.host_ptrs[p] + (size_t)k_slice * fp8_slice +
+               (size_t)in_p * INK2_FP8_KV_ROW_BYTES,
+           (const uint8_t *)kc_fp8.ptr + (size_t)pos * INK2_FP8_KV_ROW_BYTES,
+           INK2_FP8_KV_ROW_BYTES);
+    memcpy((uint8_t *)pt_fp8.host_ptrs[p] + (size_t)v_slice * fp8_slice +
+               (size_t)in_p * INK2_FP8_KV_ROW_BYTES,
+           (const uint8_t *)vc_fp8.ptr + (size_t)pos * INK2_FP8_KV_ROW_BYTES,
+           INK2_FP8_KV_ROW_BYTES);
+  }
+  uint32_t k_off_fp8 = (uint32_t)((size_t)k_slice * fp8_slice);
+  uint32_t v_off_fp8 = (uint32_t)((size_t)v_slice * fp8_slice);
+  sp_paged.k_slice_off = k_off_fp8;
+  sp_paged.v_slice_off = v_off_fp8;
+  ap_paged.k_slice_off = k_off_fp8;
+  ap_paged.v_slice_off = v_off_fp8;
+
+  cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_store_fp8);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &kc_fp8, 0);
+  gpu_bind_buffer(&cmd, 4, &vc_fp8, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &sp_flat, sizeof sp_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)add_rows, 1,
+                 HEAD_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_part_fp8);
+  gpu_bind_buffer(&cmd, 0, &qb, 0);
+  gpu_bind_buffer(&cmd, 1, &kc_fp8, 0);
+  gpu_bind_buffer(&cmd, 2, &vc_fp8, 0);
+  gpu_bind_buffer(&cmd, 3, &kb, 0);
+  gpu_bind_buffer(&cmd, 4, &vb, 0);
+  gpu_bind_buffer(&cmd, 5, &part, 0);
+  gpu_copy_bytes(&cmd, 6, &ap_flat, sizeof ap_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)INK2_MTP_BLOCK_SIZE, ATTEND_THREADS, 1, 1);
+  gpu_select_kernel(&cmd, k_comb);
+  gpu_bind_buffer(&cmd, 0, &part, 0);
+  gpu_bind_buffer(&cmd, 1, &out_flat, 0);
+  gpu_copy_bytes(&cmd, 2, &ap_flat, sizeof ap_flat);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_HEADS, (uint32_t)INK2_MTP_BLOCK_SIZE, 1,
+                 COMBINE_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_store_fp8);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &pt_fp8.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 4, &pt_fp8.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &sp_paged, sizeof sp_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)add_rows, 1,
+                 HEAD_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_part_fp8);
+  gpu_bind_buffer(&cmd, 0, &qb, 0);
+  gpu_bind_buffer(&cmd, 1, &pt_fp8.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 2, &pt_fp8.gpu_addrs, 0);
+  gpu_bind_buffer(&cmd, 3, &kb, 0);
+  gpu_bind_buffer(&cmd, 4, &vb, 0);
+  gpu_bind_buffer(&cmd, 5, &part, 0);
+  gpu_copy_bytes(&cmd, 6, &ap_paged, sizeof ap_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)INK2_MTP_BLOCK_SIZE, ATTEND_THREADS, 1, 1);
+  gpu_select_kernel(&cmd, k_comb);
+  gpu_bind_buffer(&cmd, 0, &part, 0);
+  gpu_bind_buffer(&cmd, 1, &out_paged, 0);
+  gpu_copy_bytes(&cmd, 2, &ap_paged, sizeof ap_paged);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_HEADS, (uint32_t)INK2_MTP_BLOCK_SIZE, 1,
+                 COMBINE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float worst_fp8 = 0.0f;
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_Q_DIM; i++)
+    worst_fp8 = fmaxf(worst_fp8, fabsf(((float *)out_flat.ptr)[i] -
+                                       ((float *)out_paged.ptr)[i]));
+  printf("ink2_mtp paged global FP8 max diff: %.6f\n", worst_fp8);
+  check(worst_fp8 < 1e-6f, "MTP paged global FP8 store+attend matches flat");
+
+  kv_page_table_free(&pt_bf);
+  kv_page_table_free(&pt_fp8);
+  gpu_free(&kc_bf);
+  gpu_free(&vc_bf);
+  gpu_free(&kc_fp8);
+  gpu_free(&vc_fp8);
+  gpu_free(&kr);
+  gpu_free(&vr);
+  gpu_free(&kn);
+  gpu_free(&qb);
+  gpu_free(&kb);
+  gpu_free(&vb);
+  gpu_free(&part);
+  gpu_free(&out_flat);
+  gpu_free(&out_paged);
+  gpu_free(&tgt);
+}
+
 int main(void) {
   Memory *mem = memory_new();
   MemorySlot *slot = memory_shared(mem);
@@ -1200,6 +1521,7 @@ int main(void) {
   test_block_init_and_qk(gpu, slot);
   test_attend(gpu, slot);
   test_attend_fp8(gpu, slot);
+  test_paged_global_mtp(gpu, slot);
   test_swiglu_and_markov(gpu, slot);
   test_unembed_argmax(gpu, slot);
   gpu_return_freed_memory(gpu);

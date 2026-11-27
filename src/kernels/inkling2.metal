@@ -123,12 +123,16 @@ struct Ink2QkvrParam {
   uint rows, q_stride;
   // Position of row 0 in single-state mode.
   uint pos0;
-  // Ring capacity in rows in single-state mode (0 for linear global KV).
+  // Ring capacity in rows in single-state mode (0 for global KV).
   uint ring_rows;
   // Nonzero on global layers (5, 11, 17, 23) to apply log scaling tau.
   uint is_global;
   // Nonzero to read per-row KV targets instead of single-state K/V buffers.
   uint batched;
+  // Log2 of tokens per KV page (0 for flat or ring KV buffers).
+  uint page_shift;
+  // Byte offsets of this layer's K and V slices within each KV page.
+  uint k_slice_off, v_slice_off;
 };
 
 // Parameters for FlashDecoding attention over sliding or global KV.
@@ -141,16 +145,24 @@ struct Ink2AttendDecodeParam {
   uint nparts, part_stride;
   // Nonzero to read per-row Ink2KvTarget records instead of single-state KV.
   uint batched;
+  // Log2 of tokens per KV page (0 for flat or ring KV buffers).
+  uint page_shift;
+  // Byte offsets of this layer's K and V slices within each KV page.
+  uint k_slice_off, v_slice_off;
 };
 
 // Parameters for tiled MPP FlashAttention prefill over a contiguous chunk.
 struct Ink2AttendPrefillParam {
   // Active query rows, head-major Q row stride (multiple of 64), row-0 pos.
   uint rows, q_stride, pos0;
-  // Ring capacity in rows (0 for linear global KV).
+  // Ring capacity in rows (0 for global KV).
   uint ring_rows;
   // Sliding window size (1024 on sliding layers, 0 on global layers).
   uint window;
+  // Log2 of tokens per KV page (0 for flat or ring KV buffers).
+  uint page_shift;
+  // Byte offsets of this layer's K and V slices within each KV page.
+  uint k_slice_off, v_slice_off;
 };
 
 // Parameters for dequantizing a contiguous slice of packed FP8 KV rows into
@@ -160,6 +172,10 @@ struct Ink2Fp8DequantParam {
   uint start_row;
   // Number of rows to dequantize into destination rows 0..n_rows-1.
   uint n_rows;
+  // Log2 of tokens per KV page (0 for flat or ring KV buffers).
+  uint page_shift;
+  // Byte offsets of this layer's K and V slices within each KV page.
+  uint k_slice_off, v_slice_off;
 };
 
 // Parameters for one slab of multi-slab global FlashAttention prefill.
@@ -1483,8 +1499,16 @@ kernel void ink2_qkvr_prep(device const float *q_in [[buffer(0)]],
     float v = k_in[(ulong)row * INK2_KV_DIM + h * INK2_HEAD_DIM + t];
     float norm = sqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM));
     float clipped = v * min(INK2_QK_CLIP / (norm + INK2_CLIP_EPS), 1.0f);
-    device bfloat *dst = p.batched ? targets[row].k : k_cache;
-    dst[(ulong)slot * INK2_KV_DIM + h * INK2_HEAD_DIM + t] = bfloat(bf(clipped));
+    device bfloat *dst;
+    uint dst_slot = slot;
+    if (p.page_shift) {
+      device const ulong *addrs = (device const ulong *)(p.batched ? targets[row].k : k_cache);
+      dst = (device bfloat *)(addrs[pos >> p.page_shift] + p.k_slice_off);
+      dst_slot = pos & ((1u << p.page_shift) - 1u);
+    } else {
+      dst = p.batched ? targets[row].k : k_cache;
+    }
+    dst[(ulong)dst_slot * INK2_KV_DIM + h * INK2_HEAD_DIM + t] = bfloat(bf(clipped));
     return;
   }
 
@@ -1493,8 +1517,16 @@ kernel void ink2_qkvr_prep(device const float *q_in [[buffer(0)]],
     uint h = head - INK2_HEADS - INK2_KV_HEADS;
     float v = v_in[(ulong)row * INK2_KV_DIM + h * INK2_HEAD_DIM + t];
     float inv = rsqrt(tg_sum(v * v, tmp, t, INK2_HEAD_DIM) / float(INK2_HEAD_DIM) + INK2_RMS_EPS);
-    device bfloat *dst = p.batched ? targets[row].v : v_cache;
-    dst[(ulong)slot * INK2_KV_DIM + h * INK2_HEAD_DIM + t] = bfloat(bf(v * inv));
+    device bfloat *dst;
+    uint dst_slot = slot;
+    if (p.page_shift) {
+      device const ulong *addrs = (device const ulong *)(p.batched ? targets[row].k : k_cache);
+      dst = (device bfloat *)(addrs[pos >> p.page_shift] + p.v_slice_off);
+      dst_slot = pos & ((1u << p.page_shift) - 1u);
+    } else {
+      dst = p.batched ? targets[row].v : v_cache;
+    }
+    dst[(ulong)dst_slot * INK2_KV_DIM + h * INK2_HEAD_DIM + t] = bfloat(bf(v * inv));
     return;
   }
 
@@ -1560,8 +1592,16 @@ kernel void ink2_qkvr_prep_fp8(device const float *q_in [[buffer(0)]],
     float amax = tg_max(fabs(clipped), tmp, t, INK2_HEAD_DIM);
     half h_s256 = ink2_fp8_head_scale256(amax);
     uchar code = amax > 0.0f ? ink2_fp8_encode(clipped * (INK2_FP8_SCALE / float(h_s256))) : 0u;
-    device uchar *dst = (p.batched ? (device uchar *)targets[row].k : k_cache) +
-                        (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    device uchar *dst;
+    if (p.page_shift) {
+      device const ulong *addrs = (device const ulong *)(p.batched ? (device const uchar *)targets[row].k : k_cache);
+      uint dst_slot = pos & ((1u << p.page_shift) - 1u);
+      dst = (device uchar *)(addrs[pos >> p.page_shift] + p.k_slice_off) +
+            (ulong)dst_slot * INK2_FP8_KV_ROW_BYTES;
+    } else {
+      dst = (p.batched ? (device uchar *)targets[row].k : k_cache) +
+            (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    }
     dst[h * INK2_HEAD_DIM + t] = code;
     if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
     return;
@@ -1576,8 +1616,16 @@ kernel void ink2_qkvr_prep_fp8(device const float *q_in [[buffer(0)]],
     float amax = tg_max(fabs(normed), tmp, t, INK2_HEAD_DIM);
     half h_s256 = ink2_fp8_head_scale256(amax);
     uchar code = amax > 0.0f ? ink2_fp8_encode(normed * (INK2_FP8_SCALE / float(h_s256))) : 0u;
-    device uchar *dst = (p.batched ? (device uchar *)targets[row].v : v_cache) +
-                        (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    device uchar *dst;
+    if (p.page_shift) {
+      device const ulong *addrs = (device const ulong *)(p.batched ? (device const uchar *)targets[row].k : k_cache);
+      uint dst_slot = pos & ((1u << p.page_shift) - 1u);
+      dst = (device uchar *)(addrs[pos >> p.page_shift] + p.v_slice_off) +
+            (ulong)dst_slot * INK2_FP8_KV_ROW_BYTES;
+    } else {
+      dst = (p.batched ? (device uchar *)targets[row].v : v_cache) +
+            (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+    }
     dst[h * INK2_HEAD_DIM + t] = code;
     if (t == 0u) ((device half *)(dst + INK2_FP8_KV_SCALES_OFF))[h] = h_s256;
     return;
@@ -1651,9 +1699,19 @@ kernel void ink2_fp8_dequant_kv(device const uchar *k_src [[buffer(0)]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]]) {
   if (row >= p.n_rows) return;
-  ulong src_off = ulong(p.start_row + row) * INK2_FP8_KV_ROW_BYTES;
-  device const uchar *kr = k_src + src_off;
-  device const uchar *vr = v_src + src_off;
+  uint pos = p.start_row + row;
+  device const uchar *kr;
+  device const uchar *vr;
+  if (p.page_shift) {
+    ulong page_base = ((device const ulong *)k_src)[pos >> p.page_shift];
+    ulong row_off = ulong(pos & ((1u << p.page_shift) - 1u)) * INK2_FP8_KV_ROW_BYTES;
+    kr = (device const uchar *)(page_base + p.k_slice_off) + row_off;
+    vr = (device const uchar *)(page_base + p.v_slice_off) + row_off;
+  } else {
+    ulong src_off = ulong(pos) * INK2_FP8_KV_ROW_BYTES;
+    kr = k_src + src_off;
+    vr = v_src + src_off;
+  }
   float ksc = float(((device const half *)(kr + INK2_FP8_KV_SCALES_OFF))[sg]);
   float vsc = float(((device const half *)(vr + INK2_FP8_KV_SCALES_OFF))[sg]);
   uint kp = ((device const uint *)(kr + sg * INK2_HEAD_DIM))[lane];
@@ -1711,11 +1769,31 @@ kernel void ink2_attend_part_rel(device const bfloat *q [[buffer(0)]],
   float l_run[INK2_GQA] = {0.0f, 0.0f, 0.0f};
   float4 o_run[INK2_GQA] = {float4(0.0f), float4(0.0f), float4(0.0f)};
 
+  device const ulong *page_addrs = p.page_shift ? (device const ulong *)k_base : nullptr;
+  uint page_mask = p.page_shift ? ((1u << p.page_shift) - 1u) : 0u;
+  uint cached_page = 0xFFFFFFFFu;
+  ulong cached_page_base = 0u;
+
   for (uint j = k_start + sg; j < k_end; j += INK2_DECODE_SGS) {
-    uint slot = ring_rows ? (j % ring_rows) : j;
-    ulong kv_off = (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM;
-    float4 kv = float4(((device const bfloat4 *)(k_base + kv_off))[lane]);
-    float4 vv = float4(((device const bfloat4 *)(v_base + kv_off))[lane]);
+    device const bfloat *k_row;
+    device const bfloat *v_row;
+    if (p.page_shift) {
+      uint p_idx = j >> p.page_shift;
+      if (p_idx != cached_page) {
+        cached_page = p_idx;
+        cached_page_base = page_addrs[p_idx];
+      }
+      ulong kv_off = (ulong)(j & page_mask) * INK2_KV_DIM + kv_h * INK2_HEAD_DIM;
+      k_row = (device const bfloat *)(cached_page_base + p.k_slice_off) + kv_off;
+      v_row = (device const bfloat *)(cached_page_base + p.v_slice_off) + kv_off;
+    } else {
+      uint slot = ring_rows ? (j % ring_rows) : j;
+      ulong kv_off = (ulong)slot * INK2_KV_DIM + kv_h * INK2_HEAD_DIM;
+      k_row = k_base + kv_off;
+      v_row = v_base + kv_off;
+    }
+    float4 kv = float4(((device const bfloat4 *)k_row)[lane]);
+    float4 vv = float4(((device const bfloat4 *)v_row)[lane]);
     uint dist = q_pos - j;
     float pw = (dist < INK2_REL_EXTENT && lane < INK2_D_REL)
                    ? bf16f(rel_proj_t[(ulong)dist * INK2_D_REL + lane])
@@ -1805,11 +1883,29 @@ kernel void ink2_attend_part_fp8_rel(device const bfloat *q [[buffer(0)]],
   float l_run[INK2_GQA] = {0.0f, 0.0f, 0.0f};
   float4 o_run[INK2_GQA] = {float4(0.0f), float4(0.0f), float4(0.0f)};
 
+  device const ulong *page_addrs = p.page_shift ? (device const ulong *)k_base : nullptr;
+  uint page_mask = p.page_shift ? ((1u << p.page_shift) - 1u) : 0u;
+  uint cached_page = 0xFFFFFFFFu;
+  ulong cached_page_base = 0u;
+
   for (uint j = k_start + sg; j < k_end; j += INK2_DECODE_SGS) {
-    uint slot = ring_rows ? (j % ring_rows) : j;
-    ulong row_off = (ulong)slot * INK2_FP8_KV_ROW_BYTES;
-    device const uchar *krow = k_base + row_off;
-    device const uchar *vrow = v_base + row_off;
+    device const uchar *krow;
+    device const uchar *vrow;
+    if (p.page_shift) {
+      uint p_idx = j >> p.page_shift;
+      if (p_idx != cached_page) {
+        cached_page = p_idx;
+        cached_page_base = page_addrs[p_idx];
+      }
+      ulong row_off = (ulong)(j & page_mask) * INK2_FP8_KV_ROW_BYTES;
+      krow = (device const uchar *)(cached_page_base + p.k_slice_off) + row_off;
+      vrow = (device const uchar *)(cached_page_base + p.v_slice_off) + row_off;
+    } else {
+      uint slot = ring_rows ? (j % ring_rows) : j;
+      ulong row_off = (ulong)slot * INK2_FP8_KV_ROW_BYTES;
+      krow = k_base + row_off;
+      vrow = v_base + row_off;
+    }
     float ksc = float(((device const half *)(krow + INK2_FP8_KV_SCALES_OFF))[kv_h]);
     float vsc = float(((device const half *)(vrow + INK2_FP8_KV_SCALES_OFF))[kv_h]);
     float4 kv = fp8x4(((device const uint *)(krow + kv_h * INK2_HEAD_DIM))[lane]);
@@ -1908,14 +2004,30 @@ kernel void ink2_attend_prefill_rel(device const bfloat *q [[buffer(0)]],
     if (acc.is_valid_element(i)) acc[i] = 0.0f;
 
   float rmax = -INFINITY, rsum = 0.0f;
+  device const ulong *page_addrs = p.page_shift ? (device const ulong *)k_cache : nullptr;
+  uint page_rows = p.page_shift ? (1u << p.page_shift) : 0u;
+  uint page_mask = p.page_shift ? (page_rows - 1u) : 0u;
   for (uint k0 = k_lo; k0 < k_hi;) {
-    uint slot0 = p.ring_rows ? (k0 % p.ring_rows) : k0;
+    uint slot0;
     uint chunk = min(BK, k_hi - k0);
-    if (p.ring_rows) chunk = min(chunk, p.ring_rows - slot0);
+    device bfloat *k_ptr;
+    device bfloat *v_ptr;
+    if (p.page_shift) {
+      ulong page_base = page_addrs[k0 >> p.page_shift];
+      slot0 = k0 & page_mask;
+      chunk = min(chunk, page_rows - slot0);
+      k_ptr = (device bfloat *)(page_base + p.k_slice_off);
+      v_ptr = (device bfloat *)(page_base + p.v_slice_off);
+    } else {
+      slot0 = p.ring_rows ? (k0 % p.ring_rows) : k0;
+      if (p.ring_rows) chunk = min(chunk, p.ring_rows - slot0);
+      k_ptr = (device bfloat *)k_cache;
+      v_ptr = (device bfloat *)v_cache;
+    }
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tk(
-        (device bfloat *)k_cache, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
+        k_ptr, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tv(
-        (device bfloat *)v_cache, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
+        v_ptr, dextents<int32_t, 2>(INK2_KV_DIM, slot0 + chunk));
     auto kt = tk.slice(kv_h * INK2_HEAD_DIM, slot0);
     auto vt = tv.slice(kv_h * INK2_HEAD_DIM, slot0);
     auto sc = sop.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
