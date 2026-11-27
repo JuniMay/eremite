@@ -28,24 +28,21 @@ static constexpr int INK2_MTP_RNN_OUT = 3 * INK2_MTP_MARKOV_RANK;
 static constexpr int INK2_MTP_LOCAL_COUNT = 2;
 static constexpr int INK2_MTP_GLOBAL_LAYER = 1;
 
-// Rolling ring capacities and byte sizes for per-state MTP context caches.
+// Rolling ring capacities and fixed byte sizes for per-state MTP context
+// caches.
 static constexpr int INK2_MTP_SLIDE_RING = INK2_MTP_WINDOW + INK2_REWIND_MARGIN;
 static constexpr int INK2_MTP_FRNN_RING = INK2_REWIND_MARGIN + INK2_MAX_VERIFY;
-static constexpr size_t INK2_MTP_SLIDE_KV_ONE_BYTES =
-    (size_t)INK2_MTP_SLIDE_RING * INK2_KV_DIM * sizeof(uint16_t);
-static constexpr size_t INK2_MTP_SLIDE_KV_BYTES =
-    (size_t)INK2_MTP_LOCAL_COUNT * 2 * INK2_MTP_SLIDE_KV_ONE_BYTES;
 static constexpr size_t INK2_MTP_FRNN_BYTES =
     (size_t)INK2_MTP_FRNN_RING * INK2_DIM * sizeof(float);
-static constexpr size_t INK2_MTP_SNAP_ROLLING_BYTES =
-    INK2_MTP_SLIDE_KV_BYTES + INK2_MTP_FRNN_BYTES;
 
 // Per-sequence MTP draft context caches (one global KV pair, two SWA rings and
 // the rolling Markov context feature ring).
 typedef struct {
-  // Growing BF16 global context K and V caches for draft layer 1.
+  // Growing global context K and V caches (BF16 or packed FP8) for draft layer
+  // 1.
   Buf gk, gv;
-  // Rolling BF16 context K and V rings for SWA draft layers 0 and 2.
+  // Rolling context K and V rings (BF16 or packed FP8) for SWA draft layers 0
+  // and 2.
   Buf slide_kv;
   // Rolling FP32 Markov context features f_rnn indexed by pos % frnn_ring.
   Buf frnn;
@@ -70,13 +67,23 @@ typedef struct {
 } Ink2MtpWork;
 
 // Initializes MTP configuration, kernels and weight registration from
-// dir/mtp.safetensors when requested_drafts > 0. Returns the active draft
-// limit (0 when disabled or mtp.safetensors is absent).
+// dir/mtp.safetensors when requested_drafts > 0. Selects packed FP8 E4M3 KV
+// caches when fp8_kv is nonzero. Returns the active draft limit (0 when
+// disabled or mtp.safetensors is absent).
 int inkling2_mtp_init(Gpu *gpu, WeightGroup *weights, const char *dir,
-                      int requested_drafts);
+                      int requested_drafts, int fp8_kv);
 
 // Returns the active maximum drafts per pass, or 0 when MTP is disabled.
 int inkling2_mtp_active_drafts(void);
+
+// Returns the byte width of one MTP KV cache row (BF16 or packed FP8).
+size_t inkling2_mtp_kv_row_bytes(void);
+
+// Returns the total byte size of one state's MTP sliding-window KV rings.
+size_t inkling2_mtp_slide_kv_bytes(void);
+
+// Returns the rolling snapshot byte size contributed by MTP (0 when disabled).
+size_t inkling2_mtp_snap_rolling_bytes(void);
 
 // Estimates GPU workspace bytes needed by MTP for `rows` forward tokens.
 uint64_t inkling2_mtp_estimate_work_bytes(int rows);

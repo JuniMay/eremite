@@ -230,6 +230,95 @@ kernel void ink2_mtp_ctx_kv_store(
   vd[d1] = bfloat(v1);
 }
 
+// Applies per-head RMSNorm and NeoX split-half RoPE to context K rows and
+// stores packed FP8 E4M3 K and V rows with per-head FP16 scales.
+// Grid: (8, rows, 1), TG: (64, 1, 1).
+kernel void ink2_mtp_ctx_kv_store_fp8(
+    device const float *k_raw [[buffer(0)]],
+    device const float *v_raw [[buffer(1)]],
+    device const float *k_norm [[buffer(2)]],
+    device uchar *k_dst [[buffer(3)]],
+    device uchar *v_dst [[buffer(4)]],
+    device const Ink2MtpKvTarget *tgt [[buffer(5)]],
+    constant Ink2MtpCtxKvParam &p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  uint kh = tg.x;
+  uint r = tg.y;
+  if (kh >= INK2_MTP_KV_HEADS || r >= p.rows) return;
+  uint d0 = tid;
+  uint d1 = tid + INK2_MTP_HALF_HEAD;
+  ulong in_off = ulong(r) * INK2_MTP_KV_DIM + ulong(kh) * INK2_MTP_HEAD_DIM;
+  float k0 = k_raw[in_off + d0];
+  float k1 = k_raw[in_off + d1];
+  float v0 = v_raw[in_off + d0];
+  float v1 = v_raw[in_off + d1];
+
+  float s2 = simd_sum(k0 * k0 + k1 * k1);
+  threadgroup float sm[INK2_MTP_HEAD_SGS];
+  threadgroup float sm_k[INK2_MTP_HEAD_SGS];
+  threadgroup float sm_v[INK2_MTP_HEAD_SGS];
+  if (lane == 0) sm[sg] = s2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float inv = rsqrt((sm[0] + sm[1]) / float(INK2_MTP_HEAD_DIM) + p.eps);
+
+  float x0 = k0 * inv * k_norm[d0];
+  float x1 = k1 * inv * k_norm[d1];
+
+  uint pos;
+  device uchar *krow;
+  device uchar *vrow;
+  if (p.batched) {
+    Ink2MtpKvTarget tr = tgt[r];
+    pos = tr.pos;
+    uint slot = tr.ring_rows ? (pos % tr.ring_rows) : pos;
+    ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
+    krow = (device uchar *)tr.k + row_off;
+    vrow = (device uchar *)tr.v + row_off;
+  } else {
+    pos = p.pos0 + r;
+    uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+    ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
+    krow = k_dst + row_off;
+    vrow = v_dst + row_off;
+  }
+
+  float freq = pow(p.rope_theta, -float(2u * d0) / float(INK2_MTP_HEAD_DIM));
+  float ang = float(pos) * freq;
+  float cs = cos(ang);
+  float sn = sin(ang);
+  float rk0 = x0 * cs - x1 * sn;
+  float rk1 = x0 * sn + x1 * cs;
+
+  float kmax = simd_max(max(fabs(rk0), fabs(rk1)));
+  float vmax = simd_max(max(fabs(v0), fabs(v1)));
+  if (lane == 0) {
+    sm_k[sg] = kmax;
+    sm_v[sg] = vmax;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float k_amax = max(sm_k[0], sm_k[1]);
+  float v_amax = max(sm_v[0], sm_v[1]);
+
+  half ks256 = ink2_fp8_head_scale256(k_amax);
+  half vs256 = ink2_fp8_head_scale256(v_amax);
+  float k_inv = k_amax > 0.0f ? (INK2_FP8_SCALE / float(ks256)) : 0.0f;
+  float v_inv = v_amax > 0.0f ? (INK2_FP8_SCALE / float(vs256)) : 0.0f;
+
+  device uchar *kd = krow + ulong(kh) * INK2_MTP_HEAD_DIM;
+  device uchar *vd = vrow + ulong(kh) * INK2_MTP_HEAD_DIM;
+  kd[d0] = k_amax > 0.0f ? ink2_fp8_encode(rk0 * k_inv) : 0u;
+  kd[d1] = k_amax > 0.0f ? ink2_fp8_encode(rk1 * k_inv) : 0u;
+  vd[d0] = v_amax > 0.0f ? ink2_fp8_encode(v0 * v_inv) : 0u;
+  vd[d1] = v_amax > 0.0f ? ink2_fp8_encode(v1 * v_inv) : 0u;
+  if (tid == 0u) {
+    ((device half *)(krow + INK2_FP8_KV_SCALES_OFF))[kh] = ks256;
+    ((device half *)(vrow + INK2_FP8_KV_SCALES_OFF))[kh] = vs256;
+  }
+}
+
 // Initializes the 8-row draft block input: row 0 is RMSNorm(embed[anchor],
 // embed_norm) and rows 1..7 are mask_embed.
 // Grid: (block_size, 1, 1), TG: (256, 1, 1).
@@ -399,6 +488,122 @@ kernel void ink2_mtp_attend_part(
     }
     float4 kv = float4(float(kr[0]), float(kr[1]), float(kr[2]), float(kr[3]));
     float4 vv = float4(float(vr[0]), float(vr[1]), float(vr[2]), float(vr[3]));
+    for (uint g = 0u; g < INK2_MTP_GQA; g++) {
+      float score = simd_sum(dot(qv[g], kv));
+      float mn = max(m[g], score);
+      float alpha = (l[g] > 0.0f) ? exp(m[g] - mn) : 0.0f;
+      float beta = exp(score - mn);
+      ov[g] = ov[g] * alpha + vv * beta;
+      l[g] = l[g] * alpha + beta;
+      m[g] = mn;
+    }
+  }
+
+  threadgroup float sm_m[INK2_MTP_GQA][INK2_MTP_ATTEND_SGS];
+  threadgroup float sm_l[INK2_MTP_GQA][INK2_MTP_ATTEND_SGS];
+  threadgroup float4 sm_o[INK2_MTP_GQA][INK2_MTP_ATTEND_SGS][INK2_MTP_SIMD_WIDTH];
+  for (uint g = 0u; g < INK2_MTP_GQA; g++) {
+    if (lane == 0) {
+      sm_m[g][sg] = m[g];
+      sm_l[g][sg] = l[g];
+    }
+    sm_o[g][sg][lane] = ov[g];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg < INK2_MTP_GQA) {
+    uint g = sg;
+    uint h = kh * INK2_MTP_GQA + g;
+    float mmax = -INFINITY;
+    for (uint s = 0u; s < INK2_MTP_ATTEND_SGS; s++) {
+      if (sm_l[g][s] > 0.0f) mmax = max(mmax, sm_m[g][s]);
+    }
+    float lsum = 0.0f;
+    float4 osum = float4(0.0f);
+    for (uint s = 0u; s < INK2_MTP_ATTEND_SGS; s++) {
+      float ls = sm_l[g][s];
+      if (ls > 0.0f) {
+        float w = exp(sm_m[g][s] - mmax);
+        lsum += ls * w;
+        osum += sm_o[g][s][lane] * w;
+      }
+    }
+    device float *dst =
+        part_out + ((ulong(r) * INK2_MTP_HEADS + h) * p.part_stride + part) *
+                       INK2_MTP_PART_FLOATS;
+    dst[d_base + 0u] = osum.x;
+    dst[d_base + 1u] = osum.y;
+    dst[d_base + 2u] = osum.z;
+    dst[d_base + 3u] = osum.w;
+    if (lane == 0) {
+      dst[INK2_MTP_HEAD_DIM] = mmax;
+      dst[INK2_MTP_HEAD_DIM + 1u] = lsum;
+    }
+  }
+}
+
+// Noncausal FlashDecoding attention partition over packed FP8 E4M3 context KV
+// [ctx_lo, pos0) followed by BF16 draft block rows [0, block).
+// Grid: (8, nparts, block), TG: (128, 1, 1).
+kernel void ink2_mtp_attend_part_fp8(
+    device const bfloat *q_blk [[buffer(0)]],
+    device const uchar *k_ctx [[buffer(1)]],
+    device const uchar *v_ctx [[buffer(2)]],
+    device const bfloat *k_blk [[buffer(3)]],
+    device const bfloat *v_blk [[buffer(4)]],
+    device float *part_out [[buffer(5)]],
+    constant Ink2MtpAttendParam &p [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  uint kh = tg.x;
+  uint part = tg.y;
+  uint r = tg.z;
+  uint ctx_lo = (p.window > 0u && p.pos0 > p.window) ? (p.pos0 - p.window) : 0u;
+  uint ctx_len = p.pos0 - ctx_lo;
+  uint total_k = ctx_len + p.block;
+  uint per = (total_k + p.nparts - 1u) / p.nparts;
+  uint k_beg = part * per;
+  uint k_end = min(total_k, k_beg + per);
+
+  uint d_base = lane * INK2_MTP_VEC4_LANES;
+  float4 qv[INK2_MTP_GQA];
+  float m[INK2_MTP_GQA];
+  float l[INK2_MTP_GQA];
+  float4 ov[INK2_MTP_GQA];
+  for (uint g = 0u; g < INK2_MTP_GQA; g++) {
+    uint h = kh * INK2_MTP_GQA + g;
+    device const bfloat *qr =
+        q_blk + ulong(r) * INK2_MTP_Q_DIM + ulong(h) * INK2_MTP_HEAD_DIM + d_base;
+    qv[g] = float4(float(qr[0]), float(qr[1]), float(qr[2]), float(qr[3])) *
+            INK2_MTP_ATTN_SCALE;
+    m[g] = -INFINITY;
+    l[g] = 0.0f;
+    ov[g] = float4(0.0f);
+  }
+
+  for (uint ki = k_beg + sg; ki < k_end; ki += INK2_MTP_ATTEND_SGS) {
+    float4 kv;
+    float4 vv;
+    if (ki < ctx_len) {
+      uint pos = ctx_lo + ki;
+      uint slot = p.ring_rows ? (pos % p.ring_rows) : pos;
+      ulong row_off = ulong(slot) * INK2_FP8_KV_ROW_BYTES;
+      device const uchar *krow = k_ctx + row_off;
+      device const uchar *vrow = v_ctx + row_off;
+      float ksc = float(((device const half *)(krow + INK2_FP8_KV_SCALES_OFF))[kh]);
+      float vsc = float(((device const half *)(vrow + INK2_FP8_KV_SCALES_OFF))[kh]);
+      kv = fp8x4(((device const uint *)(krow + ulong(kh) * INK2_MTP_HEAD_DIM))[lane]) * ksc;
+      vv = fp8x4(((device const uint *)(vrow + ulong(kh) * INK2_MTP_HEAD_DIM))[lane]) * vsc;
+    } else {
+      uint bi = ki - ctx_len;
+      ulong kv_off =
+          ulong(bi) * INK2_MTP_KV_DIM + ulong(kh) * INK2_MTP_HEAD_DIM + d_base;
+      device const bfloat *kr = k_blk + kv_off;
+      device const bfloat *vr = v_blk + kv_off;
+      kv = float4(float(kr[0]), float(kr[1]), float(kr[2]), float(kr[3]));
+      vv = float4(float(vr[0]), float(vr[1]), float(vr[2]), float(vr[3]));
+    }
     for (uint g = 0u; g < INK2_MTP_GQA; g++) {
       float score = simd_sum(dot(qv[g], kv));
       float mn = max(m[g], score);

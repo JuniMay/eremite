@@ -87,6 +87,91 @@ static float bf16_to_f32(uint16_t h) {
   return f;
 }
 
+// Decodes an FP8 E4M3FN byte to FP32.
+static float e4m3_to_f32(uint8_t b) {
+  int sign = (b >> 7) & 1;
+  int exp = (b >> 3) & 0xF;
+  int mant = b & 0x7;
+  float v = exp == 0 ? ldexpf((float)mant / 8.0f, -6)
+                     : ldexpf(1.0f + (float)mant / 8.0f, exp - 7);
+  return sign ? -v : v;
+}
+
+// Decodes an IEEE 754 binary16 bit pattern to FP32.
+static float fp16_to_f32(uint16_t h) {
+  int sign = (h >> 15) & 1;
+  int exp = (h >> 10) & 0x1F;
+  int mant = h & 0x3FF;
+  float v;
+  if (exp == 0)
+    v = ldexpf((float)mant, -24);
+  else if (exp == 31)
+    v = mant ? NAN : INFINITY;
+  else
+    v = ldexpf(1.0f + (float)mant / 1024.0f, exp - 15);
+  return sign ? -v : v;
+}
+
+// Encodes an FP32 value to a finite IEEE 754 binary16 bit pattern.
+static uint16_t f32_to_fp16(float x) {
+  uint32_t u;
+  memcpy(&u, &x, sizeof u);
+  uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+  int exp = (int)((u >> 23) & 0xFFu) - 127 + 15;
+  uint32_t mant = u & 0x7FFFFFu;
+  if (exp <= 0) return sign;
+  if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+  uint32_t m = mant + 0x1000u + ((mant >> 13) & 1u);
+  if (m & 0x800000u) m = 0, exp++;
+  if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+  return (uint16_t)(sign | ((uint16_t)exp << 10) | (uint16_t)(m >> 13));
+}
+
+// Encodes an FP32 value to finite FP8 E4M3 round-to-nearest-even.
+static uint8_t f32_to_e4m3(float v) {
+  uint8_t sign = signbit(v) ? 0x80u : 0u;
+  float a = fabsf(v);
+  if (a > 448.0f) a = 448.0f;
+  if (a < 0.015625f) return (uint8_t)(sign | (uint8_t)lrintf(a * 512.0f));
+  int e = 0;
+  (void)frexpf(a, &e);
+  int exp = e - 1;
+  uint32_t q = (uint32_t)lrintf(ldexpf(a, 3 - exp));
+  uint32_t code = ((uint32_t)(exp + 7) << 3) + (q - 8u);
+  if (code > 0x7Eu) code = 0x7Eu;
+  return (uint8_t)(sign | code);
+}
+
+// Packs one KV head of 128 floats into a packed FP8 E4M3 row.
+static void fp8_kv_pack_head(uint8_t *base, int slot, int kh,
+                             const float *src) {
+  uint8_t *row = base + (size_t)slot * INK2_FP8_KV_ROW_BYTES;
+  float amax = 0.0f;
+  for (int d = 0; d < INK2_HEAD_DIM; d++) amax = fmaxf(amax, fabsf(src[d]));
+  uint16_t hscale = 0;
+  float inv = 0.0f;
+  if (amax > 0.0f) {
+    float s256 = amax * (256.0f / 448.0f);
+    if (s256 < 6.103515625e-5f) s256 = 6.103515625e-5f;
+    if (s256 > 65504.0f) s256 = 65504.0f;
+    hscale = f32_to_fp16(s256);
+    inv = 256.0f / fp16_to_f32(hscale);
+  }
+  memcpy(row + INK2_FP8_KV_SCALES_OFF + (size_t)kh * 2, &hscale, sizeof hscale);
+  for (int d = 0; d < INK2_HEAD_DIM; d++)
+    row[(size_t)kh * INK2_HEAD_DIM + d] =
+        amax > 0.0f ? f32_to_e4m3(src[d] * inv) : 0u;
+}
+
+// Decodes one element from a packed FP8 E4M3 row.
+static float fp8_kv_get(const uint8_t *base, int slot, int kh, int d) {
+  const uint8_t *row = base + (size_t)slot * INK2_FP8_KV_ROW_BYTES;
+  uint16_t hscale;
+  memcpy(&hscale, row + INK2_FP8_KV_SCALES_OFF + (size_t)kh * 2, sizeof hscale);
+  float scale = fp16_to_f32(hscale) / 256.0f;
+  return e4m3_to_f32(row[(size_t)kh * INK2_HEAD_DIM + d]) * scale;
+}
+
 // Deterministic pseudo-random float in [-1, 1] from seed state.
 static float rand_f32(uint64_t *st) {
   *st = *st * 6364136223846793005ull + 1442695040888963407ull;
@@ -308,6 +393,149 @@ static void test_ctx_kv_store(Gpu *gpu, MemorySlot *slot) {
   gpu_free(&kn);
   gpu_free(&kd);
   gpu_free(&vd);
+  gpu_free(&tgt);
+}
+
+// Verifies ink2_mtp_ctx_kv_store_fp8 in ring and batched modes, including
+// wide-range unnormalized V magnitudes (0, 1e-3, 100) and NaN-free encoding.
+static void test_ctx_kv_store_fp8(Gpu *gpu, MemorySlot *slot) {
+  int k_store = gpu_find_kernel(gpu, "ink2_mtp_ctx_kv_store_fp8");
+  int rows = 3, ring = 8, pos0 = 6;
+  Buf kr = make_buf(gpu, slot, (size_t)rows * INK2_KV_DIM * sizeof(float));
+  Buf vr = make_buf(gpu, slot, (size_t)rows * INK2_KV_DIM * sizeof(float));
+  Buf kn = make_buf(gpu, slot, (size_t)INK2_HEAD_DIM * sizeof(float));
+  Buf kd = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf vd = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf kd_b0 = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf vd_b0 = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf kd_b1 = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf vd_b1 = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf tgt = make_buf(gpu, slot, (size_t)rows * sizeof(KvTarget));
+
+  uint64_t st = 209;
+  float *kp = (float *)kr.ptr, *vp = (float *)vr.ptr, *knp = (float *)kn.ptr;
+  for (int i = 0; i < rows * INK2_KV_DIM; i++) {
+    kp[i] = rand_f32(&st);
+    vp[i] = rand_f32(&st);
+  }
+  // Exercise unnormalized V scales: head 0 = 0, head 1 ~ 1e-3, head 2 ~ 100.
+  for (int d = 0; d < INK2_HEAD_DIM; d++) {
+    vp[0 * INK2_HEAD_DIM + d] = 0.0f;
+    vp[1 * INK2_HEAD_DIM + d] *= 1e-3f;
+    vp[2 * INK2_HEAD_DIM + d] *= 100.0f;
+  }
+  for (int i = 0; i < INK2_HEAD_DIM; i++) knp[i] = 0.7f + 0.3f * rand_f32(&st);
+
+  CtxKvParam p = {(uint32_t)rows,  (uint32_t)pos0, (uint32_t)ring, 0u,
+                  TEST_ROPE_THETA, TEST_EPS};
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_store);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &kd, 0);
+  gpu_bind_buffer(&cmd, 4, &vd, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &p, sizeof p);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)rows, 1, HEAD_THREADS,
+                 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  int no_nan = 1, zero_ok = 1;
+  float worst_rel = 0.0f;
+  float ref[INK2_HEAD_DIM];
+  const uint8_t *kout = (const uint8_t *)kd.ptr;
+  const uint8_t *vout = (const uint8_t *)vd.ptr;
+  for (int r = 0; r < rows; r++) {
+    int pos = pos0 + r;
+    int sidx = pos % ring;
+    const uint8_t *krow = kout + (size_t)sidx * INK2_FP8_KV_ROW_BYTES;
+    const uint8_t *vrow = vout + (size_t)sidx * INK2_FP8_KV_ROW_BYTES;
+    for (int i = 0; i < INK2_KV_DIM; i++)
+      if ((krow[i] & 0x7Fu) == 0x7Fu || (vrow[i] & 0x7Fu) == 0x7Fu) no_nan = 0;
+    for (int kh = 0; kh < INK2_KV_HEADS; kh++) {
+      cpu_head_norm_rope(kp + (size_t)r * INK2_KV_DIM + kh * INK2_HEAD_DIM, knp,
+                         pos, ref);
+      const float *vrh = vp + (size_t)r * INK2_KV_DIM + kh * INK2_HEAD_DIM;
+      float kamax = 0.0f, vamax = 0.0f;
+      for (int d = 0; d < INK2_HEAD_DIM; d++) {
+        kamax = fmaxf(kamax, fabsf(ref[d]));
+        vamax = fmaxf(vamax, fabsf(vrh[d]));
+      }
+      if (r == 0 && kh == 0) {
+        uint16_t vs16;
+        memcpy(&vs16, vrow + INK2_FP8_KV_SCALES_OFF, sizeof vs16);
+        if (vs16 != 0) zero_ok = 0;
+        for (int d = 0; d < INK2_HEAD_DIM; d++)
+          if (vrow[d] != 0) zero_ok = 0;
+      }
+      for (int d = 0; d < INK2_HEAD_DIM; d++) {
+        float ek =
+            fabsf(fp8_kv_get(kout, sidx, kh, d) - ref[d]) / fmaxf(kamax, 1e-6f);
+        if (ek > worst_rel) worst_rel = ek;
+        if (vamax > 0.0f) {
+          float ev = fabsf(fp8_kv_get(vout, sidx, kh, d) - vrh[d]) / vamax;
+          if (ev > worst_rel) worst_rel = ev;
+        }
+      }
+    }
+  }
+  printf("ink2_mtp_ctx_kv_store_fp8 ring max rel err: %.6f\n", worst_rel);
+  check(no_nan, "ink2_mtp_ctx_kv_store_fp8 emits no FP8 NaN codes");
+  check(zero_ok, "ink2_mtp_ctx_kv_store_fp8 encodes all-zero V head cleanly");
+  check(worst_rel < 0.07f,
+        "ink2_mtp_ctx_kv_store_fp8 matches CPU across scale range");
+
+  // Batched mode writing row 0 to b0 at pos=pos0 (ring) and row 1 to b1 at
+  // pos=pos0+1 (ring): must match single-state bytes exactly.
+  KvTarget *kt = (KvTarget *)tgt.ptr;
+  kt[0] = (KvTarget){kd_b0.address + kd_b0.off, vd_b0.address + vd_b0.off,
+                     (uint32_t)pos0, (uint32_t)ring};
+  kt[1] = (KvTarget){kd_b1.address + kd_b1.off, vd_b1.address + vd_b1.off,
+                     (uint32_t)(pos0 + 1), (uint32_t)ring};
+  p.rows = 2u;
+  p.batched = 1u;
+  cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_store);
+  gpu_bind_buffer(&cmd, 0, &kr, 0);
+  gpu_bind_buffer(&cmd, 1, &vr, 0);
+  gpu_bind_buffer(&cmd, 2, &kn, 0);
+  gpu_bind_buffer(&cmd, 3, &kd, 0);
+  gpu_bind_buffer(&cmd, 4, &vd, 0);
+  gpu_bind_buffer(&cmd, 5, &tgt, 0);
+  gpu_copy_bytes(&cmd, 6, &p, sizeof p);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, 2u, 1, HEAD_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  int s0 = pos0 % ring, s1 = (pos0 + 1) % ring;
+  check(!memcmp((const uint8_t *)kd_b0.ptr + (size_t)s0 * INK2_FP8_KV_ROW_BYTES,
+                kout + (size_t)s0 * INK2_FP8_KV_ROW_BYTES,
+                INK2_FP8_KV_ROW_BYTES) &&
+            !memcmp((const uint8_t *)vd_b0.ptr +
+                        (size_t)s0 * INK2_FP8_KV_ROW_BYTES,
+                    vout + (size_t)s0 * INK2_FP8_KV_ROW_BYTES,
+                    INK2_FP8_KV_ROW_BYTES) &&
+            !memcmp((const uint8_t *)kd_b1.ptr +
+                        (size_t)s1 * INK2_FP8_KV_ROW_BYTES,
+                    kout + (size_t)s1 * INK2_FP8_KV_ROW_BYTES,
+                    INK2_FP8_KV_ROW_BYTES) &&
+            !memcmp((const uint8_t *)vd_b1.ptr +
+                        (size_t)s1 * INK2_FP8_KV_ROW_BYTES,
+                    vout + (size_t)s1 * INK2_FP8_KV_ROW_BYTES,
+                    INK2_FP8_KV_ROW_BYTES),
+        "ink2_mtp_ctx_kv_store_fp8 batched matches single-state bytes");
+
+  gpu_free(&kr);
+  gpu_free(&vr);
+  gpu_free(&kn);
+  gpu_free(&kd);
+  gpu_free(&vd);
+  gpu_free(&kd_b0);
+  gpu_free(&vd_b0);
+  gpu_free(&kd_b1);
+  gpu_free(&vd_b1);
   gpu_free(&tgt);
 }
 
@@ -562,6 +790,137 @@ static void test_attend(Gpu *gpu, MemorySlot *slot) {
   }
   printf("ink2_mtp_attend SWA multi-part max err: %.6f\n", worst);
   check(worst < TOL_F32, "ink2_mtp_attend matches CPU noncausal reference");
+
+  free(scores);
+  gpu_free(&qb);
+  gpu_free(&kc);
+  gpu_free(&vc);
+  gpu_free(&kb);
+  gpu_free(&vb);
+  gpu_free(&part);
+  gpu_free(&out);
+}
+
+// Verifies ink2_mtp_attend_part_fp8 + ink2_mtp_attend_combine for SWA wrap +
+// multi-part FlashDecoding over FP8 context KV + BF16 draft block KV.
+static void test_attend_fp8(Gpu *gpu, MemorySlot *slot) {
+  int k_part = gpu_find_kernel(gpu, "ink2_mtp_attend_part_fp8");
+  int k_comb = gpu_find_kernel(gpu, "ink2_mtp_attend_combine");
+  int ring = 40, window = 32, pos0 = 50, nparts = 3, part_stride = 4;
+  int ctx_lo = pos0 - window;
+  int ctx_len = window;
+  int total_k = ctx_len + INK2_MTP_BLOCK_SIZE;
+
+  Buf qb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_Q_DIM * sizeof(uint16_t));
+  Buf kc = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf vc = make_buf(gpu, slot, (size_t)ring * INK2_FP8_KV_ROW_BYTES);
+  Buf kb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_KV_DIM * sizeof(uint16_t));
+  Buf vb = make_buf(
+      gpu, slot, (size_t)INK2_MTP_BLOCK_SIZE * INK2_KV_DIM * sizeof(uint16_t));
+  Buf part = make_buf(gpu, slot,
+                      (size_t)INK2_MTP_BLOCK_SIZE * INK2_HEADS * part_stride *
+                          (INK2_HEAD_DIM + 2) * sizeof(float));
+  Buf out = make_buf(gpu, slot,
+                     (size_t)INK2_MTP_BLOCK_SIZE * INK2_Q_DIM * sizeof(float));
+
+  uint64_t st = 409;
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_Q_DIM; i++)
+    ((uint16_t *)qb.ptr)[i] = f32_to_bf16(rand_f32(&st));
+  for (int sl = 0; sl < ring; sl++) {
+    for (int kh = 0; kh < INK2_KV_HEADS; kh++) {
+      float khv[INK2_HEAD_DIM], vhv[INK2_HEAD_DIM];
+      for (int d = 0; d < INK2_HEAD_DIM; d++) {
+        khv[d] = rand_f32(&st);
+        vhv[d] = rand_f32(&st) * 3.0f;
+      }
+      fp8_kv_pack_head((uint8_t *)kc.ptr, sl, kh, khv);
+      fp8_kv_pack_head((uint8_t *)vc.ptr, sl, kh, vhv);
+    }
+  }
+  for (int i = 0; i < INK2_MTP_BLOCK_SIZE * INK2_KV_DIM; i++) {
+    ((uint16_t *)kb.ptr)[i] = f32_to_bf16(rand_f32(&st));
+    ((uint16_t *)vb.ptr)[i] = f32_to_bf16(rand_f32(&st) * 3.0f);
+  }
+
+  AttendParam ap = {(uint32_t)pos0,   (uint32_t)INK2_MTP_BLOCK_SIZE,
+                    (uint32_t)ring,   (uint32_t)window,
+                    (uint32_t)nparts, (uint32_t)part_stride};
+  GpuCommandBuffer cmd = gpu_begin(gpu);
+  gpu_select_kernel(&cmd, k_part);
+  gpu_bind_buffer(&cmd, 0, &qb, 0);
+  gpu_bind_buffer(&cmd, 1, &kc, 0);
+  gpu_bind_buffer(&cmd, 2, &vc, 0);
+  gpu_bind_buffer(&cmd, 3, &kb, 0);
+  gpu_bind_buffer(&cmd, 4, &vb, 0);
+  gpu_bind_buffer(&cmd, 5, &part, 0);
+  gpu_copy_bytes(&cmd, 6, &ap, sizeof ap);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_KV_HEADS, (uint32_t)nparts,
+                 (uint32_t)INK2_MTP_BLOCK_SIZE, ATTEND_THREADS, 1, 1);
+
+  gpu_select_kernel(&cmd, k_comb);
+  gpu_bind_buffer(&cmd, 0, &part, 0);
+  gpu_bind_buffer(&cmd, 1, &out, 0);
+  gpu_copy_bytes(&cmd, 2, &ap, sizeof ap);
+  gpu_run_kernel(&cmd, (uint32_t)INK2_HEADS, (uint32_t)INK2_MTP_BLOCK_SIZE, 1,
+                 COMBINE_THREADS, 1, 1);
+  gpu_commit(&cmd);
+  gpu_sync(gpu);
+
+  float scale = 1.0f / sqrtf((float)INK2_HEAD_DIM);
+  float worst = 0.0f;
+  float *scores = xmalloc((size_t)total_k * sizeof(float));
+  const uint8_t *kcp = (const uint8_t *)kc.ptr, *vcp = (const uint8_t *)vc.ptr;
+  for (int r = 0; r < INK2_MTP_BLOCK_SIZE; r++) {
+    for (int h = 0; h < INK2_HEADS; h++) {
+      int kh = h / INK2_GQA;
+      const uint16_t *qr =
+          (const uint16_t *)qb.ptr + (size_t)r * INK2_Q_DIM + h * INK2_HEAD_DIM;
+      float mx = -INFINITY;
+      for (int ki = 0; ki < total_k; ki++) {
+        double dot = 0.0;
+        if (ki < ctx_len) {
+          int sl = (ctx_lo + ki) % ring;
+          for (int d = 0; d < INK2_HEAD_DIM; d++)
+            dot += (double)bf16_to_f32(qr[d]) * fp8_kv_get(kcp, sl, kh, d);
+        } else {
+          const uint16_t *kr = (const uint16_t *)kb.ptr +
+                               (size_t)(ki - ctx_len) * INK2_KV_DIM +
+                               kh * INK2_HEAD_DIM;
+          for (int d = 0; d < INK2_HEAD_DIM; d++)
+            dot += (double)bf16_to_f32(qr[d]) * bf16_to_f32(kr[d]);
+        }
+        scores[ki] = (float)dot * scale;
+        if (scores[ki] > mx) mx = scores[ki];
+      }
+      double lsum = 0.0;
+      for (int ki = 0; ki < total_k; ki++) {
+        scores[ki] = expf(scores[ki] - mx);
+        lsum += scores[ki];
+      }
+      for (int d = 0; d < INK2_HEAD_DIM; d++) {
+        double acc = 0.0;
+        for (int ki = 0; ki < total_k; ki++) {
+          float vv =
+              ki < ctx_len
+                  ? fp8_kv_get(vcp, (ctx_lo + ki) % ring, kh, d)
+                  : bf16_to_f32(
+                        ((const uint16_t *)
+                             vb.ptr)[(size_t)(ki - ctx_len) * INK2_KV_DIM +
+                                     kh * INK2_HEAD_DIM + d]);
+          acc += scores[ki] * vv;
+        }
+        float ref = (float)(acc / lsum);
+        float got =
+            ((float *)out.ptr)[(size_t)r * INK2_Q_DIM + h * INK2_HEAD_DIM + d];
+        float e = fabsf(got - ref);
+        if (e > worst) worst = e;
+      }
+    }
+  }
+  printf("ink2_mtp_attend_fp8 SWA multi-part max err: %.6f\n", worst);
+  check(worst < TOL_F32, "ink2_mtp_attend_fp8 matches CPU noncausal reference");
 
   free(scores);
   gpu_free(&qb);
@@ -837,8 +1196,10 @@ int main(void) {
 
   test_fuse_norm(gpu, slot);
   test_ctx_kv_store(gpu, slot);
+  test_ctx_kv_store_fp8(gpu, slot);
   test_block_init_and_qk(gpu, slot);
   test_attend(gpu, slot);
+  test_attend_fp8(gpu, slot);
   test_swiglu_and_markov(gpu, slot);
   test_unembed_argmax(gpu, slot);
   gpu_return_freed_memory(gpu);

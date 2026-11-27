@@ -21,8 +21,6 @@ static constexpr float MTP_LOGIT_SOFTCAP = 30.0f;
 static constexpr int MTP_MAX_PARTS = 64;
 static constexpr int MTP_PART_TARGET = 128;
 static constexpr int MTP_PART_FLOATS = INK2_HEAD_DIM + 2;
-static constexpr size_t MTP_GLOBAL_KV_ROW_BYTES =
-    (size_t)INK2_KV_DIM * sizeof(uint16_t);
 static constexpr size_t MTP_ALIGN_READ_MIN_BYTES = 1u << 20;
 static constexpr size_t MTP_ALIGN_MASK = 15u;
 static constexpr size_t MTP_PATH_CAP = 1024;
@@ -167,6 +165,7 @@ typedef struct {
 
 // Loaded MTP metadata, weights and kernel handles.
 static int active_drafts;
+static int use_fp8_kv;
 static TensorIndex *mtp_index;
 static float fuse_probs[INK2_MTP_LAYERS + 1][INK2_MTP_TAPS];
 static MtpLayer mtp_layers[INK2_MTP_LAYERS];
@@ -175,10 +174,12 @@ static Buf markov_dflare_norm, markov_w1, rnn_bias, hidden_bias;
 static MtpBf16Lin rnn_proj, hidden_out;
 
 // Compiled Metal kernel handles.
-static int K_mv_bf16, K_mvm_bf16, K_mvm_bf16_3, K_mm_bf16;
+static int K_mv_bf16, K_mv_bf16_2, K_mvm_bf16, K_mvm_bf16_2, K_mvm_bf16_3,
+    K_mm_bf16;
 static int K_rmsnorm, K_copy, K_add;
-static int K_fuse_norm, K_ctx_kv_store, K_block_init, K_block_qk_prep;
-static int K_attend_part, K_attend_combine, K_swiglu;
+static int K_fuse_norm, K_ctx_kv_store, K_ctx_kv_store_fp8, K_block_init,
+    K_block_qk_prep;
+static int K_attend_part, K_attend_part_fp8, K_attend_combine, K_swiglu;
 static int K_markov_concat, K_markov_gru, K_markov_add;
 static int K_unembed_argmax_part, K_unembed_argmax_final;
 
@@ -202,9 +203,30 @@ static float bf16_to_f32(uint16_t bits) {
   return v;
 }
 
+// Returns the byte width of one MTP KV row for the active format.
+size_t inkling2_mtp_kv_row_bytes(void) {
+  return use_fp8_kv ? INK2_FP8_KV_ROW_BYTES : INK2_BF16_KV_ROW_BYTES;
+}
+
+// Returns the byte size of one SWA draft layer's K or V ring.
+static size_t mtp_slide_one_bytes(void) {
+  return (size_t)INK2_MTP_SLIDE_RING * inkling2_mtp_kv_row_bytes();
+}
+
+// Returns the total byte size of all MTP sliding-window KV rings.
+size_t inkling2_mtp_slide_kv_bytes(void) {
+  return (size_t)INK2_MTP_LOCAL_COUNT * 2 * mtp_slide_one_bytes();
+}
+
+// Returns the rolling snapshot byte size contributed by MTP when active.
+size_t inkling2_mtp_snap_rolling_bytes(void) {
+  return active_drafts ? inkling2_mtp_slide_kv_bytes() + INK2_MTP_FRNN_BYTES
+                       : 0;
+}
+
 // Returns the byte offset of SWA draft layer local_slot's K or V ring.
 static size_t mtp_slide_off(int local_slot, int is_v) {
-  return ((size_t)local_slot * 2 + (size_t)is_v) * INK2_MTP_SLIDE_KV_ONE_BYTES;
+  return ((size_t)local_slot * 2 + (size_t)is_v) * mtp_slide_one_bytes();
 }
 
 // Allocates a resident GPU buffer counted in `slot`.
@@ -318,8 +340,9 @@ static void load_fuse_probs(Tensor t) {
 }
 
 int inkling2_mtp_init(Gpu *gpu, WeightGroup *weights, const char *dir,
-                      int requested_drafts) {
+                      int requested_drafts, int fp8_kv) {
   active_drafts = 0;
+  use_fp8_kv = fp8_kv != 0;
   if (requested_drafts <= 0) return 0;
 
   char path[MTP_PATH_CAP];
@@ -425,7 +448,9 @@ int inkling2_mtp_init(Gpu *gpu, WeightGroup *weights, const char *dir,
 
 #define K(field, name) field = gpu_find_kernel(gpu, name)
   K(K_mv_bf16, "mv_bf16");
+  K(K_mv_bf16_2, "mv_bf16_2");
   K(K_mvm_bf16, "mvm_bf16");
+  K(K_mvm_bf16_2, "mvm_bf16_2");
   K(K_mvm_bf16_3, "mvm_bf16_3");
   K(K_mm_bf16, "mm_bf16");
   K(K_rmsnorm, "ink2_rmsnorm");
@@ -433,9 +458,11 @@ int inkling2_mtp_init(Gpu *gpu, WeightGroup *weights, const char *dir,
   K(K_add, "ink2_add");
   K(K_fuse_norm, "ink2_mtp_fuse_norm");
   K(K_ctx_kv_store, "ink2_mtp_ctx_kv_store");
+  K(K_ctx_kv_store_fp8, "ink2_mtp_ctx_kv_store_fp8");
   K(K_block_init, "ink2_mtp_block_init");
   K(K_block_qk_prep, "ink2_mtp_block_qk_prep");
   K(K_attend_part, "ink2_mtp_attend_part");
+  K(K_attend_part_fp8, "ink2_mtp_attend_part_fp8");
   K(K_attend_combine, "ink2_mtp_attend_combine");
   K(K_swiglu, "ink2_mtp_swiglu");
   K(K_markov_concat, "ink2_mtp_markov_concat");
@@ -585,7 +612,8 @@ int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot,
                             Ink2MtpState *ms) {
   *ms = (Ink2MtpState){0};
   if (!active_drafts) return 1;
-  ms->slide_kv = mtp_state_try_alloc(gpu, state_slot, INK2_MTP_SLIDE_KV_BYTES);
+  size_t slide_bytes = inkling2_mtp_slide_kv_bytes();
+  ms->slide_kv = mtp_state_try_alloc(gpu, state_slot, slide_bytes);
   ms->frnn = ms->slide_kv.obj
                  ? mtp_state_try_alloc(gpu, state_slot, INK2_MTP_FRNN_BYTES)
                  : (Buf){0};
@@ -594,7 +622,7 @@ int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot,
     *ms = (Ink2MtpState){0};
     return 0;
   }
-  memset(ms->slide_kv.ptr, 0, INK2_MTP_SLIDE_KV_BYTES);
+  memset(ms->slide_kv.ptr, 0, slide_bytes);
   memset(ms->frnn.ptr, 0, INK2_MTP_FRNN_BYTES);
   return 1;
 }
@@ -602,8 +630,9 @@ int inkling2_mtp_state_init(Gpu *gpu, MemorySlot *state_slot,
 int inkling2_mtp_state_resize_global(Gpu *gpu, MemorySlot *state_slot,
                                      Ink2MtpState *ms, int new_cap, int keep) {
   if (!active_drafts) return 1;
-  size_t new_bytes = (size_t)new_cap * MTP_GLOBAL_KV_ROW_BYTES;
-  size_t copy_bytes = (size_t)keep * MTP_GLOBAL_KV_ROW_BYTES;
+  size_t row_bytes = inkling2_mtp_kv_row_bytes();
+  size_t new_bytes = (size_t)new_cap * row_bytes;
+  size_t copy_bytes = (size_t)keep * row_bytes;
   Buf nk = mtp_state_try_alloc(gpu, state_slot, new_bytes);
   Buf nv = nk.obj ? mtp_state_try_alloc(gpu, state_slot, new_bytes) : (Buf){0};
   if (!nv.obj) {
@@ -631,8 +660,9 @@ void inkling2_mtp_state_free(Ink2MtpState *ms) {
 
 size_t inkling2_mtp_state_bytes(int cap) {
   if (!active_drafts) return 0;
-  size_t gk_one = gpu_round_up_to_pages((size_t)cap * MTP_GLOBAL_KV_ROW_BYTES);
-  return 2 * gk_one + gpu_round_up_to_pages(INK2_MTP_SLIDE_KV_BYTES) +
+  size_t gk_one =
+      gpu_round_up_to_pages((size_t)cap * inkling2_mtp_kv_row_bytes());
+  return 2 * gk_one + gpu_round_up_to_pages(inkling2_mtp_slide_kv_bytes()) +
          gpu_round_up_to_pages(INK2_MTP_FRNN_BYTES);
 }
 
@@ -677,6 +707,51 @@ static void run_linear(GpuCommandBuffer *c, const Buf *w, const Buf *x,
     uint32_t tiles_m = ((uint32_t)m + MTP_MM_TILE_M - 1u) / MTP_MM_TILE_M;
     gpu_run_kernel(c, tiles_n * tiles_m, 1, 1, MTP_MM_THREADS, 1, 1);
   }
+}
+
+// Dispatches 2 BF16 projections sharing input x and width k in one fused
+// dispatch for m <= INK2_MAX_BATCH_ROWS, or 2 mm_bf16 calls during prefill.
+static void run_linear2(GpuCommandBuffer *c, const MtpBf16Lin *a, const Buf *ya,
+                        const MtpBf16Lin *b, const Buf *yb, const Buf *x, int m,
+                        int is_prefill) {
+  if (!is_prefill && m <= INK2_MAX_BATCH_ROWS) {
+    uint32_t max_n = (uint32_t)(a->n > b->n ? a->n : b->n);
+    uint32_t split = (max_n <= 1024u) ? 2u : 1u;
+    uint32_t rows_per_tg = (MTP_BF16_MV_SGS / split) * MTP_BF16_MV_ROWS_PER_SG;
+    uint32_t dims[2][2] = {{(uint32_t)a->n, (uint32_t)a->n},
+                           {(uint32_t)b->n, (uint32_t)b->n}};
+    if (m == 1) {
+      MtpMvParam p = {max_n, (uint32_t)a->k, max_n, 0, 0, split};
+      gpu_select_kernel(c, K_mv_bf16_2);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, (max_n + rows_per_tg - 1u) / rows_per_tg, 2, 1,
+                     MTP_MV_THREADS, 1, 1);
+    } else {
+      MtpMvmParam p = {{max_n, (uint32_t)a->k, max_n, 0, 0, split},
+                       (uint32_t)m,
+                       (uint32_t)a->k,
+                       max_n};
+      gpu_select_kernel(c, K_mvm_bf16_2);
+      gpu_bind_buffer(c, 0, &a->w, 0);
+      gpu_bind_buffer(c, 2, x, 0);
+      gpu_bind_buffer(c, 3, ya, 0);
+      gpu_copy_bytes(c, 4, &p, sizeof p);
+      gpu_bind_buffer(c, 5, &b->w, 0);
+      gpu_bind_buffer(c, 7, yb, 0);
+      gpu_copy_bytes(c, 11, dims, sizeof dims);
+      gpu_run_kernel(c, (max_n + rows_per_tg - 1u) / rows_per_tg, 2, 1,
+                     MTP_MV_THREADS, 1, 1);
+    }
+    return;
+  }
+  run_linear(c, &a->w, x, ya, m, a->n, a->k, a->n, 1u, is_prefill);
+  run_linear(c, &b->w, x, yb, m, b->n, b->k, b->n, 1u, is_prefill);
 }
 
 // Dispatches fused Q, K, V BF16 projections for the 8-row draft block.
@@ -805,10 +880,8 @@ void inkling2_mtp_inject(GpuCommandBuffer *cmd, Ink2MtpWork *w,
     gpu_copy_bytes(cmd, 4, &fp, sizeof fp);
     gpu_run_kernel(cmd, (uint32_t)run_rows, 1, 1, MTP_ROW_THREADS, 1, 1);
 
-    run_linear(cmd, &ml->wk_ctx.w, &w->ctx, &w->k_ctx_raw, run_rows,
-               ml->wk_ctx.n, ml->wk_ctx.k, ml->wk_ctx.n, 1u, is_prefill);
-    run_linear(cmd, &ml->wv_ctx.w, &w->ctx, &w->v_ctx_raw, run_rows,
-               ml->wv_ctx.n, ml->wv_ctx.k, ml->wv_ctx.n, 1u, is_prefill);
+    run_linear2(cmd, &ml->wk_ctx, &w->k_ctx_raw, &ml->wv_ctx, &w->v_ctx_raw,
+                &w->ctx, run_rows, is_prefill);
 
     const Buf *k_dst = ml->is_global ? &s0->gk : &s0->slide_kv;
     const Buf *v_dst = ml->is_global ? &s0->gv : &s0->slide_kv;
@@ -819,7 +892,7 @@ void inkling2_mtp_inject(GpuCommandBuffer *cmd, Ink2MtpWork *w,
     MtpCtxKvParam kp = {(uint32_t)run_rows, (uint32_t)(pos0 + row_off),
                         ring_rows,          (uint32_t)batched,
                         MTP_ROPE_THETA,     MTP_RMS_EPS};
-    gpu_select_kernel(cmd, K_ctx_kv_store);
+    gpu_select_kernel(cmd, use_fp8_kv ? K_ctx_kv_store_fp8 : K_ctx_kv_store);
     gpu_bind_buffer(cmd, 0, &w->k_ctx_raw, 0);
     gpu_bind_buffer(cmd, 1, &w->v_ctx_raw, 0);
     gpu_bind_buffer(cmd, 2, &ml->k_norm_ctx, 0);
@@ -926,7 +999,7 @@ void inkling2_mtp_propose(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
                          ring_rows,        window,
                          (uint32_t)nparts, (uint32_t)MTP_MAX_PARTS};
 
-    gpu_select_kernel(&cmd, K_attend_part);
+    gpu_select_kernel(&cmd, use_fp8_kv ? K_attend_part_fp8 : K_attend_part);
     gpu_bind_buffer(&cmd, 0, &w->q_blk, 0);
     gpu_bind_buffer(&cmd, 1, k_ctx, k_off);
     gpu_bind_buffer(&cmd, 2, v_ctx, v_off);
@@ -950,10 +1023,8 @@ void inkling2_mtp_propose(Gpu *gpu, MemorySlot *work_slot, Ink2MtpWork *w,
 
     run_rmsnorm(&cmd, &w->cur, &ml->post_attn_norm, &w->xn,
                 INK2_MTP_BLOCK_SIZE);
-    run_linear(&cmd, &ml->gate_proj.w, &w->xn, &w->gate, INK2_MTP_BLOCK_SIZE,
-               ml->gate_proj.n, ml->gate_proj.k, ml->gate_proj.n, 1u, 0);
-    run_linear(&cmd, &ml->up_proj.w, &w->xn, &w->up, INK2_MTP_BLOCK_SIZE,
-               ml->up_proj.n, ml->up_proj.k, ml->up_proj.n, 1u, 0);
+    run_linear2(&cmd, &ml->gate_proj, &w->gate, &ml->up_proj, &w->up, &w->xn,
+                INK2_MTP_BLOCK_SIZE, 0);
 
     gpu_select_kernel(&cmd, K_swiglu);
     gpu_bind_buffer(&cmd, 0, &w->gate, 0);

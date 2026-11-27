@@ -1554,7 +1554,7 @@ static int grown_cap(int positions) {
 // Returns the rolling snapshot byte size, including MTP rings when active.
 static size_t snap_rolling_bytes(void) {
   return slide_kv_bytes() + CONV_TOTAL_BYTES +
-         (inkling2_mtp_active_drafts() ? INK2_MTP_SNAP_ROLLING_BYTES : 0);
+         inkling2_mtp_snap_rolling_bytes();
 }
 
 // Returns the snapshot format flag bitmask matching the active MTP and FP8 KV
@@ -1683,7 +1683,7 @@ static int ink2_write_state_regions(ModelState *ms, int positions, int fill,
     out[n++] = (StateRegion){s->gv[i].ptr, row_bytes, 1, 0, 0};
   }
   if (inkling2_mtp_active_drafts()) {
-    uint32_t mtp_row_bytes = (uint32_t)INK2_BF16_KV_ROW_BYTES;
+    uint32_t mtp_row_bytes = (uint32_t)inkling2_mtp_kv_row_bytes();
     out[n++] = (StateRegion){s->mtp.gk.ptr, mtp_row_bytes, 1, 0, 0};
     out[n++] = (StateRegion){s->mtp.gv.ptr, mtp_row_bytes, 1, 0, 0};
   }
@@ -1715,9 +1715,9 @@ static ModelSnapshot *ink2_snapshot_take(ModelState *ms, int pos,
   memcpy(x->rows, s->slide_kv.ptr, slide_bytes);
   memcpy(x->rows + slide_bytes, s->conv_ring.ptr, CONV_TOTAL_BYTES);
   if (inkling2_mtp_active_drafts()) {
-    memcpy(x->rows + base_rolling, s->mtp.slide_kv.ptr,
-           INK2_MTP_SLIDE_KV_BYTES);
-    memcpy(x->rows + base_rolling + INK2_MTP_SLIDE_KV_BYTES, s->mtp.frnn.ptr,
+    size_t mtp_slide = inkling2_mtp_slide_kv_bytes();
+    memcpy(x->rows + base_rolling, s->mtp.slide_kv.ptr, mtp_slide);
+    memcpy(x->rows + base_rolling + mtp_slide, s->mtp.frnn.ptr,
            INK2_MTP_FRNN_BYTES);
   }
   if (lg) {
@@ -1738,9 +1738,9 @@ static void ink2_snapshot_restore(ModelState *ms, const ModelSnapshot *mx) {
   memcpy(s->slide_kv.ptr, x->rows, slide_bytes);
   memcpy(s->conv_ring.ptr, x->rows + slide_bytes, CONV_TOTAL_BYTES);
   if (inkling2_mtp_active_drafts()) {
-    memcpy(s->mtp.slide_kv.ptr, x->rows + base_rolling,
-           INK2_MTP_SLIDE_KV_BYTES);
-    memcpy(s->mtp.frnn.ptr, x->rows + base_rolling + INK2_MTP_SLIDE_KV_BYTES,
+    size_t mtp_slide = inkling2_mtp_slide_kv_bytes();
+    memcpy(s->mtp.slide_kv.ptr, x->rows + base_rolling, mtp_slide);
+    memcpy(s->mtp.frnn.ptr, x->rows + base_rolling + mtp_slide,
            INK2_MTP_FRNN_BYTES);
   }
 }
@@ -1787,7 +1787,8 @@ static int ink2_write_snapshot_parts(ModelSnapshot *mx, ModelState *ms, int pos,
   out[n++] = (SnapshotPart){s->slide_kv.ptr, slide_kv_bytes()};
   out[n++] = (SnapshotPart){s->conv_ring.ptr, CONV_TOTAL_BYTES};
   if (mtp_on) {
-    out[n++] = (SnapshotPart){s->mtp.slide_kv.ptr, INK2_MTP_SLIDE_KV_BYTES};
+    out[n++] =
+        (SnapshotPart){s->mtp.slide_kv.ptr, inkling2_mtp_slide_kv_bytes()};
     out[n++] = (SnapshotPart){s->mtp.frnn.ptr, INK2_MTP_FRNN_BYTES};
   }
   return n;
@@ -3297,7 +3298,7 @@ static int ink2_load(Gpu *model_gpu, MemorySlot *work_mem, const char *dir,
         weight_group_new(gpu, work_mem->account, "Inkling-2-Mini weights");
     register_text_weights();
     register_expert_spans();
-    inkling2_mtp_init(gpu, text_weights, dir, opt.draft);
+    inkling2_mtp_init(gpu, text_weights, dir, opt.draft, opt.inkling2.fp8_kv);
     inkling2_vision_init(gpu, work_mem, checkpoint, text_weights);
 
     ExpertLayout layout = {.layers = INK2_PHYS_LAYERS,
